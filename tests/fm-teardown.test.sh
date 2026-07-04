@@ -886,6 +886,79 @@ test_gh_error_and_content_absent_refuses() {
   pass "gh lookup error with content not in default refuses (fail-safe)"
 }
 
+# Override the treehouse mock so `treehouse return` fails, simulating treehouse
+# refusing a worktree it does not manage (the "is not managed by treehouse"
+# choke the robustness fix must survive).
+add_treehouse_return_failure() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = return ]; then
+  echo "error: worktree is not managed by treehouse" >&2
+  exit 1
+fi
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+}
+
+# A meta that records a directory which is NOT a registered worktree of the
+# project (reproduces a pre-fix meta that recorded the launch cwd / firstmate
+# home instead of the leased worktree) must not brick teardown: it should skip
+# the worktree return, warn, and still kill the window and clear volatile state.
+test_stale_nontreehouse_worktree_degrades_gracefully() {
+  local case_dir rc other
+  case_dir=$(make_case stale-nontreehouse)
+  # Standalone clone of origin: HEAD is on origin/main (landed, so the
+  # landed-work check passes to the worktree-return step) but the clone is not a
+  # worktree registered in the project's `git worktree list`.
+  other="$case_dir/not-a-pool-worktree"
+  git clone -q "$case_dir/origin.git" "$other"
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    "window=fm-task-x1" \
+    "worktree=$other" \
+    "project=$case_dir/project" \
+    "kind=ship" \
+    "mode=no-mistakes"
+  add_treehouse_return_failure "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "stale-nontreehouse: teardown must not abort on a non-treehouse worktree"
+  grep -q "not a treehouse-managed worktree" "$case_dir/stderr" \
+    || fail "stale-nontreehouse: expected a graceful warning about the non-treehouse worktree"$'\n'"$(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/state/task-x1.meta" "stale-nontreehouse: meta should be cleared after teardown"
+  pass "teardown degrades gracefully when the recorded worktree is not a treehouse worktree"
+}
+
+# When the recorded worktree IS a registered worktree but `treehouse return`
+# itself fails (e.g. already returned, or a transient treehouse error), teardown
+# must warn and continue rather than aborting mid-cleanup.
+test_registered_worktree_return_failure_is_nonfatal() {
+  local case_dir rc
+  case_dir=$(make_case return-failure-nonfatal)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "shippable work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+  add_treehouse_return_failure "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "return-failure-nonfatal: a failed treehouse return must not abort teardown"
+  grep -q "treehouse return failed" "$case_dir/stderr" \
+    || fail "return-failure-nonfatal: expected a non-fatal warning about the failed return"$'\n'"$(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/state/task-x1.meta" "return-failure-nonfatal: meta should be cleared after teardown"
+  pass "a failed treehouse return warns but does not abort teardown"
+}
+
+
 test_stale_index_lock_cleared_and_teardown_succeeds() {
   local case_dir rc lock
   case_dir=$(make_case stale-index-lock)
@@ -1014,7 +1087,17 @@ test_stale_index_lock_cleanup_rechecks_dirty_worktree() {
   pass "stale lock cleanup rechecks and refuses dirty worktree before return"
 }
 
-test_non_linked_index_lock_path_is_checked_from_worktree() {
+# A recorded worktree that is a standalone clone rather than a REGISTERED
+# worktree of the project (the shape a pre-worktree-path-fix meta could record)
+# never reaches the lock machinery at all: safe_task_worktree refuses it, so
+# teardown warns, skips the return, and touches nothing inside it - including a
+# stale index.lock. That refusal is the point (teardown must not detach,
+# branch-delete, or `treehouse return` a directory that is not the task's pool
+# worktree), and it is why the "non-linked" .git/index.lock form is only ever a
+# defensive branch of worktree_git_lock_path now. The lock-clearing behavior
+# itself stays covered for the real (linked, registered) worktree by
+# test_stale_index_lock_cleared_and_teardown_succeeds.
+test_unregistered_worktree_lock_is_left_untouched() {
   local case_dir rc lock
   case_dir=$(make_case non-linked-index-lock)
   git -C "$case_dir/project" worktree remove --force "$case_dir/wt"
@@ -1039,11 +1122,13 @@ test_non_linked_index_lock_path_is_checked_from_worktree() {
   rc=$?
   set -e
 
-  expect_code 0 "$rc" "non-linked-index-lock: teardown should clear a normal repo index.lock"
-  assert_grep "removed provably-stale git lock" "$case_dir/stderr" \
-    "non-linked-index-lock: teardown did not report clearing the stale lock"
-  assert_absent "$lock" "non-linked-index-lock: stale lock file should have been removed"
-  pass "normal repo index.lock is resolved from the worktree and cleared when stale"
+  expect_code 0 "$rc" "unregistered-worktree-lock: teardown should still complete (window kill + state clear)"
+  assert_grep "not a treehouse-managed worktree" "$case_dir/stderr" \
+    "unregistered-worktree-lock: teardown did not warn that the recorded worktree is unregistered"
+  assert_not_contains "$(cat "$case_dir/stderr")" "removed provably-stale git lock" \
+    "unregistered-worktree-lock: teardown must not touch git state inside an unregistered worktree"
+  assert_present "$lock" "unregistered-worktree-lock: the lock file must be left exactly as found"
+  pass "an unregistered (cloned) worktree is never returned and its index.lock is left untouched"
 }
 
 test_index_lock_mtime_read_failure_refuses() {
@@ -1287,9 +1372,11 @@ test_stale_index_lock_cleared_and_teardown_succeeds
 test_live_index_lock_is_never_removed_and_teardown_refuses
 test_lsof_error_never_clears_index_lock
 test_stale_index_lock_cleanup_rechecks_dirty_worktree
-test_non_linked_index_lock_path_is_checked_from_worktree
+test_unregistered_worktree_lock_is_left_untouched
 test_index_lock_mtime_read_failure_refuses
 test_transient_index_lock_clears_after_first_attempt_and_retry_succeeds
 test_persistent_index_lock_exhausts_retries_and_refuses_loudly
 test_empty_retry_wait_uses_default_without_aborting
 test_fractional_legacy_retry_wait_refuses_without_arithmetic_error
+test_stale_nontreehouse_worktree_degrades_gracefully
+test_registered_worktree_return_failure_is_nonfatal

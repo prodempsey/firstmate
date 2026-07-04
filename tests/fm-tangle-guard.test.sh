@@ -149,9 +149,9 @@ test_brief_assertion_precedes_branch() {
 
 # --- GUARD 1b: fm-spawn isolation abort -------------------------------------
 
-# A fake tmux that reports FM_FAKE_PANE_PATH as the post-`treehouse get` pane cwd
-# (so the spawn's worktree-resolution loop resolves to a path we control), names
-# the session on '#S', and swallows window ops. Echoes the fakebin dir.
+# A fake tmux that names the session on '#S' and swallows window ops, paired with
+# a fake treehouse whose `get --lease` prints FM_FAKE_PANE_PATH - so the spawn's
+# worktree resolution lands on a path the caller controls. Echoes the fakebin dir.
 make_spawn_fakebin() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
@@ -169,7 +169,18 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse
+  # fm-spawn resolves the worktree from `treehouse get --lease` stdout, so echo
+  # the caller-controlled FM_FAKE_PANE_PATH to steer WT to the path under test
+  # (a non-git dir, a primary subdir, or a genuine isolated worktree).
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = get ]; then
+  printf '%s\n' "${FM_FAKE_PANE_PATH:-}"
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
   printf '%s\n' "$fakebin"
 }
 
@@ -224,11 +235,11 @@ test_spawn_isolation_abort() {
 #     tmux appends at the next free index instead of the active window index, which
 #     collides under base-index 1;
 #   - the window id is captured (-P -F #{window_id}) and automatic-rename/allow-rename
-#     are disabled so the fm-<id> name survives treehouse cd'ing into the worktree;
-#   - the treehouse-get send-keys and the worktree wait loop target that stable
-#     window id, never the (possibly-renamed) name - a lost name would let
-#     display-message fall back to the active client's window and misread firstmate's
-#     OWN pane as the worktree, tangling a hook into the primary checkout.
+#     are disabled so the fm-<id> name survives the pane cd'ing into the worktree;
+#   - the send that moves the pane into the leased worktree targets that stable
+#     window id, never the (possibly-renamed) name - a lost name would let a
+#     name-addressed send fall back to the active client's window, i.e. firstmate's
+#     OWN pane, and cd the primary checkout's shell into the crew worktree.
 make_spawn_record_fakebin() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
@@ -236,9 +247,6 @@ make_spawn_record_fakebin() {
 #!/usr/bin/env bash
 set -u
 [ -n "${FM_TMUX_REC:-}" ] && printf 'tmux %s\n' "$*" >> "$FM_TMUX_REC"
-case "$*" in
-  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
-esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
   new-window) printf '%s\n' "@spawnwid"; exit 0 ;;
@@ -248,7 +256,17 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse
+  # fm-spawn leases the worktree out-of-band; echo the caller-controlled path so
+  # WT resolves to the genuine isolated worktree the case created.
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = get ]; then
+  printf '%s\n' "${FM_FAKE_PANE_PATH:-}"
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
   printf '%s\n' "$fakebin"
 }
 
@@ -292,11 +310,14 @@ test_spawn_tmux_window_construction() {
   assert_grep "set-window-option -t @spawnwid allow-rename off" "$rec" \
     "must disable allow-rename on the spawned window"
 
-  # Bug 2 fix (b): treehouse-get and the worktree wait loop target the stable id.
-  assert_grep "send-keys -t @spawnwid treehouse get Enter" "$rec" \
-    "treehouse get must be sent to the stable window id"
-  assert_grep "display-message -p -t @spawnwid #{pane_current_path}" "$rec" \
-    "the worktree wait loop must query the stable window id, not the name"
+  # Bug 2 fix (b): the send that enters the leased worktree targets the stable id.
+  # (The pane is no longer polled for the worktree at all - fm-spawn leases it
+  # out-of-band with `treehouse get --lease` - so the only rename-critical send
+  # left in the worktree-entry sequence is this cd.)
+  assert_grep "send-keys -t @spawnwid cd '$wt' Enter" "$rec" \
+    "the worktree cd must be sent to the stable window id, not the name"
+  assert_no_grep "send-keys -t firstmate:fm-rec-win-gg7 cd " "$rec" \
+    "the worktree cd must not be addressed by the (renameable) window name"
 
   pass "fm-spawn: appends windows by session-colon, pins the name, and targets the window id"
 }

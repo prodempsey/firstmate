@@ -754,7 +754,17 @@ esac
 exit 0
 SH
   chmod +x "$fb/tmux"
-  fm_fake_exit0 "$fb" treehouse
+  # fm-spawn leases the worktree out-of-band with `treehouse get --lease` and
+  # reads the path from stdout; echo the fake worktree so WT resolves to it.
+  cat > "$fb/treehouse" <<SH
+#!/usr/bin/env bash
+{ printf 'treehouse'; for a in "\$@"; do printf '\\x1f%s' "\$a"; done; printf '\\n'; } >> "\${FM_TMUX_LOG:?}"
+if [ "\${1:-}" = get ]; then
+  printf '%s\\n' "$wt"
+fi
+exit 0
+SH
+  chmod +x "$fb/treehouse"
   printf '%s\n' "$fb"
 }
 
@@ -783,72 +793,114 @@ run_spawn_case() {  # <bin-root> <fakebin> <log> <state> <data> <config> <proj> 
 # by tests/fm-backend-tmux-smoke.test.sh. The send/peek/teardown conformance
 # tests below remain pure extractions and stay. (make_spawn_fakebin and
 # run_spawn_case are retained: test_spawn_default_backend_writes_no_meta_field
-# uses make_spawn_fakebin, and #294's run_spawn_symlink_case uses run_spawn_case.)
+# uses make_spawn_fakebin, #294's run_spawn_symlink_case uses run_spawn_case, and
+# the leased-worktree mechanism test below uses both.)
+
+test_spawn_leases_worktree_and_drives_pane() {
+  # fm-spawn's worktree resolution no longer sends `treehouse get` into the pane
+  # and polls pane_current_path (which could latch onto a spurious cwd like the
+  # firstmate home). It leases the worktree out-of-band with
+  # `treehouse get --lease` - whose stdout is the authoritative leased path -
+  # and sends `cd <worktree>` into the pane. This asserts that mechanism end to
+  # end through the recording fake-tmux: the leased path reaches the meta, the
+  # lease call is actually made, and the pane is moved and launched.
+  local fb proj wt data id log_new out_new state_new config_new
+  proj="$TMP_ROOT/spawn-project"; wt="$TMP_ROOT/spawn-wt"; data="$TMP_ROOT/spawn-data"
+  id="spawnconform1"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  fb=$(make_spawn_fakebin "$TMP_ROOT/spawn-fake" "$wt")
+  mkdir -p "$data/$id"
+  printf 'test brief content\n' > "$data/$id/brief.md"
+  state_new="$TMP_ROOT/spawn-state-new"; config_new="$TMP_ROOT/spawn-config-new"
+  mkdir -p "$state_new" "$config_new"
+  log_new="$TMP_ROOT/spawn-new.log"
+
+  out_new=$(run_spawn_case "$ROOT" "$fb" "$log_new" "$state_new" "$data" "$config_new" "$proj" -- "$id" "$proj" claude 2>&1)
+  local rc_new=$?
+
+  expect_code 0 "$rc_new" "new fm-spawn.sh should succeed"$'\n'"$out_new"
+  assert_contains "$out_new" "spawned $id harness=claude kind=ship mode=no-mistakes yolo=off window=firstmate:fm-$id worktree=$wt" \
+    "spawn output missing the expected summary line (should record the leased worktree)"
+
+  # The leased worktree is recorded in the task meta verbatim.
+  assert_grep "worktree=$wt" "$state_new/$id.meta" "spawn meta did not record the leased worktree path"
+  # The worktree was leased out-of-band (get --lease), not sent into the pane.
+  assert_contains "$(cat "$log_new")" "treehouse"$'\x1f''get'$'\x1f''--lease' \
+    "spawn did not lease the worktree with treehouse get --lease"
+  # The pane is moved into the leased worktree with a cd send.
+  assert_contains "$(cat "$log_new")" $'\x1f'"cd '$wt'" \
+    "spawn did not send 'cd <worktree>' into the pane"
+
+  # Sanity: the log actually captured the session/window lifecycle so an
+  # accidentally-empty log (e.g. a fake tmux path typo) cannot pass silently.
+  assert_contains "$(cat "$log_new")" $'\x1f''new-window' "spawn tmux log missing new-window"
+  assert_contains "$(cat "$log_new")" $'\x1f''-l'$'\x1f'"CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions \"\$(cat '$data/$id/brief.md')\"" \
+    "spawn tmux log missing the literal launch-command send"
+
+  rm -rf "/tmp/fm-$id"
+  pass "fm-spawn.sh: leases the worktree with treehouse get --lease, records it in meta, and drives the pane (cd + launch)"
+}
 
 # --- symlinked project prefix must not false-refuse the isolation guard -----
 #
-# docs/herdr-backend.md "Known gaps": a real backend's pane_current_path read
-# (tmux, herdr) reports the OS-level PHYSICALLY-resolved cwd. When the project
-# itself lives under a symlinked prefix (e.g. macOS's /tmp -> /private/tmp),
-# fm-spawn.sh's PROJ_ABS - a logical `cd && pwd` - differs string-for-string
-# from that physical read even before treehouse moves the pane at all, so the
-# worktree-discovery poll used to mistake an UNMOVED pane for one that had
-# already left the project, handing validate_spawn_worktree the project's own
-# directory as "the worktree" and tripping its false isolation refusal.
-# make_spawn_symlink_fakebin's tmux stub returns an unmoved project path on the
-# first pane_current_path poll, then the real worktree path from the second poll
-# onward, so this test fails loudly if the PROJ_ABS/PROJ_ABS_REAL
-# canonicalization in bin/fm-spawn.sh ever regresses.
-make_spawn_symlink_fakebin() {  # <dir> <initial-project-path> <worktree-path> -> echoes fakebin dir
-  local dir=$1 initial_path=$2 wt=$3 fb="$1/fakebin" counter="$1/poll-count"
+# docs/herdr-backend.md "Known gaps": path forms can differ physically vs
+# logically. When the project itself lives under a symlinked prefix (e.g. macOS's
+# /tmp -> /private/tmp), fm-spawn.sh's PROJ_ABS is a logical `cd && pwd`, while
+# the leased worktree path treehouse prints - and the worktree root git reports
+# for it - can be the physically-resolved form. If fm-spawn compared those two
+# string-for-string, validate_spawn_worktree would refuse a spawn that never
+# actually tangled. PROJ_ABS_REAL (and validate_spawn_worktree's own `pwd -P`
+# canonicalization of WT) is what prevents that, in EITHER direction: the lease
+# may print the logical path or the physical one. Both are exercised here, so a
+# regression in that canonicalization fails loudly.
+make_spawn_symlink_fakebin() {  # <dir> <leased-worktree-path-as-reported> -> echoes fakebin dir
+  local dir=$1 lease_reply=$2 fb="$1/fakebin"
   mkdir -p "$fb"
-  : > "$counter"
   cat > "$fb/tmux" <<SH
 #!/usr/bin/env bash
 set -u
 { printf 'tmux'; for a in "\$@"; do printf '\\x1f%s' "\$a"; done; printf '\\n'; } >> "\${FM_TMUX_LOG:?}"
 case "\${1:-}" in
-  display-message)
-    for a in "\$@"; do case "\$a" in *pane_current_path*)
-      printf x >> "$counter"
-      if [ "\$(wc -c < "$counter")" -le 1 ]; then
-        printf '%s\\n' "$initial_path"
-      else
-        printf '%s\\n' "$wt"
-      fi
-      exit 0
-    ;; esac; done
-    printf 'firstmate\\n'; exit 0 ;;
+  display-message) printf 'firstmate\\n'; exit 0 ;;
   list-windows) exit 0 ;;
 esac
 exit 0
 SH
   chmod +x "$fb/tmux"
-  fm_fake_exit0 "$fb" treehouse
+  cat > "$fb/treehouse" <<SH
+#!/usr/bin/env bash
+if [ "\${1:-}" = get ]; then
+  printf '%s\\n' "$lease_reply"
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$fb/treehouse"
   printf '%s\n' "$fb"
 }
 
 run_spawn_symlink_case() {  # <label> <physical|logical>
-  local label=$1 first_reply=$2 real_root link_root proj wt id fb data state config log out rc proj_phys initial_path
+  local label=$1 lease_form=$2 real_root link_root proj wt id fb data state config log out rc lease_reply
   real_root="$TMP_ROOT/symlink-real-$label"; link_root="$TMP_ROOT/symlink-link-$label"
   mkdir -p "$real_root"
   ln -s "$real_root" "$link_root"
   proj="$link_root/proj"
-  wt="$TMP_ROOT/symlink-wt-$label"
+  # The worktree lives under the SAME symlinked prefix as the project, so the
+  # lease can plausibly report it either way.
+  wt="$link_root/wt"
   id="spawnsymlink$label"
-  fm_git_worktree "$real_root/proj" "$wt" "fm/$id"
+  fm_git_worktree "$real_root/proj" "$real_root/wt" "fm/$id"
   # TMP_ROOT itself can already sit behind an OS-level symlink (e.g. macOS's
-  # /var -> /private/var), so resolve the fakebin's "physical" reply with
-  # pwd -P rather than string concatenation - it must match exactly what
-  # fm-spawn.sh's own PROJ_ABS_REAL computes, including any symlink layers
-  # ABOVE this test's own synthetic real_root/link_root pair.
-  proj_phys=$(cd "$real_root/proj" && pwd -P)
-  case "$first_reply" in
-    physical) initial_path=$proj_phys ;;
-    logical) initial_path=$proj ;;
-    *) fail "unknown symlink first-reply mode: $first_reply" ;;
+  # /var -> /private/var), so resolve the "physical" reply with pwd -P rather
+  # than string concatenation - it must match exactly what fm-spawn.sh's own
+  # canonicalization computes, including any symlink layers ABOVE this test's
+  # own synthetic real_root/link_root pair.
+  case "$lease_form" in
+    physical) lease_reply=$(cd "$real_root/wt" && pwd -P) ;;
+    logical) lease_reply=$wt ;;
+    *) fail "unknown symlink lease-reply mode: $lease_form" ;;
   esac
-  fb=$(make_spawn_symlink_fakebin "$TMP_ROOT/symlink-fake-$label" "$initial_path" "$wt")
+  fb=$(make_spawn_symlink_fakebin "$TMP_ROOT/symlink-fake-$label" "$lease_reply")
   data="$TMP_ROOT/symlink-data-$label"
   mkdir -p "$data/$id"
   printf 'test brief content\n' > "$data/$id/brief.md"
@@ -858,9 +910,11 @@ run_spawn_symlink_case() {  # <label> <physical|logical>
 
   out=$(run_spawn_case "$ROOT" "$fb" "$log" "$state" "$data" "$config" "$proj" -- "$id" "$proj" claude 2>&1)
   rc=$?
-  expect_code 0 "$rc" "fm-spawn.sh should succeed for a project reached through a symlinked prefix when the backend reports $first_reply cwd"$'\n'"$out"
-  assert_contains "$out" "worktree=$wt" \
-    "fm-spawn.sh did not resolve a symlinked-prefix project to its real worktree when the backend reports $first_reply cwd"
+  expect_code 0 "$rc" "fm-spawn.sh should succeed for a project reached through a symlinked prefix when the lease reports the $lease_form worktree path"$'\n'"$out"
+  assert_contains "$out" "worktree=$lease_reply" \
+    "fm-spawn.sh did not record the leased worktree of a symlinked-prefix project when the lease reports the $lease_form path"
+  assert_not_contains "$out" "did not yield an isolated worktree" \
+    "fm-spawn.sh false-refused a symlinked-prefix project's genuine worktree ($lease_form lease path)"
 
   rm -rf "/tmp/fm-$id"
 }
@@ -1081,6 +1135,7 @@ test_resolve_selector_three_forms
 test_backend_of_selector_matches_explicit_target_meta
 test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
+test_spawn_leases_worktree_and_drives_pane
 test_spawn_symlinked_project_prefix_avoids_false_refusal
 test_teardown_conformance_old_vs_new
 test_spawn_refuses_unknown_backend_flag
