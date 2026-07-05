@@ -618,10 +618,26 @@ fm_backend_composer_state() {  # <backend> <target> -> empty|pending|unknown
 # primitive so callers that only need a fast alive/dead read (recovery
 # digests, the session-start fleet digest) do not re-derive it inline.
 fm_backend_target_exists() {  # <backend> <target> [expected-label]
-  local backend=$1 target=$2 expected_label=${3:-} session pane
+  local backend=$1 target=$2 expected_label=${3:-} session pane window label
   case "$backend" in
     tmux)
-      tmux display-message -p -t "$target" '#{pane_id}' >/dev/null 2>&1
+      [ -n "$target" ] || return 1
+      case "$target" in
+        *:*)
+          session=${target%%:*}
+          window=${target#*:}
+          [ -n "$session" ] && [ -n "$window" ] && [ "$window" != "$target" ] || return 1
+          [ -z "$expected_label" ] || [ "$window" = "$expected_label" ] || return 1
+          tmux list-windows -a -F '#{session_name}:#{window_name}' 2>/dev/null \
+            | grep -Fx -- "$target" >/dev/null
+          ;;
+        *)
+          label=$target
+          [ -z "$expected_label" ] || [ "$label" = "$expected_label" ] || return 1
+          tmux list-windows -a -F '#{window_name}' 2>/dev/null \
+            | grep -Fx -- "$label" >/dev/null
+          ;;
+      esac
       ;;
     herdr)
       fm_backend_source herdr || return 1

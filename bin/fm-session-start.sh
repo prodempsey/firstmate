@@ -30,20 +30,23 @@
 #                       MUTATING sweeps (secondmate fast-forward, secondmate
 #                       liveness, X-mode artifact writes, fleet sync) run only
 #                       when this session actually holds the lock.
-#   3. wake-drain     - mutates the durable wake queue, so it also only runs
+#   3. ghost-reconcile - mutates stale task state, so it also only runs when
+#                       locked.
+#   4. wake-drain     - mutates the durable wake queue, so it also only runs
 #                       when locked.
-#   4. context digest - data/projects.md, data/secondmates.md, data/captain.md,
+#   5. supervision    - emits exactly one primary-harness operating block.
+#   6. context digest - data/projects.md, data/secondmates.md, data/captain.md,
 #                       data/learnings.md: read-only, always safe, always runs.
-#   5. fleet digest   - data/backlog.md, every state/*.meta, a bounded
+#   7. fleet digest   - data/backlog.md, every state/*.meta, a bounded
 #                       state/*.status tail, state/.afk, and a cheap
 #                       per-task endpoint-liveness read: read-only, always runs.
-#   6. captain orders - prints the durable captain-order inbox digest: what the
+#   8. captain orders - prints the durable captain-order inbox digest: what the
 #                       captain has asked for that is not yet triaged, owned,
 #                       linked, or dispositioned, plus any chat capture not yet
 #                       drained. Read-only, always runs.
-#   7. fleet triage   - prints the read-only candidate digest only for the
+#   9. fleet triage   - prints the read-only candidate digest only for the
 #                       session that acquired the fleet lock.
-#   8. closing reminder - prints the context-specific watcher next step; this
+#  10. closing reminder - prints the context-specific watcher next step; this
 #                       script points back to the emitted harness supervision
 #                       block and deliberately never arms the watcher itself.
 #
@@ -162,8 +165,9 @@ if [ "$LOCK_RC" -ne 0 ]; then
     printf '●  READ-ONLY SESSION - ANOTHER LIVE FIRSTMATE SESSION HOLDS THE FLEET LOCK\n'
     printf '●  %s\n' "$LOCK_OUT"
     printf '●  Skipping every mutating step: secondmate sync, X-mode artifacts,\n'
-    printf '●  fleet sync, and wake-queue drain. Detect-only bootstrap diagnostics and\n'
-    printf '●  the rest of this read-only-safe digest still ran below.\n'
+    printf '●  fleet sync, ghost reconciliation, and wake-queue drain.\n'
+    printf '●  Detect-only bootstrap diagnostics and the rest of this read-only-safe\n'
+    printf '●  digest still ran below.\n'
     printf '●  Operate read-only until this resolves - do not spawn, steer, merge, or\n'
     printf '●  otherwise mutate fleet state from this session.\n'
     printf '%s\n' "$BAR"
@@ -183,7 +187,20 @@ else
   printf '(silent - all good)\n'
 fi
 
-# --- 3. wake-drain -------------------------------------------------------
+# --- 3. ghost reconciliation ----------------------------------------------
+subsection "GHOST RECONCILIATION"
+if [ "$READ_ONLY" -eq 1 ]; then
+  printf 'skipped (read-only session) - the session holding the lock owns ghost reconciliation.\n'
+else
+  GHOST_OUT=$("$SCRIPT_DIR/fm-reconcile-ghosts.sh" 2>&1)
+  if [ -n "$GHOST_OUT" ]; then
+    printf '%s\n' "$GHOST_OUT"
+  else
+    printf '(silent - no ghost reconciliation output)\n'
+  fi
+fi
+
+# --- 4. wake-drain -------------------------------------------------------
 # Drained records are this turn's first work queue (AGENTS.md section 8); the
 # drain also runs fm-guard.sh internally on the locked path, so the
 # tangle/watcher-liveness banners land right here too, ahead of the bulk
@@ -207,7 +224,7 @@ else
   fi
 fi
 
-# --- 4. supervision operating instructions ----------------------------------
+# --- 5. supervision operating instructions ----------------------------------
 AFK_PRESENT=0
 [ -e "$STATE/.afk" ] && AFK_PRESENT=1
 X_MODE_PRESENT=0
@@ -232,14 +249,14 @@ fi
   --afk "$AFK_PRESENT" \
   --x-mode "$X_MODE_PRESENT"
 
-# --- 4. context digest -----------------------------------------------------
+# --- 6. context digest -----------------------------------------------------
 section "CONTEXT"
 print_file_or_absent "$DATA/projects.md" "data/projects.md"
 print_file_or_absent "$DATA/secondmates.md" "data/secondmates.md"
 print_file_or_absent "$DATA/captain.md" "data/captain.md"
 print_file_or_absent "$DATA/learnings.md" "data/learnings.md"
 
-# --- 5. fleet-state digest ---------------------------------------------
+# --- 7. fleet-state digest ---------------------------------------------
 section "FLEET STATE"
 print_file_or_absent "$DATA/backlog.md" "data/backlog.md"
 
@@ -293,7 +310,7 @@ else
   printf 'absent\n'
 fi
 
-# --- 6. captain orders ---------------------------------------------------
+# --- 8. captain orders ---------------------------------------------------
 # The inbox is authoritative for whether a captain request was received, so it is read
 # here on every session start, locked or not: a read-only session may not act on an
 # order, but it must still be able to see that one is waiting.
@@ -312,7 +329,7 @@ else
   printf 'CAPTAIN ORDERS: %s\n' "$ORDERS_OUT"
 fi
 
-# --- 7. fleet triage -----------------------------------------------------
+# --- 9. fleet triage -----------------------------------------------------
 # Routed through bin/fm-triage-duty.sh's session-start trigger rather than calling the
 # enumerator directly, so session start gets the same treatment as every other
 # fleet-state-changing trigger: real enumeration, a digest only when actionable state
@@ -332,7 +349,7 @@ else
   fi
 fi
 
-# --- 8. closing reminder -----------------------------------------------
+# --- 10. closing reminder -----------------------------------------------
 section "NEXT STEP"
 if [ "$READ_ONLY" -eq 1 ]; then
   cat <<'EOF'

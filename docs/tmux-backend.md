@@ -111,6 +111,80 @@ The classifier deliberately reports `unknown` for `node`/`python`/`python3` rath
 Practical effect: a dead `pi` secondmate is not auto-healed by the liveness sweep today; it is reported as `skipped: liveness probe inconclusive` instead, which still surfaces it for a human to act on.
 Resolving this would need either a `pi`-specific env marker inspectable from outside the process (mirroring `PI_CODING_AGENT=true`, which `bin/fm-harness.sh` already uses for self-detection but which is not readable from a different process without deeper introspection) or accepting the argument-inspection fragility - not attempted here.
 
+## Endpoint liveness evidence
+
+On 2026-07-05, tmux `display-message` was verified unsuitable as a task-window existence probe because a missing window in an existing session resolved to the session's active pane.
+
+Command:
+
+```sh
+tmux -V
+```
+
+Output:
+
+```text
+tmux 3.6
+```
+
+Command:
+
+```sh
+tmux new-session -d -s fm-ghost-evidence-g1 -n active
+```
+
+Output:
+
+```text
+<no output, exit 0>
+```
+
+Command:
+
+```sh
+tmux display-message -p -t 'fm-ghost-evidence-g1:fm-does-not-exist' '#{pane_id}'
+```
+
+Output:
+
+```text
+%9
+```
+
+Exit status: `0`.
+
+The structural window inventory did not contain that missing target.
+
+Command:
+
+```sh
+bash -c "tmux list-windows -a -F '#{session_name}:#{window_name}' | grep -qx 'fm-ghost-evidence-g1:fm-does-not-exist'"
+```
+
+Output:
+
+```text
+<no output>
+```
+
+Exit status: `1`.
+
+After the fix, `fm_backend_target_exists` used the window inventory and returned the expected verdicts for the same temporary session.
+
+Command:
+
+```sh
+bash -c '. bin/fm-backend.sh; if fm_backend_target_exists tmux "fm-ghost-evidence-g1:fm-does-not-exist" "fm-does-not-exist"; then printf "missing=alive\n"; else printf "missing=dead\n"; fi; if fm_backend_target_exists tmux "fm-ghost-evidence-g1:active" "active"; then printf "active=alive\n"; else printf "active=dead\n"; fi; if fm_backend_target_exists tmux "active" "active"; then printf "bare-active=alive\n"; else printf "bare-active=dead\n"; fi'
+```
+
+Output:
+
+```text
+missing=dead
+active=alive
+bare-active=alive
+```
+
 ## Limitations
 
 None specific to tmux for the reference path itself - it is the fully verified reference backend, while Orca and cmux are the backends without secondmate support.
