@@ -40,7 +40,7 @@ It never tears down a task, merges a PR, dispatches new work, or mutates any tas
      This is the required artifact; it lives in gitignored `data/` alongside the worked example.
      If today's file already exists, delete it first, then create a new file from scratch.
    - The chat response is the concise four-section digest defined by the contract below: materially shorter than the report file, and it links to that file for the full picture.
-   - For a richer review surface, optionally offer a Lavish board with `lavish-axi` when the report has enough structure to deserve one, but the markdown file is the required artifact and the four-section chat digest is the required minimum.
+   - For a richer review surface, optionally register the report as a KrakenDesign artifact with `krakendesign` when it has enough structure to deserve one, but the markdown file is the required artifact and the four-section chat digest is the required minimum.
 
 ## Chat-response contract
 
