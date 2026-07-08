@@ -6,10 +6,14 @@
 # description, acceptance criteria, and context, and may adjust other sections
 # when the task genuinely deviates (e.g. working an existing external PR instead
 # of shipping a new one).
-# Usage: fm-brief.sh <task-id> <repo-name> [--scout] [--herdr-lab]
+# Usage: fm-brief.sh <task-id> <repo-name> [--scout] [--kd-review] [--herdr-lab]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
+#   --kd-review (alias --visual-review) appends a visual-review contract: when a
+#   rendered UI/design/mockup is ready for captain review, produce ONE self-contained
+#   KrakenDesign HTML artifact under data/<task-id>/, register it with krakendesign,
+#   report the review URL, and stop for review. Applies to ship and scout briefs.
 #   --secondmate writes a persistent secondmate charter. The project list
 #   is cloned into the secondmate home, while the natural-language scope
 #   tells the main firstmate when to route work there; routine churn stays in its own home;
@@ -73,6 +77,7 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 KIND=ship
 HERDR_LAB=0
 NO_PROJECTS=0
+KD_REVIEW=0
 POS=()
 for a in "$@"; do
   case "$a" in
@@ -80,6 +85,7 @@ for a in "$@"; do
     --secondmate) KIND=secondmate ;;
     --herdr-lab) HERDR_LAB=1 ;;
     --no-projects) NO_PROJECTS=1 ;;
+    --kd-review|--visual-review) KD_REVIEW=1 ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -106,6 +112,26 @@ shell_quote() {
 }
 
 STATUS_FILE=$(shell_quote "$STATE/$ID.status")
+
+KD_NOTE=""
+[ "$KD_REVIEW" = 1 ] && KD_NOTE=" +kd-review"
+
+# --kd-review/--visual-review appends this visual-review contract to a ship or
+# scout brief. It routes a rendered UI/design/mockup into one self-contained
+# KrakenDesign HTML artifact under data/<id>/ (register/poll procedure lives in
+# the krakendesign skill) instead of a folder of screenshots. Not applicable to a
+# secondmate charter, which is not a task brief.
+emit_kd_review_section() {
+  cat <<EOF
+
+# Visual review
+When a rendered UI, design, or mockup this task produces is ready for the captain to review, do not hand off a folder of screenshots.
+Produce ONE self-contained KrakenDesign HTML artifact under \`$DATA/$ID/\` (for example \`$DATA/$ID/$ID.kd.html\`): inline all CSS and JS, embed images and fonts as \`data:\` URIs, and freeze any sample or board data into the markup, because KrakenDesign snapshots only the text of that single HTML file.
+If the render is a live worktree app on a test port, run \`$FM_ROOT/bin/fm-kd-snapshot.sh <url> $DATA/$ID/$ID.kd.html\` to render it headless and inline its assets and sample data into that artifact.
+Register it with \`krakendesign $DATA/$ID/$ID.kd.html --title "<short title>"\`, report the printed \`helm.html?kd=...\` review URL in your status, and stop there for the captain to review.
+A screenshot is acceptable only as your own verification that the render looks right, never as the captain's review surface.
+EOF
+}
 
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
@@ -255,6 +281,9 @@ The report is the only thing that survives, so anything worth keeping must be in
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
 8. When cleaning up processes or tmux sessions you spawned, kill only their exact PID (\`kill <pid>\` on a recorded \`\$!\`) - never a broad pattern kill (\`pkill\`/\`killall\` by name, or \`kill\` fed from \`pgrep\`) - and scope any tmux teardown to your own \`-L <test-socket>\`, never a bare \`tmux kill-server\`.
+EOF
+[ "$KD_REVIEW" = 1 ] && emit_kd_review_section >> "$BRIEF"
+cat >> "$BRIEF" <<EOF
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -262,7 +291,7 @@ The report must stand alone: what you did, what you found, the evidence (command
 When the report is complete, append \`done: {one-line conclusion}\` to the status file and stop.
 If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
 EOF
-echo "scaffolded: $BRIEF (scout; replace {TASK})"
+echo "scaffolded: $BRIEF (scout$KD_NOTE; replace {TASK})"
 exit 0
 fi
 
@@ -370,7 +399,10 @@ Record only project knowledge useful to almost every future session.
 For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
 If you touch a project \`AGENTS.md\` that lacks \`## Maintaining this file\`, add that short self-governance section from \`$FM_ROOT/bin/fm-ensure-agents-md.sh\` in the same pass.
 Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
+EOF
+[ "$KD_REVIEW" = 1 ] && emit_kd_review_section >> "$BRIEF"
+cat >> "$BRIEF" <<EOF
 
 $DOD
 EOF
-echo "scaffolded: $BRIEF (ship, mode=$MODE; replace {TASK})"
+echo "scaffolded: $BRIEF (ship, mode=$MODE$KD_NOTE; replace {TASK})"
