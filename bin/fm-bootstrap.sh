@@ -43,8 +43,12 @@
 #          "treehouse get --lease" support.
 #          no-mistakes is also MISSING when its installed version is older than
 #          1.31.2.
+#          krakendesign is the cockpit-native rich-review dock that replaced the
+#          retired lavish-axi/KrakenView flow; it is validated by presence rather
+#          than installed through the loop, and lavish-axi survives only as a
+#          backward-compatible alias.
 #          tasks-axi and quota-axi are required bootstrap tools (same class as
-#          lavish-axi). tasks-axi is also version and feature gated (0.1.1+
+#          krakendesign). tasks-axi is also version and feature gated (0.1.1+
 #          with update --archive-body and mv [<id>...]); an installed but incompatible build
 #          reports MISSING like no-mistakes. When
 #          config/backlog-backend is not manual and tasks-axi is compatible,
@@ -314,7 +318,7 @@ install_cmd() {
     tmux|node|git|gh|curl|jq|orca) echo "brew install $1  # or the platform's package manager" ;;
     treehouse) echo "curl -fsSL https://kunchenguid.github.io/treehouse/install.sh | sh" ;;
     no-mistakes) echo "curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh" ;;
-    gh-axi|chrome-devtools-axi|lavish-axi) echo "npm install -g $1 && $1 setup hooks" ;;
+    gh-axi|chrome-devtools-axi) echo "npm install -g $1 && $1 setup hooks" ;;
     tasks-axi|quota-axi) echo "npm install -g $1" ;;
     *) return 1 ;;
   esac
@@ -322,8 +326,8 @@ install_cmd() {
 
 BACKEND=$(fm_backend_name)
 case "$BACKEND" in
-  orca) TOOLS="orca node git gh no-mistakes gh-axi chrome-devtools-axi lavish-axi tasks-axi quota-axi" ;;
-  *) TOOLS="tmux node git gh treehouse no-mistakes gh-axi chrome-devtools-axi lavish-axi tasks-axi quota-axi" ;;
+  orca) TOOLS="orca node git gh no-mistakes gh-axi chrome-devtools-axi krakendesign tasks-axi quota-axi" ;;
+  *) TOOLS="tmux node git gh treehouse no-mistakes gh-axi chrome-devtools-axi krakendesign tasks-axi quota-axi" ;;
 esac
 NO_MISTAKES_MIN_MAJOR=1
 NO_MISTAKES_MIN_MINOR=31
@@ -567,6 +571,13 @@ fi
 if command -v tasks-axi >/dev/null 2>&1 && ! fm_tasks_axi_compatible; then
   echo "MISSING: tasks-axi (install: $(install_cmd tasks-axi))"
 fi
+# KrakenDesign is the cockpit-native rich-review dock that replaced the retired
+# lavish-axi/KrakenView flow. It ships with the Fleet Bridge cockpit rather than a
+# package manager, so validate the launcher by presence (typically
+# ~/.local/bin/krakendesign) instead of routing it through the install loop;
+# lavish-axi survives only as a backward-compatible alias.
+command -v krakendesign >/dev/null 2>&1 || \
+  echo "MISSING: krakendesign (install: ships with the Fleet Bridge cockpit as ~/.local/bin/krakendesign; lavish-axi is a backward-compatible alias only)"
 gh auth status >/dev/null 2>&1 || echo "NEEDS_GH_AUTH"
 # Worktree-tangle check: the firstmate primary checkout (FM_ROOT) must sit on its
 # default branch, not a feature branch (see fm-tangle-lib.sh). Scoped to the

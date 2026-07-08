@@ -56,7 +56,7 @@ new_world() {
 # test deliberately breaks one. Mirrors fm-bootstrap.test.sh's fixture.
 make_fake_toolchain() {
   local fakebin=$1
-  fm_fake_exit0 "$fakebin" tmux node gh-axi chrome-devtools-axi lavish-axi
+  fm_fake_exit0 "$fakebin" tmux node gh-axi chrome-devtools-axi krakendesign
   cat > "$fakebin/gh" <<'SH'
 #!/usr/bin/env bash
 exit 0

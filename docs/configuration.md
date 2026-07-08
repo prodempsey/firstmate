@@ -212,15 +212,16 @@ Secondmate homes inherit this file from the primary, so a secondmate's own crewm
 
 ## Toolchain
 
-On session start the first mate detects what its required toolchain is missing or too old (tmux, node, git, gh with GitHub auth via `gh auth login`, treehouse with durable lease support, no-mistakes v1.31.2 or newer, gh-axi, chrome-devtools-axi, lavish-axi, compatible tasks-axi per "Backlog backend" above, and quota-axi), lists it with the exact install commands, and installs only after you say go.
+On session start the first mate detects what its required toolchain is missing or too old (tmux, node, git, gh with GitHub auth via `gh auth login`, treehouse with durable lease support, no-mistakes v1.31.2 or newer, gh-axi, chrome-devtools-axi, krakendesign, compatible tasks-axi per "Backlog backend" above, and quota-axi), lists it with the exact install commands, and installs only after you say go.
 This section is the single owner of that universal toolchain list; backend guides' prerequisites point here and add only their backend-specific tools.
-In that list, treehouse pools clean task worktrees, no-mistakes runs the validation pipeline, gh-axi, chrome-devtools-axi, and lavish-axi cover GitHub, browser, and rich-review operations, and tasks-axi plus quota-axi back backlog mutations and quota-balanced dispatch.
+In that list, treehouse pools clean task worktrees, no-mistakes runs the validation pipeline, gh-axi, chrome-devtools-axi, and krakendesign cover GitHub, browser, and rich-review operations, and tasks-axi plus quota-axi back backlog mutations and quota-balanced dispatch.
 When bootstrap resolves `backend=orca` from `FM_BACKEND` or `config/backend`, it requires `orca`, keeps the universal `node` requirement, and skips `tmux` and `treehouse`.
 When `config/crew-dispatch.json` exists, bootstrap also requires `jq` for dispatch profile validation.
 When X mode is opted in, bootstrap also requires `curl` and `jq` before arming the relay poll shim.
-`tasks-axi` and `quota-axi` are required bootstrap tools in every profile, the same class as `lavish-axi`.
+`tasks-axi` and `quota-axi` are required bootstrap tools in every profile, the same class as `krakendesign`.
 An absent or incompatible `tasks-axi` reports `MISSING: tasks-axi (install: npm install -g tasks-axi)`; when `config/backlog-backend` is not `manual` and compatible `tasks-axi` is on `PATH`, bootstrap also prints `TASKS_AXI: available` and firstmate uses its verbs for routine backlog mutations, otherwise it hand-edits `data/backlog.md` until installation is approved and completed.
 An absent `quota-axi` reports `MISSING: quota-axi (install: npm install -g quota-axi)`; `bin/fm-dispatch-select.sh` still degrades to the first profile at runtime when quota data is unavailable.
+`krakendesign` is the cockpit-native rich-review dock that replaced the retired `lavish-axi`/KrakenView flow; it ships with the Fleet Bridge cockpit rather than a package manager, so bootstrap validates it by presence (typically `~/.local/bin/krakendesign`) and `lavish-axi` survives only as a backward-compatible alias.
 Bootstrap also reports a `TANGLE:` line when `FM_ROOT` is on a named non-default branch; follow the printed checkout remediation rather than treating it as an installable tool problem.
 In a read-only session that did not get the fleet lock, the same line is advisory and omits the checkout command.
 The locked session-start bootstrap step also runs a best-effort project clone refresh through `fm-fleet-sync.sh`.
