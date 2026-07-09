@@ -186,7 +186,14 @@ SH
 
 run_session_start() {  # <home> <root> <path>
   local home=$1 root=$2 path=$3
-  FM_HOME="$home" FM_ROOT_OVERRIDE="$root" PATH="$path" "$SESSION_START"
+  # Clear the harness env markers fm-harness.sh's detect_own() checks first
+  # (CLAUDECODE, PI_CODING_AGENT, GROK_AGENT) so detection falls through to the
+  # ps-ancestry layer and honors the fake ps / FM_FAKE_HARNESS this suite sets
+  # up, rather than leaking the identity of whatever harness is actually
+  # running this test suite (e.g. a real Claude Code session sets CLAUDECODE=1
+  # ambiently, which would otherwise short-circuit every simulated harness).
+  CLAUDECODE= PI_CODING_AGENT= GROK_AGENT= \
+    FM_HOME="$home" FM_ROOT_OVERRIDE="$root" PATH="$path" "$SESSION_START"
 }
 
 hash_file_for_test() {

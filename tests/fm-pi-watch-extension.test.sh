@@ -6,7 +6,19 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-pi-watch-extension)
+mkdir -p "$TMP_ROOT"
 GEN="$ROOT/bin/fm-pi-watch-extension.sh"
+
+# The generated Pi extension is a .ts module; running it directly requires
+# Node's built-in TypeScript type stripping. Some distro-packaged Node builds
+# (e.g. Debian's DFSG-stripped node, which omits the bundled Amaro stripper)
+# lack it entirely. Probe once so the one test that executes the .ts module
+# can skip on that environment limitation instead of failing.
+NODE_HAS_TS_STRIPPING=0
+if printf 'export const probe = 1;\n' > "$TMP_ROOT/.ts-strip-probe.ts" 2>/dev/null \
+  && node --input-type=module -e "await import('$(printf 'file://%s' "$TMP_ROOT/.ts-strip-probe.ts")')" >/dev/null 2>&1; then
+  NODE_HAS_TS_STRIPPING=1
+fi
 
 test_generator_writes_extension() {
   local home out file text expected_config_source version version_text marker_write
@@ -82,6 +94,10 @@ test_spawn_template_mentions_pi_watch_placeholder() {
 
 test_pi_extension_reports_external_healthy_watcher() {
   local repo home out status
+  if [ "$NODE_HAS_TS_STRIPPING" -ne 1 ]; then
+    echo "skip: node lacks built-in TypeScript type stripping (cannot import the generated .ts extension)"
+    return 0
+  fi
   repo="$TMP_ROOT/pi-external-healthy-root"
   home="$TMP_ROOT/pi-external-healthy-home"
   mkdir -p "$repo/bin" "$home/state" "$home/config"
