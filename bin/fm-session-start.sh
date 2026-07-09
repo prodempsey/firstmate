@@ -35,11 +35,16 @@
 #   4. context digest - data/projects.md, data/secondmates.md, data/captain.md,
 #                       data/learnings.md: read-only, always safe, always runs.
 #   5. fleet digest   - data/backlog.md, every state/*.meta, a bounded
-#                       state/*.status tail, state/.afk, and a cheap
-#                       per-task endpoint-liveness read: read-only, always runs.
+#                       state/*.status tail, state/.afk, a cheap
+#                       per-task endpoint-liveness read, and the Needs
+#                       FirstMate inbox from fm-needs-firstmate-reconcile.sh
+#                       --digest: read-only, always runs.
 #   6. closing reminder - prints the context-specific watcher next step; this
 #                       script points back to the emitted harness supervision
 #                       block and deliberately never arms the watcher itself.
+#                       When the NF inbox is non-empty and this session holds
+#                       the lock, NEXT STEP also reminds to process NF before
+#                       silent supervision.
 #
 # Why lock first: the old documented order (bootstrap, THEN lock) let a
 # SECOND concurrent session run bootstrap's mutating sweeps - fast-forwarding
@@ -295,6 +300,29 @@ else
   printf 'absent\n'
 fi
 
+# Needs FirstMate inbox: terminal meta still present is incomplete closeout.
+# Read-only enumerator only; firstmate acts or packages per AGENTS §5 step 9.
+subsection "Needs FirstMate inbox"
+NF_NONE=1
+if [ -x "$SCRIPT_DIR/fm-needs-firstmate-reconcile.sh" ]; then
+  NF_DIGEST=$("$SCRIPT_DIR/fm-needs-firstmate-reconcile.sh" --digest 2>&1) || NF_DIGEST=""
+  if [ -z "$NF_DIGEST" ]; then
+    printf 'NEEDS_FIRSTMATE: reconcile failed - scan terminal status last lines yourself\n'
+    NF_NONE=0
+  else
+    printf '%s\n' "$NF_DIGEST"
+    # Empty queue is exactly "NEEDS_FIRSTMATE: none" on the first line.
+    if printf '%s\n' "$NF_DIGEST" | head -1 | grep -qx 'NEEDS_FIRSTMATE: none'; then
+      NF_NONE=1
+    else
+      NF_NONE=0
+    fi
+  fi
+else
+  printf 'NEEDS_FIRSTMATE: script absent - scan terminal status last lines yourself\n'
+  NF_NONE=0
+fi
+
 # --- 6. closing reminder -----------------------------------------------
 section "NEXT STEP"
 if [ "$READ_ONLY" -eq 1 ]; then
@@ -311,6 +339,14 @@ load /afk and ensure the daemon is running, because the daemon owns watcher
 supervision.
 
 EOF
+  if [ "$NF_NONE" -eq 0 ]; then
+    cat <<'EOF'
+Process Needs FirstMate inbox before silent supervision (AGENTS §5 step 9).
+Away mode does not expand approval authority: package captain-gated land/merge
+items; do not auto-land under yolo=off.
+
+EOF
+  fi
 elif [ -f "$CONFIG/x-mode.env" ]; then
   cat <<EOF
 Follow the supervision operating instructions block above for harness '$PRIMARY_HARNESS'.
@@ -318,12 +354,24 @@ X mode is active, so the emitted block's cadence instruction applies.
 This script never starts supervision itself.
 
 EOF
+  if [ "$NF_NONE" -eq 0 ]; then
+    cat <<'EOF'
+Process Needs FirstMate inbox before silent supervision (AGENTS §5 step 9).
+
+EOF
+  fi
 else
 cat <<EOF
 Follow the supervision operating instructions block above for harness '$PRIMARY_HARNESS'.
 This script never starts supervision itself.
 
 EOF
+  if [ "$NF_NONE" -eq 0 ]; then
+    cat <<'EOF'
+Process Needs FirstMate inbox before silent supervision (AGENTS §5 step 9).
+
+EOF
+  fi
 fi
 cat <<'EOF'
 The digest above is complete for this session start. Do NOT re-read

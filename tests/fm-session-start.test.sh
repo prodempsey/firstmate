@@ -334,8 +334,10 @@ $rec
 EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
-  # Force a MISSING diagnostic line so the bootstrap section is non-trivial.
-  rm -f "$fakebin/node"
+  # Force a MISSING diagnostic so the bootstrap section is non-trivial.
+  # Use treehouse (not node): node often lives on BASE_PATH (/usr/bin/node),
+  # which would hide the removal of the fakebin stub.
+  rm -f "$fakebin/treehouse"
 
   printf 'window=fm-sess:w1\nkind=ship\n' > "$home/state/task-a.meta"
 
@@ -358,7 +360,7 @@ EOF
   [ "$context_line" -lt "$fleet_line" ] || fail "CONTEXT did not precede FLEET STATE"
   [ "$fleet_line" -lt "$next_line" ] || fail "FLEET STATE did not precede NEXT STEP"
 
-  missing_line=$(printf '%s\n' "$out" | grep -n 'MISSING: node' | head -1 | cut -d: -f1)
+  missing_line=$(printf '%s\n' "$out" | grep -n 'MISSING: treehouse' | head -1 | cut -d: -f1)
   [ -n "$missing_line" ] || fail "MISSING diagnostic did not appear at all"
   [ "$missing_line" -lt "$fleet_line" ] || fail "actionable MISSING diagnostic was buried after the bulk fleet-state digest"
 
@@ -478,7 +480,8 @@ $rec
 EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
-  rm -f "$fakebin/node"
+  # treehouse is not on BASE_PATH; removing the fakebin stub forces a real MISSING line.
+  rm -f "$fakebin/treehouse"
 
   append_wake "$home/state" signal task-z "needs-decision: pick a library"
 
@@ -487,7 +490,7 @@ EOF
   # fm-lock.sh's own exact success text.
   assert_contains "$out" "lock acquired: harness pid" "fm-lock.sh's real output did not appear (composition, not reimplementation)"
   # fm-bootstrap.sh's own exact MISSING-tool line format.
-  assert_contains "$out" "MISSING: node (install:" "fm-bootstrap.sh's real detect line did not appear verbatim"
+  assert_contains "$out" "MISSING: treehouse (install:" "fm-bootstrap.sh's real detect line did not appear verbatim"
   # fm-wake-drain.sh's real drained record (raw tab-separated queue line).
   assert_contains "$out" "$(printf 'signal\ttask-z\tneeds-decision: pick a library')" "fm-wake-drain.sh's real drained record did not appear"
 
@@ -508,8 +511,36 @@ EOF
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
   assert_contains "$out" "(none)" "empty fleet did not report (none) for in-flight tasks"
   assert_contains "$out" "absent" "empty fleet's AFK section did not report absent"
+  assert_contains "$out" "Needs FirstMate inbox" "empty fleet missing Needs FirstMate inbox subsection"
+  assert_contains "$out" "NEEDS_FIRSTMATE: none" "empty fleet NF inbox should report none"
+  assert_not_contains "$out" "Process Needs FirstMate inbox before silent supervision" \
+    "empty NF should not demand NF processing in NEXT STEP"
 
   pass "an empty fleet reports (none) for in-flight tasks and an absent AFK flag"
+}
+
+test_nf_inbox_nonempty_next_step() {
+  local rec root home fakebin out
+  rec=$(new_world nf-inbox)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+
+  fm_write_meta "$home/state/land-me.meta" \
+    "window=fm-sess:w1" "project=demo" "harness=claude" \
+    "kind=ship" "mode=local-only" "yolo=off"
+  printf 'done: ready in branch fm/land-me @ abcdef1\n' > "$home/state/land-me.status"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "Needs FirstMate inbox" "NF subsection missing"
+  assert_contains "$out" "NEEDS_FIRSTMATE: 1 open" "NF digest should list open item"
+  assert_contains "$out" "ready_to_land_local" "NF should classify local-only ready"
+  assert_contains "$out" "Process Needs FirstMate inbox before silent supervision" \
+    "non-empty NF must remind before silent supervision"
+
+  pass "session-start NF section lists open items and NEXT STEP demands processing"
 }
 
 test_next_step_sources_x_mode_cadence() {
@@ -695,6 +726,7 @@ test_endpoint_liveness_tmux
 test_endpoint_liveness_herdr
 test_composition_invokes_real_scripts
 test_fleet_digest_empty_fleet
+test_nf_inbox_nonempty_next_step
 test_next_step_sources_x_mode_cadence
 test_next_step_afk_delegates_to_daemon
 test_supervision_block_exactly_one_and_pi_diagnostic

@@ -130,10 +130,11 @@ It composes today's `fm-lock.sh`, `fm-bootstrap.sh`, and `fm-wake-drain.sh` - ca
    When the lock could not be acquired, the queue is left untouched because another session owns it, and the guard's tangle/watcher-liveness alarms still print in read-only advisory mode without drain, supervision repair, or checkout repair commands.
 4. **Context digest** - the full contents of `data/projects.md`, `data/secondmates.md`, `data/captain.md`, and `data/learnings.md`, each clearly delimited.
    A file that does not exist prints an explicit `ABSENT` marker, never confused with an empty-but-present file: absence is meaningful (`captain.md` absent means use this template's defaults, `projects.md` absent means rebuild it from the clones under `projects/`, etc.).
-5. **Fleet-state digest** - the full `data/backlog.md`; every `state/<id>.meta`; a bounded tail of each task's `state/<id>.status` (labeled as wake-EVENT history, not current state, with the full log path printed for a deeper read); the `state/.afk` flag; and one cheap alive/dead read of each task's recorded backend endpoint.
+5. **Fleet-state digest** - the full `data/backlog.md`; every `state/<id>.meta`; a bounded tail of each task's `state/<id>.status` (labeled as wake-EVENT history, not current state, with the full log path printed for a deeper read); the `state/.afk` flag; one cheap alive/dead read of each task's recorded backend endpoint; and a **Needs FirstMate inbox** subsection from `bin/fm-needs-firstmate-reconcile.sh --digest` (or a clear "script absent" fallback).
    That liveness line is a fast presence check only, not a full state read - when you need a crew's actual current state (a run-step, not just "is the pane there"), read it with `bin/fm-crew-state.sh <id>` as before; the digest deliberately skips that deeper, slower read for every task so it stays fast and bounded.
+   When the NF inbox is non-empty and this session holds the lock, process it before silent supervision (section 5 step 9); do not re-read every meta afterward - act on the printed NF section.
 6. **Supervision operating instructions and next step** - after the wake queue and before context, the digest emits exactly one operating block for the detected primary harness.
-   The closing reminder points back to that emitted block and preserves only the lock, afk, X-mode, and read-once reminders.
+   The closing reminder points back to that emitted block and preserves only the lock, afk, X-mode, NF-inbox-when-non-empty, and read-once reminders.
    The script itself never starts supervision; the emitted harness protocol owns the exact wait or wake mechanism.
 
 **Everything in this digest is read exactly once, at session start.**
@@ -333,9 +334,16 @@ Reconcile reality with your records before doing anything else, working from the
    Each secondmate is a firstmate in its own home, so it reconciles only work that is already its own and then idles; it never creates new work during recovery.
 8. The digest already reports whether `state/.afk` is present.
    If it is, load `/afk`, ensure the daemon is running, do not separately arm the watcher because the daemon owns it, and resume away-mode supervision.
-9. Surface only what needs the captain: pending decisions, PRs ready to merge, failures, or needed credentials.
-   If there is nothing that needs them, say nothing and resume.
-10. Having already handled the drained wakes from the digest, follow the emitted supervision operating block through the digest's own closing reminder; if the lock was refused or `state/.afk` exists, follow the digest's no-direct-supervision guidance.
+9. **Needs FirstMate inbox (mandatory).**
+   Run the home's NF reconcile (prefer `bin/fm-needs-firstmate-reconcile.sh` when present; otherwise the skill's status-scan fallback).
+   The session-start digest already printed the NF section - act on it; do not treat unfinished `done:` / terminal crews as optional backlog.
+   For each item: classify, then either (a) act immediately when policy allows without captain approval, or (b) package a captain-facing batch and surface it in step 10.
+   Never land/merge/force-teardown under yolo=off without the captain's explicit word.
+   Load `needs-firstmate-inbox` for the full classification and land/closeout procedure (including serving-land homes).
+   Do not re-arm supervision with an actionable NF queue left unaddressed (no package and no allowed self-action).
+10. Surface only what needs the captain: pending decisions, PRs ready to merge, land/merge packages from step 9, failures, or needed credentials.
+   If there is nothing that needs them and NF is empty, say nothing and resume.
+11. Having already handled the drained wakes from the digest and the NF inbox, follow the emitted supervision operating block through the digest's own closing reminder; if the lock was refused or `state/.afk` exists, follow the digest's no-direct-supervision guidance.
 
 A firstmate restart must be a non-event.
 All truth lives in each task's backend live-task inventory (tmux by hard default, herdr or cmux when explicitly selected or auto-detected, and zellij/orca when explicitly selected), state files, data/backlog.md, data/captain.md, data/learnings.md, data/secondmates.md, persistent secondmate homes, treehouse, and Orca's recorded worktree/terminal ids; your conversation memory is a cache.
@@ -711,13 +719,19 @@ bin/fm-fleet-view.sh                # read-only Markdown whole-fleet view render
 On wake, in order of cheapness:
 
 1. Read the reason line and drain queued wake records with `bin/fm-wake-drain.sh`.
+1b. **Needs FirstMate inbox (cheap).**
+    On any terminal `done`/`blocked`/`failed`/`needs-decision`/`PR ready`/`checks green`/`ready in branch` signal for a task: process that id through the NF procedure immediately (`bin/fm-needs-firstmate-reconcile.sh --id <task>` plus `needs-firstmate-inbox`).
+    On session start, AFK exit flush, and heartbeat fleet review: run full reconcile (not only the wake's ids).
+    Unclosed `done:` with meta still present is incomplete work even if already seen once; seen-markers must not block inbox duty.
+    Do not re-arm supervision with a non-empty actionable NF queue left unaddressed (no package for captain and no allowed self-action).
+    Load `needs-firstmate-inbox` for classification, captain package template, and serving-land notes.
 2. `signal:` read the listed status files first; a wake lists every signal that landed within the coalescing grace window (e.g. a status write plus the same turn's turn-end marker), and each is ~30 tokens and usually sufficient.
    A status line is the wake *event*, not the crewmate's current state; when you need the live state - especially to confirm a `needs-decision`/`blocked` is still real and not already resolved-and-resumed - read it with `bin/fm-crew-state.sh <id>`, which reconciles the authoritative run-step over the possibly-stale log line, and never `tail` the status log as the current-state source.
 3. `stale:` the crewmate stopped without reporting; peek the pane (`bin/fm-peek.sh <window>`) to diagnose.
    If the stale reason includes `demand-deep-inspection`, inspect the pane, `bin/fm-crew-state.sh <id>`, and the validation logs before resuming supervision.
    If the pane is waiting, looping, confused, or unresponsive, load `stuck-crewmate-recovery`.
 4. `check:` a per-task poll fired (usually a merge, or X mode when enabled); act on it.
-5. `heartbeat:` a heartbeat wake now reaches you only when the watcher's bash fleet-scan caught a captain-relevant status the per-wake path missed (no-change heartbeats are absorbed in bash, never surfaced), so treat it as "something turned up" and review the whole fleet: start with `bin/fm-fleet-view.sh` for the structured overview, use `bin/fm-crew-state.sh <id>` only for targeted follow-up, peek panes that look off, check PR-ready tasks for merge, reconcile data/backlog.md, then resume the emitted supervision protocol.
+5. `heartbeat:` a heartbeat wake now reaches you only when the watcher's bash fleet-scan caught a captain-relevant status the per-wake path missed (no-change heartbeats are absorbed in bash, never surfaced), so treat it as "something turned up" and review the whole fleet: start with `bin/fm-fleet-view.sh` for the structured overview, run full NF reconcile (`bin/fm-needs-firstmate-reconcile.sh --digest`; PR-ready is one sublane of NF), use `bin/fm-crew-state.sh <id>` only for targeted follow-up, peek panes that look off, reconcile data/backlog.md, then resume the emitted supervision protocol.
    Do not report that the fleet is unchanged.
 
 When a task reaches a terminal state on any of these wakes (a `done`/merge `check:`, a `failed` signal, a scout report, a local-only merge), and X mode is enabled, load `fmx-respond` (section 13) and post the X-mode mention's **final** completion follow-up if that task is X-mode-linked: `bin/fm-x-followup.sh --check <id>` then `bin/fm-x-followup.sh <id> --final --text-file <path>`, so the link always clears here regardless of how many of the up-to-three follow-ups were already spent on earlier milestones.
@@ -897,6 +911,7 @@ These skills are not captain-invocable; they are conditional operating reference
 - `firstmate-orca` - load before switching to Orca, spawning or supervising Orca-backed work, smoke-testing Orca backend behavior, debugging Orca task state, or reconciling Orca-backed task metadata.
 - `stuck-crewmate-recovery` - load after a stale wake, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer.
 - `secondmate-provisioning` - load before creating, seeding, validating, launching, handing backlog to, recovering, pushing inherited config into, or retiring a secondmate home, and before editing `data/secondmates.md`.
+- `needs-firstmate-inbox` - load on session-start recovery, every terminal `done`/PR-ready/`checks green`/`ready in branch`/`needs-decision`/`blocked`/`failed` wake, AFK exit flush, and heartbeat when any terminal meta remains; owns NF classification, captain package template, and serving-land closeout notes.
 - `fmx-respond` - load on an `x-mention <request_id>` `check:` wake to handle the mention, on an `x-mode-error ...` `check:` wake to report the X-mode configuration blocker, and on any milestone or terminal wake for an X-mode-linked task before posting its completion follow-up; relevant only when X mode is on.
 - `firstmate-codexapp` - load before coordinating a visible Codex Desktop thread, evaluating a Codex App backend request, or reconciling Codex Desktop host-tool smoke evidence for Firstmate work.
 - `firstmate-coding-guidelines` - load before changing firstmate's shared, tracked material, as defined by section 1's list, whether editing directly or briefing a crewmate for a firstmate-repo task.
