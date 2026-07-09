@@ -50,6 +50,13 @@ Unsupported supervisor backends refuse at daemon startup.
 Stalled escalation delivery raises `state/.subsuper-inject-wedged` after `FM_MAX_DEFER_SECS` instead of silently deferring forever.
 `fm-send.sh` selects a pre-Enter popup-settle for slash commands and for codex `$...` skill invocations using metadata-routed target `harness=` values, then adds its own `FM_SEND_SETTLE` pause after successful text sends so immediate peeks catch the receiving turn starting; the sub-supervisor uses only the shared submit core and does not pay that post-submit pause.
 
+## Needs FirstMate inbox
+
+While `state/<id>.meta` still exists, a terminal status - `done:`, `needs-decision:`, `blocked:`, `failed:`, `PR ready`, `checks green`, `ready in branch`, or `merged` - is unfinished closeout work, not settled backlog; the status line is a wake event, not proof the work was ever presented and gated.
+`bin/fm-needs-firstmate-reconcile.sh` is a read-only enumerator that classifies every such item (ready to land local or serving, PR ready, PR open but unchecked, scout report, needs-decision, blocked/failed, already-live, superseded, hold/fold, or unclassifiable) from meta fields, backlog notes, and optional serving-worktree containment (`FM_SERVING_WORKTREE` or `--serving`); it never lands, merges, tears down, or clears seen-markers itself.
+`--digest` feeds `bin/fm-session-start.sh`'s fleet-state digest and heartbeat fleet review, `--json` emits the stable `fm-needs-firstmate-reconcile/v1` schema with per-item and batch detail, and `--id <task>` gives the cheap single-task read used on every terminal wake.
+The agent-only `needs-firstmate-inbox` skill owns the classification table, the captain-facing package template used for `yolo=off` approvals, and the standing rule: firstmate must never re-arm silent supervision while an actionable item has neither a captain package nor a policy-allowed self-action.
+
 ## Runtime session backends
 
 The runtime backend is the session-provider layer below firstmate's scripts.
