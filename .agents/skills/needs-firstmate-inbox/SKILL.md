@@ -2,10 +2,8 @@
 name: needs-firstmate-inbox
 description: >-
   Agent-only playbook for FirstMate's standing Needs FirstMate (NF) inbox duty.
-  Load on session-start recovery, every terminal done/PR-ready wake, AFK exit flush,
-  and heartbeat when any terminal meta remains. Classifies unfinished closeouts,
-  packages captain-gated land/merge batches under yolo=off, and forbids re-arming
-  silent supervision with an unaddressed actionable NF queue.
+  Load on session-start recovery, every terminal done/PR-ready wake, AFK exit flush, and heartbeat when any terminal meta remains.
+  Classifies unfinished closeouts, packages captain-gated land/merge batches under yolo=off, and forbids re-arming silent supervision with an unaddressed actionable NF queue.
 user-invocable: false
 metadata:
   internal: true

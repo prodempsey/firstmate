@@ -192,7 +192,7 @@ run_session_start() {  # <home> <root> <path>
   # up, rather than leaking the identity of whatever harness is actually
   # running this test suite (e.g. a real Claude Code session sets CLAUDECODE=1
   # ambiently, which would otherwise short-circuit every simulated harness).
-  CLAUDECODE= PI_CODING_AGENT= GROK_AGENT= \
+  CLAUDECODE='' PI_CODING_AGENT='' GROK_AGENT='' \
     FM_HOME="$home" FM_ROOT_OVERRIDE="$root" PATH="$path" "$SESSION_START"
 }
 
