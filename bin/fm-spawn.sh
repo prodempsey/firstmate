@@ -715,10 +715,10 @@ is_task_worktree_of_project() {  # <candidate> <require_pool 0|1>
 # Fail closed: never write meta or launch after a failed validate.
 # require_pool=1 for treehouse acquire (refuse same-repo long-lived siblings);
 # require_pool=0 for Orca (provider-scoped paths are not under .treehouse/).
-validate_spawn_worktree() {  # <source> <inspect-target> [require_pool 0|1]
-  local source=$1 inspect_target=$2 require_pool=${3:-0}
-  local kind wt_common proj_common
-  kind=$(is_task_worktree_of_project "$WT" "$require_pool" || true)
+validate_spawn_worktree() {  # <source> <inspect-target> [require_pool 0|1] [precomputed_kind]
+  local source=$1 inspect_target=$2 require_pool=${3:-0} kind=${4:-}
+  local wt_common proj_common
+  [ -n "$kind" ] || kind=$(is_task_worktree_of_project "$WT" "$require_pool" || true)
   case "$kind" in
     ok) return 0 ;;
     membership)
@@ -907,9 +907,12 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
 
   # Membership + pool-prefix: fail closed before meta/launch. On failure, best-
   # effort release the lease so a refused path is not left held forever.
-  if ! is_task_worktree_of_project "$WT" 1 >/dev/null; then
+  # Classify once and thread the result into validate_spawn_worktree so it
+  # does not reclassify the same worktree a second time.
+  WT_KIND=$(is_task_worktree_of_project "$WT" 1 || true)
+  if [ "$WT_KIND" != ok ]; then
     ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1 || true
-    validate_spawn_worktree "treehouse get --lease" "$T" 1
+    validate_spawn_worktree "treehouse get --lease" "$T" 1 "$WT_KIND"
   fi
 
   # Move the task pane into the leased worktree so the agent runs there; the

@@ -618,13 +618,18 @@ validate_worktree_teardown_safety() {
 
 # A recorded worktree is safe to act on (branch cleanup + `treehouse return`)
 # only when it is a real, registered worktree of the task's project AND is not
-# the firstmate repo root or the active firstmate home. The second guard matters
-# for firstmate-on-itself tasks whose meta was written before the worktree-path
-# fix: such a meta can record the runtime home (a genuine worktree of the
-# firstmate repo, so registered) as the "worktree", and teardown must never
-# detach/branch-delete or hand that runtime home to `treehouse return`.
+# the firstmate repo root, the active firstmate home, or the project's own
+# primary checkout. The FM_ROOT/FM_HOME guard matters for firstmate-on-itself
+# tasks whose meta was written before the worktree-path fix: such a meta can
+# record the runtime home (a genuine worktree of the firstmate repo, so
+# registered) as the "worktree", and teardown must never detach/branch-delete
+# or hand that runtime home to `treehouse return`. The project-checkout guard
+# matters the same way for any project: `git worktree list --porcelain`
+# always lists the project's own primary checkout as a registered worktree, so
+# a task meta that (mis)records worktree=<project's own checkout> must not
+# let teardown detach HEAD and delete whatever branch is checked out there.
 safe_task_worktree() {  # <project> <wt>
-  local project=$1 wt=$2 wt_abs root_abs home_abs
+  local project=$1 wt=$2 wt_abs root_abs home_abs proj_abs
   worktree_registered_for_project "$project" "$wt" || return 1
   wt_abs=$(canonical_existing_dir "$wt") || return 1
   root_abs=$(cd "$FM_ROOT" && pwd -P) || return 1
@@ -632,6 +637,8 @@ safe_task_worktree() {  # <project> <wt>
   if home_abs=$(cd "$FM_HOME" 2>/dev/null && pwd -P); then
     [ "$wt_abs" != "$home_abs" ] || return 1
   fi
+  proj_abs=$(canonical_existing_dir "$project") || return 1
+  [ "$wt_abs" != "$proj_abs" ] || return 1
   return 0
 }
 

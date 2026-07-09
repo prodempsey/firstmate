@@ -49,6 +49,7 @@
 #   (w) index.lock mtime read failure                         -> lock kept, REFUSE
 #   (x) transient lock cleared after first failed return      -> retry ALLOW
 #   (y) persistent lock (never clears, not provably stale)    -> REFUSE loudly
+#   (z) recorded worktree == project's own checkout            -> return skipped, ALLOW (graceful)
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -934,6 +935,37 @@ test_stale_nontreehouse_worktree_degrades_gracefully() {
   pass "teardown degrades gracefully when the recorded worktree is not a treehouse worktree"
 }
 
+# `git worktree list --porcelain` always lists a project's own primary
+# checkout as a registered worktree, so a corrupted/hand-edited meta that
+# records worktree=<project's own checkout> must still be refused by
+# safe_task_worktree - not just FM_ROOT/FM_HOME - or teardown would detach
+# HEAD and delete whatever branch (main) is checked out in the shared clone.
+test_project_own_checkout_worktree_degrades_gracefully() {
+  local case_dir rc head_branch
+  case_dir=$(make_case project-own-checkout)
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    "window=fm-task-x1" \
+    "worktree=$case_dir/project" \
+    "project=$case_dir/project" \
+    "kind=ship" \
+    "mode=no-mistakes"
+  add_treehouse_return_failure "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "project-own-checkout: teardown must not abort when worktree=project"
+  grep -q "not a treehouse-managed worktree" "$case_dir/stderr" \
+    || fail "project-own-checkout: expected a graceful warning about the project's own checkout"$'\n'"$(cat "$case_dir/stderr")"
+  head_branch=$(git -C "$case_dir/project" rev-parse --abbrev-ref HEAD)
+  [ "$head_branch" = main ] \
+    || fail "project-own-checkout: teardown detached HEAD on the project's own checkout (branch: $head_branch)"
+  assert_absent "$case_dir/state/task-x1.meta" "project-own-checkout: meta should be cleared after graceful teardown"
+  pass "recorded worktree equal to the project's own checkout degrades gracefully instead of mutating it"
+}
+
 # When the recorded worktree IS a registered worktree but `treehouse return`
 # itself fails (e.g. already returned, or a transient treehouse error), teardown
 # must warn and continue rather than aborting mid-cleanup.
@@ -1388,4 +1420,5 @@ test_persistent_index_lock_exhausts_retries_and_refuses_loudly
 test_empty_retry_wait_uses_default_without_aborting
 test_fractional_legacy_retry_wait_refuses_without_arithmetic_error
 test_stale_nontreehouse_worktree_degrades_gracefully
+test_project_own_checkout_worktree_degrades_gracefully
 test_registered_worktree_return_failure_is_nonfatal
