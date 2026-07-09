@@ -648,6 +648,62 @@ fi
 # comparison uses the same physical form (docs/herdr-backend.md "Known gaps").
 PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_ABS"
 
+# Absolute git-common-dir for a path, or empty when unreadable. Same form as
+# bin/fm-ff-lib.sh's fetch_once so symlink dual-homes still compare equal.
+git_common_dir_abs() {  # <dir>
+  git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true
+}
+
+# True when $1 looks like a treehouse pool slot (portable: path contains
+# `/.treehouse/`). Used after project membership to refuse long-lived same-repo
+# sibling worktrees (serving checkouts, runtime homes) that share a common-dir
+# with the project but are not disposable pool slots.
+is_under_treehouse_pool() {  # <abs-path>
+  case "$1" in
+    */.treehouse/*|*/.treehouse) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Full membership + isolation predicate for a task worktree of $PROJ_ABS.
+# Prints one of: ok | isolation | membership | non_pool
+#   ok           - candidate is a disposable task worktree of the project
+#   isolation    - missing, not a worktree root, or is the primary checkout
+#   membership   - isolated worktree of a different repository
+#   non_pool     - same repo and isolated, but not under the treehouse pool
+#                 (only when require_pool=1; treehouse acquire path)
+is_task_worktree_of_project() {  # <candidate> <require_pool 0|1>
+  local candidate=$1 require_pool=${2:-0}
+  local wt_real proj_real wt_top wt_top_real wt_common proj_common
+  wt_real=
+  if ! wt_real=$(cd "$candidate" 2>/dev/null && pwd -P); then
+    printf '%s\n' isolation
+    return 1
+  fi
+  proj_real=$PROJ_ABS_REAL
+  wt_top=$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null || true)
+  wt_top_real=
+  if ! wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P); then
+    wt_top_real=
+  fi
+  if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
+    printf '%s\n' isolation
+    return 1
+  fi
+  wt_common=$(git_common_dir_abs "$candidate")
+  proj_common=$(git_common_dir_abs "$PROJ_ABS")
+  if [ -z "$wt_common" ] || [ -z "$proj_common" ] || [ "$wt_common" != "$proj_common" ]; then
+    printf '%s\n' membership
+    return 1
+  fi
+  if [ "$require_pool" = 1 ] && ! is_under_treehouse_pool "$wt_real"; then
+    printf '%s\n' non_pool
+    return 1
+  fi
+  printf '%s\n' ok
+  return 0
+}
+
 # Session-provider container-ensure + task creation. tmux stays exactly as P1
 # left it (same session-name / new-window sequence, see bin/backends/tmux.sh);
 # a herdr spawn goes through the version-gated, workspace-per-HOME,
@@ -656,22 +712,32 @@ PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_AB
 # herdr-sm-spaces-k4). Both branches converge on the same $T ("target") string
 # that every downstream operation (send/capture/kill) already treats as opaque
 # per-backend routing (fm_backend_resolve_selector).
-validate_spawn_worktree() {  # <source> <inspect-target>
-  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real
-  wt_real=
-  if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
-    wt_real=
-  fi
-  proj_real=$PROJ_ABS_REAL
-  wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null || true)
-  wt_top_real=
-  if ! wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P); then
-    wt_top_real=
-  fi
-  if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
-    echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
-    exit 1
-  fi
+# Fail closed: never write meta or launch after a failed validate.
+# require_pool=1 for treehouse acquire (refuse same-repo long-lived siblings);
+# require_pool=0 for Orca (provider-scoped paths are not under .treehouse/).
+validate_spawn_worktree() {  # <source> <inspect-target> [require_pool 0|1]
+  local source=$1 inspect_target=$2 require_pool=${3:-0}
+  local kind wt_common proj_common
+  kind=$(is_task_worktree_of_project "$WT" "$require_pool" || true)
+  case "$kind" in
+    ok) return 0 ;;
+    membership)
+      wt_common=$(git_common_dir_abs "$WT")
+      proj_common=$(git_common_dir_abs "$PROJ_ABS")
+      echo "error: $source resolved worktree '$WT' that is not a linked worktree of project '$PROJ_ABS' (worktree git-common-dir='${wt_common:-none}'; project git-common-dir='${proj_common:-none}'); refusing to record worktree= or launch. Inspect target $inspect_target" >&2
+      exit 1
+      ;;
+    non_pool)
+      echo "error: $source resolved worktree '$WT' belonging to project '$PROJ_ABS' but not under the treehouse pool (refusing long-lived sibling worktrees such as serving checkouts). Inspect target $inspect_target" >&2
+      exit 1
+      ;;
+    *)
+      local wt_top
+      wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null || true)
+      echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
+      exit 1
+      ;;
+  esac
 }
 
 W="fm-$ID"
@@ -768,7 +834,7 @@ EOF
       echo "error: orca did not return a worktree id/path for $W" >&2
       exit 1
     fi
-    validate_spawn_worktree "orca worktree create" "$W"
+    validate_spawn_worktree "orca worktree create" "$W" 0
     if [ -z "$ORCA_TERMINAL" ]; then
       ORCA_TERMINAL=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W") || exit 1
     fi
@@ -839,7 +905,12 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     exit 1
   fi
 
-  validate_spawn_worktree "treehouse get --lease" "$T"
+  # Membership + pool-prefix: fail closed before meta/launch. On failure, best-
+  # effort release the lease so a refused path is not left held forever.
+  if ! is_task_worktree_of_project "$WT" 1 >/dev/null; then
+    ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1 || true
+    validate_spawn_worktree "treehouse get --lease" "$T" 1
+  fi
 
   # Move the task pane into the leased worktree so the agent runs there; the
   # GOTMPDIR export and launch command below are sent into this same shell.

@@ -1100,6 +1100,10 @@ test_stale_index_lock_cleanup_rechecks_dirty_worktree() {
 test_unregistered_worktree_lock_is_left_untouched() {
   local case_dir rc lock
   case_dir=$(make_case non-linked-index-lock)
+  # Replace the registered linked worktree with a standalone clone. That clone
+  # is not in the project's `git worktree list`, so safe_task_worktree refuses
+  # destructive return (the pre-fix "meta recorded the launch cwd" class).
+  # Teardown must still complete: warn, skip return, clear volatile state.
   git -C "$case_dir/project" worktree remove --force "$case_dir/wt"
   git clone -q "$case_dir/origin.git" "$case_dir/wt"
   git -C "$case_dir/wt" checkout -q -b fm/task-x1
@@ -1111,6 +1115,9 @@ test_unregistered_worktree_lock_is_left_untouched() {
   add_lock_aware_treehouse "$case_dir"
   add_lsof_no_holder "$case_dir"
 
+  # Even with a stale index.lock on a normal (non-linked) repo, a non-registered
+  # worktree must not brick teardown. Lock clearing is owned by the return path
+  # for registered worktrees; this case takes the graceful skip path instead.
   lock=$(git_index_lock_path "$case_dir/wt")
   mkdir -p "$(dirname "$lock")"
   : > "$lock"
@@ -1128,6 +1135,8 @@ test_unregistered_worktree_lock_is_left_untouched() {
   assert_not_contains "$(cat "$case_dir/stderr")" "removed provably-stale git lock" \
     "unregistered-worktree-lock: teardown must not touch git state inside an unregistered worktree"
   assert_present "$lock" "unregistered-worktree-lock: the lock file must be left exactly as found"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "unregistered-worktree-lock: meta should be cleared after the graceful teardown"
   pass "an unregistered (cloned) worktree is never returned and its index.lock is left untouched"
 }
 

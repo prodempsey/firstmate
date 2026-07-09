@@ -46,7 +46,7 @@ make_spawn_case() {
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
   proj="$case_dir/project"
-  wt="$case_dir/wt"
+  wt="$case_dir/.treehouse/pool/1/wt"
   fakebin=$(make_spawn_fakebin "$case_dir/fake")
   grok_home="$case_dir/grok"
   id="grok-$name-x1"

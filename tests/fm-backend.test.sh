@@ -805,7 +805,7 @@ test_spawn_leases_worktree_and_drives_pane() {
   # end through the recording fake-tmux: the leased path reaches the meta, the
   # lease call is actually made, and the pane is moved and launched.
   local fb proj wt data id log_new out_new state_new config_new
-  proj="$TMP_ROOT/spawn-project"; wt="$TMP_ROOT/spawn-wt"; data="$TMP_ROOT/spawn-data"
+  proj="$TMP_ROOT/spawn-project"; wt="$TMP_ROOT/.treehouse/spawn-pool/1/spawn-wt"; data="$TMP_ROOT/spawn-data"
   id="spawnconform1"
   fm_git_worktree "$proj" "$wt" "fm/$id"
   fb=$(make_spawn_fakebin "$TMP_ROOT/spawn-fake" "$wt")
@@ -867,11 +867,13 @@ esac
 exit 0
 SH
   chmod +x "$fb/tmux"
+  # The lease is authoritative (the pane is never polled for WT), so echo the
+  # caller-chosen path form and log the call.
   cat > "$fb/treehouse" <<SH
 #!/usr/bin/env bash
+{ printf 'treehouse'; for a in "\$@"; do printf '\\x1f%s' "\$a"; done; printf '\\n'; } >> "\${FM_TMUX_LOG:?}"
 if [ "\${1:-}" = get ]; then
   printf '%s\\n' "$lease_reply"
-  exit 0
 fi
 exit 0
 SH
@@ -885,18 +887,20 @@ run_spawn_symlink_case() {  # <label> <physical|logical>
   mkdir -p "$real_root"
   ln -s "$real_root" "$link_root"
   proj="$link_root/proj"
-  # The worktree lives under the SAME symlinked prefix as the project, so the
-  # lease can plausibly report it either way.
-  wt="$link_root/wt"
+  # The pool slot lives under the SAME symlinked prefix as the project (and under
+  # a `.treehouse` dir, which fm-spawn now requires of a leased task worktree),
+  # so the lease can plausibly report it in either path form.
+  wt="$link_root/.treehouse/pool/wt"
   id="spawnsymlink$label"
-  fm_git_worktree "$real_root/proj" "$real_root/wt" "fm/$id"
+  mkdir -p "$real_root/.treehouse/pool"
+  fm_git_worktree "$real_root/proj" "$real_root/.treehouse/pool/wt" "fm/$id"
   # TMP_ROOT itself can already sit behind an OS-level symlink (e.g. macOS's
   # /var -> /private/var), so resolve the "physical" reply with pwd -P rather
   # than string concatenation - it must match exactly what fm-spawn.sh's own
   # canonicalization computes, including any symlink layers ABOVE this test's
   # own synthetic real_root/link_root pair.
   case "$lease_form" in
-    physical) lease_reply=$(cd "$real_root/wt" && pwd -P) ;;
+    physical) lease_reply=$(cd "$real_root/.treehouse/pool/wt" && pwd -P) ;;
     logical) lease_reply=$wt ;;
     *) fail "unknown symlink lease-reply mode: $lease_form" ;;
   esac
@@ -1041,7 +1045,7 @@ test_spawn_refuses_unknown_fm_backend_env() {
 
 test_spawn_default_backend_writes_no_meta_field() {
   local proj wt data id state config out
-  proj="$TMP_ROOT/nobackend-project"; wt="$TMP_ROOT/nobackend-wt"; data="$TMP_ROOT/nobackend-data"
+  proj="$TMP_ROOT/nobackend-project"; wt="$TMP_ROOT/.treehouse/nobackend-pool/1/wt"; data="$TMP_ROOT/nobackend-data"
   id="nobackendz3"
   fm_git_worktree "$proj" "$wt" "fm/$id"
   local fb
@@ -1064,7 +1068,7 @@ test_spawn_default_backend_writes_no_meta_field() {
 
 test_spawn_explicit_backend_flag_beats_autodetect_herdr_env() {
   local proj wt data id state config out fb
-  proj="$TMP_ROOT/explicit-backend-project"; wt="$TMP_ROOT/explicit-backend-wt"; data="$TMP_ROOT/explicit-backend-data"
+  proj="$TMP_ROOT/explicit-backend-project"; wt="$TMP_ROOT/.treehouse/explicit-pool/1/wt"; data="$TMP_ROOT/explicit-backend-data"
   id="explicitbackendz4"
   fm_git_worktree "$proj" "$wt" "fm/$id"
   fb=$(make_spawn_fakebin "$TMP_ROOT/explicit-backend-fake" "$wt")
@@ -1088,7 +1092,7 @@ test_spawn_explicit_backend_flag_beats_autodetect_herdr_env() {
 
 test_spawn_autodetect_nesting_resolves_tmux_silently() {
   local proj wt data id state config out fb
-  proj="$TMP_ROOT/nest-project"; wt="$TMP_ROOT/nest-wt"; data="$TMP_ROOT/nest-data"
+  proj="$TMP_ROOT/nest-project"; wt="$TMP_ROOT/.treehouse/nest-pool/1/wt"; data="$TMP_ROOT/nest-data"
   id="nestbackendz5"
   fm_git_worktree "$proj" "$wt" "fm/$id"
   fb=$(make_spawn_fakebin "$TMP_ROOT/nest-fake" "$wt")

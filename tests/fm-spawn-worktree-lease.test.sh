@@ -32,9 +32,11 @@ make_spawn_case() {
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
   project="$home/projects/repo"
-  leased="$case_dir/leased-worktree"
+  # Pool-shaped path: validate_spawn_worktree requires treehouse acquires to
+  # sit under `/.treehouse/` so same-repo long-lived siblings are refused.
+  leased="$case_dir/.treehouse/repo-pool/1/repo"
   fakebin="$case_dir/fakebin"
-  mkdir -p "$home/state" "$home/config" "$home/data/$id" "$fakebin"
+  mkdir -p "$home/state" "$home/config" "$home/data/$id" "$fakebin" "$(dirname "$leased")"
 
   # A real project repo so treehouse can add a worktree of it, and the leased
   # worktree fm-spawn will validate as a genuine isolated worktree.
@@ -96,7 +98,7 @@ test_meta_records_leased_worktree_path() {
   case_dir=$(make_spawn_case lease-basic "$id")
   home="$case_dir/home"
   fakebin="$case_dir/fakebin"
-  leased="$case_dir/leased-worktree"
+  leased="$case_dir/.treehouse/repo-pool/1/repo"
 
   set +e
   run_spawn "$home" "$fakebin" "$id" projects/repo codex \

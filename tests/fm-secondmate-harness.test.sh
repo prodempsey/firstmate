@@ -664,7 +664,7 @@ test_spawn_fallback_chain_and_crew_scout_unaffected() {
   id="crew-unaffected-z1"
   home="$w/home"
   proj="$w/crew-project"
-  wt="$w/crew-wt"
+  wt="$w/.treehouse/crew-pool/1/wt"
   fakebin=$(make_launch_capturing_tmux "$w/tmux-crew")
   fm_git_worktree "$proj" "$wt" "wt-crew"
   mkdir -p "$home/data/$id" "$home/projects" "$home/state"

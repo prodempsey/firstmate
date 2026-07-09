@@ -202,8 +202,10 @@ test_spawn_isolation_abort() {
   mkdir -p "$home/data"
   proj=$(make_repo "$TMP_ROOT/spawn-proj")
   fakebin=$(make_spawn_fakebin "$TMP_ROOT/spawn-fake")
-  # A genuine isolated linked worktree of the project, detached on the default.
-  git -C "$proj" worktree add -q --detach "$TMP_ROOT/spawn-wt" >/dev/null 2>&1
+  # A genuine isolated linked worktree of the project under a treehouse-shaped
+  # pool path (membership + pool-prefix both pass).
+  mkdir -p "$TMP_ROOT/.treehouse/spawn-pool"
+  git -C "$proj" worktree add -q --detach "$TMP_ROOT/.treehouse/spawn-pool/spawn-wt" >/dev/null 2>&1
   mkdir -p "$TMP_ROOT/spawn-notgit" "$proj/sub"
 
   # Abort: the pane resolves to a plain non-git directory (not a worktree at all).
@@ -217,8 +219,8 @@ test_spawn_isolation_abort() {
   expect_code 1 "$status" "spawn landing inside the primary checkout should abort"
   assert_contains "$out" "did not yield an isolated worktree" "primary-checkout spawn lacked the isolation error"
 
-  # Proceed: the pane resolves to a genuine, isolated worktree.
-  out=$(run_spawn "$home" ok-isolated-ff6 "$proj" "$TMP_ROOT/spawn-wt" "$fakebin"); status=$?
+  # Proceed: the pane resolves to a genuine, isolated pool worktree.
+  out=$(run_spawn "$home" ok-isolated-ff6 "$proj" "$TMP_ROOT/.treehouse/spawn-pool/spawn-wt" "$fakebin"); status=$?
   expect_code 0 "$status" "spawn into a genuine isolated worktree should succeed"
   assert_contains "$out" "spawned ok-isolated-ff6" "isolated spawn did not report success"
   assert_not_contains "$out" "did not yield an isolated worktree" "isolated spawn wrongly tripped the guard"
@@ -291,7 +293,8 @@ test_spawn_tmux_window_construction() {
   fakebin=$(make_spawn_record_fakebin "$TMP_ROOT/spawn-rec-fake")
   rec="$TMP_ROOT/spawn-rec.log"
   : > "$rec"
-  wt="$TMP_ROOT/spawn-rec-wt"
+  wt="$TMP_ROOT/.treehouse/pool/spawn-rec-wt"
+  mkdir -p "$TMP_ROOT/.treehouse/pool"
   git -C "$proj" worktree add -q --detach "$wt" >/dev/null 2>&1
 
   out=$(run_spawn_record "$home" rec-win-gg7 "$proj" "$wt" "$fakebin" "$rec"); status=$?
