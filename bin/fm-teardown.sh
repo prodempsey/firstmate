@@ -112,6 +112,10 @@ PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
 ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
 ORCA_PATH_MATCH_VERIFIED=0
+TASK_RUN_BRANCH=
+if [ -d "$WT" ]; then
+  TASK_RUN_BRANCH=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+fi
 
 KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
@@ -137,6 +141,94 @@ default_branch() {
 meta_value() {
   local meta=$1 key=$2
   fm_meta_get "$meta" "$key"
+}
+
+iso_utc_from_epoch() {
+  local epoch=$1
+  if [ "$(uname)" = Darwin ]; then
+    date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%SZ'
+  else
+    date -u -d "@$epoch" '+%Y-%m-%dT%H:%M:%SZ'
+  fi
+}
+
+meta_ctime_epoch() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %c "$1" 2>/dev/null
+  else
+    stat -c %Z "$1" 2>/dev/null
+  fi
+}
+
+append_task_run_ledger() {
+  local ledger="$STATE/task-runs.jsonl" lock="$STATE/task-runs.lock"
+  local kind project harness model effort provider worktree spawned_at ended_at outcome
+  local spawned_at_estimated=false ctime record
+
+  kind=$(meta_value "$META" kind)
+  project=$(meta_value "$META" project)
+  harness=$(meta_value "$META" harness)
+  model=$(meta_value "$META" model)
+  effort=$(meta_value "$META" effort)
+  provider=$(meta_value "$META" provider)
+  worktree=$(meta_value "$META" worktree)
+  spawned_at=$(meta_value "$META" spawned_at)
+  if [ -z "$spawned_at" ]; then
+    ctime=$(meta_ctime_epoch "$META" || true)
+    if [ -n "$ctime" ]; then
+      spawned_at=$(iso_utc_from_epoch "$ctime" || true)
+    fi
+    spawned_at_estimated=true
+  fi
+  ended_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  outcome=torn_down
+  if [ "$FORCE" = --force ]; then
+    outcome=forced
+  elif [ -z "$FORCE" ]; then
+    outcome=landed
+  fi
+
+  record=$(jq -nc \
+    --arg task "$ID" \
+    --arg kind "$kind" \
+    --arg project "$project" \
+    --arg harness "$harness" \
+    --arg model "$model" \
+    --arg effort "$effort" \
+    --arg provider "$provider" \
+    --arg branch "$TASK_RUN_BRANCH" \
+    --arg worktree "$worktree" \
+    --arg spawned_at "$spawned_at" \
+    --arg ended_at "$ended_at" \
+    --arg outcome "$outcome" \
+    --argjson spawned_at_estimated "$spawned_at_estimated" '
+      def nullable: if . == "" then null else . end;
+      {
+        schema: "task_run/1",
+        task: ($task | nullable),
+        kind: ($kind | nullable),
+        project: ($project | nullable),
+        harness: ($harness | nullable),
+        model: ($model | nullable),
+        effort: ($effort | nullable),
+        provider: ($provider | nullable),
+        branch: ($branch | nullable),
+        worktree: ($worktree | nullable),
+        spawned_at: ($spawned_at | nullable),
+        ended_at: ($ended_at | nullable),
+        outcome: ($outcome | nullable)
+      } + if $spawned_at_estimated then {spawned_at_estimated: true} else {} end
+    ') || {
+      echo "warning: could not serialize task-run ledger record for $ID; teardown will continue" >&2
+      return 0
+    }
+
+  if ! (
+    flock -x 9 || exit 1
+    printf '%s\n' "$record" >> "$ledger"
+  ) 9> "$lock"; then
+    echo "warning: could not append task-run ledger record for $ID to $ledger; teardown will continue" >&2
+  fi
 }
 
 require_orca_worktree_id() {
@@ -1087,6 +1179,7 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
+append_task_run_ledger
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
