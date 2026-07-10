@@ -71,7 +71,9 @@ export REAL_GIT_FOR_TEST
 # Echoes the case dir.
 make_case() {
   local name=$1 case_dir fakebin
-  case_dir="$TMP_ROOT/$name"
+  # Ordinary task worktrees live below a pool-shaped path so teardown's shared
+  # treehouse-pool predicate exercises the normal destructive-return path.
+  case_dir="$TMP_ROOT/.treehouse/$name"
   fakebin="$case_dir/fakebin"
   mkdir -p "$case_dir/state" "$case_dir/config" "$fakebin"
 
@@ -966,6 +968,45 @@ test_project_own_checkout_worktree_degrades_gracefully() {
   pass "recorded worktree equal to the project's own checkout degrades gracefully instead of mutating it"
 }
 
+# A same-repo sibling can be registered with the project while still being a
+# long-lived serving checkout outside the treehouse pool. Legacy bad meta may
+# name one, so teardown must neither detach/delete its branch nor call
+# `treehouse return --force` for it.
+test_same_repo_sibling_outside_pool_degrades_gracefully() {
+  local case_dir rc sibling head_branch return_marker
+  case_dir=$(make_case same-repo-sibling-outside-pool)
+  sibling="$TMP_ROOT/serving-checkout"
+  return_marker="$case_dir/treehouse-return-called"
+  git -C "$case_dir/project" worktree add -q -b serving-live "$sibling" main
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    "window=fm-task-x1" \
+    "worktree=$sibling" \
+    "project=$case_dir/project" \
+    "kind=ship" \
+    "mode=no-mistakes"
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$return_marker"
+exit 1
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "same-repo-sibling: teardown must skip a registered sibling outside the pool"
+  assert_grep "not a treehouse-managed worktree" "$case_dir/stderr" \
+    "same-repo-sibling: expected a graceful warning about the non-pool sibling"
+  head_branch=$(git -C "$sibling" rev-parse --abbrev-ref HEAD)
+  [ "$head_branch" = serving-live ] \
+    || fail "same-repo-sibling: teardown detached or deleted the serving branch (branch: $head_branch)"
+  assert_absent "$return_marker" "same-repo-sibling: teardown called treehouse return for a non-pool sibling"
+  assert_absent "$case_dir/state/task-x1.meta" "same-repo-sibling: meta should be cleared after graceful teardown"
+  pass "same-repo sibling outside the treehouse pool is preserved and return is skipped"
+}
+
 # When the recorded worktree IS a registered worktree but `treehouse return`
 # itself fails (e.g. already returned, or a transient treehouse error), teardown
 # must warn and continue rather than aborting mid-cleanup.
@@ -1421,4 +1462,5 @@ test_empty_retry_wait_uses_default_without_aborting
 test_fractional_legacy_retry_wait_refuses_without_arithmetic_error
 test_stale_nontreehouse_worktree_degrades_gracefully
 test_project_own_checkout_worktree_degrades_gracefully
+test_same_repo_sibling_outside_pool_degrades_gracefully
 test_registered_worktree_return_failure_is_nonfatal

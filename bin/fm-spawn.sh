@@ -104,6 +104,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
+# shellcheck source=bin/fm-worktree-lib.sh
+. "$SCRIPT_DIR/fm-worktree-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
@@ -656,17 +658,6 @@ PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_AB
 # bin/fm-ff-lib.sh's fetch_once so symlink dual-homes still compare equal.
 git_common_dir_abs() {  # <dir>
   git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true
-}
-
-# True when $1 looks like a treehouse pool slot (portable: path contains
-# `/.treehouse/`). Used after project membership to refuse long-lived same-repo
-# sibling worktrees (serving checkouts, runtime homes) that share a common-dir
-# with the project but are not disposable pool slots.
-is_under_treehouse_pool() {  # <abs-path>
-  case "$1" in
-    */.treehouse/*|*/.treehouse) return 0 ;;
-    *) return 1 ;;
-  esac
 }
 
 # Full membership + isolation predicate for a task worktree of $PROJ_ABS.

@@ -89,6 +89,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 # shellcheck source=bin/fm-lock-lib.sh
 . "$SCRIPT_DIR/fm-lock-lib.sh"
 FM_LOCK_LOG_PREFIX=teardown
+# shellcheck source=bin/fm-worktree-lib.sh
+. "$SCRIPT_DIR/fm-worktree-lib.sh"
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
 FORCE=${2:-}
@@ -617,9 +619,11 @@ validate_worktree_teardown_safety() {
 }
 
 # A recorded worktree is safe to act on (branch cleanup + `treehouse return`)
-# only when it is a real, registered worktree of the task's project AND is not
-# the firstmate repo root, the active firstmate home, or the project's own
-# primary checkout. The FM_ROOT/FM_HOME guard matters for firstmate-on-itself
+# only when it is a real, registered worktree of the task's project, sits under
+# the treehouse pool, AND is not the firstmate repo root, the active firstmate
+# home, or the project's own primary checkout. The pool guard protects legacy
+# bad meta from naming a long-lived same-repo sibling such as a serving checkout.
+# The FM_ROOT/FM_HOME guard matters for firstmate-on-itself
 # tasks whose meta was written before the worktree-path fix: such a meta can
 # record the runtime home (a genuine worktree of the firstmate repo, so
 # registered) as the "worktree", and teardown must never detach/branch-delete
@@ -632,6 +636,7 @@ safe_task_worktree() {  # <project> <wt>
   local project=$1 wt=$2 wt_abs root_abs home_abs proj_abs
   worktree_registered_for_project "$project" "$wt" || return 1
   wt_abs=$(canonical_existing_dir "$wt") || return 1
+  is_under_treehouse_pool "$wt_abs" || return 1
   root_abs=$(cd "$FM_ROOT" && pwd -P) || return 1
   [ "$wt_abs" != "$root_abs" ] || return 1
   if home_abs=$(cd "$FM_HOME" 2>/dev/null && pwd -P); then
