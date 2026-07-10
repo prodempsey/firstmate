@@ -48,8 +48,10 @@
 
 # Busy footers per harness (mirror fm-watch.sh). claude/codex: "esc to
 # interrupt"; opencode: "esc interrupt"; pi: "Working..."; grok: "Ctrl+c:cancel"
-# (grok's mid-turn cancel hint, shown iff a turn is running - verified grok 0.2.73).
-FM_TMUX_BUSY_REGEX_DEFAULT='esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'
+# (grok's mid-turn cancel hint, shown iff a turn is running - verified grok 0.2.73);
+# gemini: "esc to cancel" (spinner line "Thinking... (esc to cancel, Ns)" - verified
+# gemini-cli 0.50.0).
+FM_TMUX_BUSY_REGEX_DEFAULT='esc (to )?interrupt|esc to cancel|Working\.\.\.|Ctrl\+c:cancel'
 
 # fm_tmux_strip_ghost: thin adapter over the shared, fleet-wide ghost extractor
 # fm_composer_strip_ghost (bin/fm-composer-lib.sh). It drops de-emphasised
@@ -126,10 +128,20 @@ fm_pane_input_pending() {  # <target>
 
 # fm_pane_is_busy: 0 if the pane's last few non-blank lines show a busy footer
 # (an agent mid-turn). Scans a 40-line tail like fm-watch.sh.
+# Non-blank tail depth is 12, not 6: verified empirically (gemini-cli 0.50.0)
+# that gemini's footer chrome below its "Thinking..." spinner line - a
+# separator, a YOLO/skill-count row, another separator, the composer
+# placeholder, another separator, and a workspace/branch/sandbox/model info
+# bar (header + values, 2 lines) - is 7 non-blank lines deep, which a tail -6
+# window cuts the spinner line off of entirely, false-reading a genuinely busy
+# gemini pane as idle. 12 covers that with margin and is a no-op risk for the
+# shorter-footer harnesses (claude/codex/opencode/pi/grok), whose busy line
+# already sits within the last 1-2 non-blank lines.
+FM_TMUX_BUSY_TAIL_LINES=12
 fm_pane_is_busy() {  # <target>
   local win=$1 tail40
   tail40=$(tmux capture-pane -p -t "$win" -S -40 2>/dev/null) || return 1
-  printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -6 \
+  printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -"$FM_TMUX_BUSY_TAIL_LINES" \
     | grep -qiE "${FM_BUSY_REGEX:-$FM_TMUX_BUSY_REGEX_DEFAULT}"
 }
 

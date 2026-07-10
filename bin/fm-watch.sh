@@ -106,8 +106,13 @@ SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trai
 # claude/codex: "esc to interrupt"; opencode: "esc interrupt"; pi: "Working...";
 # grok: "Ctrl+c:cancel" (the mid-turn cancel hint in grok's keybind bar, shown iff a
 # turn is running; absent when idle - verified grok 0.2.73, ASCII to avoid the
-# locale fragility of matching grok's braille spinner glyph directly).
-BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'}
+# locale fragility of matching grok's braille spinner glyph directly);
+# gemini: "esc to cancel" (spinner line "Thinking... (esc to cancel, Ns)", absent
+# when idle - verified gemini-cli 0.50.0). NOTE: gemini has no per-turn hook
+# equivalent to claude's Stop (its AfterAgent hook fires only at full CLI exit,
+# not per interactive turn - verified), so gemini crews rely on this stale-pane
+# busy/idle detection alone, same as any harness with no turn-end hook installed.
+BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|esc to cancel|Working\.\.\.|Ctrl\+c:cancel'}
 # Always-on wake triage: most wakes during a long crew validation are benign (a
 # working: note or turn-end while a pipeline runs, a no-change heartbeat). Rather
 # than wake firstmate's LLM for each, this watcher classifies every wake in bash
@@ -186,7 +191,10 @@ window_is_busy() {  # <window> <tail40>
     busy) return 0 ;;
     idle) return 1 ;;
     *)
-      printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -6 | grep -qiE "$BUSY_REGEX"
+      # Tail depth 12, not 6: mirrors fm-tmux-lib.sh's fm_pane_is_busy - gemini's
+      # footer chrome below its "Thinking..." line is 7 non-blank lines deep
+      # (verified, gemini-cli 0.50.0), which a 6-line window cuts off entirely.
+      printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -12 | grep -qiE "$BUSY_REGEX"
       ;;
   esac
 }

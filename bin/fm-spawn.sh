@@ -33,7 +33,7 @@
 #   profile consultation. A --secondmate spawn is exempt and resolves the SECONDMATE
 #   harness (config/secondmate-harness -> config/crew-harness -> own), so the
 #   secondmate-vs-crewmate split is DURABLE across every respawn (recovery,
-#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|grok)
+#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|grok|gemini)
 #   overrides it for this spawn (either kind). A non-flag string containing
 #   whitespace is treated as a RAW launch command - the escape hatch for verifying
 #   new adapters.
@@ -283,7 +283,7 @@ FIRSTMATE_HOME=
 
 if [ "$KIND" = secondmate ]; then
   case "${POS[1]:-}" in
-    ''|claude|codex|opencode|pi|grok)
+    ''|claude|codex|opencode|pi|grok|gemini)
       ARG3=${POS[1]:-}
       ;;
     *' '*)
@@ -346,6 +346,17 @@ launch_template() {
     # launch command - it is a Stop-event hook installed below (global hook +
     # per-task pointer), so the template is identical for ship/scout/secondmate.
     grok) printf '%s' 'grok --always-approve __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"' ;;
+    # gemini (Gemini CLI, @google/gemini-cli): a positional prompt starts the
+    # supervised interactive session. --yolo auto-accepts every tool call
+    # (verified: footer shows "YOLO Ctrl+Y", a WriteFile was auto-accepted with
+    # no confirmation prompt). gemini has no verified effort/thinking flag, so
+    # __EFFORTFLAG__ is intentionally never populated for this harness (see
+    # effort_flag_for_harness). gemini's turn-end signal does NOT ride a hook -
+    # its hook vocabulary (BeforeTool/AfterTool/BeforeAgent/AfterAgent/...) has
+    # no per-turn event; AfterAgent fires only at full CLI exit (verified), so
+    # no hook is installed below and gemini crews rely on stale-pane busy/idle
+    # detection alone (BUSY_REGEX above already covers gemini's "esc to cancel").
+    gemini) printf '%s' 'gemini --yolo __MODELFLAG__"$(cat __BRIEF__)"' ;;
     *) return 1 ;;
   esac
 }
@@ -433,7 +444,7 @@ model_flag_for_harness() {
   local harness=$1 model=$2
   [ -n "$model" ] && [ "$model" != default ] || return 0
   case "$harness" in
-    claude|codex|opencode|pi|grok)
+    claude|codex|opencode|pi|grok|gemini)
       printf -- '--model %s ' "$(shell_quote "$model")"
       ;;
   esac

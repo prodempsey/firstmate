@@ -1,6 +1,6 @@
 ---
 name: harness-adapters
-description: Agent-only reference for firstmate harness operations. Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter. Contains verified facts for claude, codex, opencode, pi, and grok.
+description: Agent-only reference for firstmate harness operations. Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter. Contains verified facts for claude, codex, opencode, pi, grok, and gemini.
 user-invocable: false
 metadata:
   internal: true
@@ -86,6 +86,7 @@ The supported launch-profile flags below were verified locally on 2026-06-30 wit
 | grok | `--model <model>` | `--reasoning-effort <low\|medium\|high\|xhigh>` | Verified on grok 0.2.73. `--effort` parses too, but firstmate's profile axis is reasoning effort. `--reasoning-effort max` is rejected, so `max` is omitted. |
 | pi | `--model <model>` | `--thinking <low\|medium\|high\|xhigh>` | Verified on pi 0.80.2. `max` prints an invalid-thinking warning, so firstmate omits Pi effort when the requested effort is `max`. |
 | opencode | `--model <provider/model>` | none for firstmate's interactive launch | Verified on opencode 1.17.6. `opencode run` has `--variant`, but firstmate launches the interactive `opencode --prompt` path, which has no verified effort flag. |
+| gemini | `--model <model>` | none | Verified on @google/gemini-cli 0.50.0. `--help` shows no reasoning/thinking-effort flag, so firstmate omits an effort flag for gemini entirely. |
 
 When a requested effort value is outside the harness-specific accepted set, `fm-spawn` records the requested `effort=` in meta but emits no effort flag for that harness.
 This preserves launch success instead of passing a known-bad value.
@@ -100,6 +101,7 @@ Natural language is acceptable if uncertain.
 - opencode: no separate verified skill invocation beyond normal slash-command behavior; use natural language if the exact skill command is uncertain.
 - pi: no separate verified skill invocation beyond normal command behavior; use natural language if the exact skill command is uncertain.
 - grok: `/<skill>`, for example `/no-mistakes` (same form as claude). Verified end to end: grok discovers the user-level `no-mistakes` skill, `/no-mistakes` invokes it, and grok drives a real `no-mistakes axi run`. Like codex's `$`/`/` popups, typing `/<skill>` opens grok's slash-autocomplete, so a too-fast Enter selects the popup entry instead of sending, and for an argument-taking command (like `/no-mistakes`'s optional task-first argument) that first Enter only expands the popup selection into an argument-hint placeholder rather than submitting - a genuine second Enter is required (see the grok section below for the 2026-07-03 incident and fix). `fm_tmux_submit_core`'s retried Enter (used by `fm-send` on the tmux backend) already handles this correctly by reading the cursor row; the herdr backend needed a dedicated fix (`fm_backend_herdr_composer_state`, docs/herdr-backend.md) because its prior delta-based verification false-positived on that same popup-close content change.
+- gemini: not verified. Gemini CLI has its own native skill/extension system (footer shows a live skill count, e.g. "15 skills") separate from firstmate's `/no-mistakes`-style skills; whether a `/no-mistakes`-shaped invocation would work is untested and out of scope of the 2026-07-10 verification pass. Use natural language until tested.
 
 ## claude (VERIFIED)
 
@@ -264,3 +266,27 @@ The adapter therefore runs the shared predicate and, when it returns 2, forces o
 It does not pass `--permission-mode`, so the passive hook cannot escalate the primary session's tool permissions.
 Project-local Grok hooks require folder trust, verified with launch-time `--trust`; if the primary firstmate checkout is not trusted for Grok hooks, this primary guard fails open and `fm-guard.sh` remains the next-command alarm.
 Grok's primary watcher protocol is Claude-shaped background-notify around `bin/fm-watch-arm.sh`; the passive Stop hook is only a backstop for blind turn ends.
+
+## gemini (VERIFIED 2026-07-10, @google/gemini-cli 0.50.0)
+
+Gemini CLI, Google's own coding-agent TUI.
+Launch with a positional prompt: `gemini --yolo "$(cat <brief>)"`.
+Already installed and authenticated in this fleet (`~/.gemini/gemini-credentials.json`, `GEMINI_API_KEY` in the fleet secrets) - no install step needed here.
+
+| Fact | Value |
+|---|---|
+| Busy-pane signature | `esc to cancel` (spinner line `⠙ Thinking... (esc to cancel, Ns)`; also shown during tool-selection as `Considering <Action> (esc to cancel, Ns)`). Idle composer shows no such line. |
+| Exit command | `/quit` (single Enter submits immediately, no double-confirm; prints a session cost/usage summary and a `gemini --resume <session-id>` hint) |
+| Interrupt | single Escape (prints `ℹ Request cancelled.`) |
+| Autonomy | `--yolo` (footer shows `YOLO Ctrl+Y`; verified live - a `WriteFile` tool call was auto-accepted with no confirmation prompt) |
+| Resume | `gemini --resume <session-id>` (id printed at quit) or a bare `--resume` with an index; replays prior turn history into the same interactive session, verified live |
+| Env marker | `GEMINI_CLI=1`, set for child/tool processes (verified via a live `env \| grep` run inside a crewmate task) |
+| Skill invocation | untested (see above) |
+
+**Trust dialog:** none observed in this verification pass (fresh treehouse worktree, `--yolo` flag). Not confirmed absent - only not observed in this one path; if a captain-visible trust/confirmation dialog ever appears on a gemini spawn, accept it and record the exact prompt text here.
+
+**No native per-turn hook - this is the important gap.** Gemini's own hook vocabulary (`gemini hooks migrate --from-claude` reveals it: `BeforeTool`, `AfterTool`, `BeforeAgent`, `AfterAgent`, `Notification`, `SessionStart`, `SessionEnd`, `PreCompress`, `BeforeModel`, `AfterModel`, `BeforeToolSelection`) has no event that fires once per interactive turn the way claude's `Stop` or grok's `Stop`-equivalent does. Verified empirically: a `.gemini/settings.json` hook wired to `AfterAgent` did **not** fire when a turn completed while the session stayed open, but **did** fire the instant `/quit` was run - `AfterAgent` fires only at full CLI-process exit, the same semantics as pi's `agent_end` (not `turn_end`). Because there is no turn-end signal to install, `fm-spawn`'s per-harness turn-end hook installer has no `gemini*` case - gemini crews are supervised by stale-pane busy/idle detection alone, same as any harness with no hook wired.
+
+**Busy-detection tail-depth fix (applies to every harness, not gemini-specific).** Gemini's footer has more chrome below its busy spinner line than the other adapters: a separator, a `YOLO Ctrl+Y` / skill-count row, another separator, the composer placeholder, another separator, and a two-line workspace/branch/sandbox/model info bar - 7 non-blank lines between the spinner and the bottom of the pane. `fm_pane_is_busy` (`bin/fm-tmux-lib.sh`) and `window_is_busy` (`bin/fm-watch.sh`) previously scanned only the last 6 non-blank lines, which cut the spinner line off entirely and false-read a genuinely busy gemini pane as idle - verified live (a `sleep 8` tool call ran busy the whole time; the tail-6 check reported idle throughout). Fixed by widening both to a 12-line non-blank tail (`FM_TMUX_BUSY_TAIL_LINES` in `fm-tmux-lib.sh`); this is a no-op risk for the shorter-footer harnesses, whose busy line already sits within the first 1-2 non-blank lines from the bottom. **Not re-confirmed live after the widen** - the verification session hit a Gemini API usage-limit error (`Usage limit reached for gemini-3.5-flash`, then a generic request failure on a second model) before a second live busy-window check could complete. The structural math is solid (7 lines measured directly from a captured busy pane, tail-12 comfortably covers it), but re-confirm live once API quota resets, ideally with a longer-running real tool call (a test suite or build) rather than a bare `sleep`.
+
+**Quota/rate-limit dialog (new dialog type, not seen on other harnesses).** Hitting a provider usage limit mid-turn surfaces an interactive chooser: `Usage limit reached for gemini-<model>. / /stats model for usage details / /model to switch models.` followed by `● 1. Keep trying` / `2. Stop`, navigated with arrow keys + Enter. Selecting "Stop" returns cleanly to the idle composer with a `ℹ This request failed...` notice. This needs a supervision answer before gemini ships broadly: does firstmate steer "Keep trying" (risk of a long stall) or "Stop" (fails the turn cleanly, crewmate can retry or report blocked)? Recommend "Stop" as the safer default until failover (`provider-failover-runtime-p1`) can route around an exhausted Gemini quota automatically, but this is a captain/design call, not yet encoded anywhere.
