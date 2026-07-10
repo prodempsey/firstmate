@@ -41,17 +41,18 @@ run_ack() {
   FM_HOME="$home" "$ACK" "$@"
 }
 
-test_unhandled_terminal_emits_once() {
-  local home out
-  home=$(new_home emits-once)
+test_unhandled_terminal_reemits_until_acked() {
+  local home first_out second_out
+  home=$(new_home reemits)
   write_task "$home" ready-a1 'done: ready in branch fm/ready-a1 @ abcdef1'
 
-  out=$(run_reconcile "$home")
-  assert_contains "$out" 'NEEDS FIRSTMATE: 1 unhandled - ready-a1' \
+  first_out=$(run_reconcile "$home")
+  assert_contains "$first_out" 'NEEDS FIRSTMATE: 1 unhandled - ready-a1' \
     "first check should surface the unhandled terminal task"
-  out=$(run_reconcile "$home")
-  [ -z "$out" ] || fail "unchanged surfaced set should be silent, got: $out"
-  pass "unhandled terminal status emits once"
+  second_out=$(run_reconcile "$home")
+  assert_contains "$second_out" 'NEEDS FIRSTMATE: 1 unhandled - ready-a1' \
+    "later check should re-surface an unchanged unacknowledged task"
+  pass "unchanged unacknowledged terminal status re-emits"
 }
 
 test_acked_unchanged_is_silent() {
@@ -142,7 +143,7 @@ test_phase_two_flags_are_non_mutating_stubs() {
   pass "Phase 2 ownership flags are explicit non-mutating stubs"
 }
 
-test_unhandled_terminal_emits_once
+test_unhandled_terminal_reemits_until_acked
 test_acked_unchanged_is_silent
 test_changed_fingerprint_reemits
 test_local_state_without_board_data

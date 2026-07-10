@@ -2,7 +2,7 @@
 # Reconcile local terminal task signals against durable FirstMate handling state.
 #
 # Usage:
-#   fm-nf-reconcile.sh           Emit one check line when the unhandled set changes.
+#   fm-nf-reconcile.sh           Emit one check line while any item is unhandled.
 #   fm-nf-reconcile.sh list      Print full detail for every current unhandled item.
 #   fm-nf-reconcile.sh install   Install the persistent watcher check shim.
 #
@@ -16,7 +16,6 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 LEDGER="$STATE/.nf-handled"
-SURFACED="$STATE/.nf-surfaced"
 MODE=${1:-check}
 
 # shellcheck disable=SC1091 # Dynamic sibling path is resolved from BASH_SOURCE.
@@ -26,8 +25,8 @@ usage() {
   cat <<'EOF'
 usage: fm-nf-reconcile.sh [list|install]
 
-With no mode, emit one NEEDS FIRSTMATE line only when the current unhandled
-local terminal-signal set differs from the last surfaced set.
+With no mode, emit one NEEDS FIRSTMATE line on every check while any local
+terminal signal is absent from the handled ledger.
 EOF
 }
 
@@ -85,10 +84,9 @@ if [ ! -d "$STATE" ]; then
 fi
 
 PENDING=$(mktemp "${TMPDIR:-/tmp}/fm-nf-pending.XXXXXX")
-NEXT_SURFACED=$(mktemp "$STATE/.nf-surfaced.XXXXXX")
 # shellcheck disable=SC2317,SC2329 # Invoked by the EXIT trap below.
 cleanup() {
-  rm -f "$PENDING" "$NEXT_SURFACED"
+  rm -f "$PENDING"
 }
 trap cleanup EXIT
 
@@ -173,13 +171,7 @@ if [ "$MODE" = list ]; then
   exit 0
 fi
 
-cp "$PENDING" "$NEXT_SURFACED"
-if [ -f "$SURFACED" ] && cmp -s "$NEXT_SURFACED" "$SURFACED"; then
-  exit 0
-fi
-
 if [ -s "$PENDING" ]; then
   print_check_line
 fi
-mv "$NEXT_SURFACED" "$SURFACED"
 exit 0
