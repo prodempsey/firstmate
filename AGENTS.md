@@ -129,15 +129,16 @@ It composes today's `fm-lock.sh`, `fm-bootstrap.sh`, and `fm-wake-drain.sh` - ca
    The secondmate liveness sweep deterministically guarantees every registered secondmate is actually running: it probes each live secondmate's endpoint for a real agent process (not just pane presence) and respawns only on a confident dead reading, reported as `SECONDMATE_LIVENESS:` lines (`bin/fm-bootstrap.sh`; `bin/fm-backend.sh`'s `fm_backend_agent_alive`).
 3. **Wake queue** - when locked, drains the durable wake queue and prints the records prominently as this turn's first work queue, exactly as `bin/fm-wake-drain.sh` did before; a lapsed watcher chain still surfaces here via the same guard banner.
    When the lock could not be acquired, the queue is left untouched because another session owns it, and the guard's tangle/watcher-liveness alarms still print in read-only advisory mode without drain, supervision repair, or checkout repair commands.
-4. **Context digest** - the full contents of `data/projects.md`, `data/secondmates.md`, `data/captain.md`, and `data/learnings.md`, each clearly delimited.
+4. **Supervision operating instructions** - after the wake queue and before context, the digest emits exactly one operating block for the detected primary harness.
+5. **Context digest** - the full contents of `data/projects.md`, `data/secondmates.md`, `data/captain.md`, and `data/learnings.md`, each clearly delimited.
    A file that does not exist prints an explicit `ABSENT` marker, never confused with an empty-but-present file: absence is meaningful (`captain.md` absent means use this template's defaults, `projects.md` absent means rebuild it from the clones under `projects/`, etc.).
-5. **Fleet-state digest** - the full `data/backlog.md`; every `state/<id>.meta`; a bounded tail of each task's `state/<id>.status` (labeled as wake-EVENT history, not current state, with the full log path printed for a deeper read); the `state/.afk` flag; and one cheap alive/dead read of each task's recorded backend endpoint.
+6. **Fleet-state digest** - the full `data/backlog.md`; every `state/<id>.meta`; a bounded tail of each task's `state/<id>.status` (labeled as wake-EVENT history, not current state, with the full log path printed for a deeper read); the `state/.afk` flag; and one cheap alive/dead read of each task's recorded backend endpoint.
    That liveness line is a fast presence check only, not a full state read - when you need a crew's actual current state (a run-step, not just "is the pane there"), read it with `bin/fm-crew-state.sh <id>` as before; the digest deliberately skips that deeper, slower read for every task so it stays fast and bounded.
-6. **Supervision operating instructions and next step** - after the wake queue and before context, the digest emits exactly one operating block for the detected primary harness.
-   The closing reminder points back to that emitted block and preserves only the lock, afk, X-mode, and read-once reminders.
+7. **Fleet triage** - after the context and fleet-state digest, a locked primary prints the read-only fleet-triage digest and loads `fleet-triage` before acting on unhandled candidates; a read-only session skips the pass.
+8. **Next step** - the closing reminder points back to the emitted supervision block and preserves only the lock, afk, X-mode, and read-once reminders.
    The script itself never starts supervision; the emitted harness protocol owns the exact wait or wake mechanism.
 
-**Everything in this digest is read exactly once, at session start.**
+**Everything in the human digest is printed exactly once at session start, and the composed triage pass may reuse its structured inputs internally without another agent turn.**
 Do not separately run `bin/fm-bootstrap.sh`, `bin/fm-lock.sh`, or `bin/fm-wake-drain.sh`, and do not separately read `data/projects.md`, `data/secondmates.md`, `data/captain.md`, `data/learnings.md`, `data/backlog.md`, or any `state/*.meta` afterward - they were just printed in full, and re-reading them defeats the entire point of collapsing session start into one command.
 Do not bulk-read `state/*.status` afterward either: the digest printed bounded tails with full log paths for targeted follow-up when older wake-event history is actually needed.
 Re-read a file only if the digest flagged it `ABSENT` (then rebuild or create it per the guidance in this section and section 6), its contents looked unparseable or corrupt, or an individual full status log is needed for older wake-event history.
@@ -253,7 +254,8 @@ Reconcile reality with your records before doing anything else, working from the
    If it is, load `/afk`, ensure the daemon is running, do not separately arm the watcher because the daemon owns it, and resume away-mode supervision.
 9. Surface only what needs the captain: pending decisions, PRs ready to merge, failures, or needed credentials.
    If there is nothing that needs them, say nothing and resume.
-10. Having already handled the drained wakes from the digest, follow the emitted supervision operating block through the digest's own closing reminder; if the lock was refused or `state/.afk` exists, follow the digest's no-direct-supervision guidance.
+10. Load `fleet-triage` and disposition the locked session-start digest before deciding that recovery is complete.
+11. Having already handled the drained wakes from the digest, follow the emitted supervision operating block through the digest's own closing reminder; if the lock was refused or `state/.afk` exists, follow the digest's no-direct-supervision guidance.
 
 A firstmate restart must be a non-event.
 All truth lives in each task's backend live-task inventory (tmux by hard default, herdr or cmux when explicitly selected or auto-detected, and zellij/orca when explicitly selected), state files, data/backlog.md, data/captain.md, data/learnings.md, data/secondmates.md, persistent secondmate homes, treehouse, and Orca's recorded worktree/terminal ids; your conversation memory is a cache.
@@ -282,6 +284,7 @@ That reference owns the exact line format, home leases, secondmate harness pins,
 A secondmate is idle by default: it acts only on work the main firstmate routes to it.
 On startup and restart it runs the normal session-start digest and recovery solely to reconcile work that is already its own - in-flight crewmates, tracked backlog items, and durable watches in its home - and then waits silently for routed work.
 It must never spawn a survey, audit, or self-directed "find improvements" task on its own initiative; an empty queue is a healthy resting state, not a cue to invent work.
+The proactive `fleet-triage` duty is a main-primary responsibility and does not relax this secondmate boundary.
 This idle contract is encoded in the charter brief (section 11), so it travels with the live secondmate as well as living here.
 
 **Hand off in-scope backlog on creation.**
@@ -460,6 +463,7 @@ This do-not-fight rule does not license evidence commits in firstmate's own repo
 
 **yolo (orthogonal).** With `yolo=off` (default) every approval is the captain's: ask-user findings, PR merges, the local-only merge.
 With `yolo=on`, firstmate makes those calls itself without asking - resolve ask-user findings on your judgment, and run `bin/fm-pr-merge.sh <id> <full GitHub PR URL>` / `bin/fm-merge-local.sh` once the work is green/approved - EXCEPT anything destructive, irreversible, or security-sensitive, which still escalates to the captain.
+For proactive coordination discovered outside an existing task, load `fleet-triage`; that skill owns the reversible-action and captain-gate boundary without changing these merge rules.
 Never merge a red PR even under yolo.
 `bin/fm-pr-merge.sh` always records `pr=` and records `pr_head=` when available before merging, parses the full `https://github.com/<owner>/<repo>/pull/<n>` URL into `gh-axi pr merge <n> --repo <owner>/<repo>`, and defaults to `--squash` unless an explicit merge method is forwarded after `--`; this holds even on a repo with no PR CI where the "checks green" signal that normally triggers `bin/fm-pr-check.sh` never fires - do not call `gh-axi pr merge` directly for a task's PR, or the recording step can be silently skipped and a later `fm-teardown.sh` has nothing to verify a squash merge against.
 After any merge you perform without asking the captain, post a one-line "merged <full PR URL or local main> after checks passed" FYI so the captain keeps a trail.
@@ -588,7 +592,7 @@ On wake, in order of cheapness:
    If the stale reason includes `demand-deep-inspection`, inspect the pane, `bin/fm-crew-state.sh <id>`, and the validation logs before resuming supervision.
    If the pane is waiting, looping, confused, or unresponsive, load `stuck-crewmate-recovery`.
 4. `check:` a per-task poll fired (usually a merge, or X mode when enabled); act on it.
-5. `heartbeat:` a heartbeat wake now reaches you only when the watcher's bash fleet-scan caught a captain-relevant status the per-wake path missed (no-change heartbeats are absorbed in bash, never surfaced), so treat it as "something turned up" and review the whole fleet: start with `bin/fm-fleet-view.sh` for the structured overview, use `bin/fm-crew-state.sh <id>` only for targeted follow-up, peek panes that look off, check PR-ready tasks for merge, reconcile data/backlog.md, then resume the emitted supervision protocol.
+5. `heartbeat:` a heartbeat wake now reaches you only when the watcher's bash fleet-scan caught a captain-relevant status the per-wake path missed (no-change heartbeats are absorbed in bash, never surfaced), so treat it as "something turned up", load `fleet-triage`, run a full pass, and then resume the emitted supervision protocol.
    Do not report that the fleet is unchanged.
 
 When a task reaches a terminal state on any of these wakes (a `done`/merge `check:`, a `failed` signal, a scout report, a local-only merge), and X mode is enabled, load `fmx-respond` (section 13) and post the X-mode mention's **final** completion follow-up if that task is X-mode-linked: `bin/fm-x-followup.sh --check <id>` then `bin/fm-x-followup.sh <id> --final --text-file <path>`, so the link always clears here regardless of how many of the up-to-three follow-ups were already spent on earlier milestones.
@@ -686,7 +690,7 @@ Update the backlog on every dispatch, completion, and decision for a work item.
 - [x] <id> - <one line> - data/<id>/report.md (reported <date>)
 ```
 
-Re-evaluate Queued on every teardown and every heartbeat: anything whose blocker is gone and whose time/date gate, if any, has arrived gets dispatched.
+Load `fleet-triage` to re-evaluate Queued and the other duty lanes on every teardown and every heartbeat.
 
 A tracked `.tasks.toml` at this repo root pins the default `tasks-axi` markdown backend to `data/backlog.md`, with `done_keep = 10` and an archive at `data/done-archive.md`.
 The local, gitignored `config/backlog-backend` file is the explicit opt-out knob.
@@ -764,6 +768,7 @@ These skills are not captain-invocable; they are conditional operating reference
 - `fmx-respond` - load on an `x-mention <request_id>` `check:` wake to handle the mention, on an `x-mode-error ...` `check:` wake to report the X-mode configuration blocker, and on any milestone or terminal wake for an X-mode-linked task before posting its completion follow-up; relevant only when X mode is on.
 - `firstmate-codexapp` - load before coordinating a visible Codex Desktop thread, evaluating a Codex App backend request, or reconciling Codex Desktop host-tool smoke evidence for Firstmate work.
 - `firstmate-coding-guidelines` - load before changing firstmate's shared, tracked material, as defined by section 1's list, whether editing directly or briefing a crewmate for a firstmate-repo task.
+- `fleet-triage` - load when the main primary starts or recovers, handles an actionable wake, closes or tears down work, re-evaluates the backlog, or sees an unhandled fleet-triage candidate.
 
 ## 14. X mode
 

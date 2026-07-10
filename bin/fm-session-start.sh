@@ -37,7 +37,9 @@
 #   5. fleet digest   - data/backlog.md, every state/*.meta, a bounded
 #                       state/*.status tail, state/.afk, and a cheap
 #                       per-task endpoint-liveness read: read-only, always runs.
-#   6. closing reminder - prints the context-specific watcher next step; this
+#   6. fleet triage   - prints the read-only candidate digest only for the
+#                       session that acquired the fleet lock.
+#   7. closing reminder - prints the context-specific watcher next step; this
 #                       script points back to the emitted harness supervision
 #                       block and deliberately never arms the watcher itself.
 #
@@ -80,6 +82,7 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 PRIMARY_HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 
 # shellcheck source=bin/fm-backend.sh
+# shellcheck disable=SC1091 # Dynamic sibling path is resolved from SCRIPT_DIR.
 . "$SCRIPT_DIR/fm-backend.sh"
 
 STATUS_TAIL=${FM_SESSION_START_STATUS_TAIL:-5}
@@ -286,7 +289,21 @@ else
   printf 'absent\n'
 fi
 
-# --- 6. closing reminder -----------------------------------------------
+# --- 6. fleet triage -----------------------------------------------------
+section "FLEET TRIAGE"
+if [ "$READ_ONLY" -eq 1 ]; then
+  printf 'skipped (read-only session) - the session holding the lock owns triage.\n'
+else
+  TRIAGE_OUT=$("$SCRIPT_DIR/fm-fleet-triage.sh" --digest 2>&1)
+  TRIAGE_RC=$?
+  if [ "$TRIAGE_RC" -eq 0 ]; then
+    printf '%s\n' "$TRIAGE_OUT"
+  else
+    printf 'FLEET TRIAGE: unavailable - %s\n' "$TRIAGE_OUT"
+  fi
+fi
+
+# --- 7. closing reminder -----------------------------------------------
 section "NEXT STEP"
 if [ "$READ_ONLY" -eq 1 ]; then
   cat <<'EOF'
