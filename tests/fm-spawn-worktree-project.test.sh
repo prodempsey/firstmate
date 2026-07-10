@@ -73,7 +73,7 @@ run_spawn() {
 # T1: foreign project's worktree (`.fb-redesign` class when spawning firstmate)
 test_foreign_project_worktree_refused() {
   local home proj foreign foreign_wt fakebin out status id
-  id=foreign-wt-t1
+  id="foreign-wt-t1"
   home="$TMP_ROOT/foreign-home"
   mkdir -p "$home/data"
   proj="$TMP_ROOT/foreign-proj"
@@ -99,7 +99,7 @@ test_foreign_project_worktree_refused() {
 # T2: same-repo long-lived sibling outside the pool (serving checkout class)
 test_same_repo_sibling_outside_pool_refused() {
   local home proj sibling fakebin out status id
-  id=sibling-wt-t2
+  id="sibling-wt-t2"
   home="$TMP_ROOT/sibling-home"
   mkdir -p "$home/data"
   proj="$TMP_ROOT/sibling-proj"
