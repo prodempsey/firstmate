@@ -56,12 +56,27 @@ fm_triage_item_id() {  # <lane> <source-id>
 
 # Print the evidence version for one enumerated candidate read as JSON on stdin.
 # Only structured fields participate, per lane. A prose edit must not change this.
+#
+# A bug's disposition turns on more than its open/resolved bit: a bug that gains a task
+# link, a resolution note, or a reclassified type has materially moved, and a rejection
+# decided before that move no longer holds. All four are structured, so hashing them
+# invalidates a stale disposition without churning on wording. Its title and sourceText
+# stay excluded, per the prose rule above.
+#
+# A scout report's deliverable IS its body, so the report path alone cannot say whether
+# the findings changed. The lane therefore hashes a digest of the file's contents, which
+# the enumerator computes; a report rewritten in place re-opens a disposition made
+# against the old findings. This is not a prose exception: the body is the evidence.
 fm_triage_evidence_version() {
   jq -cS '
     {lane, source_id: .id}
     + (if .lane == "needs_firstmate" then {signal: .source_fingerprint}
-       elif .lane == "bugs" then {status}
-       elif .lane == "scout_reports" then {report: .source}
+       elif .lane == "bugs" then {status,
+                                  type: (.type // null),
+                                  links: (.links // null),
+                                  note: (.note // null)}
+       elif .lane == "scout_reports" then {report: .source,
+                                           digest: (.report_digest // null)}
        elif .lane == "backlog_hygiene" then {status, blocked_by: (.blocked_by // null)}
        elif .lane == "visibility_history" then {status}
        else {status} end)
@@ -89,6 +104,51 @@ fm_triage_fold() {  # <ledger-path>
       | if ($e | type) != "object" or ($e.item_id // "") == "" then .
         else .[$e.item_id] = ((.[$e.item_id] // {}) + $e)
         end)
+  ' "$ledger"
+}
+
+# Print the ledger's structural health as JSON, accounting for every row the fold above
+# silently skips. fm_triage_fold survives a malformed row, which is the right availability
+# behavior, but a skip that leaves no trace is a defect that can never be repaired: the
+# two directions are not symmetric. A malformed TERMINAL row fails safe, reverting its
+# item to actionable and costing rework. A malformed SURFACE row fails DANGEROUS: the item
+# loses first_seen_at, so it can never age into stale_unprocessed and the self-audit is
+# structurally unable to notice it sitting unprocessed forever.
+#
+# The excerpt is bounded and stripped of non-printable bytes so a corrupt row can be named
+# in a digest without pasting arbitrary content into a report. Whitespace-only lines are
+# not rows and are neither counted nor reported.
+fm_triage_ledger_health() {  # <ledger-path>
+  local ledger=$1
+  [ -f "$ledger" ] || {
+    jq -cn --arg path "$ledger" \
+      '{path: $path, present: false, total_rows: 0, malformed_rows: 0, rows: []}'
+    return 0
+  }
+  jq -Rn --arg path "$ledger" '
+    reduce inputs as $line
+      ({path: $path, present: true, total_rows: 0, malformed_rows: 0, rows: [], _line: 0};
+       ._line += 1
+       | if ($line | test("^[[:space:]]*$")) then .
+         else
+           .total_rows += 1
+           | ($line | try fromjson catch null) as $e
+           | (if ($e | type) != "object" then "unparseable JSON"
+              elif (($e.item_id // "") == "") then "missing item_id"
+              else null end) as $why
+           | if $why == null then .
+             else
+               .malformed_rows += 1
+               | .rows += (if (.rows | length) < 5
+                           then [{line: ._line,
+                                  reason: $why,
+                                  excerpt: ($line
+                                            | gsub("[^ -~]"; "?")
+                                            | .[0:120])}]
+                           else [] end)
+             end
+         end)
+    | del(._line)
   ' "$ledger"
 }
 

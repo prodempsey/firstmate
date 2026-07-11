@@ -4,7 +4,7 @@
 #
 # Usage:
 #   fm-fleet-triage-record.sh surface <item-id>...        Stamp first sight, durably.
-#   fm-fleet-triage-record.sh surface --all               Stamp every enumerated item.
+#   fm-fleet-triage-record.sh surface --all               Stamp every ACTIONABLE item.
 #   fm-fleet-triage-record.sh claim <item-id> --owner <who>
 #   fm-fleet-triage-record.sh release <item-id> [--reason <why>]
 #   fm-fleet-triage-record.sh successor <item-id> --link <task-id> [--reason <note>]
@@ -18,6 +18,10 @@
 # printed, seen, or acknowledged. successor_created, resolved, and captain_batch need
 # --link; rejected needs --reason; held needs both --reason and --review-after.
 # There is deliberately no acknowledge verb: an acknowledgement is not an outcome.
+#
+# Events set fields, and an explicit null IS a set: the fold accumulates, so a terminal
+# outcome clears the claim it ends, and a surface clears the disposition it re-opens.
+# Clearing applies only to the folded CURRENT state; the ledger keeps every event verbatim.
 #
 # Writes are refused unless this session owns the per-home session lock, and refused
 # entirely under FLEET_TRIAGE_MODE=enumerate_only.
@@ -134,12 +138,19 @@ load_triage() {
     || die 'could not enumerate current triage items'
 }
 
+# --all stamps first sight of the items that still need one, which is every ACTIONABLE
+# item. It deliberately skips items that are already dispositioned and healthy: a surface
+# re-opens an item and clears the disposition it is re-opening, so a blanket --all across
+# every enumerated item would resurrect settled work on each pass - and this command is
+# meant to be safe to run on a schedule. Re-opening a finished item is a deliberate act;
+# it needs an explicit `surface <item-id>`.
 if [ "$ALL" = true ]; then
   [ "$EVENT" = surface ] || die '--all is only supported for the surface event' 2
   load_triage
   while IFS= read -r id; do
     [ -n "$id" ] && ITEMS+=("$id")
-  done < <(printf '%s' "$TRIAGE_JSON" | jq -r '.items[].item_id')
+  done < <(printf '%s' "$TRIAGE_JSON" | jq -r '.items[] | select(.actionable) | .item_id')
+  [ "${#ITEMS[@]}" -gt 0 ] || { printf 'nothing to surface: no actionable items\n'; exit 0; }
 fi
 
 [ "${#ITEMS[@]}" -gt 0 ] || die 'no item id given' 2
@@ -182,9 +193,27 @@ for item in "${ITEMS[@]}"; do
     {schema: $schema, item_id: $item_id, event: $event, ts: $ts}
     + (if $processing_state == "" then {} else {processing_state: $processing_state} end)
     + (if $evidence_version == "" then {} else {evidence_version: $evidence_version} end)
-    + (if $event == "surface" then {first_seen_at: $ts} else {} end)
+    # An event carries only the keys it means to set, and an explicit null IS the update:
+    # the fold accumulates, so a null overwrites a field where an absent key would leave
+    # the previous value standing. `release` has always relied on that to clear a claim.
+    #
+    # A surface RE-OPENS an item, so it must also clear the disposition it is re-opening.
+    # Without this a re-surfaced item still advertised outcome_type "resolved" with a
+    # live-looking link and decision date, and kept the owner of the crew that finished and
+    # left - a phantom that excluded it from the ownerless metric, so firstmate believed
+    # someone was on it. Only the FOLDED CURRENT STATE is cleared; every prior event stays
+    # in the append-only ledger verbatim, which is where the history belongs.
+    + (if $event == "surface"
+       then {first_seen_at: $ts,
+             outcome_type: null, outcome_link: null, outcome_reason: null,
+             decided_at: null, decided_by: null, review_after: null}
+       else {} end)
     + (if $event == "claim" then {owner: $owner, claimed_at: $ts} else {} end)
     + (if $event == "release" then {owner: null, claimed_at: null} else {} end)
+    # A terminal outcome ends the work, so it ends the claim with it. Otherwise an item
+    # folded to terminal AND actively claimed at once, which is not a state the fleet can
+    # be in. A hold is deliberately excluded: it parks work that still has an owner.
+    + (if $processing_state == "terminal" then {owner: null, claimed_at: null} else {} end)
     + (if $outcome_type == "" then {}
        else {outcome_type: $outcome_type, decided_by: $decided_by, decided_at: $ts} end)
     + (if $outcome_link == "" then {} else {outcome_link: $outcome_link} end)

@@ -72,17 +72,26 @@ SH
   chmod +x "$root/bin/bug-cli"
 }
 
+# The visibility lane is joined by an explicit (triage: ...) marker on the backlog row, so
+# the fixture carries the row's raw text: that marker is the only thing that puts a row in
+# the lane, and it is what the classifier reads.
+#
+# hist-datetime-d3 is the load-bearing negative. It is an ordinary engineering defect whose
+# TITLE merely contains the word "history". The retired title-substring selector pulled
+# exactly this row into the visibility lane and escalated it to the captain.
 snapshot_fixture() {
   cat <<'EOF'
 {
   "schema":"fm-fleet-snapshot.v1",
   "backlog":{"records":[
-    {"order":1,"state":"queued","structured":true,"id":"ready-q1","title":"Ready queued work","blocked_by":null},
-    {"order":2,"state":"done","structured":true,"id":"blocker-d1","title":"Completed blocker","blocked_by":null},
-    {"order":3,"state":"queued","structured":true,"id":"unblocked-q2","title":"Now unblocked","blocked_by":"blocker-d1"},
-    {"order":4,"state":"queued","structured":true,"id":"visibility-never-drop-s5","title":"Keep fleet history visible","blocked_by":null},
+    {"order":1,"state":"queued","structured":true,"id":"ready-q1","title":"Ready queued work","blocked_by":null,"raw":"- [ ] ready-q1 - Ready queued work"},
+    {"order":2,"state":"done","structured":true,"id":"blocker-d1","title":"Completed blocker","blocked_by":null,"raw":"- [x] blocker-d1 - Completed blocker"},
+    {"order":3,"state":"queued","structured":true,"id":"unblocked-q2","title":"Now unblocked","blocked_by":"blocker-d1","raw":"- [ ] unblocked-q2 - Now unblocked blocked-by: blocker-d1"},
+    {"order":4,"state":"queued","structured":true,"id":"visibility-umbrella-u1","title":"Standing order: no dropped tasks","blocked_by":null,"raw":"- [ ] visibility-umbrella-u1 - Standing order: no dropped tasks (repo: firstmate, triage: visibility-umbrella)"},
     {"order":5,"state":"queued","structured":false,"id":null,"raw":"legacy free-form item"},
-    {"order":6,"state":"done","structured":true,"id":"processed-s2","title":"Processed report","blocked_by":null}
+    {"order":6,"state":"done","structured":true,"id":"processed-s2","title":"Processed report","blocked_by":null,"raw":"- [x] processed-s2 - Processed report"},
+    {"order":7,"state":"queued","structured":true,"id":"hist-datetime-d3","title":"Fix Crew Task History datetime column","blocked_by":null,"raw":"- [ ] hist-datetime-d3 - Fix Crew Task History datetime column (repo: bridge)"},
+    {"order":8,"state":"queued","structured":true,"id":"vis-gap-v2","title":"Reconcile a dropped row","blocked_by":null,"raw":"- [ ] vis-gap-v2 - Reconcile a dropped row (repo: firstmate, triage: visibility)"}
   ]},
   "tasks":[
     {"id":"active-orphan-t1","kind":"ship","current_state":{"state":"working"},"paths":{"meta":{"path":"/home/state/active-orphan-t1.meta"}}},
@@ -177,16 +186,84 @@ test_json_covers_all_lanes_and_reuses_nf() {
     || fail "scout lane should exclude reports recorded in the Done archive"
   [ "$(printf '%s' "$out" | jq -r '.lanes.backlog_hygiene.items | map(.status) | unique | sort | join(",")')" = 'blocker_done,ready,unstructured' ] \
     || fail "backlog lane should cover ready, unblocked, and unstructured rows"
-  [ "$(printf '%s' "$out" | jq -r '.lanes.visibility_history.items | map(.source_id) | sort | join(",")')" = 'active-orphan-t1,visibility-never-drop-s5' ] \
-    || fail "visibility lane should retain the umbrella and flag active tasks missing from backlog"
+  [ "$(printf '%s' "$out" | jq -r '.lanes.visibility_history.items | map(.source_id) | sort | join(",")')" = 'active-orphan-t1,vis-gap-v2,visibility-umbrella-u1' ] \
+    || fail "visibility lane should hold marked rows and active tasks missing from backlog"
 
-  # Action class is deterministic and deliberately conservative: only the mechanically
-  # proven done-blocker row may ever be auto-coordinated.
-  [ "$(printf '%s' "$out" | jq -r '[.items[] | select(.action_class == "AUTO_COORDINATION") | .source_id] | join(",")')" = unblocked-q2 ] \
-    || fail "only a done-blocker row should be classified AUTO_COORDINATION"
-  [ "$(printf '%s' "$out" | jq -r '[.items[] | select(.action_class == "CAPTAIN_GATE") | .lane] | unique | join(",")')" = visibility_history ] \
-    || fail "only the visibility lane should be captain-gated"
+  # Action class is deterministic and deliberately conservative. AUTO_COORDINATION is only
+  # for a mechanically known correction: a proven-done blocker, or an active task simply
+  # missing its backlog row.
+  [ "$(printf '%s' "$out" | jq -r '[.items[] | select(.action_class == "AUTO_COORDINATION") | .source_id] | sort | join(",")')" = 'active-orphan-t1,unblocked-q2' ] \
+    || fail "a done-blocker row and a task missing from the backlog should be AUTO_COORDINATION"
+  [ "$(printf '%s' "$out" | jq -r '[.items[] | select(.action_class == "CAPTAIN_GATE") | .source_id] | join(",")')" = visibility-umbrella-u1 ] \
+    || fail "only the declared product-semantics umbrella should be captain-gated"
   pass "JSON covers every triage lane and composes the NF reconciler"
+}
+
+# --- Gap 4: the visibility lane is classified by verb, not by lane or by title keyword. --
+test_mechanical_visibility_items_are_not_captain_gated() {
+  local pair root home out
+  pair=$(new_world visibility)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  write_bug_stub "$root"
+  out=$(FM_TEST_SNAPSHOT="$(snapshot_fixture)" FM_TEST_NF_LOG="$home/nf.log" \
+    run_triage "$root" "$home" --json)
+
+  # An active task missing from the backlog is a mechanically known correction: the task
+  # exists, its id is known, and the row simply has to be restored. That is coordination,
+  # not a product decision.
+  [ "$(printf '%s' "$out" | jq -r '.items[] | select(.source_id == "active-orphan-t1") | .action_class')" = AUTO_COORDINATION ] \
+    || fail "a task missing from the backlog must be AUTO_COORDINATION, not CAPTAIN_GATE"
+  [ "$(printf '%s' "$out" | jq -r '.items[] | select(.source_id == "active-orphan-t1") | .proposed_action.verb')" = restore_active_visibility ] \
+    || fail "the mechanical visibility item should keep its distinguishing verb"
+
+  # A marked engineering visibility gap needs a human read, but it is not the captain's.
+  # Selected by item_id: a marked backlog row is also an ordinary queued row, so it appears
+  # in the backlog_hygiene lane too, and only its visibility-lane item is under test here.
+  [ "$(printf '%s' "$out" | jq -r '.items[] | select(.item_id == "visibility_history:vis-gap-v2") | .action_class')" = FIRSTMATE_JUDGMENT ] \
+    || fail "an engineering visibility gap belongs to firstmate, not the captain"
+  pass "mechanical visibility work is coordinated, not escalated to the captain"
+}
+
+test_history_in_a_title_does_not_captain_gate_a_row() {
+  local pair root home out
+  pair=$(new_world histtitle)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  write_bug_stub "$root"
+  out=$(FM_TEST_SNAPSHOT="$(snapshot_fixture)" FM_TEST_NF_LOG="$home/nf.log" \
+    run_triage "$root" "$home" --json)
+
+  # hist-datetime-d3 is an ordinary datetime bug. The retired selector matched the word
+  # "history" in its title, pulled it into the visibility lane, and escalated it.
+  [ "$(printf '%s' "$out" | jq -r '[.items[] | select(.source_id == "hist-datetime-d3") | .lane] | join(",")')" = backlog_hygiene ] \
+    || fail "a title containing 'history' must not pull a row into the visibility lane"
+  [ "$(printf '%s' "$out" | jq -r '.items[] | select(.source_id == "hist-datetime-d3") | .action_class')" != CAPTAIN_GATE ] \
+    || fail "an engineering row must never be captain-gated for a keyword in its title"
+
+  # Lane membership is declared, so no captain personal backlog id is baked into the tool.
+  grep -q 'visibility-never-drop' "$root/bin/fm-fleet-triage.sh" \
+    && fail "a specific captain's backlog id must not ship in the shared enumerator"
+  pass "a keyword in a title neither joins the visibility lane nor reaches the captain"
+}
+
+test_product_semantics_item_still_captain_gates() {
+  local pair root home out
+  pair=$(new_world umbrella)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  write_bug_stub "$root"
+  out=$(FM_TEST_SNAPSHOT="$(snapshot_fixture)" FM_TEST_NF_LOG="$home/nf.log" \
+    run_triage "$root" "$home" --json)
+
+  [ "$(printf '%s' "$out" | jq -r '.items[] | select(.item_id == "visibility_history:visibility-umbrella-u1") | .action_class')" = CAPTAIN_GATE ] \
+    || fail "the declared product-semantics umbrella must still reach the captain"
+  [ "$(printf '%s' "$out" | jq -r '.metrics.captain_gated')" -eq 1 ] \
+    || fail "exactly the umbrella item should be counted as captain-gated"
+  pass "genuine product-semantics work still gates on the captain"
 }
 
 test_evidence_version_ignores_prose_edits() {
@@ -218,7 +295,88 @@ test_evidence_version_ignores_prose_edits() {
     || fail "structured change must keep the same logical identity"
   ev3=$(printf '%s' "$out" | jq -r '.items[0].evidence_version')
   [ "$ev1" != "$ev3" ] || fail "changed structured evidence must change the evidence version"
+
+  # Both properties are asserted in one test on purpose. Widening evidence coverage and
+  # keeping prose out of the hash pull against each other: a fix for either one alone can
+  # silently break the other, turning the queue either blind or churning.
+  [ "$ev1" = "$ev2" ] || fail "widening evidence coverage must not start churning on prose"
   pass "evidence version tracks structured fields and ignores prose"
+}
+
+# --- Gap 2: the bugs and scout lanes were materially blind. ---------------------------
+# The bug CLI emits id, kind, links, note, schema, sourceText, status, title, ts, type.
+# The lane hashed `status` alone, so a bug could gain a task link, a resolution note, or a
+# reclassified type without ever invalidating a disposition decided before that move.
+write_var_bug_stub() {
+  local root=$1
+  cat > "$root/bin/bug-var-cli" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$FM_TEST_BUG_JSON"
+SH
+  chmod +x "$root/bin/bug-var-cli"
+}
+
+bug_evidence_version() {  # <root> <home> <bug-json>
+  local root=$1 home=$2 bug=$3
+  FM_TEST_SNAPSHOT='{"backlog":{"records":[]},"scout_reports":[],"tasks":[]}' \
+    FM_TEST_BUG_JSON="$bug" FM_FLEET_TRIAGE_BUG_CLI="$root/bin/bug-var-cli" \
+    run_triage "$root" "$home" --json | jq -r '.items[0].evidence_version'
+}
+
+test_evidence_version_tracks_material_bug_drift() {
+  local pair root home base ev0 ev_link ev_note ev_type ev_prose
+  pair=$(new_world bugdrift)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  write_var_bug_stub "$root"
+
+  base='[{"id":"bug-b1","title":"Ask is broken","sourceText":"Ask is broken","status":"open","type":"bug","links":{},"note":""}]'
+  ev0=$(bug_evidence_version "$root" "$home" "$base")
+
+  # Each of these is a material move: the bug now has a task on it, a resolution note, or a
+  # different classification. A rejection decided before any of them no longer holds.
+  ev_link=$(bug_evidence_version "$root" "$home" \
+    '[{"id":"bug-b1","title":"Ask is broken","sourceText":"Ask is broken","status":"open","type":"bug","links":{"taskId":"fix-ask-a1"},"note":""}]')
+  ev_note=$(bug_evidence_version "$root" "$home" \
+    '[{"id":"bug-b1","title":"Ask is broken","sourceText":"Ask is broken","status":"open","type":"bug","links":{},"note":"repro found: scoping prompt"}]')
+  ev_type=$(bug_evidence_version "$root" "$home" \
+    '[{"id":"bug-b1","title":"Ask is broken","sourceText":"Ask is broken","status":"open","type":"improvement","links":{},"note":""}]')
+
+  [ "$ev0" != "$ev_link" ] || fail "a bug gaining a task link must move its evidence version"
+  [ "$ev0" != "$ev_note" ] || fail "a bug gaining a resolution note must move its evidence version"
+  [ "$ev0" != "$ev_type" ] || fail "a reclassified bug type must move its evidence version"
+
+  # ...and the prose rule still holds on this lane too: the title and repro text are not
+  # structured evidence, so rewording them must not mint a new logical item.
+  ev_prose=$(bug_evidence_version "$root" "$home" \
+    '[{"id":"bug-b1","title":"The Ask feature does not work","sourceText":"Completely different wording of the same report","status":"open","type":"bug","links":{},"note":""}]')
+  [ "$ev0" = "$ev_prose" ] || fail "rewording a bug must not move its evidence version"
+  pass "material bug drift moves the evidence version and prose does not"
+}
+
+test_evidence_version_tracks_rewritten_scout_report() {
+  local pair root home snap ev1 ev2 out
+  pair=$(new_world reportdrift)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  mkdir -p "$home/data/orphan-s1"
+  snap="{\"backlog\":{\"records\":[]},\"tasks\":[],\"scout_reports\":[{\"id\":\"orphan-s1\",\"path\":\"$home/data/orphan-s1/report.md\",\"kind\":\"scout\"}]}"
+
+  printf 'Finding: the cache is cold on boot.\n' > "$home/data/orphan-s1/report.md"
+  ev1=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json | jq -r '.items[0].evidence_version')
+
+  # Same report path, entirely different findings. The report IS the deliverable, so a
+  # disposition decided against the old body cannot survive the rewrite.
+  printf 'Finding: the cache is fine; the clock is wrong.\n' > "$home/data/orphan-s1/report.md"
+  out=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+  ev2=$(printf '%s' "$out" | jq -r '.items[0].evidence_version')
+
+  [ "$(printf '%s' "$out" | jq -r '.items[0].item_id')" = 'scout_reports:orphan-s1' ] \
+    || fail "a rewritten report must stay the same logical item"
+  [ "$ev1" != "$ev2" ] || fail "a report rewritten with different findings must move its evidence version"
+  pass "a rewritten scout report invalidates a disposition made against the old one"
 }
 
 test_repeat_scans_do_not_duplicate_or_wake() {
@@ -510,6 +668,279 @@ test_digest_reports_metrics_and_caps_detail() {
   pass "digest reports lane counts, oldest age, and stays capped"
 }
 
+# --- Gap 3: a skipped ledger row must leave a trace. -----------------------------------
+# The fold survives a malformed row, which is right. Surviving it silently is not: the two
+# directions are asymmetric. A malformed TERMINAL row fails safe (the item reverts to
+# actionable, costing rework). A malformed SURFACE row fails DANGEROUS - first_seen_at is
+# gone, so age() is null, stale_unprocessed can never fire, and the item can sit forever
+# with the self-audit structurally unable to see it.
+test_malformed_ledger_row_does_not_break_the_fold() {
+  local pair root home snap out
+  pair=$(new_world malformedfold)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  snap=$(one_item_snapshot 'Ready work')
+  own_lock "$home"
+
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" resolve backlog_hygiene:ready-q1 \
+    --link sha-abc >/dev/null
+  printf '%s\n' 'this row is not json at all' >> "$(ledger_of "$home")"
+
+  out=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+  [ "$(printf '%s' "$out" | jq -r '.items[] | select(.item_id == "backlog_hygiene:ready-q1") | .processing_state')" = terminal ] \
+    || fail "a malformed row must not cost the fold the good rows around it"
+  [ "$(printf '%s' "$out" | jq -r '.items[] | select(.item_id == "backlog_hygiene:ready-q1") | .outcome_link')" = sha-abc ] \
+    || fail "the surviving rows must keep their recorded lineage"
+  pass "a malformed ledger row does not break the fold"
+}
+
+test_malformed_ledger_row_is_visible_and_repairable() {
+  local pair root home snap out digest
+  pair=$(new_world malformedvisible)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  snap=$(one_item_snapshot 'Ready work')
+  own_lock "$home"
+
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" surface backlog_hygiene:ready-q1 >/dev/null
+  printf '%s\n' '{"item_id":"backlog_hygiene:ready-q1","processing_state":' \
+    >> "$(ledger_of "$home")"
+
+  out=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+  [ "$(printf '%s' "$out" | jq -r '.metrics.ledger_health.malformed_rows')" -eq 1 ] \
+    || fail "a malformed row must be counted in metrics.ledger_health"
+  [ "$(printf '%s' "$out" | jq -r '.metrics.ledger_health.rows[0].line')" -eq 2 ] \
+    || fail "a malformed row must be reported with the line that holds it"
+  [ "$(printf '%s' "$out" | jq -r '.lanes.ledger_health.items[0].item_id')" = 'ledger_health:fleet-triage.jsonl' ] \
+    || fail "a malformed ledger must surface a stable ledger-health item"
+
+  digest=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --digest)
+  assert_contains "$digest" 'ledger health: 1 malformed of' \
+    "the digest should name the corruption it found"
+  assert_contains "$digest" 'first at line 2' "the digest should point at the bad row"
+  pass "a malformed ledger row is counted, located, and named in the digest"
+}
+
+test_malformed_rows_surface_one_stable_item() {
+  local pair root home snap first second
+  pair=$(new_world malformedstable)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  snap=$(one_item_snapshot 'Ready work')
+
+  # Many bad rows, and one of them is bad in the other way the fold skips: valid JSON with
+  # no item_id.
+  printf '%s\n' 'garbage one' 'garbage two' '{"processing_state":"surfaced"}' \
+    >> "$(ledger_of "$home")"
+
+  first=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+  second=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+
+  [ "$(printf '%s' "$first" | jq -r '.metrics.ledger_health.malformed_rows')" -eq 3 ] \
+    || fail "every skipped row should be counted"
+  # The anti-recursion property: N bad rows are ONE item, and rescanning never grows a
+  # chain of triage-about-triage items.
+  [ "$(printf '%s' "$first" | jq -r '[.items[] | select(.lane == "ledger_health")] | length')" -eq 1 ] \
+    || fail "3 malformed rows must produce exactly one ledger-health item, never one per row"
+  [ "$(printf '%s' "$second" | jq -r '[.items[] | select(.lane == "ledger_health")] | length')" -eq 1 ] \
+    || fail "a repeated scan must not add a second ledger-health item"
+  [ "$(printf '%s' "$first" | jq -r '[.items[] | select(.lane == "ledger_health") | .item_id] | join(",")')" \
+    = "$(printf '%s' "$second" | jq -r '[.items[] | select(.lane == "ledger_health") | .item_id] | join(",")')" ] \
+    || fail "the ledger-health item id must be stable across scans"
+  pass "N malformed rows surface exactly one stable item across repeated scans"
+}
+
+test_malformed_surface_row_is_reported_not_silently_lost() {
+  local pair root home snap out
+  pair=$(new_world malformedsurface)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  snap=$(one_item_snapshot 'Ready work')
+
+  # The fail-dangerous direction. This item's ONLY ledger row is a corrupt surface row, so
+  # its first_seen_at is gone for good and it can never age into stale_unprocessed. The
+  # timestamp is unrecoverable; what must not happen is losing it in silence.
+  printf '%s\n' '{"item_id":"backlog_hygiene:ready-q1","processing_state":"surfaced","first_seen_at' \
+    >> "$(ledger_of "$home")"
+  out=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+
+  [ "$(printf '%s' "$out" | jq -r '.items[] | select(.item_id == "backlog_hygiene:ready-q1") | .processing_state')" = new ] \
+    || fail "an item whose only row is corrupt folds back to new"
+  [ "$(printf '%s' "$out" | jq -r '.metrics.ledger_health.malformed_rows')" -eq 1 ] \
+    || fail "the lost surface row must be reported, not silently dropped"
+  [ "$(printf '%s' "$out" | jq -r '.metrics.ledger_health.rows[0].reason')" = 'unparseable JSON' ] \
+    || fail "the report should say why the row could not be read"
+  assert_contains "$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --digest)" \
+    'ledger health: 1 malformed' "a lost surface stamp must be visible in the digest"
+  pass "a malformed surface row is reported rather than silently losing first_seen_at"
+}
+
+# --- Gap 5: the folded current state must be coherent. ---------------------------------
+# The ledger accumulates, so a field an event does not mention keeps its old value. That
+# left an item folding to terminal while still carrying the owner and claimed_at of the
+# crew that finished it, and left a re-opened item advertising the outcome it had been
+# re-opened FROM - with a phantom owner that hid it from the ownerless metric.
+fold_field() {  # <root> <home> <item-id> <field>
+  # shellcheck disable=SC1090 # Path is the per-test copy of the library under test.
+  . "$1/bin/fm-fleet-triage-lib.sh"
+  fm_triage_fold "$(ledger_of "$2")" | jq -r --arg id "$3" --arg f "$4" '.[$id][$f] // "null"'
+}
+
+test_terminal_outcome_clears_the_claim() {
+  local pair root home snap out
+  pair=$(new_world terminalclaim)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  own_lock "$home"
+  snap=$(one_item_snapshot 'Ready work')
+
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" surface backlog_hygiene:ready-q1 >/dev/null
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" claim backlog_hygiene:ready-q1 \
+    --owner crew-a >/dev/null
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" resolve backlog_hygiene:ready-q1 \
+    --link sha-abc >/dev/null
+
+  out=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+  [ "$(printf '%s' "$out" | jq -r '.items[0].processing_state')" = terminal ] \
+    || fail "a resolve should fold to terminal"
+  [ "$(printf '%s' "$out" | jq -r '.items[0].owner')" = null ] \
+    || fail "an item cannot be terminal AND still actively claimed"
+  [ "$(fold_field "$root" "$home" backlog_hygiene:ready-q1 claimed_at)" = null ] \
+    || fail "a terminal outcome must clear claimed_at, not just the owner"
+  [ "$(printf '%s' "$out" | jq -r '.items[0].actionable')" = false ] \
+    || fail "a resolved item with lineage should still retire"
+  pass "a terminal outcome ends the claim it finishes"
+}
+
+test_resurfacing_clears_the_stale_disposition() {
+  local pair root home snap out
+  pair=$(new_world resurface)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  own_lock "$home"
+  snap=$(one_item_snapshot 'Ready work')
+
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" claim backlog_hygiene:ready-q1 \
+    --owner crew-a >/dev/null
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" resolve backlog_hygiene:ready-q1 \
+    --link sha-abc >/dev/null
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" surface backlog_hygiene:ready-q1 >/dev/null
+
+  out=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+  [ "$(printf '%s' "$out" | jq -r '.items[0].processing_state')" = surfaced ] \
+    || fail "a re-surfaced item should come back as surfaced"
+  [ "$(printf '%s' "$out" | jq -r '.items[0].actionable')" = true ] \
+    || fail "a re-opened item must be actionable again"
+  [ "$(printf '%s' "$out" | jq -r '.items[0].outcome_type')" = null ] \
+    || fail "a re-opened item must not still advertise the outcome it was re-opened from"
+  [ "$(printf '%s' "$out" | jq -r '.items[0].outcome_link')" = null ] \
+    || fail "a re-opened item must not carry a live-looking outcome link"
+  [ "$(printf '%s' "$out" | jq -r '.items[0].decided_at')" = null ] \
+    || fail "a re-opened item must not carry a stale decision date"
+
+  # The phantom-owner metric bug: the item kept the owner of a crew that finished and left,
+  # so it was excluded from `ownerless` and firstmate believed someone was on it.
+  [ "$(printf '%s' "$out" | jq -r '.items[0].owner')" = null ] \
+    || fail "a re-opened item must not keep the owner of the crew that finished it"
+  [ "$(printf '%s' "$out" | jq -r '.metrics.ownerless')" -eq 1 ] \
+    || fail "a re-opened item with no live owner must count as ownerless"
+  pass "re-surfacing clears the stale disposition and the phantom owner"
+}
+
+test_ledger_preserves_prior_decisions_as_history() {
+  local pair root home snap ledger
+  pair=$(new_world history)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  own_lock "$home"
+  snap=$(one_item_snapshot 'Ready work')
+  ledger=$(ledger_of "$home")
+
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" claim backlog_hygiene:ready-q1 \
+    --owner crew-a >/dev/null
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" resolve backlog_hygiene:ready-q1 \
+    --link sha-abc --reason 'fixed upstream' >/dev/null
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" surface backlog_hygiene:ready-q1 >/dev/null
+
+  # Clearing is about what the fold computes as CURRENT. The log itself is append-only and
+  # every prior event stays in it verbatim, which is where the history belongs.
+  [ "$(wc -l < "$ledger" | tr -d ' ')" -eq 3 ] \
+    || fail "every event must remain in the append-only ledger"
+  [ "$(jq -r 'select(.event == "claim") | .owner' "$ledger")" = crew-a ] \
+    || fail "the original claim must survive verbatim in the ledger"
+  [ "$(jq -r 'select(.event == "resolve") | .outcome_link' "$ledger")" = sha-abc ] \
+    || fail "the prior resolution must survive verbatim in the ledger"
+  [ "$(jq -r 'select(.event == "resolve") | .outcome_reason' "$ledger")" = 'fixed upstream' ] \
+    || fail "the prior decision's reason must survive verbatim in the ledger"
+  pass "clearing the folded state never deletes ledger history"
+}
+
+test_surface_all_does_not_reopen_dispositioned_work() {
+  local pair root home snap out
+  pair=$(new_world surfaceall)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  own_lock "$home"
+  snap=$(one_item_snapshot 'Ready work')
+
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" resolve backlog_hygiene:ready-q1 \
+    --link sha-abc >/dev/null
+
+  # A surface re-opens an item and clears the disposition it re-opens, so a blanket --all
+  # over every enumerated item would resurrect settled work on every pass. --all stamps
+  # first sight of what still needs one; re-opening finished work is a deliberate act.
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" surface --all >/dev/null
+  out=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+
+  [ "$(printf '%s' "$out" | jq -r '.items[0].processing_state')" = terminal ] \
+    || fail "surface --all must not re-open a dispositioned item"
+  [ "$(printf '%s' "$out" | jq -r '.items[0].outcome_type')" = resolved ] \
+    || fail "surface --all must not clear a healthy disposition"
+  [ "$(printf '%s' "$out" | jq -r '.items[0].actionable')" = false ] \
+    || fail "a scheduled surface --all must not resurrect finished work"
+  pass "surface --all stamps unfinished work without re-opening finished work"
+}
+
+test_hold_expiry_and_successor_disappearance() {
+  local pair root home snap out
+  pair=$(new_world holdsuccessor)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  own_lock "$home"
+  snap=$(one_item_snapshot 'Ready work')
+
+  # Driven through the writer rather than seeded rows, so the writer's own event shapes are
+  # what the self-audit is tested against.
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" hold backlog_hygiene:ready-q1 \
+    --reason 'waiting on upstream' --review-after '2020-01-01T00:00:00Z' >/dev/null
+  out=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+  [ "$(printf '%s' "$out" | jq -r '.items[0].processing_state')" = held ] \
+    || fail "a hold should fold to held"
+  [ "$(printf '%s' "$out" | jq -r '.items[0].health')" = hold_expired ] \
+    || fail "a hold whose review date has passed must expire"
+  [ "$(printf '%s' "$out" | jq -r '.items[0].actionable')" = true ] \
+    || fail "an expired hold must return to the queue"
+
+  : > "$(ledger_of "$home")"
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" successor backlog_hygiene:ready-q1 \
+    --link ghost-task-x9 >/dev/null
+  out=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+  [ "$(printf '%s' "$out" | jq -r '.items[0].health')" = successor_missing ] \
+    || fail "a successor that does not exist must re-open the item it was supposed to own"
+  [ "$(printf '%s' "$out" | jq -r '.items[0].actionable')" = true ] \
+    || fail "work handed to a task that never appeared must come back"
+  pass "an expired hold and a vanished successor both return the work"
+}
+
 test_enumerator_does_not_mutate_operational_inputs() {
   local pair root home before after
   pair=$(new_world readonly)
@@ -528,7 +959,21 @@ test_enumerator_does_not_mutate_operational_inputs() {
 }
 
 test_json_covers_all_lanes_and_reuses_nf
+test_mechanical_visibility_items_are_not_captain_gated
+test_history_in_a_title_does_not_captain_gate_a_row
+test_product_semantics_item_still_captain_gates
 test_evidence_version_ignores_prose_edits
+test_evidence_version_tracks_material_bug_drift
+test_evidence_version_tracks_rewritten_scout_report
+test_malformed_ledger_row_does_not_break_the_fold
+test_malformed_ledger_row_is_visible_and_repairable
+test_malformed_rows_surface_one_stable_item
+test_malformed_surface_row_is_reported_not_silently_lost
+test_terminal_outcome_clears_the_claim
+test_resurfacing_clears_the_stale_disposition
+test_ledger_preserves_prior_decisions_as_history
+test_surface_all_does_not_reopen_dispositioned_work
+test_hold_expiry_and_successor_disappearance
 test_repeat_scans_do_not_duplicate_or_wake
 test_terminal_outcome_requires_lineage
 test_surfacing_does_not_handle_an_item

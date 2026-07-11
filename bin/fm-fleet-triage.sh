@@ -67,6 +67,20 @@ Health values re-surface an item the fleet thought it had finished with:
 
 The bugs lane uses FM_FLEET_TRIAGE_BUG_CLI when set, then the sanctioned `bug` command
 on PATH, through `<cli> list --json`. Set FM_FLEET_TRIAGE_BUG_CLI=off to disable it.
+
+A backlog row joins the visibility lane only by declaring itself, with an explicit marker
+in the row's metadata parens beside repo: and kind:
+  - [ ] some-id - Title (repo: fleet-bridge, triage: visibility)
+  - [ ] some-id - Title (repo: fleet-bridge, triage: visibility-umbrella)
+  triage: visibility            an engineering visibility gap  -> FIRSTMATE_JUDGMENT
+  triage: visibility-umbrella   standing product semantics     -> CAPTAIN_GATE
+Keep the marker inside an existing metadata group so it stays out of the row's title.
+Action class follows the item's verb, never its lane, so ordinary engineering defects are
+never escalated to the captain just for sharing a lane with product-semantics work.
+
+The ledger_health lane raises exactly ONE item, and only when the append-only ledger holds
+rows the fold had to skip. A skipped row is survivable but not free: a malformed `surface`
+row loses its item's first_seen_at, so that item can never age into stale_unprocessed.
 EOF
 }
 
@@ -97,7 +111,10 @@ NF_FILE="$TMP_ROOT/nf.json"
 BUG_FILE="$TMP_ROOT/bugs.json"
 ARCHIVE_IDS_FILE="$TMP_ROOT/archive-ids.json"
 RAW_ITEMS="$TMP_ROOT/raw-items.json"
+REPORT_DIGEST_TSV="$TMP_ROOT/report-digests.tsv"
+REPORT_DIGEST_FILE="$TMP_ROOT/report-digests.json"
 FOLD_FILE="$TMP_ROOT/fold.json"
+HEALTH_FILE="$TMP_ROOT/ledger-health.json"
 EV_TSV="$TMP_ROOT/evidence.tsv"
 EV_FILE="$TMP_ROOT/evidence.json"
 
@@ -149,6 +166,11 @@ elif [ -n "$BUG_CLI" ]; then
       && printf '%s' "$BUG_RAW" | jq -e 'type == "array"' >/dev/null 2>&1; then
       BUG_AVAILABLE=true
       BUG_NOTE='open bugs from the configured Fleet Bridge bug CLI'
+      # type, links, and note ride along because they are the structured fields a bug's
+      # disposition actually turns on: a bug that gains a task link, a resolution note, or
+      # a reclassified type has moved, and an outcome decided before that move is stale.
+      # Widening the evidence version alone would not see them; the projection has to
+      # carry them first.
       printf '%s' "$BUG_RAW" | jq '
         [ .[]
           | select((.status // "open") != "resolved")
@@ -156,6 +178,9 @@ elif [ -n "$BUG_CLI" ]; then
              id:(.id // .bug_id // ("bug-" + ((.title // .sourceText // "untitled") | @base64))),
              title:(.title // .sourceText // "Untitled open bug"),
              status:(.status // "open"),
+             type:(.type // null),
+             links:(.links // null),
+             note:(.note // null),
              source:"bug-cli",
              source_type:"bug",
              action:"batch_or_route_bug"} ]
@@ -167,6 +192,23 @@ elif [ -n "$BUG_CLI" ]; then
     BUG_NOTE='sanctioned bug CLI is not executable'
   fi
 fi
+
+# A scout report's deliverable is its body, not its path, so the lane digests the file's
+# actual contents. A report rewritten in place with different findings must re-open a
+# disposition that was decided against the old ones; the path alone can never say so.
+# An unreadable or missing report digests to the empty string, which is itself a state
+# change the evidence version will see.
+: > "$REPORT_DIGEST_TSV"
+while IFS=$'\t' read -r report_id report_path; do
+  [ -n "$report_id" ] || continue
+  report_digest=''
+  if [ -n "$report_path" ] && [ -f "$report_path" ]; then
+    report_digest=$(fm_triage_hash < "$report_path" 2>/dev/null || true)
+  fi
+  printf '%s\t%s\n' "$report_id" "$report_digest" >> "$REPORT_DIGEST_TSV"
+done < <(jq -r '(.scout_reports // [])[] | [.id, (.path // "")] | @tsv' "$SNAPSHOT_FILE")
+jq -Rn '[inputs | split("\t") | {key: .[0], value: (.[1] // "")}] | from_entries' \
+  "$REPORT_DIGEST_TSV" > "$REPORT_DIGEST_FILE"
 
 if [ -f "$DATA/done-archive.md" ]; then
   awk '
@@ -181,22 +223,50 @@ else
   printf '[]\n' > "$ARCHIVE_IDS_FILE"
 fi
 
+# The fold skips a malformed ledger row rather than dying on it, which keeps the fleet
+# readable through a corrupt write. Accounting for those skips is what makes them
+# repairable instead of merely survivable.
+fm_triage_ledger_health "$(fm_triage_ledger_path "$DATA")" > "$HEALTH_FILE"
+
 # --- Enumerate candidates. ----------------------------------------------------------
-# Action class is assigned deterministically from lane and status, and stays deliberately
-# conservative. Only a backlog item whose blocker is mechanically proven done is
-# AUTO_COORDINATION. Anything that needs prose read, evidence matched, or overlap judged
-# is FIRSTMATE_JUDGMENT, and the visibility lane is CAPTAIN_GATE because it turns on
-# product semantics rather than engineering mechanics.
+# Action class is assigned deterministically, and stays deliberately conservative. Only a
+# correction that is mechanically known is AUTO_COORDINATION: a backlog row whose blocker
+# is proven done, or an active task simply missing its backlog row. Anything that needs
+# prose read, evidence matched, or overlap judged is FIRSTMATE_JUDGMENT.
+#
+# CAPTAIN_GATE is reserved for genuine product semantics, and is chosen by the item's VERB,
+# never by its lane. Hard-gating the whole visibility lane escalated ordinary engineering
+# defects to the captain - a datetime bug, leaking test files, a scout task missing from
+# the backlog - as though each were a product decision. Once the triage duty fires
+# automatically, that is a captain-spam loop rather than a mis-labelled report.
 jq -s '
   def action_class:
     if .lane == "backlog_hygiene" and .status == "blocker_done" then "AUTO_COORDINATION"
-    elif .lane == "visibility_history" then "CAPTAIN_GATE"
+    elif .action == "restore_active_visibility" then "AUTO_COORDINATION"
+    elif .action == "review_visibility_umbrella" then "CAPTAIN_GATE"
     else "FIRSTMATE_JUDGMENT" end;
+
+  # A backlog row joins the visibility lane only by carrying an explicit triage marker in
+  # its metadata parens - the same (key: value) convention the backlog already uses for
+  # repo, kind, and priority:
+  #   (repo: firstmate, triage: visibility)            an engineering visibility gap
+  #   (repo: firstmate, triage: visibility-umbrella)   standing product-semantics work
+  # The retired selector matched the words "visibility", "history", or "never drop" as
+  # substrings of a row TITLE, so any backlog item merely containing the word "history" was
+  # pulled into the lane and escalated. It also hardcoded one captain personal backlog id
+  # into what AGENTS.md calls a shared template. A declared marker is durable under both
+  # rewording and reuse; a keyword and an id are neither.
+  def triage_marker:
+    ((.raw // "")
+     | capture("(?:^|[(,])[[:space:]]*triage:[[:space:]]*(?<v>[A-Za-z0-9_-]+)"; "i")
+     | .v | ascii_downcase) // "";
 
   .[0] as $snapshot
   | .[1] as $nf
   | .[2] as $bugs
   | .[3] as $archive_ids
+  | .[4] as $report_digests
+  | .[5] as $ledger_health
   | ($snapshot.backlog.records // []) as $records
   | ($records | map(select(.structured == true))) as $structured
   | ($snapshot.scout_reports // []) as $reports
@@ -207,6 +277,7 @@ jq -s '
          | select(($archive_ids | index($report.id)) == null)
          | {lane:"scout_reports",id:$report.id,title:("Unreconciled scout report " + $report.id),
             status:"unreconciled",source:$report.path,source_type:"report",
+            report_digest:($report_digests[$report.id] // ""),
             action:"review_report_follow_up"} ]
      + [ $records[]
          | select(.state == "queued" and .structured == true and (.blocked_by // null) == null)
@@ -233,10 +304,27 @@ jq -s '
             blocked_by:null,source:"data/backlog.md",source_type:"backlog",
             action:"reconcile_duplicate"} ]
      + [ $records[]
-         | select(.structured == true and ((.id == "visibility-never-drop-s5") or ((.title // "") | test("visibility|history|never drop"; "i"))))
-         | select(.state != "done")
+         | select(.structured == true and .state != "done")
+         | . as $row
+         | ($row | triage_marker) as $marker
+         | select($marker == "visibility" or $marker == "visibility-umbrella")
          | {lane:"visibility_history",id:.id,title:(.title // .raw),status:.state,
-            source:"data/backlog.md",source_type:"backlog",action:"reconcile_visibility_gap"} ]
+            source:"data/backlog.md",source_type:"backlog",
+            action:(if $marker == "visibility-umbrella" then "review_visibility_umbrella"
+                    else "reconcile_visibility_gap" end)} ]
+     + [ $ledger_health
+         | select(.malformed_rows > 0)
+         | {lane:"ledger_health",
+            id:(.path | split("/") | last),
+            title:("Malformed rows in the triage ledger: " + (.malformed_rows | tostring)
+                   + " of " + (.total_rows | tostring) + " rows, first at line "
+                   + ((.rows[0].line // 0) | tostring)),
+            status:("malformed_rows:" + (.malformed_rows | tostring)),
+            source:.path,
+            source_type:"ledger",
+            malformed_rows:.malformed_rows,
+            malformed_row_refs:.rows,
+            action:"repair_ledger_rows"} ]
      + [ ($snapshot.tasks // [])[]
          | . as $task
          | select(.kind != "secondmate")
@@ -258,7 +346,8 @@ jq -s '
                  + ($bugs | map(.id))
                  + (($snapshot.tasks // []) | map(.id))
                  + $archive_ids | unique)}
-' "$SNAPSHOT_FILE" "$NF_FILE" "$BUG_FILE" "$ARCHIVE_IDS_FILE" > "$RAW_ITEMS"
+' "$SNAPSHOT_FILE" "$NF_FILE" "$BUG_FILE" "$ARCHIVE_IDS_FILE" \
+  "$REPORT_DIGEST_FILE" "$HEALTH_FILE" > "$RAW_ITEMS"
 
 # --- Evidence versions: structured fields only, never prose. -------------------------
 # fm_triage_evidence_version names the participating fields per lane. A title or report
@@ -291,6 +380,7 @@ RESULT=$(jq -n \
   --arg bug_note "$BUG_NOTE" \
   --slurpfile raw "$RAW_ITEMS" \
   --slurpfile fold "$FOLD_FILE" \
+  --slurpfile health "$HEALTH_FILE" \
   --slurpfile ev "$EV_FILE" '
   # Seconds since an ISO-8601 stamp, or null when absent or unparseable.
   def age($ts; $now_epoch):
@@ -311,6 +401,7 @@ RESULT=$(jq -n \
   ($raw[0].items // []) as $items
   | ($raw[0].known_ids // []) as $known
   | ($fold[0] // {}) as $ledger_state
+  | ($health[0] // {}) as $ledger_health
   | ($ev[0] // {}) as $evmap
 
   | [ $items[]
@@ -370,13 +461,22 @@ RESULT=$(jq -n \
                format: "append-only JSONL, firstmate/fleet-triage-item/v1",
                writer: "bin/fm-fleet-triage-record.sh"},
       metrics: {
+        # Rows the fold had to skip. Reported as a count with line references, and as
+        # exactly ONE stable item in the ledger_health lane however many rows are bad, so
+        # a corrupt ledger can never grow a chain of triage-about-triage items.
+        ledger_health: {
+          malformed_rows: ($ledger_health.malformed_rows // 0),
+          total_rows: ($ledger_health.total_rows // 0),
+          rows: ($ledger_health.rows // [])
+        },
         total: ($all | length),
         actionable: ($act | length),
         terminal: ($all | map(select(.processing_state == "terminal" and .health == "ok")) | length),
         ownerless: ($act | map(select(.owner == null)) | length),
         captain_gated: ($act | map(select(.action_class == "CAPTAIN_GATE")) | length),
         auto_coordination: ($act | map(select(.action_class == "AUTO_COORDINATION")) | length),
-        by_lane: (["needs_firstmate","bugs","scout_reports","backlog_hygiene","visibility_history"]
+        by_lane: (["needs_firstmate","bugs","scout_reports","backlog_hygiene",
+                   "visibility_history","ledger_health"]
                   | map(. as $l
                         | {key: $l,
                            value: (($act | map(select(.lane == $l))) as $in
@@ -397,8 +497,11 @@ RESULT=$(jq -n \
                           note: "ready, newly unblocked, duplicate, and unstructured backlog candidates",
                           items: [$all[] | select(.lane == "backlog_hygiene")]},
         visibility_history: {available: true,
-                             note: "active visibility and history umbrella work",
-                             items: [$all[] | select(.lane == "visibility_history")]}
+                             note: "backlog rows marked (triage: visibility|visibility-umbrella) and active tasks missing from the backlog",
+                             items: [$all[] | select(.lane == "visibility_history")]},
+        ledger_health: {available: true,
+                        note: "malformed ledger rows the fold had to skip",
+                        items: [$all[] | select(.lane == "ledger_health")]}
       },
       items: $all
     }
@@ -418,13 +521,25 @@ printf '%s' "$RESULT" | jq -r --argjson max "$MAX_ITEMS" '
     else ((($s / 86400) | floor | tostring) + "d") end;
 
   .metrics as $m
+  | .ledger.path as $ledger_path
   | ["FLEET TRIAGE: " + ($m.actionable | tostring) + " actionable, "
       + ($m.total | tostring) + " total (mode: " + .mode + ")",
      "  ownerless: " + ($m.ownerless | tostring)
       + " | captain-gated: " + ($m.captain_gated | tostring)
       + " | auto-coordination: " + ($m.auto_coordination | tostring)]
+  # Additive. A corrupt ledger row is otherwise invisible: the fold skips it silently, and
+  # a skipped SURFACE row costs the item its first_seen_at, so it can never age into
+  # stale_unprocessed and no health check can ever notice it.
+  + (if $m.ledger_health.malformed_rows > 0
+     then ["  ledger health: " + ($m.ledger_health.malformed_rows | tostring)
+           + " malformed of " + ($m.ledger_health.total_rows | tostring)
+           + " rows in " + $ledger_path
+           + " (first at line " + (($m.ledger_health.rows[0].line // 0) | tostring)
+           + ": " + ($m.ledger_health.rows[0].reason // "unknown") + ")"]
+     else [] end)
   + [ .lanes | to_entries[]
       | .key as $k
+      | select($k != "ledger_health" or $m.by_lane[$k].actionable > 0)
       | "  " + ($k | gsub("_"; " ")) + ": " + ($m.by_lane[$k].actionable | tostring)
         + (if .value.available then "" else " (unavailable: " + .value.note + ")" end)
         + (if $m.by_lane[$k].actionable > 0

@@ -48,7 +48,13 @@ Treat the lanes as follows.
 - `bugs` contains open bug records from the configured sanctioned bug interface.
 - `scout_reports` contains report artifacts without a matching backlog record and therefore needing disposition.
 - `backlog_hygiene` contains ready, newly unblocked, duplicate, or unstructured backlog candidates.
-- `visibility_history` contains active umbrella work about Bridge visibility and Crew Task History continuity.
+- `visibility_history` contains active tasks missing from the backlog, plus backlog rows that declare themselves visibility work with an explicit marker inside the row's metadata group, alongside `repo:` and `kind:` — `- [ ] some-id - Title (repo: fleet-bridge, triage: visibility-umbrella)`.
+  A row joins this lane only by carrying `triage: visibility` or `triage: visibility-umbrella`; a keyword in a title never does, and no backlog id is special-cased.
+  Keep the marker inside an existing metadata group so it stays out of the row's title.
+  Mark a row `visibility-umbrella` only when it is genuine product semantics, because that marker is what routes it to the captain.
+- `ledger_health` contains one item, and only when the processing ledger holds rows the fold had to skip.
+  A malformed row is skipped rather than fatal, which keeps the fleet readable, but a skipped `surface` row costs its item the `first_seen_at` stamp, so that item can never age into `stale_unprocessed` and no health check can see it sitting unprocessed.
+  However many rows are corrupt, the lane raises exactly one item, so a damaged ledger never grows a chain of triage-about-triage work.
 
 An unavailable lane is missing evidence, not evidence that the lane is empty.
 Fix or explicitly note the missing input before claiming the fleet is clear.
