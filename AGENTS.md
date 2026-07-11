@@ -107,6 +107,7 @@ state/               volatile runtime signals; gitignored
   .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .last-* .heartbeat-streak   watcher internals; never touch
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
   .last-watcher-beat watcher liveness beacon, touched every poll (including while absorbing benign wakes); guard scripts read it
+  .triage-duty-last.json   volatile cache of the last bin/fm-triage-duty.sh pass (trigger, scope, actionable/ownerless/unhealthy/captain_gated counts, fingerprint, ok); overwritten every pass; read by bin/fm-guard.sh's fleet-triage supervision preflight, never hand-edited
   .subsuper-* .supervise-daemon.*   sub-supervisor internals; never touch
 .no-mistakes/        local validation state and evidence; gitignored
 ```
@@ -134,7 +135,7 @@ It composes today's `fm-lock.sh`, `fm-bootstrap.sh`, and `fm-wake-drain.sh` - ca
    A file that does not exist prints an explicit `ABSENT` marker, never confused with an empty-but-present file: absence is meaningful (`captain.md` absent means use this template's defaults, `projects.md` absent means rebuild it from the clones under `projects/`, etc.).
 6. **Fleet-state digest** - the full `data/backlog.md`; every `state/<id>.meta`; a bounded tail of each task's `state/<id>.status` (labeled as wake-EVENT history, not current state, with the full log path printed for a deeper read); the `state/.afk` flag; and one cheap alive/dead read of each task's recorded backend endpoint.
    That liveness line is a fast presence check only, not a full state read - when you need a crew's actual current state (a run-step, not just "is the pane there"), read it with `bin/fm-crew-state.sh <id>` as before; the digest deliberately skips that deeper, slower read for every task so it stays fast and bounded.
-7. **Fleet triage** - after the context and fleet-state digest, a locked primary prints the read-only fleet-triage digest and loads `fleet-triage` before acting on unhandled candidates; a read-only session skips the pass.
+7. **Fleet triage** - after the context and fleet-state digest, a locked primary runs `bin/fm-triage-duty.sh session-start` (a full pass) and loads `fleet-triage` before acting on unhandled candidates; a clear fleet prints nothing here, same as a clean bootstrap section, and a read-only session skips the pass.
 8. **Next step** - the closing reminder points back to the emitted supervision block and preserves only the lock, afk, X-mode, and read-once reminders.
    The script itself never starts supervision; the emitted harness protocol owns the exact wait or wake mechanism.
 
@@ -255,6 +256,7 @@ Reconcile reality with your records before doing anything else, working from the
 9. Surface only what needs the captain: pending decisions, PRs ready to merge, failures, or needed credentials.
    If there is nothing that needs them, say nothing and resume.
 10. Load `fleet-triage` and disposition the locked session-start digest before deciding that recovery is complete.
+    Recovery has no script chokepoint of its own for the fleet-triage duty - it reconciles through the session-start digest, which already fired the `session-start` trigger (section 3) - but if THIS recovery pass itself reconciled a dead endpoint (a respawn, a re-registered secondmate), that reconciliation is its own fleet-state change and owes an explicit `bin/fm-triage-duty.sh recovery` pass before recovery is considered complete.
 11. Having already handled the drained wakes from the digest, follow the emitted supervision operating block through the digest's own closing reminder; if the lock was refused or `state/.afk` exists, follow the digest's no-direct-supervision guidance.
 
 A firstmate restart must be a non-event.
@@ -602,13 +604,15 @@ On wake, in order of cheapness:
 When a task reaches a terminal state on any of these wakes (a `done`/merge `check:`, a `failed` signal, a scout report, a local-only merge), and X mode is enabled, load `fmx-respond` (section 13) and post the X-mode mention's **final** completion follow-up if that task is X-mode-linked: `bin/fm-x-followup.sh --check <id>` then `bin/fm-x-followup.sh <id> --final --text-file <path>`, so the link always clears here regardless of how many of the up-to-three follow-ups were already spent on earlier milestones.
 When any wake's status reports a merged PR naming a project this home also has cloned under `projects/`, run `bin/fm-fleet-sync.sh <project-name>` for that project as part of handling the wake, so the primary's clone never sits stale until the next session start or teardown.
 
-**The triage duty is prompted, not remembered.**
+**The triage duty is proven, not just prompted.**
 Session start is not the only moment the fleet-triage ledger's answer changes; every event that changes fleet state changes it.
-So the scripts that make those changes print a bordered `FLEET TRIAGE DUTY` banner on stderr through `bin/fm-triage-duty.sh`, the same pull-based way `bin/fm-guard.sh` surfaces a lapsed watcher: `bin/fm-wake-drain.sh` after it drains actionable wakes (a drained heartbeat asks for a full pass, an ordinary wake for a targeted one), `bin/fm-teardown.sh` after a closeout, and `bin/fm-pr-merge.sh` and `bin/fm-merge-local.sh` once ship work lands.
-When that banner appears, load `fleet-triage`, run the pass it asks for, and record every disposition with `bin/fm-fleet-triage-record.sh` before returning to silent supervision; a terminal outcome must name its lineage, and an item that was merely seen is still actionable.
-The banner is a prompt, never an action: it enumerates nothing, writes nothing, and never blocks the operation it follows.
-Four trigger points have no script chokepoint firstmate owns and are therefore your duty to run unprompted: after a backlog mutation (section 10), after recording or resolving a bug, after a blocker completes and its dependents come free, and in the AFK-exit catch-up (below).
-The banner stays silent for a read-only session, which does not own triage, and while `state/.afk` exists, because the away daemon owns supervision until the captain returns.
+`bin/fm-triage-duty.sh <trigger>` runs the read-only enumerator itself (`bin/fm-fleet-triage.sh --json`, once per pass) for eleven named triggers and prints a bordered `FLEET TRIAGE DUTY` banner on stderr, the same pull-based way `bin/fm-guard.sh` surfaces a lapsed watcher, ONLY when that pass actually finds actionable state - a clear fleet stays exactly as silent as any other healthy diagnostic in this codebase, and the banner itself carries the pass's machine-readable result (`TRIAGE_DUTY_RESULT:` - trigger, scope, actionable, ownerless, unhealthy, captain_gated, fingerprint) so you can act on it without re-parsing prose.
+`bin/fm-wake-drain.sh` fires `wake-drain` (targeted) or `heartbeat` (full) after it drains actionable wakes, `bin/fm-teardown.sh` fires `teardown` or `scout-complete` after a closeout, `bin/fm-pr-merge.sh` and `bin/fm-merge-local.sh` fire `ship-complete` once ship work lands, and `bin/fm-session-start.sh` itself fires `session-start` as part of its own digest (section 3).
+When a banner appears, load `fleet-triage`, run the pass it asks for, and record every disposition with `bin/fm-fleet-triage-record.sh` before returning to silent supervision; a terminal outcome must name its lineage, and an item that was merely seen is still actionable.
+The pass is read-only and non-mutating regardless of what it finds: it never records an outcome, edits the backlog, or touches a bug or task itself - only `state/.triage-duty-last.json`, its own volatile result cache.
+Five trigger points have no script chokepoint firstmate owns and are therefore your duty to run explicitly, by name, rather than trusting conversational memory: `recovery` once recovery reconciles a dead or respawned endpoint (section 5), `backlog-mutation` after a `tasks-axi` or hand-edited backlog change (section 10), `bug-mutation` after recording or resolving a bug through the bug CLI, `blocker-freed` after a blocker completes and its dependents come free, and `afk-exit` in the AFK-exit catch-up (below).
+The pass is silent for a read-only session, which does not own triage, and while `state/.afk` exists, because the away daemon owns supervision until the captain returns.
+If the enumerator itself fails mid-pass (a missing `jq`, a broken snapshot), the duty script never swallows that: it prints a distinct `ENUMERATION FAILED` banner and caches `ok: false` in `state/.triage-duty-last.json`, so `bin/fm-guard.sh`'s supervision preflight (below) keeps surfacing the outage at every later checkpoint even if this banner scrolls past - a caller's `|| true` only protects the caller's own exit status, never this signal.
 
 Never rely on hooks or status files alone; when a heartbeat wake does reach you, the review of every window is mandatory and unconditional.
 Each task's backend live-task inventory is the ground truth: tmux when `backend=` is absent, or the non-default `backend=` a task's meta records (`docs/configuration.md` "Runtime backend" owns the backend set).
@@ -628,6 +632,12 @@ If a guard warning says watcher liveness is stale, drain any queued wakes and th
 If a crewmate sent to work firstmate-on-itself branches or commits in the primary checkout instead of its own isolated worktree, the primary is stranded on a feature branch (the failure this guards against); the guard names the offending branch and prints the non-destructive restore (`git -C <root> checkout <default>`), so the tangle surfaces on the very next fleet action.
 Only a named non-default branch checked out in the primary alarms: detached HEAD (the legitimate resting state of crewmate worktrees and secondmate homes) and the default branch never do.
 The same assertion runs at session start as the bootstrap `TANGLE:` line (handled via `bootstrap-diagnostics`), and two upstream guards prevent the tangle: `fm-spawn`'s isolated-worktree assertion and the ship brief's opening isolation check (section 11).
+
+`fm-guard.sh` carries a third, independent alarm in the same bordered style: the **fleet-triage supervision preflight**.
+It reads `state/.triage-duty-last.json` - the volatile result cache `bin/fm-triage-duty.sh` writes on every pass, success or failure - and warns before you go quiet again if the last pass found actionable items with no owner, or if the last pass failed to enumerate at all.
+This is a deterministic file read, never a re-enumeration: `fm-guard.sh` runs on every wake, and paying the full snapshot/NF/bug/ledger cost that often would defeat the point of a cheap guard.
+It fires independent of in-flight task count, unlike the watcher-liveness alarm above, because ownerless triage items (a bug, an unreconciled report, a captain-gated backlog row) are fleet-wide and do not depend on whether any task happens to be in flight right now.
+Like the other two alarms, it never blocks: the guarded operation still runs, and a read-only session gets the same warning worded as "the session holding the fleet lock owns this" rather than a repair instruction it cannot carry out.
 
 On every verified primary harness, "no turn ends blind" has a structural backstop beyond the pull-based banner: `bin/fm-turnend-guard.sh` blocks the turn end (or forces one bounded follow-up on passive harnesses) when tasks are in flight without a live identity-matched watcher lock and fresh beacon, fires only in the actual primary checkout, and stays silent when supervision is healthy.
 `docs/turnend-guard.md` owns the per-harness hook mechanisms, empirical validation, scoping details, and documented fail-open tradeoffs.
@@ -649,8 +659,8 @@ Inline facts that must survive without a loaded skill:
 - While `state/.afk` exists, the daemon owns the watcher; do not separately arm `fm-watch-arm.sh` or `fm-watch.sh`.
 - If firstmate receives a marked message while afk is active, it is an internal escalation: stay afk and process it.
 - If the message starts with `/afk`, stay afk and refresh the flag.
-- Any other unmarked message means the captain is back: clear `state/.afk`, stop the daemon, flush catch-up from `state/.wake-queue`, `state/.subsuper-escalations`, and `state/.subsuper-inject-wedged`, then load `fleet-triage` and run a full pass as part of that catch-up before resuming the emitted primary-harness supervision protocol.
-  The duty banner is suppressed for the whole away stretch precisely because the daemon owns supervision, so this pass is the one place the away window's accumulated fleet-state changes get dispositioned - run it even when the catch-up looks quiet.
+- Any other unmarked message means the captain is back: clear `state/.afk`, stop the daemon, flush catch-up from `state/.wake-queue`, `state/.subsuper-escalations`, and `state/.subsuper-inject-wedged`, then run `bin/fm-triage-duty.sh afk-exit` as part of that catch-up and load `fleet-triage` if it reports anything actionable, before resuming the emitted primary-harness supervision protocol.
+  The duty pass is suppressed for the whole away stretch precisely because the daemon owns supervision, so this is the one place the away window's accumulated fleet-state changes get dispositioned - run the command even when the catch-up looks quiet, because a clear result and a never-run pass look identical from memory alone and only running it tells them apart.
 - Afk never changes approval authority; PR merges, ask-user findings, destructive actions, irreversible actions, and security-sensitive choices still require the same approval they required before.
 - Bias ambiguous cases toward exit because a present captain beats token savings and a false exit is self-correcting.
 
@@ -704,8 +714,8 @@ Update the backlog on every dispatch, completion, and decision for a work item.
 ```
 
 Load `fleet-triage` to re-evaluate Queued and the other duty lanes on every teardown and every heartbeat.
-Teardown, merge, and the wake drain prompt that duty for you with a banner (section 8); a backlog mutation you make by hand - filing, starting, blocking, unblocking, or closing an item, or seeing a blocker's dependents come free - does not, because `tasks-axi` is not firstmate's script to prompt from.
-Run the pass yourself after one, on the same terms: what the mutation changed, dispositioned through `bin/fm-fleet-triage-record.sh`, before you go quiet.
+Teardown, merge, session start, and the wake drain prompt that duty for you with a banner (section 8); a backlog mutation you make by hand - filing, starting, blocking, unblocking, or closing an item - does not, because `tasks-axi` is not firstmate's script to prompt from.
+Run `bin/fm-triage-duty.sh backlog-mutation` yourself right after one (or `blocker-freed` specifically when you see a blocker's dependents come free), on the same terms as any other trigger: a banner appears only if that mutation left actionable state, and every disposition it names gets recorded through `bin/fm-fleet-triage-record.sh` before you go quiet.
 
 A tracked `.tasks.toml` at this repo root pins the default `tasks-axi` markdown backend to `data/backlog.md`, with `done_keep = 10` and an archive at `data/done-archive.md`.
 The local, gitignored `config/backlog-backend` file is the explicit opt-out knob.

@@ -513,46 +513,7 @@ if [ "$MODE" = --json ]; then
 fi
 
 # --- Digest. ------------------------------------------------------------------------
-printf '%s' "$RESULT" | jq -r --argjson max "$MAX_ITEMS" '
-  def dur($s):
-    if $s == null or $s < 60 then "new"
-    elif $s < 3600 then ((($s / 60) | floor | tostring) + "m")
-    elif $s < 86400 then ((($s / 3600) | floor | tostring) + "h")
-    else ((($s / 86400) | floor | tostring) + "d") end;
-
-  .metrics as $m
-  | .ledger.path as $ledger_path
-  | ["FLEET TRIAGE: " + ($m.actionable | tostring) + " actionable, "
-      + ($m.total | tostring) + " total (mode: " + .mode + ")",
-     "  ownerless: " + ($m.ownerless | tostring)
-      + " | captain-gated: " + ($m.captain_gated | tostring)
-      + " | auto-coordination: " + ($m.auto_coordination | tostring)]
-  # Additive. A corrupt ledger row is otherwise invisible: the fold skips it silently, and
-  # a skipped SURFACE row costs the item its first_seen_at, so it can never age into
-  # stale_unprocessed and no health check can ever notice it.
-  + (if $m.ledger_health.malformed_rows > 0
-     then ["  ledger health: " + ($m.ledger_health.malformed_rows | tostring)
-           + " malformed of " + ($m.ledger_health.total_rows | tostring)
-           + " rows in " + $ledger_path
-           + " (first at line " + (($m.ledger_health.rows[0].line // 0) | tostring)
-           + ": " + ($m.ledger_health.rows[0].reason // "unknown") + ")"]
-     else [] end)
-  + [ .lanes | to_entries[]
-      | .key as $k
-      | select($k != "ledger_health" or $m.by_lane[$k].actionable > 0)
-      | "  " + ($k | gsub("_"; " ")) + ": " + ($m.by_lane[$k].actionable | tostring)
-        + (if .value.available then "" else " (unavailable: " + .value.note + ")" end)
-        + (if $m.by_lane[$k].actionable > 0
-           then " (oldest " + dur($m.by_lane[$k].oldest_age_seconds) + ")" else "" end) ]
-  + [ ([.items[] | select(.actionable)][:$max])[]
-      | "  - [" + (.lane | gsub("_"; " ")) + "] " + .source_id
-        + (if .health != "ok" then " !" + .health else "" end)
-        + ": " + (.title | gsub("[[:space:]]+"; " ")) ]
-  + (($m.actionable - $max) as $rest
-     | if $rest > 0
-       then ["  - and " + ($rest | tostring)
-             + " more; run bin/fm-fleet-triage.sh --json for full detail"]
-       else [] end)
-  | .[]
-' | cut -c1-200
+# Shared with bin/fm-triage-duty.sh (fm_triage_render_digest in fm-fleet-triage-lib.sh)
+# so the two presentations of one enumeration never drift into two implementations.
+printf '%s' "$RESULT" | fm_triage_render_digest "$MAX_ITEMS"
 exit 0

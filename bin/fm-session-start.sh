@@ -290,16 +290,22 @@ else
 fi
 
 # --- 6. fleet triage -----------------------------------------------------
+# Routed through bin/fm-triage-duty.sh's session-start trigger rather than calling the
+# enumerator directly, so session start gets the same treatment as every other
+# fleet-state-changing trigger: real enumeration, a digest only when actionable state
+# exists (silence means all good, same as the bootstrap section above), the
+# machine-readable pass result, and a stable failure banner instead of a swallowed
+# enumerator crash. This also stamps state/.triage-duty-last.json for bin/fm-guard.sh's
+# supervision preflight to read on the very first wake this session handles.
 section "FLEET TRIAGE"
 if [ "$READ_ONLY" -eq 1 ]; then
   printf 'skipped (read-only session) - the session holding the lock owns triage.\n'
 else
-  TRIAGE_OUT=$("$SCRIPT_DIR/fm-fleet-triage.sh" --digest 2>&1)
-  TRIAGE_RC=$?
-  if [ "$TRIAGE_RC" -eq 0 ]; then
+  TRIAGE_OUT=$("$SCRIPT_DIR/fm-triage-duty.sh" session-start 2>&1)
+  if [ -n "$TRIAGE_OUT" ]; then
     printf '%s\n' "$TRIAGE_OUT"
   else
-    printf 'FLEET TRIAGE: unavailable - %s\n' "$TRIAGE_OUT"
+    printf '(clear - no actionable items across any lane)\n'
   fi
 fi
 

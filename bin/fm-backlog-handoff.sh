@@ -332,3 +332,9 @@ echo "  into $SUB_BACKLOG"
 if [ "${#ALREADY[@]}" -gt 0 ]; then
   echo "  already present (skipped): ${ALREADY[*]}"
 fi
+
+# A handoff removes items from the MAIN backlog, which is exactly the kind of
+# backlog mutation the fleet-triage duty exists to re-check (AGENTS.md section 10);
+# unlike an ordinary hand-edit or tasks-axi call, this one runs through a script
+# firstmate owns, so it can prompt the pass itself instead of leaving it to memory.
+"$SCRIPT_DIR/fm-triage-duty.sh" backlog-mutation --detail "handed off ${#TO_MOVE[@]} item(s) to $ID." || true

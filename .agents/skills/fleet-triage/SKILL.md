@@ -34,10 +34,16 @@ Run a full triage pass at locked primary session start or recovery, on a heartbe
 Run a targeted pass after an ordinary actionable wake by reading the affected lane and then checking whether the resulting state changed another lane.
 Use a full pass when several tasks finish together, a scout exposes cross-project work, or a targeted pass reveals a shared blocker or visibility mismatch.
 
-Most of those points prompt themselves.
-`bin/fm-wake-drain.sh`, `bin/fm-teardown.sh`, `bin/fm-pr-merge.sh`, and `bin/fm-merge-local.sh` print a bordered `FLEET TRIAGE DUTY` banner through `bin/fm-triage-duty.sh` naming the trigger and the pass it wants; that banner is why this skill just loaded.
-The rest have no script chokepoint firstmate owns - a hand-edited or `tasks-axi` backlog mutation, a bug recorded or resolved through the bug CLI, a blocker whose dependents came free, the return from away mode - so run those passes unprompted.
-The banner is a prompt only: it enumerates nothing and writes nothing, so it is never a substitute for the pass itself.
+`bin/fm-triage-duty.sh <trigger>` is not a static reminder: it RUNS the read-only enumerator itself (`bin/fm-fleet-triage.sh --json`, once per pass) and prints a bordered `FLEET TRIAGE DUTY` banner ONLY when that pass actually finds actionable state, carrying the pass's machine-readable result (`TRIAGE_DUTY_RESULT:` - trigger, scope, actionable, ownerless, unhealthy, captain_gated, fingerprint) inline.
+A clear fleet stays silent, exactly like every other diagnostic in this codebase; being shown a banner is itself proof the pass ran and found something, not just a prompt that something might be there.
+Eleven triggers exist: `wake-drain` (targeted), `heartbeat`, `ship-complete`, `scout-complete`, `teardown`, `session-start`, `recovery`, `backlog-mutation`, `bug-mutation`, `blocker-freed`, and `afk-exit` (all full passes).
+
+Six of those fire themselves from a script chokepoint firstmate owns: `bin/fm-wake-drain.sh` (`wake-drain`/`heartbeat`), `bin/fm-teardown.sh` (`teardown`/`scout-complete`), `bin/fm-pr-merge.sh` and `bin/fm-merge-local.sh` (`ship-complete`), and `bin/fm-session-start.sh` itself (`session-start`).
+The other five have no script chokepoint firstmate owns - `tasks-axi` and the bug CLI are external tools, recovery reconciliation and away-mode exit are conversational transitions - so run them explicitly, by name, rather than trusting memory: `bin/fm-triage-duty.sh recovery` once recovery reconciles a dead or respawned endpoint, `bin/fm-triage-duty.sh backlog-mutation` after a hand-edited or `tasks-axi` backlog change, `bin/fm-triage-duty.sh bug-mutation` after recording or resolving a bug through the bug CLI, `bin/fm-triage-duty.sh blocker-freed` after a blocker completes and its dependents come free, and `bin/fm-triage-duty.sh afk-exit` in the AFK-exit catch-up.
+Naming the exact command here, rather than "load fleet-triage and run a pass," is deliberate: a concrete command is grep-able and testable, so it does not silently rot into "I meant to check" the way a purely conversational reminder can.
+
+The pass stays read-only regardless of what it finds: it never records an outcome, edits the backlog, or touches a bug or task, and it never blocks the operation that triggered it - only `state/.triage-duty-last.json`, its own volatile result cache, changes as a side effect.
+If the enumerator itself fails (a missing `jq`, a broken snapshot), the pass prints a distinct `ENUMERATION FAILED` banner and caches that failure rather than silently reverting to "nothing actionable" - `bin/fm-guard.sh`'s supervision preflight then keeps surfacing the outage at later checkpoints even if this banner scrolls past.
 
 Do not run or act from a session that failed to acquire the fleet lock.
 Do not keep rerunning an unchanged full pass in the same turn: several triggers can fire in one turn (a merge, then a teardown, then a drained wake), and they collapse into one full pass over the resulting state, not three.
@@ -102,8 +108,9 @@ Route uncertainty to a bounded scout instead of guessing an implementation.
 Present captain gates as a compact decision batch with the options, evidence, tradeoff, and recommended choice.
 Record the outcome for each item the disposition actually covers, and leave the rest actionable.
 
-`FLEET_TRIAGE_MODE=enumerate_only` is the kill switch.
-Under it the enumerator still inspects, classifies, and reports, while every ledger write and domain action is refused.
+Two separate switches exist; do not confuse them.
+`FLEET_TRIAGE_MODE=enumerate_only` is a REPORT-ONLY mode, not a way to silence anything: the enumerator and `bin/fm-triage-duty.sh` still run in full and still report - a duty pass can still print a banner and still cache its own result - but every ledger write and domain action is refused, enforced by `bin/fm-fleet-triage-record.sh` refusing to write.
+`FM_TRIAGE_DUTY=off` is the actual kill switch for the duty prompt itself: under it, `bin/fm-triage-duty.sh` produces no output and runs nothing at all - no enumeration, no state-file write, no banner. It does not affect `bin/fm-fleet-triage.sh` or `bin/fm-fleet-triage-record.sh` run directly.
 
 ## Closeout
 

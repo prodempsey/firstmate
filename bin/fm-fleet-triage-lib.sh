@@ -178,6 +178,82 @@ fm_triage_mode() {
   printf '%s' "${FLEET_TRIAGE_MODE:-active}"
 }
 
+# Render the fm-fleet-triage/v2 JSON on stdin as the same token-capped digest text
+# fm-fleet-triage.sh --digest prints. Shared so a caller that already paid for one
+# --json enumeration (bin/fm-triage-duty.sh) never re-runs the whole snapshot/NF/bug/
+# ledger pipeline a second time just to get the human-readable rendering; the two
+# presentations of one enumeration must never drift apart into two implementations.
+fm_triage_render_digest() {  # <max-items>
+  local max=${1:-8}
+  jq -r --argjson max "$max" '
+    def dur($s):
+      if $s == null or $s < 60 then "new"
+      elif $s < 3600 then ((($s / 60) | floor | tostring) + "m")
+      elif $s < 86400 then ((($s / 3600) | floor | tostring) + "h")
+      else ((($s / 86400) | floor | tostring) + "d") end;
+
+    .metrics as $m
+    | .ledger.path as $ledger_path
+    | ["FLEET TRIAGE: " + ($m.actionable | tostring) + " actionable, "
+        + ($m.total | tostring) + " total (mode: " + .mode + ")",
+       "  ownerless: " + ($m.ownerless | tostring)
+        + " | captain-gated: " + ($m.captain_gated | tostring)
+        + " | auto-coordination: " + ($m.auto_coordination | tostring)]
+    + (if $m.ledger_health.malformed_rows > 0
+       then ["  ledger health: " + ($m.ledger_health.malformed_rows | tostring)
+             + " malformed of " + ($m.ledger_health.total_rows | tostring)
+             + " rows in " + $ledger_path
+             + " (first at line " + (($m.ledger_health.rows[0].line // 0) | tostring)
+             + ": " + ($m.ledger_health.rows[0].reason // "unknown") + ")"]
+       else [] end)
+    + [ .lanes | to_entries[]
+        | .key as $k
+        | select($k != "ledger_health" or $m.by_lane[$k].actionable > 0)
+        | "  " + ($k | gsub("_"; " ")) + ": " + ($m.by_lane[$k].actionable | tostring)
+          + (if .value.available then "" else " (unavailable: " + .value.note + ")" end)
+          + (if $m.by_lane[$k].actionable > 0
+             then " (oldest " + dur($m.by_lane[$k].oldest_age_seconds) + ")" else "" end) ]
+    + [ ([.items[] | select(.actionable)][:$max])[]
+        | "  - [" + (.lane | gsub("_"; " ")) + "] " + .source_id
+          + (if .health != "ok" then " !" + .health else "" end)
+          + ": " + (.title | gsub("[[:space:]]+"; " ")) ]
+    + (($m.actionable - $max) as $rest
+       | if $rest > 0
+         then ["  - and " + ($rest | tostring)
+               + " more; run bin/fm-fleet-triage.sh --json for full detail"]
+         else [] end)
+    | .[]
+  ' | cut -c1-200
+}
+
+# Print machine-readable pass results for one fm-fleet-triage/v2 JSON blob on stdin:
+# actionable, ownerless, unhealthy (actionable but health != ok), and captain_gated
+# counts, plus a deterministic fingerprint over the current actionable set. The
+# fingerprint changes only when the actionable set's membership or disposition
+# changes (item_id, processing_state, health), never on a title or prose edit, so a
+# caller can tell "still the same open items" from "something actually moved."
+# fm-triage-duty.sh is the primary caller: it exposes this alongside the trigger and
+# scope so a duty pass proves what it found instead of only prompting that something
+# might be there.
+fm_triage_pass_result() {  # <trigger> <scope>
+  local trigger=$1 scope=$2 base fp
+  base=$(jq -c --arg trigger "$trigger" --arg scope "$scope" '
+    .metrics as $m
+    | {trigger: $trigger,
+       scope: $scope,
+       actionable: $m.actionable,
+       ownerless: $m.ownerless,
+       unhealthy: ($m.actionable - ($m.health.ok // 0)),
+       captain_gated: $m.captain_gated,
+       fingerprint_input: ([.items[] | select(.actionable)
+                            | (.item_id + ":" + .processing_state + ":" + .health)]
+                           | sort | join("|"))
+      }
+  ') || return 1
+  fp=$(printf '%s' "$base" | jq -r '.fingerprint_input' | fm_triage_hash) || return 1
+  printf '%s' "$base" | jq -c --arg fp "$fp" 'del(.fingerprint_input) + {fingerprint: $fp}'
+}
+
 # True when this session owns the per-home firstmate session lock.
 # The lock file holds the harness PID (see bin/fm-lock.sh). This session owns it only
 # when that PID is in our own process ancestry, which is what distinguishes the locked

@@ -60,6 +60,63 @@ if [ -n "$tangle_branch" ]; then
   } >&2
 fi
 
+# --- Fleet-triage supervision preflight, checked SECOND and also independent of
+# in-flight tasks. -------------------------------------------------------------------
+# A deterministic, cheap check that a return to silent supervision is not walking past
+# actionable work nobody owns. This reads the LAST recorded bin/fm-triage-duty.sh pass
+# (state/.triage-duty-last.json, a small cache written by that script) rather than
+# re-running the read-only enumerator here - fm-guard.sh runs on every wake, and
+# re-enumerating on every guard check would pay the full snapshot/NF/bug/ledger cost far
+# more often than any actual fleet-state change. The duty script is what keeps this
+# cache fresh; this is purely a deterministic file read. Banner-only: it never blocks,
+# and it fires independent of in-flight task count because ownerless triage items (a
+# bug, an unreconciled report, a captain-gated backlog row) are fleet-wide, not tied to
+# whether any task happens to be in flight right now.
+triage_last="$STATE/.triage-duty-last.json"
+if [ -f "$triage_last" ] && command -v jq >/dev/null 2>&1; then
+  # jq's `//` treats `false` as no-value (same as null), so a plain `.ok // empty`
+  # would silently discard a genuine `ok: false` failure record. Read it with
+  # `tostring` instead so false survives.
+  triage_ok=$(jq -r '.ok | tostring' "$triage_last" 2>/dev/null)
+  trule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+  if [ "$triage_ok" = false ]; then
+    t_trigger=$(jq -r '.trigger // "unknown"' "$triage_last" 2>/dev/null)
+    t_ts=$(jq -r '.ts // "unknown"' "$triage_last" 2>/dev/null)
+    t_err=$(jq -r '.error // "unknown error"' "$triage_last" 2>/dev/null)
+    {
+      printf '●%s\n' "$trule"
+      printf '●  FLEET TRIAGE DUTY - LAST PASS FAILED TO ENUMERATE\n'
+      printf '●  The %s pass at %s did not complete: %s\n' "$t_trigger" "$t_ts" "$t_err"
+      printf '●  Fleet-triage visibility may be stale until this is fixed.\n'
+      printf '●  Investigate directly: bin/fm-fleet-triage.sh --json\n'
+      printf '●%s\n' "$trule"
+    } >&2
+  elif [ "$triage_ok" = true ]; then
+    t_ownerless=$(jq -r '.ownerless // 0' "$triage_last" 2>/dev/null)
+    case "$t_ownerless" in ''|*[!0-9]*) t_ownerless=0 ;; esac
+    if [ "$t_ownerless" -gt 0 ]; then
+      t_actionable=$(jq -r '.actionable // 0' "$triage_last" 2>/dev/null)
+      t_captain_gated=$(jq -r '.captain_gated // 0' "$triage_last" 2>/dev/null)
+      t_trigger=$(jq -r '.trigger // "unknown"' "$triage_last" 2>/dev/null)
+      t_ts=$(jq -r '.ts // "unknown"' "$triage_last" 2>/dev/null)
+      {
+        printf '●%s\n' "$trule"
+        printf '●  FLEET TRIAGE ATTENTION - RETURNING TO SUPERVISION WITH OWNERLESS WORK\n'
+        printf '●  %s of %s actionable item(s) have no owner (%s captain-gated), as of the\n' "$t_ownerless" "$t_actionable" "$t_captain_gated"
+        printf '●  %s pass at %s.\n' "$t_trigger" "$t_ts"
+        if [ "$READ_ONLY" -eq 1 ]; then
+          printf '●  This read-only session cannot record dispositions; the session holding the\n'
+          printf '●  fleet lock owns this.\n'
+        else
+          printf '●  Load the fleet-triage skill and disposition them with\n'
+          printf '●  bin/fm-fleet-triage-record.sh before going quiet.\n'
+        fi
+        printf '●%s\n' "$trule"
+      } >&2
+    fi
+  fi
+fi
+
 # Compute in-flight count and watcher-beacon freshness via the shared
 # grace-based predicate (bin/fm-supervision-lib.sh). Only act with tasks in
 # flight; count them so the banner can say how much is riding on an absent
