@@ -40,7 +40,7 @@ Do not keep rerunning an unchanged full pass in the same turn.
 ## Reading the output
 
 Use the digest for orientation and the JSON output when taking action.
-The JSON schema is `fm-fleet-triage/v1` and the script help owns its exact flags and ledger wire format.
+The JSON schema is `fm-fleet-triage/v2` and the script help owns its exact flags and ledger wire format.
 
 Treat the lanes as follows.
 
@@ -53,16 +53,35 @@ Treat the lanes as follows.
 An unavailable lane is missing evidence, not evidence that the lane is empty.
 Fix or explicitly note the missing input before claiming the fleet is clear.
 
-The item fingerprint covers the candidate's material fields.
-An acknowledgement means the candidate was dispositioned, not merely noticed.
-After completing the action, routing concrete successor work, or deliberately placing the candidate on hold with a durable reason, append the exact lane, id, and fingerprint tuple to the handled ledger described by the script.
-Never acknowledge an item before its disposition is durable.
-A changed candidate receives a new fingerprint and surfaces again.
-For a `needs_firstmate` item, also complete the existing Needs FirstMate acknowledgement procedure because the triage ledger does not replace that lane's own handling state.
+An unhandled item is reported as `actionable`, and it stays actionable until it carries a terminal outcome with lineage.
+
+## Outcomes, not acknowledgements
+
+An item is not handled because it was printed, seen, summarized, or acknowledged.
+It is handled only when it reaches one of five outcomes, each of which must name its lineage:
+
+- `successor_created` with the id of the task, scout, or backlog item that now owns the work.
+- `resolved` with the evidence that resolved it: a commit, a merged PR, a report, a bug resolution.
+- `rejected` with the reason it will not be acted on.
+- `held` with both a reason and a review date or explicit unblock condition.
+- `captain_batch` with the id of the decision batch it was packaged into.
+
+There is deliberately no acknowledge verb.
+Record every outcome with `bin/fm-fleet-triage-record.sh`, which is the only sanctioned writer of the processing ledger and refuses a terminal outcome that has no lineage attached.
+Claim an item with `claim` before working it so a second session does not pick it up, and `release` it if you put it down without an outcome.
+Never record an outcome before its disposition is durable in the domain system that owns it: the bug CLI for bugs, `tasks-axi` for backlog, the normal ship and scout lifecycle for tasks.
+The triage ledger records that the work was converted, never the work itself.
+
+The enumerator re-surfaces an item whose recorded disposition stopped holding, reporting why in its `health` field: the evidence moved, a linked successor does not exist, a hold's review date arrived, a claim went stale, or a terminal outcome lost its lineage.
+Treat a re-surfaced item as live work again, not as a duplicate.
+Age and repeated appearances raise an item's priority and demand a recorded reason for the delay; they are never themselves a reason to escalate to the captain.
+Escalate on the decision's content, per the action classes above.
+
+For a `needs_firstmate` item, also complete the existing Needs FirstMate acknowledgement procedure, because the triage ledger does not replace that lane's own handling state.
 
 ## Action loop
 
-For each unhandled candidate, verify its current source and overlap with in-flight or queued work.
+For each actionable item, verify its current source and overlap with in-flight or queued work.
 Classify it as automatic reversible coordination, a captain gate, a bounded scout, or a hold with a concrete recheck condition.
 Prefer one batch for related bugs or reports over several overlapping tasks.
 Promote a report finding into an existing umbrella item when that lineage already owns the gap.
@@ -70,10 +89,13 @@ Create a new backlog item only when no current item owns the follow-up.
 Route a known-shape fix when project, scope, acceptance criteria, and non-overlap are clear.
 Route uncertainty to a bounded scout instead of guessing an implementation.
 Present captain gates as a compact decision batch with the options, evidence, tradeoff, and recommended choice.
-Record the disposition and acknowledge only the candidates the disposition actually covers.
+Record the outcome for each item the disposition actually covers, and leave the rest actionable.
+
+`FLEET_TRIAGE_MODE=enumerate_only` is the kill switch.
+Under it the enumerator still inspects, classifies, and reports, while every ledger write and domain action is refused.
 
 ## Closeout
 
 After action, rerun targeted triage for the affected lane.
 Run a full pass when closeout unblocks queued work or changes shared visibility history.
-Resume normal supervision when no unhandled candidate remains and every unavailable lane has been accounted for.
+Resume normal supervision once every remaining item has an owner, an active claim, a successor, a hold with a review condition, a captain batch, or a recorded rejection or resolution, and every unavailable lane has been accounted for.
