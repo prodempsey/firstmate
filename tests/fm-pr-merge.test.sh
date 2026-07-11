@@ -122,6 +122,10 @@ test_merge_failure_propagates_after_recording() {
   mkdir -p "$case_dir/wt"
   add_gh_mocks_merge_fails "$case_dir"
   : > "$case_dir/gh-axi.log"
+  # Own the session lock so the duty banner is NOT suppressed for the wrong
+  # reason: this case must prove a failed merge owes no duty, not that an
+  # unlocked session is silent.
+  printf '%s\n' "$$" > "$case_dir/state/.lock"
 
   set +e
   run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/13 \
@@ -132,7 +136,31 @@ test_merge_failure_propagates_after_recording() {
   expect_code 1 "$rc" "merge-fails: fm-pr-merge should propagate the gh-axi merge failure"
   assert_grep 'pr=https://github.com/example/repo/pull/13' "$case_dir/state/task-x1.meta" \
     "merge-fails: pr= should already be recorded even though the merge itself failed"
+  assert_no_grep 'FLEET TRIAGE DUTY' "$case_dir/stderr" \
+    "merge-fails: a merge that never landed prompted the fleet-triage duty"
   pass "fm-pr-merge propagates a real merge failure without silently succeeding"
+}
+
+# A merge is the moment ship work actually lands - it can clear a blocker or resolve a
+# bug before the matching teardown ever runs - so it prompts the triage duty itself.
+test_successful_merge_prompts_the_fleet_triage_duty() {
+  local case_dir
+  case_dir=$(make_case triage-duty)
+  mkdir -p "$case_dir/wt"
+  add_gh_mocks "$case_dir" deadbeefcafefeed0000000000000000deadbeef
+  printf '%s\n' "$$" > "$case_dir/state/.lock"
+
+  run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/9 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" \
+    || fail "triage-duty: fm-pr-merge should succeed"
+
+  assert_grep 'FLEET TRIAGE DUTY - SHIP WORK LANDED' "$case_dir/stderr" \
+    "triage-duty: a landed PR did not prompt the fleet-triage duty"
+  assert_grep 'https://github.com/example/repo/pull/9' "$case_dir/stderr" \
+    "triage-duty: the duty banner did not name the PR that landed"
+  assert_no_grep 'FLEET TRIAGE DUTY' "$case_dir/stdout" \
+    "triage-duty: the banner reached stdout; it must stay on stderr"
+  pass "a landed PR merge prompts the fleet-triage duty"
 }
 
 test_extra_merge_args_forwarded() {
@@ -297,6 +325,7 @@ test_parses_pr_url_for_gh_axi() {
 
 test_records_pr_and_head_before_merging
 test_merge_failure_propagates_after_recording
+test_successful_merge_prompts_the_fleet_triage_duty
 test_extra_merge_args_forwarded
 test_missing_meta_refuses_before_merge
 test_malformed_url_refuses_before_merge

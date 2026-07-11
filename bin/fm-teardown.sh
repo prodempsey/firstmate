@@ -1093,3 +1093,10 @@ if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only 
 fi
 echo "teardown $ID complete (window $T, worktree $WT)"
 backlog_refresh_reminder
+# Closeout is the highest-value triage trigger: a torn-down task can clear a blocker,
+# leave a scout report needing a successor, or resolve a bug, and none of that surfaces
+# on its own. A scout closeout is named separately because its report IS the artifact
+# that the scout_reports lane tracks. Banner goes to stderr; stdout stays as-is.
+triage_trigger=teardown
+[ "$KIND" = scout ] && triage_trigger=scout-complete
+"$SCRIPT_DIR/fm-triage-duty.sh" "$triage_trigger" --detail "$ID torn down." || true

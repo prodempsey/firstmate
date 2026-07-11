@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Atomically drain durable watcher wake records, then assert watcher liveness.
+# Atomically drain durable watcher wake records, then assert watcher liveness and
+# the fleet-triage duty the drained wakes just created.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +23,20 @@ DRAIN_LOCK_HELD=false
 # drain's exit status.
 assert_watcher_liveness() {
   "$SCRIPT_DIR/fm-guard.sh" || true
+}
+
+# Every drained wake is an actionable fleet-state change, which is exactly when the
+# triage ledger's answer can have moved. Prompt the duty here rather than trusting
+# the agent to remember it, and pass the wake kinds so a heartbeat - the wake that
+# means "the fleet scan turned something up" - asks for a full pass instead of a
+# targeted one. An empty drain changed nothing and stays silent. The banner goes to
+# stderr, so this run's parseable record lines on stdout are untouched.
+assert_triage_duty() {  # <drained-records-file>
+  local trigger=wake-drain
+  if awk -F '\t' '$3 == "heartbeat" { found = 1 } END { exit !found }' "$1" 2>/dev/null; then
+    trigger=heartbeat
+  fi
+  "$SCRIPT_DIR/fm-triage-duty.sh" "$trigger" || true
 }
 
 # shellcheck disable=SC2317,SC2329 # Invoked by trap handlers below.
@@ -55,6 +70,7 @@ mv "$FM_WAKE_QUEUE" "$DRAIN_TMP" || exit 1
 : > "$FM_WAKE_QUEUE" || exit 1
 
 fm_wake_print_deduped "$DRAIN_TMP" || exit "$?"
+assert_triage_duty "$DRAIN_TMP"
 rm -f "$DRAIN_TMP"
 DRAIN_TMP=
 assert_watcher_liveness

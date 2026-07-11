@@ -66,3 +66,7 @@ before=$(git -C "$PROJ" rev-parse --short "$DEFAULT")
 git -C "$PROJ" merge --ff-only "$BRANCH" >/dev/null
 after=$(git -C "$PROJ" rev-parse --short "$DEFAULT")
 echo "merged $BRANCH into local $DEFAULT ($before -> $after) in $PROJ"
+
+# A local-only merge is a ship completion with no PR and no CI, so this is the only
+# moment the work lands. It can clear a blocker or resolve a bug before teardown runs.
+"$SCRIPT_DIR/fm-triage-duty.sh" ship-complete --detail "$ID landed on local $DEFAULT in $PROJ." || true

@@ -87,4 +87,9 @@ if ! caller_has_merge_method "$@"; then
   merge_args=(--squash)
 fi
 
-gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" ${merge_args[@]+"${merge_args[@]}"} "$@"
+gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" ${merge_args[@]+"${merge_args[@]}"} "$@" || exit "$?"
+
+# The merge is the moment the ship task's work actually landed, and it can clear a
+# blocker or resolve a bug well before the matching teardown runs. Prompt the triage
+# duty on the merge itself, not only on closeout.
+"$SCRIPT_DIR/fm-triage-duty.sh" ship-complete --detail "$ID landed: $URL" || true

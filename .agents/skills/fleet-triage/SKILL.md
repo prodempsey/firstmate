@@ -30,12 +30,17 @@ The prime directives and project delivery mode remain authoritative.
 
 ## When to run
 
-Run a full triage pass at locked primary session start or recovery, on a heartbeat that reaches the agent, after backlog mutation, and after closeout or teardown.
+Run a full triage pass at locked primary session start or recovery, on a heartbeat that reaches the agent, after ship or scout work completes, after closeout or teardown, after a backlog mutation, after recording or resolving a bug, after a blocker completes and frees its dependents, and in the AFK-exit catch-up.
 Run a targeted pass after an ordinary actionable wake by reading the affected lane and then checking whether the resulting state changed another lane.
 Use a full pass when several tasks finish together, a scout exposes cross-project work, or a targeted pass reveals a shared blocker or visibility mismatch.
 
+Most of those points prompt themselves.
+`bin/fm-wake-drain.sh`, `bin/fm-teardown.sh`, `bin/fm-pr-merge.sh`, and `bin/fm-merge-local.sh` print a bordered `FLEET TRIAGE DUTY` banner through `bin/fm-triage-duty.sh` naming the trigger and the pass it wants; that banner is why this skill just loaded.
+The rest have no script chokepoint firstmate owns - a hand-edited or `tasks-axi` backlog mutation, a bug recorded or resolved through the bug CLI, a blocker whose dependents came free, the return from away mode - so run those passes unprompted.
+The banner is a prompt only: it enumerates nothing and writes nothing, so it is never a substitute for the pass itself.
+
 Do not run or act from a session that failed to acquire the fleet lock.
-Do not keep rerunning an unchanged full pass in the same turn.
+Do not keep rerunning an unchanged full pass in the same turn: several triggers can fire in one turn (a merge, then a teardown, then a drained wake), and they collapse into one full pass over the resulting state, not three.
 
 ## Reading the output
 

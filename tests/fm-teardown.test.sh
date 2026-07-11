@@ -552,6 +552,49 @@ test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present() {
   pass "teardown honors config/backlog-backend=manual even when tasks-axi is compatible"
 }
 
+# Closeout is the fleet-triage duty's highest-value trigger: a torn-down task can
+# clear a blocker or leave a report with no successor, and nothing else surfaces it.
+# The banner is stderr-only so teardown's own stdout stays byte-identical.
+# Lock ownership: fm-triage-duty walks our process ancestry for the lock PID, so
+# writing this test's own PID makes the case home the locked primary.
+own_session_lock() {
+  printf '%s\n' "$$" > "$1/state/.lock"
+}
+
+test_teardown_prompts_the_fleet_triage_duty() {
+  local case_dir
+  case_dir=$(make_case triage-duty-ship)
+  write_meta "$case_dir" local-only ship
+  own_session_lock "$case_dir"
+  wt_commit "$case_dir" "landed work"
+  git -C "$case_dir/project" update-ref refs/heads/main "$(git -C "$case_dir/wt" rev-parse HEAD)"
+
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" \
+    || fail "triage-duty-ship: teardown failed"
+  assert_grep 'FLEET TRIAGE DUTY - TASK TORN DOWN' "$case_dir/stderr" \
+    "ship teardown did not prompt the fleet-triage duty"
+  assert_grep 'task-x1 torn down.' "$case_dir/stderr" \
+    "teardown's duty banner did not name the task"
+  assert_no_grep 'FLEET TRIAGE DUTY' "$case_dir/stdout" \
+    "the duty banner reached teardown's stdout; it must stay on stderr"
+  pass "ship teardown prompts the fleet-triage duty on stderr"
+}
+
+test_scout_teardown_prompts_the_scout_completion_duty() {
+  local case_dir
+  case_dir=$(make_case triage-duty-scout)
+  write_meta "$case_dir" local-only scout
+  own_session_lock "$case_dir"
+  mkdir -p "$case_dir/data/task-x1"
+  printf '# findings\n' > "$case_dir/data/task-x1/report.md"
+
+  FM_DATA_OVERRIDE="$case_dir/data" run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" \
+    || fail "triage-duty-scout: teardown failed"
+  assert_grep 'FLEET TRIAGE DUTY - SCOUT REPORT CLOSED OUT' "$case_dir/stderr" \
+    "scout teardown did not prompt the scout-completion duty"
+  pass "scout teardown prompts the duty as a scout completion"
+}
+
 test_local_only_truly_unpushed_refuses() {
   local case_dir rc
   case_dir=$(make_case truly-unpushed)
@@ -1435,6 +1478,8 @@ test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
 test_local_only_truly_unpushed_refuses
 test_local_only_merged_to_local_main_allows
+test_teardown_prompts_the_fleet_triage_duty
+test_scout_teardown_prompts_the_scout_completion_duty
 test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
