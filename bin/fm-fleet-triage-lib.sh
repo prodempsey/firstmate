@@ -67,10 +67,19 @@ fm_triage_item_id() {  # <lane> <source-id>
 # the findings changed. The lane therefore hashes a digest of the file's contents, which
 # the enumerator computes; a report rewritten in place re-opens a disposition made
 # against the old findings. This is not a prose exception: the body is the evidence.
+#
+# A captain order's evidence is its disposition, never the captain's wording: the request
+# text is preserved verbatim forever and must never mint a new logical item. Its status,
+# owner, lineage links, and review condition are what a triage decision was made against,
+# so those - and only those - participate.
 fm_triage_evidence_version() {
   jq -cS '
     {lane, source_id: .id}
-    + (if .lane == "needs_firstmate" then {signal: .source_fingerprint}
+    + (if .lane == "captain_orders" then {status,
+                                          owner: (.owner // null),
+                                          links: (.links // null),
+                                          review_after: (.review_after // null)}
+       elif .lane == "needs_firstmate" then {signal: .source_fingerprint}
        elif .lane == "bugs" then {status,
                                   type: (.type // null),
                                   links: (.links // null),
@@ -199,6 +208,15 @@ fm_triage_render_digest() {  # <max-items>
        "  ownerless: " + ($m.ownerless | tostring)
         + " | captain-gated: " + ($m.captain_gated | tostring)
         + " | auto-coordination: " + ($m.auto_coordination | tostring)]
+    # Captain orders lead the digest when any are waiting: an unanswered captain request
+    # outranks the housekeeping in every other lane.
+    + (($m.captain_orders // {}) as $co
+       | if ($co.actionable // 0) > 0 or ($co.pending_chat_captures // 0) > 0
+         then ["  captain orders: " + (($co.actionable // 0) | tostring) + " needing action"
+               + " | untriaged: " + (($co.untriaged // 0) | tostring)
+               + " | captain decision: " + (($co.captain_decision // 0) | tostring)
+               + " | undrained chat captures: " + (($co.pending_chat_captures // 0) | tostring)]
+         else [] end)
     + (if $m.ledger_health.malformed_rows > 0
        then ["  ledger health: " + ($m.ledger_health.malformed_rows | tostring)
              + " malformed of " + ($m.ledger_health.total_rows | tostring)

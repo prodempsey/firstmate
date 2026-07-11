@@ -37,9 +37,13 @@
 #   5. fleet digest   - data/backlog.md, every state/*.meta, a bounded
 #                       state/*.status tail, state/.afk, and a cheap
 #                       per-task endpoint-liveness read: read-only, always runs.
-#   6. fleet triage   - prints the read-only candidate digest only for the
+#   6. captain orders - prints the durable captain-order inbox digest: what the
+#                       captain has asked for that is not yet triaged, owned,
+#                       linked, or dispositioned, plus any chat capture not yet
+#                       drained. Read-only, always runs.
+#   7. fleet triage   - prints the read-only candidate digest only for the
 #                       session that acquired the fleet lock.
-#   7. closing reminder - prints the context-specific watcher next step; this
+#   8. closing reminder - prints the context-specific watcher next step; this
 #                       script points back to the emitted harness supervision
 #                       block and deliberately never arms the watcher itself.
 #
@@ -289,7 +293,26 @@ else
   printf 'absent\n'
 fi
 
-# --- 6. fleet triage -----------------------------------------------------
+# --- 6. captain orders ---------------------------------------------------
+# The inbox is authoritative for whether a captain request was received, so it is read
+# here on every session start, locked or not: a read-only session may not act on an
+# order, but it must still be able to see that one is waiting.
+section "CAPTAIN ORDERS"
+if ORDERS_OUT=$("$SCRIPT_DIR/fm-order.sh" digest 2>&1); then
+  printf '%s\n' "$ORDERS_OUT"
+  PENDING_OUT=$("$SCRIPT_DIR/fm-order.sh" pending 2>/dev/null || true)
+  case "$PENDING_OUT" in
+    'no undrained captain chat captures'|'') : ;;
+    *)
+      printf '\nUNDRAINED CAPTAIN CHAT CAPTURES - record or dismiss each one FIRST:\n'
+      printf '%s\n' "$PENDING_OUT"
+      ;;
+  esac
+else
+  printf 'CAPTAIN ORDERS: %s\n' "$ORDERS_OUT"
+fi
+
+# --- 7. fleet triage -----------------------------------------------------
 # Routed through bin/fm-triage-duty.sh's session-start trigger rather than calling the
 # enumerator directly, so session start gets the same treatment as every other
 # fleet-state-changing trigger: real enumeration, a digest only when actionable state
@@ -309,7 +332,7 @@ else
   fi
 fi
 
-# --- 7. closing reminder -----------------------------------------------
+# --- 8. closing reminder -----------------------------------------------
 section "NEXT STEP"
 if [ "$READ_ONLY" -eq 1 ]; then
   cat <<'EOF'

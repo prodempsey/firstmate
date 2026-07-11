@@ -199,6 +199,40 @@ test_unknown_trigger_fails_loudly() {
   pass "an unknown or missing trigger fails loudly instead of running an unactionable pass"
 }
 
+# The captain-order digest line and the duty banner were built on separate branches
+# against separate renderings of the same enumeration, so the one thing that can silently
+# regress here is the captain-order line surviving in only ONE of them. It lives in
+# fm_triage_render_digest (fm-fleet-triage-lib.sh), which both callers share, so both must
+# lead with it while the fleet ALSO has ordinary actionable work of its own: an unanswered
+# captain request outranks that housekeeping, and neither presentation may drop it.
+test_captain_orders_lead_the_shared_digest_alongside_other_actionable_items() {
+  local home inbox banner digest
+  home=$(make_home)
+  seed_actionable "$home"          # ownerless backlog_hygiene item
+  inbox="$home/captain-orders.jsonl"
+  FM_ORDERS_PATH="$inbox" "$ROOT/bin/fm-order.sh" add "Fix the bug history mismatch." >/dev/null \
+    || fail "could not record the captain order fixture"
+
+  banner=$(FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_FLEET_TRIAGE_BUG_CLI=off FM_ORDERS_PATH="$inbox" "$DUTY" heartbeat 2>&1)
+  assert_contains "$banner" 'captain orders: 1 needing action' \
+    "the duty banner dropped the captain-order line the digest is supposed to lead with"
+  assert_contains "$banner" 'untriaged: 1' "the duty banner lost the untriaged captain-order count"
+  assert_contains "$banner" '[captain orders] ORD-001' \
+    "the duty banner did not list the captain order as an actionable item"
+  assert_contains "$banner" 'ready-q1' \
+    "the captain-order line displaced the fleet's other actionable work instead of leading it"
+
+  digest=$(FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_FLEET_TRIAGE_BUG_CLI=off FM_ORDERS_PATH="$inbox" "$ROOT/bin/fm-fleet-triage.sh" --digest 2>/dev/null)
+  assert_contains "$digest" 'captain orders: 1 needing action' \
+    "fm-fleet-triage.sh --digest dropped the captain-order line the duty banner still prints"
+  [ "$(printf '%s\n' "$digest" | grep -n 'captain orders: 1 needing action' | cut -d: -f1)" -lt \
+    "$(printf '%s\n' "$digest" | grep -n 'backlog hygiene:' | cut -d: -f1)" ] \
+    || fail "captain orders no longer lead the digest"
+  pass "captain orders lead both renderings of one enumeration, next to the fleet's other actionable work"
+}
+
 test_banner_never_pollutes_stdout() {
   local home stdout
   home=$(make_home)
@@ -333,6 +367,7 @@ test_banner_fires_at_every_wired_call_site() {
 }
 
 test_silent_when_nothing_actionable
+test_captain_orders_lead_the_shared_digest_alongside_other_actionable_items
 test_banner_fires_for_each_trigger_only_when_actionable
 test_scope_differs_between_targeted_and_full_triggers
 test_detail_is_surfaced

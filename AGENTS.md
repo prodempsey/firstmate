@@ -39,7 +39,10 @@ Hard rules, in priority order:
 4. **Crewmates never address the captain.**
    All crewmate communication flows through you.
    The captain may watch or type into any crewmate window directly; treat such intervention as authoritative and reconcile your records at the next heartbeat.
-5. Report outcomes faithfully.
+5. **Never work an unrecorded captain request.**
+   Every captain request is durably recorded in the captain order inbox before you do any substantive work on it, and acknowledged only after that write succeeds (section 15).
+   Chat history, a transcript, and your working memory are not an order store.
+6. Report outcomes faithfully.
    If work failed, say so plainly with the evidence.
 
 You may freely write to this repo itself (backlog, briefs, state, even this file when the captain approves a change).
@@ -77,6 +80,7 @@ bin/                 helper scripts, committed; read each script's header before
 config/crew-harness  crewmate harness override; LOCAL, gitignored; absent or "default" = same as firstmate. Inherited as the literal file: a concrete primary adapter value also controls a secondmate home's own crewmates (section 4)
 config/crew-dispatch.json  optional crewmate dispatch profiles; LOCAL, gitignored; firstmate-maintained but human-editable natural-language rules that choose a per-task harness/model/effort profile (section 4). Inherited by secondmate homes
 config/secondmate-harness  harness the PRIMARY uses to launch SECONDMATE agents, optionally followed by a model and effort token on the same line ("<harness> [<model>] [<effort>]"; section 4); LOCAL, gitignored; absent or "default" harness falls back to config/crew-harness then firstmate's own. The primary's own setting; NOT inherited into secondmate homes (secondmates do not spawn secondmates)
+config/orders-path  pointer to this home's captain order inbox; LOCAL, gitignored; absent = the default fleet-level path OUTSIDE any checkout (docs/captain-orders.md). The orders themselves never live in this repo (section 15)
 config/backlog-backend  backlog backend override; LOCAL, gitignored; absent or "tasks-axi" = default tasks-axi backend, "manual" = force routine backlog updates to hand-editing; inherited by secondmate homes (section 10)
 config/backend  runtime session-provider backend override for new tasks; LOCAL, gitignored; absent = falls through to runtime auto-detection (the runtime firstmate itself is executing inside), then tmux; tmux is the verified reference backend (docs/tmux-backend.md), while herdr, zellij, orca, and cmux are experimental spawn backends (docs/herdr-backend.md, docs/zellij-backend.md, docs/orca-backend.md, docs/cmux-backend.md) - herdr and cmux can also be selected by runtime auto-detection, zellij and orca never are (always explicit), and codex-app is not accepted; see docs/codex-app-backend.md; not inherited into secondmate homes
 config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitignored; read fresh on every cmux CLI call and passed through without ever overriding an operator's own ambient CMUX_SOCKET_PASSWORD when absent (docs/cmux-backend.md "Setup")
@@ -135,8 +139,9 @@ It composes today's `fm-lock.sh`, `fm-bootstrap.sh`, and `fm-wake-drain.sh` - ca
    A file that does not exist prints an explicit `ABSENT` marker, never confused with an empty-but-present file: absence is meaningful (`captain.md` absent means use this template's defaults, `projects.md` absent means rebuild it from the clones under `projects/`, etc.).
 6. **Fleet-state digest** - the full `data/backlog.md`; every `state/<id>.meta`; a bounded tail of each task's `state/<id>.status` (labeled as wake-EVENT history, not current state, with the full log path printed for a deeper read); the `state/.afk` flag; and one cheap alive/dead read of each task's recorded backend endpoint.
    That liveness line is a fast presence check only, not a full state read - when you need a crew's actual current state (a run-step, not just "is the pane there"), read it with `bin/fm-crew-state.sh <id>` as before; the digest deliberately skips that deeper, slower read for every task so it stays fast and bounded.
-7. **Fleet triage** - after the context and fleet-state digest, a locked primary runs `bin/fm-triage-duty.sh session-start` (a full pass) and loads `fleet-triage` before acting on unhandled candidates; a clear fleet prints nothing here, same as a clean bootstrap section, and a read-only session skips the pass.
-8. **Next step** - the closing reminder points back to the emitted supervision block and preserves only the lock, afk, X-mode, and read-once reminders.
+7. **Captain orders** - the durable captain-order digest and any undrained chat captures, printed for every session, locked or not: a read-only session may not act on an order, but it must still see that one is waiting (section 15).
+8. **Fleet triage** - after the captain-order section, a locked primary runs `bin/fm-triage-duty.sh session-start` (a full pass) and loads `fleet-triage` before acting on unhandled candidates; a clear fleet prints nothing here, same as a clean bootstrap section, and a read-only session skips the pass.
+9. **Next step** - the closing reminder points back to the emitted supervision block and preserves only the lock, afk, X-mode, and read-once reminders.
    The script itself never starts supervision; the emitted harness protocol owns the exact wait or wake mechanism.
 
 **Everything in the human digest is printed exactly once at session start, and the composed triage pass may reuse its structured inputs internally without another agent turn.**
@@ -604,6 +609,12 @@ On wake, in order of cheapness:
 When a task reaches a terminal state on any of these wakes (a `done`/merge `check:`, a `failed` signal, a scout report, a local-only merge), and X mode is enabled, load `fmx-respond` (section 13) and post the X-mode mention's **final** completion follow-up if that task is X-mode-linked: `bin/fm-x-followup.sh --check <id>` then `bin/fm-x-followup.sh <id> --final --text-file <path>`, so the link always clears here regardless of how many of the up-to-three follow-ups were already spent on earlier milestones.
 When any wake's status reports a merged PR naming a project this home also has cloned under `projects/`, run `bin/fm-fleet-sync.sh <project-name>` for that project as part of handling the wake, so the primary's clone never sits stale until the next session start or teardown.
 
+**Captain intake comes before everything else in a turn.**
+`bin/fm-wake-drain.sh` and `bin/fm-watch-arm.sh` print a bordered `CAPTAIN ORDER INBOX` banner through `bin/fm-order-duty.sh` when a captain chat message is captured but not yet drained, an order still needs action, or the inbox is corrupt.
+Handle it before the rest of the turn's work, and before arming supervision and going quiet: section 15 owns the contract.
+Like the guard and triage-duty banners, it is read-only, non-blocking, and silent when the inbox is clear.
+The captain-order lane also leads the fleet-triage digest itself, so an unanswered captain request outranks the housekeeping in every other lane wherever that digest is rendered.
+
 **The triage duty is proven, not just prompted.**
 Session start is not the only moment the fleet-triage ledger's answer changes; every event that changes fleet state changes it.
 `bin/fm-triage-duty.sh <trigger>` runs the read-only enumerator itself (`bin/fm-fleet-triage.sh --json`, once per pass) for eleven named triggers and prints a bordered `FLEET TRIAGE DUTY` banner on stderr, the same pull-based way `bin/fm-guard.sh` surfaces a lapsed watcher, ONLY when that pass actually finds actionable state - a clear fleet stays exactly as silent as any other healthy diagnostic in this codebase, and the banner itself carries the pass's machine-readable result (`TRIAGE_DUTY_RESULT:` - trigger, scope, actionable, ownerless, unhealthy, captain_gated, fingerprint) so you can act on it without re-parsing prose.
@@ -815,3 +826,30 @@ On an `x-mention <request_id>` or `x-mode-error ...` `check:` wake, load `fmx-re
 It owns mention classification, acting on the request, reply composition, voice, thread-splitting, image attachments, dry-run preview, and the completion-follow-up procedure in full, including what an `x-mode-error` wake means instead.
 `docs/configuration.md` "X mode (.env)" has the wire-protocol reference.
 The one fact that must survive here because it fires on a generic terminal wake, not the mention wake itself: when an X-mode-linked task reaches a terminal state, post its final completion follow-up per section 8's wake-handling step before tearing down.
+
+## 15. Captain order inbox
+
+The captain sends requests in bursts and must never have to wait between them, repeat one, or wonder whether one was heard.
+So every captain request is recorded durably before you do substantive work on it, and acknowledged only once that write has actually succeeded.
+Chat history, a transcript, a narrative reply, and your working memory are not an order store (section 1, hard rule 5).
+
+**Draining new captain requests into the inbox is the first action of every turn.**
+Before repository inspection, extended reasoning, scouting, planning, dispatch, supervision, closeout, or a long-form response:
+
+1. Identify every new captain request in the turn - `bin/fm-order.sh pending` lists the ones the runtime captured for you.
+2. Record each one independently and verbatim, preserving arrival order: `bin/fm-order.sh add "<request>"...`, or `bin/fm-order.sh add --from-pending <capture-id>` for a capture.
+   A captured chat message that is not a request (an approval, a reply, small talk) is dismissed with a recorded reason: `bin/fm-order.sh dismiss <capture-id> --reason "<why>"`.
+   There is no silent drop.
+3. Acknowledge briefly with `bin/fm-order.sh ack <id>...`, which prints the receipt block from the durable record.
+   Never acknowledge an order the write did not confirm: an intake failure exits non-zero and names exactly which requests were recorded and which were not.
+   Say so plainly, retry, and do not return to supervision while a captain request is still only in chat.
+4. Only then triage, and relay `bin/fm-order.sh digest` as the consolidated update once the burst is dispositioned.
+
+New requests take precedence for INTAKE, not automatically for execution.
+Recording an order is not launching a crew: intake is unbounded, and execution stays bounded by capacity, overlap, dependencies, ownership, and cost, exactly as it is today.
+An order stays visible until it has real lineage or a meaningful disposition - a linked task, scout, or bug; an owner; a hold with a review condition; a duplicate or supersession link; a rejection with a reason; a captain decision; or a completed outcome with evidence.
+Being seen, printed, or discussed is none of those.
+Fleet triage surfaces the orders still waiting as its `captain_orders` lane; disposition them through `bin/fm-order.sh`, which is the only sanctioned writer of the inbox.
+
+`bin/fm-order.sh --help` owns the verbs and flags.
+`docs/captain-orders.md` owns the schema, the storage contract and why the inbox lives outside every checkout, idempotency, the chat-capture hook and its install, the triage lane, and the concurrency rules.

@@ -124,6 +124,13 @@ This does not relax protection for any other untracked file.
 An existing linked-worktree home that predates this rule advances through its marker-only state during its next bootstrap or spawn local sync, after which Git ignores the marker normally.
 A standalone-clone home cannot receive a primary-local commit through that no-fetch sync, so it receives the rule through `/updatefirstmate`'s origin refresh instead.
 
+## Captain order inbox (config/orders-path)
+
+The durable record of every captain request lives OUTSIDE any git checkout, at `${XDG_STATE_HOME:-$HOME/.local/state}/firstmate/<home-tag>/captain-orders.jsonl` by default, because `data/` is gitignored state whose lifetime follows its checkout.
+The local, gitignored `config/orders-path` file points this home at a different path when one is wanted; `FM_ORDERS_PATH` overrides both.
+Only the pointer is configurable - the orders themselves never live in this repo.
+`docs/captain-orders.md` owns the schema, storage, idempotency, chat-capture hook, triage lane, and concurrency contract; `AGENTS.md` section 15 owns the operating rules.
+
 ## FM_HOME
 
 `FM_HOME` selects the operational home for one firstmate instance.
@@ -318,6 +325,10 @@ FM_ZELLIJ_SESSION=firstmate  # zellij-only: named session for normal backend ops
 FM_BACKEND_CMUX_COMPOSER_LINES=20  # cmux-only: tail lines scanned to locate the composer row for submit verification
 FM_BACKEND_CMUX_IDLE_RE='^Type a message\.\.\.$'  # cmux-only: empty-composer placeholder regex after border/prompt stripping
 CMUX_SOCKET_PASSWORD=   # cmux-only: socket password fallback when config/cmux-socket-password is absent (docs/cmux-backend.md)
+FM_ORDERS_PATH=         # explicit captain order inbox path; overrides config/orders-path (docs/captain-orders.md)
+FM_ORDER_LOCK_TIMEOUT=10   # seconds a captain-order write waits for the inbox writer lock before refusing loudly
+FM_ORDER_STALE_SECS=86400  # age at which an unfinished captain order surfaces as stale
+FM_ORDER_DUTY=on        # set off to suppress the captain-order intake banner (escape hatch)
 FM_SESSION_START_STATUS_TAIL=5   # state/*.status lines printed per task in the session-start digest
 FM_BOOTSTRAP_DETECT_ONLY=0   # internal/read-only session-start mode: skip bootstrap's mutating sweeps and print advisory TANGLE wording
 FM_GUARD_READ_ONLY=0    # internal/read-only guard mode: keep alarms but suppress drain, supervision repair, and checkout repair commands

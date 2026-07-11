@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Atomically drain durable watcher wake records, then assert watcher liveness and
-# the fleet-triage duty the drained wakes just created.
+# Atomically drain durable watcher wake records, then assert the captain-order intake
+# duty, watcher liveness, and the fleet-triage duty the drained wakes just created.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,6 +39,14 @@ assert_triage_duty() {  # <drained-records-file>
   "$SCRIPT_DIR/fm-triage-duty.sh" "$trigger" || true
 }
 
+# A captain request that has not reached the durable inbox is the one thing that must be
+# handled BEFORE anything else in a turn, so it is asserted on every drain - including an
+# empty one, because an undrained request has nothing to do with whether a crewmate woke
+# us. Read-only, non-blocking, silent when the inbox is clear (bin/fm-order-duty.sh).
+assert_order_duty() {
+  "$SCRIPT_DIR/fm-order-duty.sh" --trigger turn-start || true
+}
+
 # shellcheck disable=SC2317,SC2329 # Invoked by trap handlers below.
 cleanup() {
   local status=$?
@@ -60,6 +68,7 @@ DRAIN_LOCK_HELD=true
 
 if [ ! -s "$FM_WAKE_QUEUE" ]; then
   : > "$FM_WAKE_QUEUE"
+  assert_order_duty
   assert_watcher_liveness
   exit 0
 fi
@@ -70,6 +79,7 @@ mv "$FM_WAKE_QUEUE" "$DRAIN_TMP" || exit 1
 : > "$FM_WAKE_QUEUE" || exit 1
 
 fm_wake_print_deduped "$DRAIN_TMP" || exit "$?"
+assert_order_duty
 assert_triage_duty "$DRAIN_TMP"
 rm -f "$DRAIN_TMP"
 DRAIN_TMP=

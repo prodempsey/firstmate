@@ -55,6 +55,9 @@ The JSON schema is `fm-fleet-triage/v2` and the script help owns its exact flags
 
 Treat the lanes as follows.
 
+- `captain_orders` contains the captain orders the durable order inbox says still need firstmate: untriaged, ownerless, missing lineage, stale, a hold whose review date arrived, a cleared blocker, a vanished linked successor, or a decision the captain owes.
+  It leads the digest, because an unanswered captain request outranks the housekeeping in every other lane.
+  This lane references the inbox and never writes it: disposition an order through `bin/fm-order.sh`, the only sanctioned writer, and record the triage outcome in the triage ledger as usual (AGENTS.md section 15, docs/captain-orders.md).
 - `needs_firstmate` contains unhandled terminal signals supplied by the existing Needs FirstMate reconciler.
 - `bugs` contains open bug records from the configured sanctioned bug interface.
 - `scout_reports` contains report artifacts without a matching backlog record and therefore needing disposition.

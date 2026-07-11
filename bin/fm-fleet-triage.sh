@@ -26,6 +26,7 @@
 # Environment:
 #   FLEET_TRIAGE_MODE=enumerate_only   kill switch; classify and report, apply nothing
 #   FM_FLEET_TRIAGE_BUG_CLI            bug CLI path, or `off` to disable bug discovery
+#   FM_ORDERS_PATH                     captain order inbox path (bin/fm-order-lib.sh)
 #   FM_FLEET_TRIAGE_DIGEST_MAX_ITEMS   digest item cap (default 8)
 #   FM_FLEET_TRIAGE_STALE_SECS         age at which an unprocessed item is stale (86400)
 #   FM_FLEET_TRIAGE_CLAIM_TTL_SECS     age at which a claim is abandoned (3600)
@@ -64,6 +65,13 @@ Health values re-surface an item the fleet thought it had finished with:
   claim_abandoned    a claim went stale without an outcome
   owner_missing      a claimed item has no owner
   stale_unprocessed  surfaced long ago and still not dispositioned
+
+The captain_orders lane REFERENCES the captain order inbox through its own sanctioned
+reader (bin/fm-order.sh list --json). It never writes an order and never decides an order
+status; it surfaces the orders the inbox says still need firstmate - received but
+untriaged, ownerless, missing lineage, stale, a hold whose review date arrived, a blocker
+that cleared, a linked task that vanished, and a decision the captain owes. An inbox that
+exists but cannot be read is reported UNAVAILABLE with the reason, never as zero orders.
 
 The bugs lane uses FM_FLEET_TRIAGE_BUG_CLI when set, then the sanctioned `bug` command
 on PATH, through `<cli> list --json`. Set FM_FLEET_TRIAGE_BUG_CLI=off to disable it.
@@ -107,6 +115,7 @@ cleanup() {
 trap cleanup EXIT
 
 SNAPSHOT_FILE="$TMP_ROOT/snapshot.json"
+ORDERS_FILE="$TMP_ROOT/orders.json"
 NF_FILE="$TMP_ROOT/nf.json"
 BUG_FILE="$TMP_ROOT/bugs.json"
 ARCHIVE_IDS_FILE="$TMP_ROOT/archive-ids.json"
@@ -123,6 +132,59 @@ FM_ROOT_OVERRIDE="$FM_ROOT" \
   FM_STATE_OVERRIDE="$STATE" \
   FM_DATA_OVERRIDE="$DATA" \
   "$SCRIPT_DIR/fm-fleet-snapshot.sh" --json > "$SNAPSHOT_FILE"
+
+# The captain order inbox is its own authoritative store with its own sanctioned writer
+# (bin/fm-order.sh). This lane REFERENCES it - it never becomes a second order ledger, and
+# it never decides an order's status. It asks the inbox which orders still need firstmate
+# and surfaces those, so a captain request cannot go quiet just because it was recorded.
+#
+# An inbox that cannot be read is reported unavailable with the reason, never folded to
+# "no orders": a silently empty inbox and a genuinely empty one look identical, and only
+# one of them means no captain is waiting.
+ORDERS_AVAILABLE=false
+ORDERS_NOTE='no captain order inbox yet (bin/fm-order.sh init)'
+ORDERS_METRICS='{}'
+printf '[]\n' > "$ORDERS_FILE"
+ORDERS_RC=0
+if [ ! -x "$SCRIPT_DIR/fm-order.sh" ]; then
+  ORDERS_NOTE='bin/fm-order.sh is unavailable'
+elif ORDERS_RAW=$(FM_ROOT_OVERRIDE="$FM_ROOT" FM_HOME="$FM_HOME" \
+  "$SCRIPT_DIR/fm-order.sh" list --json 2>/dev/null); then
+  ORDERS_AVAILABLE=true
+  ORDERS_NOTE='captain orders still awaiting triage, lineage, an owner, or a review'
+  ORDERS_METRICS=$(printf '%s' "$ORDERS_RAW" | jq -c '.metrics // {}')
+  # Every LIVE order is projected here, not only the ones the inbox already calls
+  # actionable, because one attention rule can only be applied downstream: a linked task
+  # that has disappeared is invisible to the inbox and obvious to the enumerator, which
+  # knows every id the fleet still has.
+  printf '%s' "$ORDERS_RAW" | jq '
+    [ .orders[]
+      | select((.status // "received") as $s
+               | $s != "completed" and $s != "superseded" and $s != "rejected")
+      | {lane: "captain_orders",
+         id: .order_id,
+         title: ((.short_title // .original_request) | gsub("[[:space:]]+"; " ") | .[0:120]),
+         status: (.status // "received"),
+         owner: (.owner // null),
+         links: (((.linked_task_ids // []) + (.linked_scout_ids // [])
+                  + (.linked_bug_ids // []) + (.related_order_ids // [])) | sort),
+         review_after: (.review_after // null),
+         attention: (.attention // "ok"),
+         attention_reasons: (.attention_reasons // []),
+         inbox_actionable: (.actionable // false),
+         captain_decision_required: (.captain_decision_required // false),
+         source: "captain-order-inbox",
+         source_type: "captain_order"} ]
+  ' > "$ORDERS_FILE"
+else
+  ORDERS_RC=$?
+  # rc 3 is a missing inbox, which for a home that has never taken an order is normal.
+  # Anything else means the inbox exists and could not be read: that is a defect, and the
+  # lane says so loudly rather than pretending the captain has asked for nothing.
+  if [ "$ORDERS_RC" -ne 3 ]; then
+    ORDERS_NOTE="CAPTAIN ORDER INBOX UNREADABLE (bin/fm-order.sh list --json exited $ORDERS_RC) - treat as lost captain requests, not as an empty inbox"
+  fi
+fi
 
 NF_AVAILABLE=false
 NF_NOTE='bin/fm-nf-reconcile.sh is unavailable'
@@ -244,7 +306,20 @@ jq -s '
     if .lane == "backlog_hygiene" and .status == "blocker_done" then "AUTO_COORDINATION"
     elif .action == "restore_active_visibility" then "AUTO_COORDINATION"
     elif .action == "review_visibility_umbrella" then "CAPTAIN_GATE"
+    elif .action == "prepare_captain_decision" then "CAPTAIN_GATE"
     else "FIRSTMATE_JUDGMENT" end;
+
+  # The verb an order needs next, most urgent first. Recording an order is never launching
+  # a crew, so none of these verbs dispatch anything; they say what the order is waiting on.
+  def order_action:
+    if .captain_decision_required then "prepare_captain_decision"
+    elif (.attention_reasons | index("successor_missing")) then "relink_vanished_successor"
+    elif (.attention_reasons | index("untriaged")) then "triage_captain_order"
+    elif (.attention_reasons | index("missing_lineage")) then "record_order_lineage"
+    elif (.attention_reasons | index("blocker_cleared")) then "dispatch_unblocked_order"
+    elif (.attention_reasons | index("hold_expired")) then "review_order_hold"
+    elif (.attention_reasons | index("ownerless")) then "assign_order_owner"
+    else "review_stale_order" end;
 
   # A backlog row joins the visibility lane only by carrying an explicit triage marker in
   # its metadata parens - the same (key: value) convention the backlog already uses for
@@ -267,10 +342,30 @@ jq -s '
   | .[3] as $archive_ids
   | .[4] as $report_digests
   | .[5] as $ledger_health
+  | .[6] as $live_orders
   | ($snapshot.backlog.records // []) as $records
   | ($records | map(select(.structured == true))) as $structured
   | ($snapshot.scout_reports // []) as $reports
-  | ($nf + $bugs
+  # Every id the fleet can still point at. The captain-order lane needs this BEFORE the
+  # items are assembled, because an order whose linked task has vanished is only visible
+  # from here: the inbox knows what an order was linked to, not whether that still exists.
+  | (($structured | map(.id)) + ($reports | map(.id)) + ($bugs | map(.id))
+     + (($snapshot.tasks // []) | map(.id)) + $archive_ids | unique) as $fleet_ids
+  | [ $live_orders[]
+      | . as $o
+      # A vanished successor leads the reasons it is found with: an order pointing at work
+      # that no longer exists is not merely ownerless or stale, it is unlinked from the
+      # fleet entirely, and that is what to fix first.
+      | ((if (($o.links // []) | length) > 0
+             and ([ ($o.links // [])[] | select(($fleet_ids | index(.)) == null) ] | length) > 0
+          then ["successor_missing"] else [] end)
+         + (.attention_reasons // [])) as $reasons
+      | select(($reasons | length) > 0 or ($o.captain_decision_required // false))
+      | $o + {attention_reasons: $reasons,
+              attention: ($reasons[0] // "captain_decision"),
+              action: ($o + {attention_reasons: $reasons} | order_action)}
+      | del(.inbox_actionable) ] as $order_items
+  | ($nf + $bugs + $order_items
      + [ $reports[]
          | . as $report
          | select(($structured | any(.id == $report.id)) | not)
@@ -340,14 +435,12 @@ jq -s '
              reason_codes: [.status],
              proposed_action: {verb: .action, source: .source}})
   # Known ids let the self-audit tell a linked successor that exists from one that does not.
+  # Captain order ids join them, so a triage outcome may legitimately link to the order it
+  # came from.
   | {items: .,
-     known_ids: (($structured | map(.id))
-                 + ($reports | map(.id))
-                 + ($bugs | map(.id))
-                 + (($snapshot.tasks // []) | map(.id))
-                 + $archive_ids | unique)}
+     known_ids: ($fleet_ids + ($live_orders | map(.id)) | unique)}
 ' "$SNAPSHOT_FILE" "$NF_FILE" "$BUG_FILE" "$ARCHIVE_IDS_FILE" \
-  "$REPORT_DIGEST_FILE" "$HEALTH_FILE" > "$RAW_ITEMS"
+  "$REPORT_DIGEST_FILE" "$HEALTH_FILE" "$ORDERS_FILE" > "$RAW_ITEMS"
 
 # --- Evidence versions: structured fields only, never prose. -------------------------
 # fm_triage_evidence_version names the participating fields per lane. A title or report
@@ -378,6 +471,9 @@ RESULT=$(jq -n \
   --arg nf_note "$NF_NOTE" \
   --argjson bug_available "$BUG_AVAILABLE" \
   --arg bug_note "$BUG_NOTE" \
+  --argjson orders_available "$ORDERS_AVAILABLE" \
+  --arg orders_note "$ORDERS_NOTE" \
+  --argjson orders_metrics "$ORDERS_METRICS" \
   --slurpfile raw "$RAW_ITEMS" \
   --slurpfile fold "$FOLD_FILE" \
   --slurpfile health "$HEALTH_FILE" \
@@ -461,6 +557,10 @@ RESULT=$(jq -n \
                format: "append-only JSONL, firstmate/fleet-triage-item/v1",
                writer: "bin/fm-fleet-triage-record.sh"},
       metrics: {
+        # The metrics the captain-order inbox computes for itself, carried verbatim from
+        # that authoritative source rather than recomputed here: this lane references the
+        # inbox, it does not become a second one.
+        captain_orders: $orders_metrics,
         # Rows the fold had to skip. Reported as a count with line references, and as
         # exactly ONE stable item in the ledger_health lane however many rows are bad, so
         # a corrupt ledger can never grow a chain of triage-about-triage items.
@@ -475,8 +575,8 @@ RESULT=$(jq -n \
         ownerless: ($act | map(select(.owner == null)) | length),
         captain_gated: ($act | map(select(.action_class == "CAPTAIN_GATE")) | length),
         auto_coordination: ($act | map(select(.action_class == "AUTO_COORDINATION")) | length),
-        by_lane: (["needs_firstmate","bugs","scout_reports","backlog_hygiene",
-                   "visibility_history","ledger_health"]
+        by_lane: (["captain_orders","needs_firstmate","bugs","scout_reports",
+                   "backlog_hygiene","visibility_history","ledger_health"]
                   | map(. as $l
                         | {key: $l,
                            value: (($act | map(select(.lane == $l))) as $in
@@ -487,6 +587,8 @@ RESULT=$(jq -n \
                  | map({key: .[0], value: length}) | from_entries)
       },
       lanes: {
+        captain_orders: {available: $orders_available, note: $orders_note,
+                         items: [$all[] | select(.lane == "captain_orders")]},
         needs_firstmate: {available: $nf_available, note: $nf_note,
                           items: [$all[] | select(.lane == "needs_firstmate")]},
         bugs: {available: $bug_available, note: $bug_note,

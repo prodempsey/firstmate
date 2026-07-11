@@ -135,6 +135,12 @@ case "${1:-}" in
   *) echo "usage: $(basename "$0") [--restart]" >&2; exit 2 ;;
 esac
 
+# Arming the watcher is firstmate going quiet, and going quiet on an undrained captain
+# request is exactly the failure the order inbox exists to prevent. The banner is
+# read-only, non-blocking, and silent when the inbox is clear; it never stops the arm,
+# because a supervision gap would be a worse outcome than an unread banner.
+"$SCRIPT_DIR/fm-order-duty.sh" --trigger supervision-arm || true
+
 if [ "$mode" = restart ]; then
   # Home-scoped stop: only the watcher pid recorded in THIS home's lock.
   lock_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
