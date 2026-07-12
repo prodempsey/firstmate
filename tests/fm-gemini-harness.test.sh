@@ -48,7 +48,17 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse
+  # fm-spawn leases the worktree via `treehouse get --lease`, whose stdout is the
+  # leased path. Echo the pool worktree the case advertises via FM_FAKE_PANE_PATH.
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = get ]; then
+  printf '%s\n' "${FM_FAKE_PANE_PATH:-}"
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
   printf '%s\n' "$fakebin"
 }
 
@@ -57,12 +67,13 @@ test_gemini_spawn_uses_yolo_launch_template() {
   case_dir="$TMP_ROOT/spawn"
   home="$case_dir/home"
   proj="$case_dir/project"
-  wt="$case_dir/wt"
+  wt="$case_dir/.treehouse/pool/1/wt"
   launchlog="$case_dir/launch.log"
   id=gemini-spawn-z1
   fakebin=$(make_spawn_fakebin "$case_dir/fake")
   mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config"
   printf 'brief\n' > "$home/data/$id/brief.md"
+  mkdir -p "$case_dir/.treehouse/pool/1"
   fm_git_worktree "$proj" "$wt" "fm/$id"
   touch "$home/state/.last-watcher-beat"
   : > "$launchlog"
