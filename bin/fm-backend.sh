@@ -623,13 +623,32 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
     tmux)
       [ -n "$target" ] || return 1
       case "$target" in
+        %[0-9]*)
+          # A tmux PANE ID (%<n>), the form fm-send and the away-mode daemon use
+          # for firstmate's own supervisor pane (from $TMUX_PANE). display-message
+          # cannot silently resolve a pane id to a DIFFERENT pane the way it does
+          # for a missing window name, but require the reported id to equal the
+          # requested one anyway, so this stays exact rather than trusting exit 0.
+          pane=$(tmux display-message -p -t "$target" '#{pane_id}' 2>/dev/null) || return 1
+          [ "$pane" = "$target" ]
+          ;;
         *:*)
           session=${target%%:*}
           window=${target#*:}
           [ -n "$session" ] && [ -n "$window" ] && [ "$window" != "$target" ] || return 1
           [ -z "$expected_label" ] || [ "$window" = "$expected_label" ] || return 1
-          tmux list-windows -a -F '#{session_name}:#{window_name}' 2>/dev/null \
-            | grep -Fx -- "$target" >/dev/null
+          # The structural window inventory, NOT display-message: a MISSING window
+          # in an existing session resolves to that session's ACTIVE pane and exits
+          # 0, reporting a ghost as alive (docs/tmux-backend.md "Endpoint liveness
+          # evidence"). Match BOTH addressing forms tmux accepts after the colon -
+          # a window NAME (fm-<id>, how tasks are addressed) and a window INDEX
+          # (firstmate:0, the away-mode daemon's default supervisor target) - so
+          # confirming a target always means it literally appears in tmux's own
+          # inventory, never that tmux fell back to the active window.
+          {
+            tmux list-windows -a -F '#{session_name}:#{window_name}' 2>/dev/null
+            tmux list-windows -a -F '#{session_name}:#{window_index}' 2>/dev/null
+          } | grep -Fx -- "$target" >/dev/null
           ;;
         *)
           label=$target

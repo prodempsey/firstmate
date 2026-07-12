@@ -57,7 +57,10 @@ case "${1:-}" in
       LC_ALL=C awk '{gsub(/\033\[[0-9;]*m/, ""); print}' "$f" 2>/dev/null
     fi
     exit 0 ;;
-  list-windows) exit 0 ;;
+  # fm_backend_target_exists reads the structural window inventory (a missing
+  # window resolved to the session's ACTIVE pane under the old display-message
+  # probe and reported a ghost as alive), so list the window under test.
+  list-windows) printf '%s\n' 'sess:win'; exit 0 ;;
 esac
 exit 1
 SH

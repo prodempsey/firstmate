@@ -131,7 +131,11 @@ case "${1:-}" in
     [ "$_print" = 1 ] && printf 'fakepane\n'
     exit 0 ;;
   list-windows)
+    # The window inventory the ghost-safe target check reads. The daemon's
+    # supervisor target defaults to the session:index form (firstmate:0), and a
+    # pane that FM_FAKE_TMUX_PANE_ALIVE declares alive must appear here.
     [ -n "${FM_FAKE_TMUX_WINDOW:-}" ] && printf '%s\n' "$FM_FAKE_TMUX_WINDOW"
+    [ "${FM_FAKE_TMUX_PANE_ALIVE:-1}" = "1" ] && printf 'firstmate:0\n'
     exit 0 ;;
   capture-pane)
     # Honor a single-line band capture (-S N -E M, both non-negative) the way the
@@ -208,7 +212,9 @@ case "${1:-}" in
     [ "$print" = 1 ] && printf 'fakepane\n'
     exit 0 ;;
   capture-pane) cat "$COMPOSER" 2>/dev/null; exit 0 ;;
-  list-windows) exit 0 ;;
+  # The window inventory the ghost-safe target check reads: the daemon's default
+  # supervisor target (session:index form) and the window the fm-send cases address.
+  list-windows) printf 'firstmate:0\nsess:win\n'; exit 0 ;;
   send-keys)
     shift
     text=""; is_enter=0; lit=0
