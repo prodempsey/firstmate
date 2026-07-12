@@ -12,7 +12,11 @@ visibility_cli() {
     printf '%s\n' "$FM_VISIBILITY_CLI"
     return
   fi
-  for candidate in "$FM_HOME/projects/fleet-bridge/bin/visibility.mjs" "$FM_ROOT/projects/fleet-bridge/bin/visibility.mjs"; do
+  for candidate in \
+    /home/prode/fleet/.fb-redesign/bin/visibility.mjs \
+    /home/prode/fleet/fleet-bridge/bin/visibility.mjs \
+    "$FM_HOME/projects/fleet-bridge/bin/visibility.mjs" \
+    "$FM_ROOT/projects/fleet-bridge/bin/visibility.mjs"; do
     [ -f "$candidate" ] && { printf '%s\n' "$candidate"; return; }
   done
   return 1
