@@ -969,8 +969,13 @@ test_teardown_conformance_old_vs_new() {
   local old_bin fb proj wt id
   local state_old state_new config_old config_new data log_old log_new out_old out_new rc_old rc_new
   old_bin=$(build_old_bin teardown-old)
-  proj="$TMP_ROOT/teardown-project"; wt="$TMP_ROOT/teardown-wt"
+  proj="$TMP_ROOT/teardown-project"; wt="$TMP_ROOT/.treehouse/teardown-pool/1/wt"
   id="teardownconform1"
+  # A real pool path: teardown only returns (and only detaches/branch-deletes) a
+  # worktree that is a registered worktree of the project AND a treehouse pool
+  # slot, so a fixture outside the pool would take the skip-and-warn path and
+  # never emit the `treehouse return` this conformance log compares.
+  mkdir -p "$TMP_ROOT/.treehouse/teardown-pool/1"
   fm_git_worktree "$proj" "$wt" "fm/$id"
   fb=$(make_teardown_fakebin "$TMP_ROOT/teardown-fake")
 
