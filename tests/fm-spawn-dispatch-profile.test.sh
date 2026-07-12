@@ -268,6 +268,68 @@ test_codex_omits_invalid_max_effort() {
   pass "codex omits unsupported max effort instead of passing a bad config value"
 }
 
+# A ship/scout codex crewmate must launch with CODEX_HOME pointed at a per-task
+# isolated home (mirroring fm-console.sh's own console isolation), not the
+# captain's global ~/.codex/config.toml, whose host-specific MCP/plugin config is
+# a known cause of "Codex MCP client for node_repl fails to start".
+test_codex_isolates_codex_home() {
+  local rec id out status launch user_home task_tmp config auth_target
+  id=profile-codex-home-z17
+  rec=$(make_spawn_case profile-codex-home codex "$id")
+  read_case_record "$rec"
+  user_home="$CASE_DIR/user-home"
+  mkdir -p "$user_home/.codex"
+  printf '%s\n' '{"tokens":"test-only"}' > "$user_home/.codex/auth.json"
+  task_tmp="/tmp/fm-$id"
+  rm -rf "$task_tmp"
+
+  : > "$LAUNCH_LOG"
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
+    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$WT_DIR" TMUX="fake,1,0" \
+    FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" GROK_HOME="$HOME_DIR/grok-home" PATH="$FAKEBIN_DIR:$PATH" \
+    HOME="$user_home" \
+    "$SPAWN" "$id" "$PROJ_DIR" 2>&1)
+  status=$?
+  expect_code 0 "$status" "codex spawn with an isolated home should succeed"
+  launch=$(cat "$LAUNCH_LOG")
+
+  assert_contains "$launch" "CODEX_HOME='$task_tmp/codex-home' codex --dangerously-bypass-approvals-and-sandbox" \
+    "codex launch did not set an isolated CODEX_HOME before the codex command"
+  config=$(cat "$task_tmp/codex-home/config.toml")
+  assert_contains "$config" "[projects.\"$WT_DIR\"]" \
+    "isolated Codex config lost the FirstMate trust entry for the task worktree"
+  assert_contains "$config" 'trust_level = "trusted"' \
+    "isolated Codex config did not pre-trust the task worktree"
+  auth_target=$(readlink "$task_tmp/codex-home/auth.json")
+  [ "$auth_target" = "$user_home/.codex/auth.json" ] \
+    || fail "isolated Codex home did not symlink the real credential store"
+
+  rm -rf "$task_tmp"
+  pass "codex crewmate launch isolates CODEX_HOME from the captain's global config"
+}
+
+# The isolation above is scoped to ship/scout crewmates; a codex secondmate keeps
+# managing its own firstmate home (including its own codex config) and must not
+# pick up a per-task CODEX_HOME override.
+test_codex_secondmate_launch_omits_codex_home() {
+  local rec id sm out status launch
+  id=profile-codex-home-sm-z18
+  rec=$(make_spawn_case profile-codex-home-sm codex "$id")
+  read_case_record "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
+  status=$?
+  expect_code 0 "$status" "secondmate codex spawn should succeed"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_not_contains "$launch" "CODEX_HOME=" \
+    "secondmate codex launch must not inherit the per-task CODEX_HOME override"
+  pass "codex secondmate launch keeps CODEX_HOME unset (secondmates manage their own home)"
+}
+
 test_grok_threads_model_and_reasoning_effort() {
   local rec id out status launch
   id=profile-grok-z5
@@ -384,6 +446,8 @@ test_active_dispatch_profile_allows_raw_launch_command
 test_claude_threads_model_and_effort
 test_codex_threads_model_and_effort
 test_codex_omits_invalid_max_effort
+test_codex_isolates_codex_home
+test_codex_secondmate_launch_omits_codex_home
 test_grok_threads_model_and_reasoning_effort
 test_grok_omits_invalid_max_reasoning_effort
 test_opencode_threads_model_and_ignores_effort_axis

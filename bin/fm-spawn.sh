@@ -73,6 +73,8 @@
 #                  written by this script; outside the worktree to avoid pi's trust gate)
 #     __PITURNEND__ absolute path to .pi/extensions/fm-primary-turnend-guard.ts in a pi secondmate home
 #     __PIWATCH__   absolute path to .pi/extensions/fm-primary-pi-watch.ts in a pi secondmate home
+#     __CODEXHOME__ absolute path to a per-task isolated CODEX_HOME (ship/scout codex
+#                  crewmates only; shields them from a captain's global ~/.codex/config.toml)
 # Per-harness turn-end hooks are installed automatically; some live outside the worktree.
 # grok uses a firstmate-owned global hook under ${GROK_HOME:-$HOME/.grok}/hooks
 # plus a gitignored .fm-grok-turnend worktree pointer and a state token.
@@ -321,7 +323,9 @@ launch_template() {
       if [ "$kind" = secondmate ]; then
         printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(cat __BRIEF__)"'
       else
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(cat __BRIEF__)"'
+        # CODEX_HOME=__CODEXHOME__ isolates this crewmate from the captain's global
+        # ~/.codex/config.toml (see the codex-home setup below, near __TURNEND__'s hook install).
+        printf '%s' 'CODEX_HOME=__CODEXHOME__ codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(cat __BRIEF__)"'
       fi
       ;;
     opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(cat __BRIEF__)"' ;;
@@ -982,6 +986,24 @@ EOF
       ;;
     codex*)
       # codex: turn-end rides the launch command via -c notify=[...] and __TURNEND__.
+      # firstmate-isolated Codex home: shield this crewmate from the captain's
+      # global ~/.codex/config.toml, which may carry host-specific MCP/plugin
+      # configuration unsuitable for this runtime (a known failure mode: "Codex
+      # MCP client for node_repl fails to start"). Mirrors bin/fm-console.sh's
+      # console isolation, scoped per task. The curated config carries no MCP
+      # servers, plugins, or marketplaces, and pre-trusts this worktree so the
+      # directory-trust dialog never blocks an unattended crewmate. Lives under
+      # TASK_TMP so fm-teardown's temp-root removal cleans it up automatically.
+      CODEX_HOME_FM="$TASK_TMP/codex-home"
+      mkdir -p "$CODEX_HOME_FM"
+      # Preserve login through the real credential store without copying secrets.
+      if [ ! -e "$CODEX_HOME_FM/auth.json" ] && [ -f "$HOME/.codex/auth.json" ]; then
+        ln -s "$HOME/.codex/auth.json" "$CODEX_HOME_FM/auth.json"
+      fi
+      cat > "$CODEX_HOME_FM/config.toml" <<TOML
+[projects."$WT"]
+trust_level = "trusted"
+TOML
       ;;
     grok*)
       # grok fires a Stop hook at every turn boundary (verified, grok 0.2.73), the
@@ -1099,6 +1121,7 @@ sq_turnend=$(shell_quote "$TURNEND")
 sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
 sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts")
 sq_piwatch=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts")
+sq_codexhome=$(shell_quote "${CODEX_HOME_FM:-}")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT")
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
@@ -1108,6 +1131,7 @@ LAUNCH=${LAUNCH//__TURNEND__/$sq_turnend}
 LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}
 LAUNCH=${LAUNCH//__PITURNEND__/$sq_piturnend}
 LAUNCH=${LAUNCH//__PIWATCH__/$sq_piwatch}
+LAUNCH=${LAUNCH//__CODEXHOME__/$sq_codexhome}
 if [ "$KIND" = secondmate ]; then
   sq_home=$(shell_quote "$PROJ_ABS")
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_HOME=$sq_home $LAUNCH"
