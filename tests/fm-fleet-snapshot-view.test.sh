@@ -46,6 +46,16 @@ case "${1:-}" in
       *) printf 'all quiet\n> \n' ;;
     esac
     ;;
+  # The structural window inventory fm_backend_target_exists reads (display-message
+  # resolved a MISSING window to the session's ACTIVE pane and reported a ghost as
+  # alive). Derive it from the recorded metas so every task this suite writes has a
+  # live endpoint, exactly as it did under the old probe.
+  list-windows)
+    for meta in "${FM_HOME:?}"/state/*.meta; do
+      [ -e "$meta" ] || continue
+      grep -h '^window=' "$meta" 2>/dev/null | sed 's/^window=//'
+    done
+    ;;
 esac
 exit 0
 SH
