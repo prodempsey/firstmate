@@ -31,7 +31,8 @@
 #                       liveness, X-mode artifact writes, fleet sync) run only
 #                       when this session actually holds the lock.
 #   3. ghost-reconcile - mutates stale task state, so it also only runs when
-#                       locked.
+#                       locked. It confirms a dead endpoint twice, with a
+#                       settle delay, before treating a task as a true ghost.
 #   4. wake-drain     - mutates the durable wake queue, so it also only runs
 #                       when locked.
 #   5. supervision    - emits exactly one primary-harness operating block.

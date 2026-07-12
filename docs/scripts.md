@@ -6,12 +6,12 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 
 | Script                   | Purpose                                                                              |
 | ------------------------ | ------------------------------------------------------------------------------------ |
-| `fm-session-start.sh`    | Compose lock, bootstrap, and wake drain into the single ordered session-start digest |
+| `fm-session-start.sh`    | Compose lock, bootstrap, confirm-twice ghost reconciliation, and wake drain into the single ordered session-start digest |
 | `fm-console.sh`          | Launch the cockpit console with provider failover and fresh-request-gated handoff seeding |
 | `fm-provider-failover.sh` | Manage the shared provider and harness circuit-breaker state                        |
 | `fm-install-no-mistakes.sh` | Pinned, checksum-verified no-mistakes install used by bootstrap's consent flow                 |
 | `fm-bootstrap.sh`        | Detect toolchain and fleet problems, run the locked session-start sweeps, and install approved tools |
-| `fm-reconcile-ghosts.sh` | Locked session-start sweep: retire dead recorded task endpoints through `fm-teardown.sh` and surface its refusals |
+| `fm-reconcile-ghosts.sh` | Locked session-start sweep: confirm a recorded endpoint is dead twice before delegating cleanup to `fm-teardown.sh` and surface its refusals |
 | `fm-fleet-triage.sh`     | Print the read-only fleet-triage candidate digest from existing fleet evidence                     |
 | `fm-fleet-triage-lib.sh` | Shared fleet-triage candidate detection, ledger keys, and digest rendering                         |
 | `fm-fleet-triage-record.sh` | Record a triage candidate's outcome and lineage in the durable triage ledger                    |

@@ -10,6 +10,17 @@
 # The one bypass is a known corrupt legacy shape where worktree= points at the
 # active firstmate home itself; that is never a removable worktree, so only the
 # task's volatile state records are cleared.
+#
+# Confirm-twice safeguard (bug-20260710152159-d3f294fa): a live,
+# actively-working crew can transiently read as a dead endpoint - e.g. a tmux
+# window briefly failing to resolve while a grouped session is being rebuilt -
+# and a single missed liveness probe must never be enough evidence to reap a
+# crew mid-flight (engine-room-p0, 2026-07-10; only the separate unlanded-work
+# refusal below saved it that time). A meta is only treated as a true ghost
+# once fm_backend_target_exists reports it dead on TWO independent reads, with
+# a short settle delay (FM_GHOST_SETTLE_SECS, default 2s) between them. This
+# is a second, independent layer stacked on top of - never a replacement for -
+# fm-teardown.sh's own unlanded-work refusal.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,6 +29,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+GHOST_SETTLE_SECS="${FM_GHOST_SETTLE_SECS:-2}"
 
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
@@ -67,6 +79,15 @@ for meta in "$STATE"/*.meta; do
   fi
 
   if fm_backend_target_exists "$backend" "$target" "fm-$id"; then
+    continue
+  fi
+
+  # First read says dead. Do not act on a single miss: re-check after a short
+  # settle delay and require BOTH reads to agree before this counts as a true
+  # ghost (see the confirm-twice safeguard note above).
+  sleep "$GHOST_SETTLE_SECS"
+  if fm_backend_target_exists "$backend" "$target" "fm-$id"; then
+    printf 'GHOST_RECONCILE: %s read dead once but resolved alive on recheck after %ss - treating as a transient miss, not reaping.\n' "$id" "$GHOST_SETTLE_SECS"
     continue
   fi
 
