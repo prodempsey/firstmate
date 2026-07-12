@@ -129,6 +129,7 @@ fm_triage_owns_lock "$STATE" || exit 0
 
 TMP_ERR=$(mktemp "${TMPDIR:-/tmp}/fm-triage-duty.err.XXXXXX") || exit 0
 # shellcheck disable=SC2317 # Invoked by the EXIT trap below.
+# shellcheck disable=SC2317,SC2329 # Invoked by the EXIT trap below.
 cleanup() { rm -f "$TMP_ERR"; }
 trap cleanup EXIT
 

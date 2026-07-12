@@ -109,6 +109,7 @@ command -v jq >/dev/null 2>&1 || {
 
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-fleet-triage.XXXXXX")
 # shellcheck disable=SC2317 # Invoked by the EXIT trap below.
+# shellcheck disable=SC2317,SC2329 # Invoked by the EXIT trap below.
 cleanup() {
   rm -rf "$TMP_ROOT"
 }

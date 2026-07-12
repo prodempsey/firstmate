@@ -133,7 +133,7 @@ test_install_accepts_verified_artifact() {
     NO_MISTAKES_LINK_DIR="$ldir"; export NO_MISTAKES_LINK_DIR
     FM_NO_MISTAKES_BASE_URL="$artifacts"; export FM_NO_MISTAKES_BASE_URL
     FM_NO_MISTAKES_SKIP_DAEMON=1; export FM_NO_MISTAKES_SKIP_DAEMON
-    # shellcheck disable=SC2317 # Invoked indirectly by nm_install_main below.
+    # shellcheck disable=SC2317,SC2329 # Invoked indirectly by nm_install_main below.
     pinned_sha256() { echo "$fake_sha"; }
     nm_install_main 2>&1
   )
