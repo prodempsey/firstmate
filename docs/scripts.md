@@ -9,14 +9,25 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-session-start.sh`    | Compose lock, bootstrap, and wake drain into the single ordered session-start digest |
 | `fm-console.sh`          | Launch the cockpit console with provider failover and fresh-request-gated handoff seeding |
 | `fm-provider-failover.sh` | Manage the shared provider and harness circuit-breaker state                        |
+| `fm-install-no-mistakes.sh` | Pinned, checksum-verified no-mistakes install used by bootstrap's consent flow                 |
 | `fm-bootstrap.sh`        | Detect toolchain and fleet problems, run the locked session-start sweeps, and install approved tools |
 | `fm-reconcile-ghosts.sh` | Locked session-start sweep: retire dead recorded task endpoints through `fm-teardown.sh` and surface its refusals |
+| `fm-fleet-triage.sh`     | Print the read-only fleet-triage candidate digest from existing fleet evidence                     |
+| `fm-fleet-triage-lib.sh` | Shared fleet-triage candidate detection, ledger keys, and digest rendering                         |
+| `fm-fleet-triage-record.sh` | Record a triage candidate's outcome and lineage in the durable triage ledger                    |
+| `fm-triage-duty.sh`      | Prompt (and prove consultation of) the triage duty at every fleet-state change                    |
+| `fm-order-lib.sh`        | Shared captain-order inbox parsing, validation, and record helpers                                 |
+| `fm-nf-reconcile.sh`     | Reconcile needs-firstmate terminal signals and keep unhandled firstmate cards noisy                |
+| `fm-nf-ack.sh`           | Acknowledge a needs-firstmate card so it stops resurfacing                                         |
+| `fm-nf-lib.sh`           | Shared needs-firstmate card parsing and lane-state helpers                                        |
 | `fm-fleet-sync.sh`       | Refresh project clones with safe fast-forwards, self-heals, `STUCK:` reports, branch pruning, and bounded recovery from an orphaned `.git/packed-refs.lock` |
 | `fm-fleet-snapshot.sh`   | Print the read-only structured fleet snapshot JSON (schema `fm-fleet-snapshot.v1`)   |
 | `fm-fleet-view.sh`       | Render the fleet snapshot as a human Markdown view                                   |
 | `fm-bearings-snapshot.sh` | Project the fleet snapshot to the compact TOON bearings view; local-only unless `--include-prs` |
 | `fm-update.sh`           | Fast-forward-only self-update of firstmate and secondmate homes from origin          |
 | `fm-backlog-handoff.sh`  | Validate and delegate queued backlog-item moves into a secondmate home               |
+| `fm-brief-lint.sh`       | Lint a generated brief for stale or invented model names                                          |
+| `fm-kd-snapshot.sh`      | Capture a KrakenDesign artifact snapshot for a `--kd-review` task                                 |
 | `fm-brief.sh`            | Scaffold ship, scout, secondmate-charter, and Herdr-lab briefs                       |
 | `fm-herdr-lab.sh`        | Provision and guardedly operate an isolated, never-default Herdr lab session         |
 | `fm-ensure-agents-md.sh` | Ensure a project's real `AGENTS.md`, its `CLAUDE.md` symlink, and the canonical self-governance section |
@@ -26,11 +37,14 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-guard.sh`            | Warn on primary-checkout tangles, pending queued wakes, and stale watcher liveness   |
 | `fm-turnend-guard.sh`    | Shared primary turn-end guard predicate so no turn ends blind (docs/turnend-guard.md) |
 | `fm-turnend-guard-grok.sh` | Grok Stop-hook adapter for the primary turn-end guard                              |
+| `fm-crew-kill-pretool-check.sh` | PreToolUse guard that refuses a crewmate's broad pattern kills (docs/crew-kill-guard.md)   |
 | `fm-arm-pretool-check.sh` | Stable PreToolUse transport for the watcher-arm command policy (docs/arm-pretool-check.md) |
 | `fm-arm-command-policy.mjs` | Semantic owner of the watcher-arm PreToolUse policy (docs/arm-pretool-check.md)   |
 | `fm-supervision-instructions.sh` | Render the session-start primary-harness supervision block or the one-line repair instruction |
 | `fm-home-seed.sh`        | Transactionally provision a secondmate home and maintain `data/secondmates.md`       |
 | `fm-spawn.sh`            | Spawn crewmates, scouts, `id=repo` batches, and secondmates on the resolved harness and runtime backend |
+| `fm-profile.sh`          | Resolve a task class to a capability profile (harness/model/effort) from crew-profiles.json       |
+| `fm-spawn-profile.sh`    | Thin `--class`/`--profile` spawn wrapper that resolves a profile and calls `fm-spawn.sh`          |
 | `fm-dispatch-select.sh`  | Resolve a matched crew-dispatch rule to one concrete profile, owning `quota-balanced` selection |
 | `fm-backend.sh`          | Runtime-backend selection, meta helpers, selector resolution, and operation dispatch |
 | `fm-backend-hometag-lib.sh` | Shared per-installation home-tag derivation for zellij tab and cmux workspace titles |
@@ -51,6 +65,7 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-afk-start.sh`        | Enter away mode and run the sub-supervisor daemon as a tracked foreground process    |
 | `fm-supervise-daemon.sh` | Presence-gated away-mode sub-supervisor: self-handle routine wakes, escalate batched digests, alert on failed delivery |
 | `fm-crew-state.sh`       | Print one deterministic current-state line for a crew                                |
+| `fm-worktree-lib.sh`     | Shared treehouse-pool-slot predicate used by spawn and teardown safety gates                      |
 | `fm-tangle-lib.sh`       | Shared default-branch resolution and primary-checkout tangle classification          |
 | `fm-supervision-lib.sh`  | Shared in-flight-work-without-fresh-watcher-beacon predicate                         |
 | `fm-ff-lib.sh`           | Shared guarded fast-forward helper for origin pulls and local secondmate syncs       |
