@@ -52,7 +52,7 @@ TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 if ! [ -f "$LEDGER" ] || ! awk -F '\t' -v id="$ID" -v fp="$FINGERPRINT" '$1==id && $2==fp {found=1} END {exit !found}' "$LEDGER"; then
   printf '%s\t%s\t%s\treviewed\n' "$ID" "$FINGERPRINT" "$TS" >> "$LEDGER"
 fi
-BASE=${FM_BRIDGE_URL:-http://127.0.0.1:7447}
+BASE=${FM_BRIDGE_URL:-http://127.0.0.1:8787}
 URL="$BASE/api/card/$(basename "$FM_HOME")/$ID/attention"
 BODY=$(jq -nc --arg event "$EVENT" --arg fp "$FINGERPRINT" --arg actor firstmate --arg name "$EXTRA_NAME" --arg value "$EXTRA_VALUE" '{event:$event,status_fingerprint:$fp,actor:$actor} + if $name=="" then {} else {($name):$value} end')
 curl -fsS -H 'content-type: application/json' -d "$BODY" "$URL" >/dev/null || { echo "fm-nf-ack: attention API write failed; task remains open" >&2; exit 1; }
