@@ -88,8 +88,13 @@ setup_home() {  # <dir> -> echoes home
   printf '%s\n' "$home"
 }
 
+# The worktree is created as a treehouse POOL slot: fm-teardown only returns (and
+# only detaches/branch-deletes) a worktree that is a registered worktree of the
+# project AND a pool slot, so a ghost recorded outside the pool is deliberately
+# left alone rather than returned.
 setup_project_with_worktree() {  # <project> <worktree> <branch>
   local project=$1 worktree=$2 branch=$3
+  mkdir -p "$(dirname "$worktree")"
   mkdir -p "$project"
   git -C "$project" init -q
   printf 'base\n' > "$project/file.txt"
@@ -118,7 +123,7 @@ test_landed_dead_meta_is_cleared() {
   fake_root=$(make_fake_root "$dir/fake-root")
   home=$(setup_home "$dir/home")
   repo="$dir/project"
-  wt="$dir/worktree"
+  wt="$dir/.treehouse/pool/worktree"
   windows="$dir/windows"
   tmux_log="$dir/tmux.log"
   treehouse_log="$dir/treehouse.log"
@@ -191,7 +196,7 @@ test_unlanded_dead_meta_is_preserved() {
   fake_root=$(make_fake_root "$dir/fake-root")
   home=$(setup_home "$dir/home")
   repo="$dir/project"
-  wt="$dir/worktree"
+  wt="$dir/.treehouse/pool/worktree"
   windows="$dir/windows"
   tmux_log="$dir/tmux.log"
   treehouse_log="$dir/treehouse.log"

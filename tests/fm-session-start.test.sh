@@ -153,6 +153,15 @@ make_fake_tmux() {
 #!/usr/bin/env bash
 set -u
 case "\${1:-}" in
+  # The structural window inventory is what fm_backend_target_exists reads: a
+  # missing window resolved to the session's ACTIVE pane under the old
+  # display-message probe and reported a ghost as alive (docs/tmux-backend.md
+  # "Endpoint liveness evidence"). Only the live window is listed, so every
+  # other recorded endpoint reads dead - exactly as in a real fleet.
+  list-windows)
+    printf '%s\n' "$live"
+    exit 0
+    ;;
   display-message)
     target=""
     prev=""
@@ -392,9 +401,9 @@ $rec
 EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
-  make_fake_tmux "$fakebin" "fm-sess:live"
+  make_fake_tmux "$fakebin" "fm-sess:fm-task-a"
 
-  printf 'window=fm-sess:live\nkind=ship\n' > "$home/state/task-a.meta"
+  printf 'window=fm-sess:fm-task-a\nkind=ship\n' > "$home/state/task-a.meta"
   printf 'working: step 1\nworking: step 2\nworking: step 3\nworking: step 4\nworking: step 5\nworking: step 6\nworking: step 7\n' \
     > "$home/state/task-a.status"
 
@@ -446,27 +455,41 @@ EOF
 # --- endpoint liveness: tmux and herdr, live and dead ------------------------
 
 test_endpoint_liveness_tmux() {
-  local rec root home fakebin out
+  local rec root home fakebin out dead_proj dead_wt
   rec=$(new_world liveness-tmux)
   IFS='|' read -r root home fakebin <<EOF
 $rec
 EOF
   make_fake_toolchain "$fakebin"
   make_fake_ps_claude "$fakebin"
-  make_fake_tmux "$fakebin" "fm-sess:live-window"
+  make_fake_tmux "$fakebin" "fm-sess:fm-task-live"
 
-  printf 'window=fm-sess:live-window\nkind=ship\n' > "$home/state/task-live.meta"
-  printf 'window=fm-sess:dead-window\nkind=ship\n' > "$home/state/task-dead.meta"
+  printf 'window=fm-sess:fm-task-live\nkind=ship\n' > "$home/state/task-live.meta"
+
+  # A dead endpoint is a GHOST, and ghost reconciliation (step 3) runs before the
+  # fleet digest (step 7), so a cleanable dead task is torn down and never reaches
+  # the digest at all. The digest can only report `endpoint: dead` for a ghost
+  # whose teardown was REFUSED - so this dead task carries uncommitted work, which
+  # fm-teardown.sh refuses to discard, and is preserved for the digest to report.
+  dead_proj="$home/dead-project"
+  dead_wt="$home/.treehouse/pool/dead-wt"
+  mkdir -p "$home/.treehouse/pool"
+  fm_git_worktree "$dead_proj" "$dead_wt" fm/task-dead
+  printf 'unlanded\n' > "$dead_wt/uncommitted.txt"
+  printf 'window=fm-sess:fm-task-dead\nkind=ship\nproject=%s\nworktree=%s\n' \
+    "$dead_proj" "$dead_wt" > "$home/state/task-dead.meta"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-  assert_contains "$out" "endpoint: alive (backend=tmux window=fm-sess:live-window)" "live tmux endpoint not reported alive"
-  assert_contains "$out" "endpoint: dead (backend=tmux window=fm-sess:dead-window)" "dead tmux endpoint not reported dead"
+  assert_contains "$out" "endpoint: alive (backend=tmux window=fm-sess:fm-task-live)" "live tmux endpoint not reported alive"
+  assert_contains "$out" "endpoint: dead (backend=tmux window=fm-sess:fm-task-dead)" "dead tmux endpoint not reported dead"
+  assert_contains "$out" "endpoint is dead but teardown refused or failed; state preserved" \
+    "a dead endpoint holding unlanded work must be preserved, not reconciled away"
 
   pass "tmux endpoint liveness is reported per task: alive for a live window, dead for a gone one"
 }
 
 test_endpoint_liveness_herdr() {
-  local rec root home fakebin out
+  local rec root home fakebin out dead_proj dead_wt
   rec=$(new_world liveness-herdr)
   IFS='|' read -r root home fakebin <<EOF
 $rec
@@ -476,7 +499,16 @@ EOF
   make_fake_herdr "$fakebin" "p-live"
 
   printf 'window=sess:p-live\nkind=ship\nbackend=herdr\n' > "$home/state/task-live.meta"
-  printf 'window=sess:p-dead\nkind=ship\nbackend=herdr\n' > "$home/state/task-dead.meta"
+
+  # Same as the tmux case: only a ghost whose teardown is refused survives step 3
+  # to be reported dead by the digest, so give the dead task unlanded work.
+  dead_proj="$home/dead-project"
+  dead_wt="$home/.treehouse/pool/dead-wt"
+  mkdir -p "$home/.treehouse/pool"
+  fm_git_worktree "$dead_proj" "$dead_wt" fm/task-dead
+  printf 'unlanded\n' > "$dead_wt/uncommitted.txt"
+  printf 'window=sess:p-dead\nkind=ship\nbackend=herdr\nproject=%s\nworktree=%s\n' \
+    "$dead_proj" "$dead_wt" > "$home/state/task-dead.meta"
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
   assert_contains "$out" "endpoint: alive (backend=herdr window=sess:p-live)" "live herdr endpoint not reported alive"

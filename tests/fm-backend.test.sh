@@ -613,7 +613,11 @@ case "${1:-}" in
     for a in "$@"; do case "$a" in *cursor_y*) printf '0\n'; exit 0 ;; esac; done
     printf 'fakepane\n'; exit 0 ;;
   capture-pane) printf '\xe2\x94\x82 \xe2\x94\x82\n'; exit 0 ;;
-  list-windows) exit 0 ;;
+  # fm_backend_target_exists reads the structural window inventory (a missing
+  # window resolved to the session's ACTIVE pane under the old display-message
+  # probe, reporting a ghost as alive - docs/tmux-backend.md "Endpoint liveness
+  # evidence"), so the fake must list the window the send case addresses.
+  list-windows) printf 'sess:win\nother:otherwin\n'; exit 0 ;;
 esac
 exit 0
 SH
@@ -631,9 +635,13 @@ run_send_case() {  # <bin-root> <fakebin> <log> <home> -- <send args...>
 }
 
 strip_send_preflight() {  # <log>
-  local preflight
-  preflight=$'tmux\x1fdisplay-message\x1f-p\x1f-t\x1fsess:win\x1f#{pane_id}'
-  awk -v preflight="$preflight" '$0 != preflight { print }' "$1"
+  local old_preflight new_preflight
+  # The pre-refactor bin probed the target with display-message; the current one
+  # reads the window inventory. Both are preflight, not part of the send sequence
+  # this conformance diff compares, so strip either form.
+  old_preflight=$'tmux\x1fdisplay-message\x1f-p\x1f-t\x1fsess:win\x1f#{pane_id}'
+  new_preflight=$'tmux\x1flist-windows\x1f-a\x1f-F\x1f#{session_name}:#{window_name}'
+  awk -v old="$old_preflight" -v new="$new_preflight" '$0 != old && $0 != new { print }' "$1"
 }
 
 test_send_conformance_old_vs_new() {
@@ -650,8 +658,8 @@ test_send_conformance_old_vs_new() {
   run_send_case "$ROOT" "$fb" "$log_new" "$home" -- "sess:win" --key Escape
   rc_new=$?
   expect_code "$rc_old" "$rc_new" "fm-send --key: old vs new exit code"
-  assert_contains "$(cat "$log_new")" $'\x1f''display-message'$'\x1f''-p'$'\x1f''-t'$'\x1f''sess:win'$'\x1f''#{pane_id}' \
-    "fm-send --key did not verify the explicit tmux target before sending"
+  assert_contains "$(cat "$log_new")" $'\x1f''list-windows'$'\x1f''-a'$'\x1f''-F'$'\x1f''#{session_name}:#{window_name}' \
+    "fm-send --key did not verify the explicit tmux target against the window inventory before sending"
   strip_send_preflight "$log_old" > "$filtered_old"
   strip_send_preflight "$log_new" > "$filtered_new"
   diff -u "$filtered_old" "$filtered_new" > "$TMP_ROOT/send-diff-key.txt" 2>&1 \
