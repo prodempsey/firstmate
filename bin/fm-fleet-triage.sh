@@ -4,6 +4,8 @@
 # Usage:
 #   fm-fleet-triage.sh --digest
 #   fm-fleet-triage.sh --json
+#   fm-fleet-triage.sh --check
+#   fm-fleet-triage.sh install
 #
 # The JSON contract is fm-fleet-triage/v2.
 #
@@ -30,6 +32,8 @@
 #   FM_FLEET_TRIAGE_DIGEST_MAX_ITEMS   digest item cap (default 8)
 #   FM_FLEET_TRIAGE_STALE_SECS         age at which an unprocessed item is stale (86400)
 #   FM_FLEET_TRIAGE_CLAIM_TTL_SECS     age at which a claim is abandoned (3600)
+#   FM_FLEET_TRIAGE_CHECK_INTERVAL      seconds between forced full checks (1800)
+#   FM_FLEET_TRIAGE_RESURFACE_SECS      unchanged actionable set re-surface (86400)
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,13 +45,15 @@ MODE=${1:---digest}
 MAX_ITEMS=${FM_FLEET_TRIAGE_DIGEST_MAX_ITEMS:-8}
 STALE_SECS=${FM_FLEET_TRIAGE_STALE_SECS:-86400}
 CLAIM_TTL=${FM_FLEET_TRIAGE_CLAIM_TTL_SECS:-3600}
+CHECK_INTERVAL=${FM_FLEET_TRIAGE_CHECK_INTERVAL:-1800}
+RESURFACE_SECS=${FM_FLEET_TRIAGE_RESURFACE_SECS:-86400}
 
 # shellcheck disable=SC1091 # Dynamic sibling path is resolved from BASH_SOURCE.
 . "$SCRIPT_DIR/fm-fleet-triage-lib.sh"
 
 usage() {
   cat <<'EOF'
-usage: fm-fleet-triage.sh [--digest|--json]
+usage: fm-fleet-triage.sh [--digest|--json|--check|install]
 
 Print a token-capped digest or the full fm-fleet-triage/v2 JSON object.
 The command is read-only and never records outcomes, merges, tears down, or edits the
@@ -89,11 +95,19 @@ never escalated to the captain just for sharing a lane with product-semantics wo
 The ledger_health lane raises exactly ONE item, and only when the append-only ledger holds
 rows the fold had to skip. A skipped row is survivable but not free: a malformed `surface`
 row loses its item's first_seen_at, so that item can never age into stale_unprocessed.
+
+--check is the watcher-facing path. It fingerprints local evidence with stat/find only and
+skips the full enumerator while that proxy is unchanged and its independent cooldown has
+not elapsed. The 1800-second default bounds a measured 12.8-second full scan to about 0.7%
+worst-case duty while still revisiting external evidence within 30 minutes. Configure it
+with FM_FLEET_TRIAGE_CHECK_INTERVAL; configure unchanged-set re-surfacing separately with
+FM_FLEET_TRIAGE_RESURFACE_SECS.
 EOF
 }
 
 case "$MODE" in
   --digest|--json) [ "$#" -eq 1 ] || { usage >&2; exit 2; } ;;
+  --check|install) [ "$#" -eq 1 ] || { usage >&2; exit 2; } ;;
   -h|--help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
@@ -101,6 +115,119 @@ esac
 case "$MAX_ITEMS" in ''|*[!0-9]*) MAX_ITEMS=8 ;; esac
 case "$STALE_SECS" in ''|*[!0-9]*) STALE_SECS=86400 ;; esac
 case "$CLAIM_TTL" in ''|*[!0-9]*) CLAIM_TTL=3600 ;; esac
+case "$CHECK_INTERVAL" in ''|*[!0-9]*) CHECK_INTERVAL=1800 ;; esac
+case "$RESURFACE_SECS" in ''|*[!0-9]*) RESURFACE_SECS=86400 ;; esac
+
+write_if_changed() {
+  local target=$1 tmp
+  tmp=$(mktemp "${target}.tmp.XXXXXX")
+  cat > "$tmp"
+  if [ -f "$target" ] && cmp -s "$tmp" "$target"; then
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$target"
+  fi
+}
+
+install_check() {
+  local shim="$STATE/fleet-triage.check.sh"
+  mkdir -p "$STATE"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'exec env FM_ROOT_OVERRIDE=%q FM_HOME=%q FM_STATE_OVERRIDE=%q FM_DATA_OVERRIDE=%q %q --check\n' \
+      "$FM_ROOT" "$FM_HOME" "$STATE" "$DATA" "$SCRIPT_DIR/fm-fleet-triage.sh"
+  } | write_if_changed "$shim"
+  chmod +x "$shim"
+}
+
+stat_signature() {
+  local path=$1
+  if stat -c '%n\t%s\t%Y' "$path" >/dev/null 2>&1; then
+    stat -c '%n\t%s\t%Y' "$path"
+  else
+    stat -f '%N\t%z\t%m' "$path"
+  fi
+}
+
+proxy_fingerprint() {
+  {
+    for path in "$DATA/backlog.md" "$DATA/fleet-triage.jsonl" "$DATA/captain-orders.jsonl"; do
+      [ -f "$path" ] && stat_signature "$path"
+    done
+    find "$STATE" -maxdepth 1 -type f \( -name '*.meta' -o -name '*.status' \) -print 2>/dev/null \
+      | LC_ALL=C sort | while IFS= read -r path; do stat_signature "$path"; done
+    find "$DATA" -mindepth 2 -maxdepth 2 -type f -name report.md -print 2>/dev/null \
+      | LC_ALL=C sort | while IFS= read -r path; do stat_signature "$path"; done
+  } | cksum | awk '{print $1 ":" $2}'
+}
+
+check_epoch() {
+  local file=$1 value=0
+  [ -f "$file" ] && read -r value < "$file"
+  case "$value" in ''|*[!0-9]*) value=0 ;; esac
+  printf '%s\n' "$value"
+}
+
+run_check() {
+  local proxy_file="$STATE/.fleet-triage-check-proxy"
+  local full_file="$STATE/.fleet-triage-check-last-full"
+  local summary_file="$STATE/.fleet-triage-check-last-summary"
+  local surface_file="$STATE/.fleet-triage-check-last-surface"
+  local now last_full last_surface proxy previous_proxy result rc summary old_count count new_count error_file error_detail
+  mkdir -p "$STATE"
+  now=$(date +%s)
+  last_full=$(check_epoch "$full_file")
+  proxy=$(proxy_fingerprint)
+  previous_proxy=''
+  [ -f "$proxy_file" ] && read -r previous_proxy < "$proxy_file"
+  if [ "$proxy" = "$previous_proxy" ] && [ $((now - last_full)) -lt "$CHECK_INTERVAL" ]; then
+    return 0
+  fi
+
+  error_file="$STATE/.fleet-triage-check-error.$$"
+  rc=0
+  result=$("$SCRIPT_DIR/fm-fleet-triage.sh" --json 2> "$error_file") || rc=$?
+  printf '%s\n' "$now" > "$full_file"
+  printf '%s\n' "$proxy" > "$proxy_file"
+  if [ "$rc" -ne 0 ]; then
+    error_detail=$(tail -n 1 "$error_file" 2>/dev/null || true)
+    [ -n "$error_detail" ] || error_detail=$(printf '%s' "$result" | tail -n 1)
+    rm -f "$error_file"
+    printf 'FLEET_TRIAGE: check failed: full scan exited %s: %s\n' "$rc" \
+      "$(printf '%s' "$error_detail" | tr '\n' ' ' | cut -c1-160)"
+    return 0
+  fi
+  rm -f "$error_file"
+  if ! printf '%s' "$result" | jq -e '.schema == "fm-fleet-triage/v2" and (.items | type == "array")' >/dev/null 2>&1; then
+    printf 'FLEET_TRIAGE: check failed: full scan returned invalid JSON\n'
+    return 0
+  fi
+
+  summary=$(printf '%s' "$result" | jq -r '.items[] | select(.actionable == true) | [.item_id,.evidence_version] | @tsv' | LC_ALL=C sort)
+  count=$(printf '%s\n' "$summary" | grep -c . || true)
+  old_count=0
+  [ -s "$summary_file" ] && old_count=$(grep -c . "$summary_file" || true)
+  new_count=$count
+  if [ -s "$summary_file" ]; then
+    new_count=$(comm -13 "$summary_file" <(printf '%s\n' "$summary") | grep -c . || true)
+  fi
+  last_surface=$(check_epoch "$surface_file")
+  if ! [ -f "$summary_file" ] || ! cmp -s "$summary_file" <(printf '%s\n' "$summary"); then
+    printf '%s\n' "$summary" > "$summary_file"
+    if [ "$count" -gt 0 ] || [ "$old_count" -gt 0 ]; then
+      printf 'FLEET_TRIAGE: check: %s actionable (+%s new)\n' "$count" "$new_count"
+      printf '%s\n' "$now" > "$surface_file"
+    fi
+  elif [ "$count" -gt 0 ] && [ $((now - last_surface)) -ge "$RESURFACE_SECS" ]; then
+    printf 'FLEET_TRIAGE: check: %s actionable (+0 new; re-surface)\n' "$count"
+    printf '%s\n' "$now" > "$surface_file"
+  fi
+}
+
+case "$MODE" in
+  install) install_check; exit 0 ;;
+  --check) run_check; exit 0 ;;
+esac
 
 command -v jq >/dev/null 2>&1 || {
   printf 'fm-fleet-triage: jq not found\n' >&2

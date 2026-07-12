@@ -822,7 +822,7 @@ It is not consent for destructive, irreversible, or security-sensitive actions; 
 
 **Mechanism and cadence.**
 Bootstrap wires the relay poll automatically and purely additively from `.env` presence; `docs/configuration.md` "X mode (.env)" owns the generated-artifact mechanism, the wire protocol, the poll cadence and its transition handling, and the watcher-backbone non-interference guarantee.
-X mode is a reason to keep the watcher armed even with no fleet work, so an X-only user is still served.
+X mode or an installed `state/fleet-triage.check.sh` is a reason to keep the watcher armed even with no fleet work, so incoming mentions and unattended fleet evidence are still served.
 
 **Answering.**
 On an `x-mention <request_id>` or `x-mode-error ...` `check:` wake, load `fmx-respond` (section 13).

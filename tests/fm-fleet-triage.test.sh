@@ -40,6 +40,16 @@ SH
   chmod +x "$root/bin/fm-fleet-snapshot.sh"
 }
 
+write_counting_snapshot_stub() {
+  local root=$1
+  cat > "$root/bin/fm-fleet-snapshot.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'scan\n' >> "$FM_HOME/full-scan.log"
+printf '%s\n' "$FM_TEST_SNAPSHOT"
+SH
+  chmod +x "$root/bin/fm-fleet-snapshot.sh"
+}
+
 write_nf_stub() {
   local root=$1
   cat > "$root/bin/fm-nf-reconcile.sh" <<'SH'
@@ -785,7 +795,7 @@ test_malformed_surface_row_is_reported_not_silently_lost() {
 # crew that finished it, and left a re-opened item advertising the outcome it had been
 # re-opened FROM - with a phantom owner that hid it from the ownerless metric.
 fold_field() {  # <root> <home> <item-id> <field>
-  # shellcheck disable=SC1090 # Path is the per-test copy of the library under test.
+  # shellcheck disable=SC1090,SC1091 # Path is the per-test copy of the library under test.
   . "$1/bin/fm-fleet-triage-lib.sh"
   fm_triage_fold "$(ledger_of "$2")" | jq -r --arg id "$3" --arg f "$4" '.[$id][$f] // "null"'
 }
@@ -958,6 +968,96 @@ test_enumerator_does_not_mutate_operational_inputs() {
   pass "enumerator leaves operational inputs and ledger untouched"
 }
 
+test_check_skips_unchanged_evidence_inside_cooldown() {
+  local pair root home snap first second
+  pair=$(new_world checkquiet)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_counting_snapshot_stub "$root"
+  snap=$(one_item_snapshot 'Ready work')
+
+  first=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --check)
+  second=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --check)
+  [[ "$first" == 'FLEET_TRIAGE: check: 1 actionable (+1 new)' ]] \
+    || fail "first check should surface its actionable baseline: $first"
+  [ -z "$second" ] || fail "unchanged evidence inside cooldown must stay silent"
+  [ "$(wc -l < "$home/full-scan.log")" -eq 1 ] \
+    || fail "unchanged cheap path invoked the full enumerator"
+  pass "watcher check skips the full enumerator while evidence is unchanged"
+}
+
+test_check_detects_proxy_change() {
+  local pair root home snap out
+  pair=$(new_world checkchange)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_counting_snapshot_stub "$root"
+  snap=$(one_item_snapshot 'Ready work')
+  FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --check >/dev/null
+  printf 'changed evidence\n' > "$home/data/backlog.md"
+  snap=$(one_item_snapshot 'Ready work' blocked)
+  out=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --check)
+  [[ "$out" == 'FLEET_TRIAGE: check: 1 actionable (+1 new)' ]] \
+    || fail "material evidence change did not surface: $out"
+  [ "$(wc -l < "$home/full-scan.log")" -eq 2 ] \
+    || fail "proxy change did not trigger a full scan"
+  pass "watcher check detects changed local evidence"
+}
+
+test_check_cooldown_and_resurface_are_independent() {
+  local pair root home snap out
+  pair=$(new_world checkresurface)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_counting_snapshot_stub "$root"
+  snap=$(one_item_snapshot 'Ready work')
+  FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --check >/dev/null
+  out=$(FM_FLEET_TRIAGE_CHECK_INTERVAL=0 FM_FLEET_TRIAGE_RESURFACE_SECS=999999 \
+    FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --check)
+  [ -z "$out" ] || fail "cooldown scan should stay silent when its actionable set is unchanged"
+  out=$(FM_FLEET_TRIAGE_CHECK_INTERVAL=0 FM_FLEET_TRIAGE_RESURFACE_SECS=0 \
+    FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --check)
+  [[ "$out" == 'FLEET_TRIAGE: check: 1 actionable (+0 new; re-surface)' ]] \
+    || fail "deliberate re-surface threshold did not wake: $out"
+  [ "$(wc -l < "$home/full-scan.log")" -eq 3 ] \
+    || fail "independent cooldown did not force both full scans"
+  pass "full-scan cooldown and actionable re-surface thresholds are independent"
+}
+
+test_check_surfaces_full_scan_failure() {
+  local pair root home out
+  pair=$(new_world checkfailure)
+  root=${pair%%|*}
+  home=${pair#*|}
+  cat > "$root/bin/fm-fleet-snapshot.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'snapshot unavailable\n' >&2
+exit 7
+SH
+  chmod +x "$root/bin/fm-fleet-snapshot.sh"
+  out=$(FM_TEST_SNAPSHOT='' run_triage "$root" "$home" --check)
+  [[ "$out" == FLEET_TRIAGE:\ check\ failed:*snapshot\ unavailable* ]] \
+    || fail "full-scan failure was invisible to the watcher: $out"
+  pass "watcher check converts full-scan failure into a concise wake signal"
+}
+
+test_check_installer_is_idempotent_and_executable() {
+  local pair root home shim before after
+  pair=$(new_world checkinstall)
+  root=${pair%%|*}
+  home=${pair#*|}
+  run_triage "$root" "$home" install
+  shim="$home/state/fleet-triage.check.sh"
+  [ -x "$shim" ] || fail "installer did not create an executable watcher shim"
+  before=$(stat -c '%Y:%s' "$shim")
+  sleep 1
+  run_triage "$root" "$home" install
+  after=$(stat -c '%Y:%s' "$shim")
+  [ "$before" = "$after" ] || fail "idempotent reinstall rewrote the unchanged shim"
+  grep -q -- '--check' "$shim" || fail "installed shim does not invoke watcher check mode"
+  pass "fleet-triage check installer is idempotent and executable"
+}
+
 test_json_covers_all_lanes_and_reuses_nf
 test_mechanical_visibility_items_are_not_captain_gated
 test_history_in_a_title_does_not_captain_gate_a_row
@@ -984,3 +1084,8 @@ test_only_the_lock_owner_may_mutate_processing_state
 test_enumerate_only_mode_blocks_every_domain_action
 test_digest_reports_metrics_and_caps_detail
 test_enumerator_does_not_mutate_operational_inputs
+test_check_skips_unchanged_evidence_inside_cooldown
+test_check_detects_proxy_change
+test_check_cooldown_and_resurface_are_independent
+test_check_surfaces_full_scan_failure
+test_check_installer_is_idempotent_and_executable

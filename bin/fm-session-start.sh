@@ -187,6 +187,14 @@ else
   printf '(silent - all good)\n'
 fi
 
+# The watcher-facing fleet-triage shim is local per home and self-heals only for the
+# session that owns that home's lock. A refused session remains strictly read-only.
+if [ "$READ_ONLY" -eq 0 ] && [ -x "$SCRIPT_DIR/fm-fleet-triage.sh" ]; then
+  if ! "$SCRIPT_DIR/fm-fleet-triage.sh" install; then
+    printf 'FLEET_TRIAGE_INSTALL: failed to install watcher check shim\n'
+  fi
+fi
+
 # --- 3. ghost reconciliation ----------------------------------------------
 subsection "GHOST RECONCILIATION"
 if [ "$READ_ONLY" -eq 1 ]; then
