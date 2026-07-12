@@ -15,6 +15,7 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-fleet-triage.sh`     | Print the read-only fleet-triage candidate digest from existing fleet evidence                     |
 | `fm-fleet-triage-lib.sh` | Shared fleet-triage candidate detection, ledger keys, and digest rendering                         |
 | `fm-fleet-triage-record.sh` | Record a triage candidate's outcome and lineage in the durable triage ledger                    |
+| `fm-fleet-triage-act.sh` | Dry-run-first mechanical auto-action: unblock backlog items whose blocker the enumerator proved done |
 | `fm-triage-duty.sh`      | Prompt (and prove consultation of) the triage duty at every fleet-state change                    |
 | `fm-order-lib.sh`        | Shared captain-order inbox parsing, validation, and record helpers                                 |
 | `fm-nf-reconcile.sh`     | Reconcile needs-firstmate terminal signals and keep unhandled firstmate cards noisy                |

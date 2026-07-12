@@ -99,6 +99,15 @@ Escalate on the decision's content, per the action classes above.
 
 For a `needs_firstmate` item, also complete the existing Needs FirstMate acknowledgement procedure, because the triage ledger does not replace that lane's own handling state.
 
+## Recording a disposition, and the one mechanical auto-action
+
+Recording is mechanics; matching is judgment.
+Once you have made the call - matched a bug to its resolving evidence, judged a report superseded or promoted, decided a backlog follow-up - act through the owning domain interface directly (`bug resolve`, `bug record`, `tasks-axi add`), then record the outcome with `bin/fm-fleet-triage-record.sh` as above.
+No wrapper script invents matching logic between the two steps.
+The single sanctioned exception is `bin/fm-fleet-triage-act.sh unblock`, the one triage correction that is mechanically known rather than judged: it unblocks `backlog_hygiene` items whose blocker the enumerator has proven done, via `tasks-axi unblock`, and records each disposition through the sanctioned writer.
+It prints a dry run by default and executes only with `--apply`; its header owns the exact guards and re-surface behavior.
+It deliberately never dispatches the newly-ready item - the moved evidence returns it to this duty's normal judgment loop.
+
 ## Action loop
 
 For each actionable item, verify its current source and overlap with in-flight or queued work.
