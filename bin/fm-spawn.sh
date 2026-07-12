@@ -953,8 +953,18 @@ if [ "$KIND" != secondmate ]; then
   case "$HARNESS" in
     claude*)
       mkdir -p "$WT/.claude"
+      # Crew-session broad-kill seatbelt (bug-20260712002638-66d9ce63,
+      # docs/crew-kill-guard.md): every recent live-cockpit crash was a
+      # crewmate's own cleanup kill that also matched the live fleet-bridge
+      # server or the real tmux server. Sandbox roots are this crew's own
+      # worktree and per-task tmp dir, so its own scratch fixtures never trip
+      # the guard.
+      sq_kill_check=$(shell_quote "$FM_ROOT/bin/fm-crew-kill-pretool-check.sh")
+      sq_kill_wt=$(shell_quote "$WT")
+      sq_kill_tasktmp=$(shell_quote "$TASK_TMP")
+      kill_guard_command=$(json_escape "$sq_kill_check --claude --sandbox $sq_kill_wt --sandbox $sq_kill_tasktmp")
       cat > "$WT/.claude/settings.local.json" <<EOF
-{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch '$TURNEND'"}]}]}}
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch '$TURNEND'"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"$kill_guard_command"}]}]}}
 EOF
       exclude_path '.claude/settings.local.json'
       ;;
