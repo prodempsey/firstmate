@@ -257,7 +257,19 @@ EV_TSV="$TMP_ROOT/evidence.tsv"
 EV_FILE="$TMP_ROOT/evidence.json"
 
 printf '{"ok":true,"diagnostics":[]}\n' > "$VISIBILITY_AUDIT_FILE"
-VISIBILITY_CLI=${FM_VISIBILITY_CLI:-$FM_HOME/projects/fleet-bridge/bin/visibility.mjs}
+VISIBILITY_CLI=${FM_VISIBILITY_CLI:-}
+if [ -z "$VISIBILITY_CLI" ]; then
+  for candidate in \
+    /home/prode/fleet/.fb-redesign/bin/visibility.mjs \
+    /home/prode/fleet/fleet-bridge/bin/visibility.mjs \
+    "$FM_HOME/projects/fleet-bridge/bin/visibility.mjs" \
+    "$FM_ROOT/projects/fleet-bridge/bin/visibility.mjs"; do
+    if [ -f "$candidate" ]; then
+      VISIBILITY_CLI=$candidate
+      break
+    fi
+  done
+fi
 if [ -f "$VISIBILITY_CLI" ]; then
   audit_rc=0
   node "$VISIBILITY_CLI" audit --json > "$VISIBILITY_AUDIT_FILE" || audit_rc=$?
@@ -548,8 +560,8 @@ jq -s '
             action:(if $marker == "visibility-umbrella" then "review_visibility_umbrella"
                     else "reconcile_visibility_gap" end)} ]
      + [ ($visibility_audit.diagnostics // [])[]
-         | {lane:"visibility_history",id:(.fingerprint // .code // "visibility-audit"),
-            title:(.message // .reason // "Visibility audit finding"),status:(.code // "audit_finding"),
+         | {lane:"visibility_history",id:(.fingerprint // .recordId // .code // .type // "visibility-audit"),
+            title:(.message // .reason // "Visibility audit finding"),status:(.code // .type // "audit_finding"),
             source:"visibility audit --json",source_type:"visibility_audit",action:"reconcile_visibility_gap"} ]
      + [ $ledger_health
          | select(.malformed_rows > 0)

@@ -151,6 +151,7 @@ run_triage() {
   local root=$1 home=$2
   shift 2
   FM_ROOT_OVERRIDE="$root" FM_HOME="$home" \
+    FM_VISIBILITY_CLI="${FM_VISIBILITY_CLI:-$root/bin/visibility-unavailable.mjs}" \
     FM_FLEET_TRIAGE_BUG_CLI="${FM_FLEET_TRIAGE_BUG_CLI:-off}" \
     "$root/bin/fm-fleet-triage.sh" "$@"
 }
