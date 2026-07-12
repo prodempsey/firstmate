@@ -252,8 +252,19 @@ REPORT_DIGEST_TSV="$TMP_ROOT/report-digests.tsv"
 REPORT_DIGEST_FILE="$TMP_ROOT/report-digests.json"
 FOLD_FILE="$TMP_ROOT/fold.json"
 HEALTH_FILE="$TMP_ROOT/ledger-health.json"
+VISIBILITY_AUDIT_FILE="$TMP_ROOT/visibility-audit.json"
 EV_TSV="$TMP_ROOT/evidence.tsv"
 EV_FILE="$TMP_ROOT/evidence.json"
+
+printf '{"ok":true,"diagnostics":[]}\n' > "$VISIBILITY_AUDIT_FILE"
+VISIBILITY_CLI=${FM_VISIBILITY_CLI:-$FM_HOME/projects/fleet-bridge/bin/visibility.mjs}
+if [ -f "$VISIBILITY_CLI" ]; then
+  audit_rc=0
+  node "$VISIBILITY_CLI" audit --json > "$VISIBILITY_AUDIT_FILE" || audit_rc=$?
+  if ! jq -e '.ok|type=="boolean"' "$VISIBILITY_AUDIT_FILE" >/dev/null 2>&1; then
+    jq -nc --arg detail "visibility audit returned invalid JSON (exit $audit_rc)" '{ok:false,diagnostics:[{code:"audit_invalid",message:$detail}]}' > "$VISIBILITY_AUDIT_FILE"
+  fi
+fi
 
 FM_ROOT_OVERRIDE="$FM_ROOT" \
   FM_HOME="$FM_HOME" \
@@ -471,6 +482,7 @@ jq -s '
   | .[4] as $report_digests
   | .[5] as $ledger_health
   | .[6] as $live_orders
+  | .[7] as $visibility_audit
   | ($snapshot.backlog.records // []) as $records
   | ($records | map(select(.structured == true))) as $structured
   | ($snapshot.scout_reports // []) as $reports
@@ -535,6 +547,10 @@ jq -s '
             source:"data/backlog.md",source_type:"backlog",
             action:(if $marker == "visibility-umbrella" then "review_visibility_umbrella"
                     else "reconcile_visibility_gap" end)} ]
+     + [ ($visibility_audit.diagnostics // [])[]
+         | {lane:"visibility_history",id:(.fingerprint // .code // "visibility-audit"),
+            title:(.message // .reason // "Visibility audit finding"),status:(.code // "audit_finding"),
+            source:"visibility audit --json",source_type:"visibility_audit",action:"reconcile_visibility_gap"} ]
      + [ $ledger_health
          | select(.malformed_rows > 0)
          | {lane:"ledger_health",
@@ -568,7 +584,7 @@ jq -s '
   | {items: .,
      known_ids: ($fleet_ids + ($live_orders | map(.id)) | unique)}
 ' "$SNAPSHOT_FILE" "$NF_FILE" "$BUG_FILE" "$ARCHIVE_IDS_FILE" \
-  "$REPORT_DIGEST_FILE" "$HEALTH_FILE" "$ORDERS_FILE" > "$RAW_ITEMS"
+  "$REPORT_DIGEST_FILE" "$HEALTH_FILE" "$ORDERS_FILE" "$VISIBILITY_AUDIT_FILE" > "$RAW_ITEMS"
 
 # --- Evidence versions: structured fields only, never prose. -------------------------
 # fm_triage_evidence_version names the participating fields per lane. A title or report

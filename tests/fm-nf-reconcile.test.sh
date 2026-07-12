@@ -38,7 +38,17 @@ run_reconcile() {
 run_ack() {
   local home=$1
   shift
-  FM_HOME="$home" "$ACK" "$@"
+  mkdir -p "$home/fakebin"
+  cat > "$home/fakebin/curl" <<'SH'
+#!/usr/bin/env bash
+body=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -d ]; then body=$2; shift 2; else shift; fi
+done
+if [ -n "$body" ]; then printf '%s\n' "$body" > "$FM_TEST_ATTENTION_FILE"; else cat "$FM_TEST_ATTENTION_FILE"; fi
+SH
+  chmod +x "$home/fakebin/curl"
+  FM_TEST_ATTENTION_FILE="$home/attention.json" PATH="$home/fakebin:$PATH" FM_HOME="$home" "$ACK" "$@"
 }
 
 test_unhandled_terminal_reemits_until_acked() {
@@ -55,7 +65,7 @@ test_unhandled_terminal_reemits_until_acked() {
   pass "unchanged unacknowledged terminal status re-emits"
 }
 
-test_acked_unchanged_is_silent() {
+test_reviewed_unchanged_remains_open() {
   local home out ledger_lines
   home=$(new_home acked)
   write_task "$home" ack-me-b2 'blocked: waiting for a credential'
@@ -66,8 +76,8 @@ test_acked_unchanged_is_silent() {
   ledger_lines=$(wc -l < "$home/state/.nf-handled" | tr -d ' ')
   [ "$ledger_lines" -eq 1 ] || fail "idempotent ack should write one ledger row"
   out=$(run_reconcile "$home")
-  [ -z "$out" ] || fail "acked unchanged terminal task should be silent, got: $out"
-  pass "acked unchanged card is silent"
+  assert_contains "$out" 'NEEDS FIRSTMATE: 1 unhandled' "reviewed task must remain open"
+  pass "reviewed unchanged card remains open"
 }
 
 test_changed_fingerprint_reemits() {
@@ -132,21 +142,22 @@ test_only_matching_local_terminal_tasks_are_listed() {
   pass "reconciler requires matching task state and excludes secondmates"
 }
 
-test_phase_two_flags_are_non_mutating_stubs() {
-  local home status
+test_attention_flags_call_api() {
+  local home out
   home=$(new_home phase-two)
   write_task "$home" phase-g9 'done: waiting for future ownership support'
-  status=0
-  run_ack "$home" --to-captain phase-g9 >/dev/null 2>&1 || status=$?
-  expect_code 2 "$status" "Phase 2 stub should return a usage-style code"
-  assert_absent "$home/state/.nf-handled" "Phase 2 stub must not acknowledge the signal"
-  pass "Phase 2 ownership flags are explicit non-mutating stubs"
+  out=$(run_ack "$home" --to-captain order-1 phase-g9)
+  assert_contains "$out" 'still open' "to-captain should preserve open wording"
+  [ "$(jq -r '.event + ":" + .open_item_id' "$home/attention.json")" = 'to_captain:order-1' ] || fail "to-captain API payload mismatch"
+  out=$(run_ack "$home" --reworking successor-1 phase-g9)
+  [ "$(jq -r '.event + ":" + .successor_id' "$home/attention.json")" = 'reworking:successor-1' ] || fail "reworking API payload mismatch"
+  pass "attention ownership flags call and verify the API"
 }
 
 test_unhandled_terminal_reemits_until_acked
-test_acked_unchanged_is_silent
+test_reviewed_unchanged_remains_open
 test_changed_fingerprint_reemits
 test_local_state_without_board_data
 test_install_is_idempotent
 test_only_matching_local_terminal_tasks_are_listed
-test_phase_two_flags_are_non_mutating_stubs
+test_attention_flags_call_api

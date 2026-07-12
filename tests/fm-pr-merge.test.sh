@@ -36,6 +36,7 @@ make_case() {
     "project=$case_dir/project" \
     "kind=ship" \
     "mode=no-mistakes"
+  printf '%s\n' '#!/usr/bin/env node' 'process.exit(0);' > "$case_dir/visibility.mjs"
   # No worktree/project on disk; fm-pr-check.sh tolerates a worktree it cannot
   # stat and simply skips the pr_head lookup via `gh` in that case, so give it
   # one that resolves for cases that want pr_head recorded.
@@ -89,6 +90,7 @@ run_pr_merge() {
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
   FM_TEST_GH_AXI_LOG="$case_dir/gh-axi.log" \
+  FM_VISIBILITY_CLI="$case_dir/visibility.mjs" \
   PATH="$case_dir/fakebin:$PATH" \
     "$PR_MERGE" "$@"
 }

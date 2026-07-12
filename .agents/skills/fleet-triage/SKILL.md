@@ -21,6 +21,8 @@ Unknown unknowns here means patterns in existing bugs, reports, task state, back
 
 The enumerator is read-only and its output is advisory.
 The primary remains responsible for checking current source truth before acting because backlog notes and terminal status events can be stale.
+The existing `visibility_history` lane consumes `bin/visibility.mjs audit --json` diagnostics when the Fleet Bridge CLI is available.
+Those findings remain read-only reconciliation evidence; they do not create a new lane or authorize autonomous disposition.
 
 Automatically perform reversible coordination when the evidence and scope are clear.
 This includes authoring or correcting backlog records, grouping related candidates, routing known-shape work, dispatching a bounded scout when the implementation is unclear, recording or resolving bugs through the sanctioned interface, and preparing a concise decision batch.

@@ -109,6 +109,7 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/treehouse" "$fakebin/tmux" "$fakebin/gh-axi" "$fakebin/gh"
+  printf '%s\n' '#!/usr/bin/env node' 'process.exit(0);' > "$case_dir/visibility.mjs"
 
   # Bare origin so the clone has an `origin` remote and origin/HEAD.
   git init -q --bare "$case_dir/origin.git"
@@ -496,6 +497,7 @@ run_teardown() {
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
   FM_CONFIG_OVERRIDE="$case_dir/config" \
+  FM_VISIBILITY_CLI="${FM_VISIBILITY_CLI:-$case_dir/visibility.mjs}" \
   PATH="$case_dir/fakebin:$PATH" \
     "$TEARDOWN" task-x1 "$@"
 }
@@ -1473,6 +1475,23 @@ SH
   pass "herdr teardown removes pane-owned escalation dedupe state"
 }
 
+test_closeout_failure_preserves_volatile_state() {
+  local case_dir rc
+  case_dir=$(make_case closeout-failure)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "landed work"
+  add_fork_with_pushed_branch "$case_dir"
+  printf '%s\n' 'done: ready' > "$case_dir/state/task-x1.status"
+  printf '%s\n' '#!/usr/bin/env node' 'process.exit(1);' > "$case_dir/failing-visibility.mjs"
+  rc=0
+  FM_VISIBILITY_CLI="$case_dir/failing-visibility.mjs" run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "closeout failure must refuse teardown"
+  assert_present "$case_dir/state/task-x1.meta" "closeout failure must preserve meta"
+  assert_present "$case_dir/state/task-x1.status" "closeout failure must preserve status"
+  assert_grep 'durable visibility closeout failed' "$case_dir/stderr" "refusal should name closeout failure"
+  pass "closure-evidence failure preserves volatile task state"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -1484,6 +1503,7 @@ test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_herdr_teardown_clears_escalation_marker
+test_closeout_failure_preserves_volatile_state
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows

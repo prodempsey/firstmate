@@ -65,6 +65,11 @@ fi
 before=$(git -C "$PROJ" rev-parse --short "$DEFAULT")
 git -C "$PROJ" merge --ff-only "$BRANCH" >/dev/null
 after=$(git -C "$PROJ" rev-parse --short "$DEFAULT")
+after_full=$(git -C "$PROJ" rev-parse "$DEFAULT")
+if ! "$SCRIPT_DIR/fm-task-events.sh" "$ID" landed "merged into local $DEFAULT" "$BRANCH" local-only "$after_full" >/dev/null; then
+  printf 'blocked: merge landed at %s but durable closure evidence write failed for %s\n' "$after_full" "$ID" >&2
+  exit 1
+fi
 echo "merged $BRANCH into local $DEFAULT ($before -> $after) in $PROJ"
 
 # A local-only merge is a ship completion with no PR and no CI, so this is the only

@@ -15,7 +15,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-LEDGER="$STATE/.nf-handled"
 MODE=${1:-check}
 
 # shellcheck disable=SC1091 # Dynamic sibling path is resolved from BASH_SOURCE.
@@ -90,13 +89,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-is_handled() {  # <task-id> <fingerprint>
-  local id=$1 fingerprint=$2 key
-  [ -f "$LEDGER" ] || return 1
-  key=$(printf '%s\t%s' "$id" "$fingerprint")
-  grep -Fqx -- "$key" "$LEDGER" 2>/dev/null
-}
-
 collect_unhandled() {
   local meta id fingerprint
   : > "$PENDING"
@@ -104,7 +96,8 @@ collect_unhandled() {
     [ -f "$meta" ] || continue
     id=$(basename "$meta" .meta)
     fingerprint=$(fm_nf_current_fingerprint "$STATE" "$id") || continue
-    is_handled "$id" "$fingerprint" && continue
+    # Review receipts are informational only. Closure evidence, not acknowledgement,
+    # is what removes an unresolved terminal signal from this level-triggered list.
     printf '%s\t%s\n' "$id" "$fingerprint" >> "$PENDING"
   done
   LC_ALL=C sort -o "$PENDING" "$PENDING"

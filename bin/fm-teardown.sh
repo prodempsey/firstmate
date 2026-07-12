@@ -1108,6 +1108,29 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
+# Durable closeout is a precondition for destroying the volatile card/status source.
+# Force changes the disposition, but never silently bypasses the visibility trail.
+CLOSE_BRANCH=${TASK_RUN_BRANCH:-fm/$ID}
+CLOSE_OUTCOME="task teardown completed"
+CLOSE_DISPOSITION=landed
+CLOSE_MODE=${MODE:-local-only}
+[ "$CLOSE_MODE" = local-only ] || CLOSE_MODE=PR
+CLOSE_EVIDENCE=
+if [ "$FORCE" = --force ]; then CLOSE_DISPOSITION=forced; CLOSE_OUTCOME="forced teardown approved"; fi
+if [ "$KIND" = scout ]; then
+  CLOSE_MODE=scout-report
+  CLOSE_DISPOSITION=reported
+  [ "$FORCE" = --force ] && CLOSE_DISPOSITION=forced
+  CLOSE_EVIDENCE="$DATA/$ID/report.md"
+else
+  CLOSE_EVIDENCE=$(git -C "$WT" rev-parse HEAD 2>/dev/null || meta_value "$META" pr_head)
+  [ -n "$CLOSE_EVIDENCE" ] || CLOSE_EVIDENCE=$(git -C "$PROJ" rev-parse HEAD 2>/dev/null || true)
+fi
+if ! "$SCRIPT_DIR/fm-task-events.sh" "$ID" "$CLOSE_DISPOSITION" "$CLOSE_OUTCOME" "$CLOSE_BRANCH" "$CLOSE_MODE" "$CLOSE_EVIDENCE" >/dev/null; then
+  echo "REFUSED: durable visibility closeout failed for $ID; volatile state remains intact." >&2
+  exit 1
+fi
+
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ]; then

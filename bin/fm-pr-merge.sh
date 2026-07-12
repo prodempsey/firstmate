@@ -88,6 +88,13 @@ if ! caller_has_merge_method "$@"; then
 fi
 
 gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" ${merge_args[@]+"${merge_args[@]}"} "$@" || exit "$?"
+BRANCH=$(sed -n 's/^branch=//p' "$META" | tail -1)
+[ -n "$BRANCH" ] || BRANCH="fm/$ID"
+SHA=$(sed -n 's/^pr_head=//p' "$META" | tail -1)
+if ! "$SCRIPT_DIR/fm-task-events.sh" "$ID" landed "merged PR $URL" "$BRANCH" PR "$SHA" >/dev/null; then
+  printf 'blocked: PR merged but durable closure evidence write failed for %s\n' "$ID" >&2
+  exit 1
+fi
 
 # The merge is the moment the ship task's work actually landed, and it can clear a
 # blocker or resolve a bug well before the matching teardown runs. Prompt the triage

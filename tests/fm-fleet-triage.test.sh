@@ -1058,6 +1058,18 @@ test_check_installer_is_idempotent_and_executable() {
   pass "fleet-triage check installer is idempotent and executable"
 }
 
+test_visibility_audit_feeds_existing_lane() {
+  local pair root home out cli
+  pair=$(new_world visibility-audit)
+  root=${pair%%|*}; home=${pair#*|}
+  write_snapshot_stub "$root"
+  cli="$home/visibility.mjs"
+  printf '%s\n' '#!/usr/bin/env node' 'console.log(JSON.stringify({ok:false,diagnostics:[{code:"history_missing",fingerprint:"audit-1",message:"terminal task missing from History"}]})); process.exitCode=2;' > "$cli"
+  out=$(FM_TEST_SNAPSHOT='{"backlog":{"records":[]},"tasks":[],"scout_reports":[]}' FM_VISIBILITY_CLI="$cli" run_triage "$root" "$home" --json)
+  [ "$(printf '%s' "$out" | jq -r '.lanes.visibility_history.items[0].source_id')" = audit-1 ] || fail "visibility audit finding did not enter visibility_history"
+  pass "visibility audit findings feed the existing visibility lane"
+}
+
 test_json_covers_all_lanes_and_reuses_nf
 test_mechanical_visibility_items_are_not_captain_gated
 test_history_in_a_title_does_not_captain_gate_a_row
@@ -1089,3 +1101,4 @@ test_check_detects_proxy_change
 test_check_cooldown_and_resurface_are_independent
 test_check_surfaces_full_scan_failure
 test_check_installer_is_idempotent_and_executable
+test_visibility_audit_feeds_existing_lane
