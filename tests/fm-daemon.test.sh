@@ -514,36 +514,46 @@ test_housekeeping_orca_persistent_stale_resolves_terminal() {
 }
 
 test_escalate_batches_into_one_digest() {
-  local dir state fakebin sent capture n
+  local dir state fakebin sent capture n pointer
   dir=$(make_supercase batch)
   state="$dir/state"
   fakebin="$dir/fakebin"
   sent="$dir/sent.log"; : > "$sent"
   capture="$dir/pane.txt"; : > "$capture"
+  pointer="$state/.subsuper-escalation-latest.md"
   escalate_add "$state" "event A: done: PR 1"
   escalate_add "$state" "event B: done: PR 2"
   afk_enter "$state"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
     FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
     || fail "escalate_flush failed"
-  grep -F "event A" "$sent" >/dev/null || fail "batch digest missing event A"
-  grep -F "event B" "$sent" >/dev/null || fail "batch digest missing event B"
-  grep -F 'event A: done: PR 1 | event B: done: PR 2' "$sent" >/dev/null \
-    || fail "batch digest did not join events with literal ' | '"
+  # The composer only ever sees a short pointer line, never the raw joined
+  # buffer content (the afk-prompt-dump-s3 fix): the events live in the file.
+  grep -F "event A" "$sent" >/dev/null && fail "raw event text leaked into the injected composer text"
+  grep -F "event B" "$sent" >/dev/null && fail "raw event text leaked into the injected composer text"
+  grep -F 'Supervisor escalate (2 task(s): 2 done, 0 other): read' "$sent" >/dev/null \
+    || fail "injected pointer line missing expected task-count header"
+  grep -F "$pointer" "$sent" >/dev/null || fail "injected pointer line did not name the digest file"
+  # The full digest, including both raw events joined with " | ", lives in the
+  # pointer file the injected line names.
+  [ -s "$pointer" ] || fail "pointer file was not written"
+  grep -F 'event A: done: PR 1' "$pointer" >/dev/null || fail "pointer file missing event A"
+  grep -F 'event B: done: PR 2' "$pointer" >/dev/null || fail "pointer file missing event B"
   [ -s "$state/.subsuper-escalations" ] && fail "escalation buffer not cleared after flush"
   [ -e "$state/.subsuper-escalations.since" ] && fail "first-append sidecar not cleared after flush"
   n=$(grep -c '\[ENTER\]' "$sent")
   [ "$n" -eq 1 ] || fail "expected one injected digest, got $n send-keys submits"
-  pass "multiple escalations flush as a single batched digest"
+  pass "multiple escalations flush as a single batched pointer, with the full digest in the pointer file"
 }
 
 test_escalate_batch_age_uses_first_append() {
-  local dir state fakebin sent capture
+  local dir state fakebin sent capture pointer
   dir=$(make_supercase batch-age)
   state="$dir/state"
   fakebin="$dir/fakebin"
   sent="$dir/sent.log"; : > "$sent"
   capture="$dir/pane.txt"; : > "$capture"
+  pointer="$state/.subsuper-escalation-latest.md"
   escalate_add "$state" "event A: done: PR 1"
   escalate_add "$state" "event B: done: PR 2"
   echo $(( $(date +%s) - 100 )) > "$state/.subsuper-escalations.since"
@@ -551,11 +561,94 @@ test_escalate_batch_age_uses_first_append() {
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
     FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=90 FM_HOUSEKEEPING_TICK=0 \
     housekeeping "$state"
-  grep -F 'event A: done: PR 1 | event B: done: PR 2' "$sent" >/dev/null \
-    || fail "backdated batch did not flush as a joined digest (max-delay measured from last append)"
+  grep -F 'event A: done: PR 1' "$pointer" >/dev/null \
+    || fail "backdated batch did not flush event A into the pointer file (max-delay measured from last append)"
+  grep -F 'event B: done: PR 2' "$pointer" >/dev/null \
+    || fail "backdated batch did not flush event B into the pointer file (max-delay measured from last append)"
   [ -s "$state/.subsuper-escalations" ] && fail "escalation buffer not cleared after backdated flush"
   [ -e "$state/.subsuper-escalations.since" ] && fail "first-append sidecar not cleared after flush"
   pass "batch flush measures max-delay from the first append, not the last"
+}
+
+# --- afk-prompt-dump-s3 regression coverage ---------------------------------
+# The 2026-07-09 incident: a multi-scout completion storm filled the
+# escalation buffer, and a later failed submit stranded the entire multi-KB
+# joined digest in the live composer. These three tests pin the fix: a burst
+# never produces a multi-KB inject, a swallowed Enter never strands more than
+# the short capped pointer, and a non-relevant working: sibling never
+# piggybacks into the escalate digest.
+
+test_escalate_burst_does_not_produce_multikb_inject() {
+  local dir state fakebin sent capture pointer i typed_len n_in_pointer
+  dir=$(make_supercase burst)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"; : > "$capture"
+  pointer="$state/.subsuper-escalation-latest.md"
+  # Simulate a multi-scout completion storm: ~30 near-simultaneous scout
+  # done: reports piling into one flush window (afk-prompt-dump-s3 §2.2
+  # reconstructed an ~6.4KB single-line digest from a comparable burst).
+  for i in $(seq 1 30); do
+    escalate_add "$state" "scout-${i}-s2.status: done: ready in branch fm/scout-${i}-s2, report at data/scout-${i}-s2/report.md | other-${i}.status: working: scouting more stuff that is not relevant"
+  done
+  afk_enter "$state"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
+    || fail "escalate_flush failed on a 30-item burst"
+  # The composer only ever receives the short capped pointer line (the typed
+  # text, excluding [ENTER] submit markers) - never a multi-KB dump.
+  typed_len=$(grep -v '^\[ENTER\]$' "$sent" | tr -d '\n' | wc -c | tr -d '[:space:]')
+  [ "$typed_len" -le $((INJECT_MAX_CHARS_DEFAULT + 5)) ] \
+    || fail "injected composer text was $typed_len bytes (expected <= ~$INJECT_MAX_CHARS_DEFAULT, a capped pointer, not a multi-KB dump)"
+  # The full 30-item digest survives in the pointer file, not the composer.
+  [ -s "$pointer" ] || fail "pointer file was not written for the burst"
+  n_in_pointer=$(grep -o 'scout-[0-9]*-s2\.status' "$pointer" | sort -u | wc -l | tr -d '[:space:]')
+  [ "$n_in_pointer" -eq 30 ] || fail "pointer file did not preserve all 30 scout events (got $n_in_pointer)"
+  pass "a 30-item scout-completion burst flushes as a short capped pointer; full digest lives in the pointer file"
+}
+
+test_escalate_swallowed_enter_does_not_strand_multikb_body() {
+  local dir state fakebin sent i pointer composer_len n_in_pointer
+  dir=$(make_bordered_case swallow-burst)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  printf '│ > │\n' > "$dir/composer"
+  touch "$dir/.swallow"
+  pointer="$state/.subsuper-escalation-latest.md"
+  for i in $(seq 1 30); do
+    escalate_add "$state" "scout-${i}-s2.status: done: ready in branch fm/scout-${i}-s2, report at data/scout-${i}-s2/report.md"
+  done
+  afk_enter "$state"
+  if PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_FAKE_SWALLOW="$dir/.swallow" FM_FAKE_PERSIST_SWALLOW=1 FM_INJECT_CONFIRM_SLEEP=0.05 \
+    escalate_flush "$state"; then
+    fail "escalate_flush should report failure on a persistently swallowed Enter"
+  fi
+  composer_len=$(wc -c < "$dir/composer" | tr -d '[:space:]')
+  [ "$composer_len" -le $((INJECT_MAX_CHARS_DEFAULT + 20)) ] \
+    || fail "a swallowed Enter stranded $composer_len bytes in the composer (expected a short capped pointer, not the full body)"
+  # Buffer is preserved for retry, and the full digest is still on disk in the
+  # pointer file, so no captain-relevant detail was lost even though the
+  # composer never held it.
+  [ -s "$state/.subsuper-escalations" ] || fail "buffer lost after a failed flush"
+  [ -s "$pointer" ] || fail "pointer file missing after a failed flush attempt"
+  n_in_pointer=$(grep -o 'scout-[0-9]*-s2\.status' "$pointer" | sort -u | wc -l | tr -d '[:space:]')
+  [ "$n_in_pointer" -eq 30 ] || fail "pointer file did not preserve all 30 scout events after a failed flush"
+  pass "a persistently swallowed Enter never strands more than a short capped pointer in the composer"
+}
+
+test_classify_signal_excludes_working_siblings_from_escalate_digest() {
+  local dir state out
+  dir=$(make_supercase signal-working-sibling)
+  state="$dir/state"
+  printf 'working: scouting more stuff\n' > "$state/sibling-a.status"
+  printf 'done: ready in branch fm/sibling-b\n' > "$state/sibling-b.status"
+  out=$(FM_STATE_OVERRIDE="$state" classify_signal "$state/sibling-a.status $state/sibling-b.status" "$state")
+  case "$out" in escalate\|*) ;; *) fail "multi-file wake with a relevant peer did not escalate: $out" ;; esac
+  case "$out" in *"working: scouting"*) fail "non-relevant working: sibling leaked into the escalate digest: $out" ;; esac
+  case "$out" in *"sibling-b.status: done: ready in branch fm/sibling-b"*) ;; *) fail "escalate digest missing the relevant sibling: $out" ;; esac
+  pass "classify_signal's escalate digest excludes non-relevant working: siblings"
 }
 
 test_heartbeat_scan_dedup() {
@@ -1678,6 +1771,9 @@ test_housekeeping_herdr_resumed_stale_cleared
 test_housekeeping_orca_persistent_stale_resolves_terminal
 test_escalate_batches_into_one_digest
 test_escalate_batch_age_uses_first_append
+test_escalate_burst_does_not_produce_multikb_inject
+test_escalate_swallowed_enter_does_not_strand_multikb_body
+test_classify_signal_excludes_working_siblings_from_escalate_digest
 test_heartbeat_scan_dedup
 test_handle_wake_routes_self_and_escalate
 test_inject_skip_forces_self

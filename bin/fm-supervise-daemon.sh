@@ -89,6 +89,17 @@
 #                                   re-surfaces as a recheck (default 3600)
 #          FM_ESCALATE_BATCH_SECS   buffer window for batched escalation
 #                                   digests; 0 = flush immediately (default 90)
+#          FM_INJECT_MAX_CHARS      hard cap, in characters, on any single
+#                                   injected message (default 400; 0 disables).
+#                                   escalate_flush never types the full buffer:
+#                                   it writes the complete digest to
+#                                   state/.subsuper-escalation-latest.md and
+#                                   injects only a short "N task(s) (D done, O
+#                                   other): read <path> and act" pointer line.
+#                                   This cap is a second, unconditional
+#                                   backstop in inject_msg itself, so no caller
+#                                   can ever type a multi-KB body into the
+#                                   composer.
 #          FM_HEARTBEAT_SCAN_SECS   cadence for the catch-all status scan
 #                                   (default 300)
 #          FM_HOUSEKEEPING_TICK     seconds between housekeeping passes while
@@ -196,6 +207,12 @@ WEDGE_ALARM_NOTIFIER_PID=
 INJECT_FAIL_SLEEP_DEFAULT=30
 INJECT_CONFIRM_RETRIES_DEFAULT=3
 INJECT_CONFIRM_SLEEP_DEFAULT=0.5
+# Hard cap on any single injected message, enforced unconditionally in
+# inject_msg regardless of caller. escalate_flush's pointer-line messages stay
+# far under this in normal operation; the cap exists so a failed submit
+# (verdict=pending) can never strand more than this many characters in the
+# supervisor composer.
+INJECT_MAX_CHARS_DEFAULT=400
 CRASH_THRESHOLD_DEFAULT=10
 CRASH_WINDOW_DEFAULT=60
 CRASH_BACKOFF_DEFAULT=60
@@ -374,14 +391,20 @@ discover_supervisor_backend() {
 # summary firstmate would otherwise have to re-read.
 
 classify_signal() {  # <reason-after-colon> <state>
-  local reason=$1 state=$2 f last distilled="" rel="" all_seen=1 task seen
+  local reason=$1 state=$2 f last distilled="" rel_distilled="" rel="" all_seen=1 task seen
   for f in $reason; do
     [ -e "$f" ] || continue
     last=$(last_status_line "$f")
     [ -n "$last" ] || continue
+    # distilled (ALL files, including non-relevant working: siblings) backs
+    # only the self-handle branches below, which are informational log text
+    # and never reach the composer. rel_distilled (relevant files ONLY) backs
+    # the escalate digest, so a non-relevant working: sibling coalesced into
+    # the same wake never piggybacks into what gets injected/written.
     distilled="${distilled}$(basename "$f"): ${last} | "
     status_is_captain_relevant "$last" || continue
     rel=1
+    rel_distilled="${rel_distilled}$(basename "$f"): ${last} | "
     # Dedupe against the catch-all scan: if this status was already escalated
     # (seen marker matches), skip escalating again. The seen marker is the
     # single source of truth shared between the per-wake signal path and the
@@ -390,8 +413,9 @@ classify_signal() {  # <reason-after-colon> <state>
     seen="$state/.subsuper-seen-status-$(_stale_key "$task")"
     [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ] || all_seen=0
   done
-  # strip a trailing " | " separator so the distilled line is clean
+  # strip a trailing " | " separator so the distilled lines are clean
   distilled="${distilled% | }"
+  rel_distilled="${rel_distilled% | }"
   if [ -z "$rel" ]; then
     printf 'self|routine signal: %s' "$distilled"
   elif [ "$all_seen" = "1" ]; then
@@ -399,7 +423,7 @@ classify_signal() {  # <reason-after-colon> <state>
     # self-handle to avoid a duplicate entry in the digest.
     printf 'self|signal already escalated (catch-all scan): %s' "$distilled"
   else
-    printf 'escalate|%s' "$distilled"
+    printf 'escalate|%s' "$rel_distilled"
   fi
 }
 
@@ -650,19 +674,68 @@ escalate_add() {  # <state> <distilled-item>
   printf '%s\n' "$item" >> "$buf"
 }
 
-# Flush the escalation buffer as ONE batched, single-line digest to the
-# supervisor pane. Returns 0 on successful inject (or empty buffer), non-zero on
-# inject failure (buffer preserved for retry / catch-up).
+# Count buffered escalations as TASKS, not raw buffer lines. A multi-file
+# signal wake (classify_signal) distills several tasks into ONE buffer line
+# shaped "<task>.status: <verb>: <note> | <task>.status: <verb>: <note> | ...",
+# so a plain `wc -l` undercounts a burst of near-simultaneous finishes (the
+# root cause of the 2026-07-09 afk-prompt-dump-s3 incident's misleading "N
+# event(s)" header). Every OTHER buffered item (a stale/wedge recheck, a
+# check: result, an unknown-wake fail-safe) carries no ".status: " marker and
+# is exactly one task, so it is counted once via the line-without-marker path.
+_escalate_task_count() {  # <buf>
+  local buf=$1 status_segments bare_lines
+  status_segments=$(grep -o '\.status: ' "$buf" 2>/dev/null | wc -l | tr -d '[:space:]')
+  # NOTE: `grep -c` exits 1 on zero matches while still printing "0", so an
+  # `|| echo 0` fallback here would double-fire and print "0" twice (corrupting
+  # the arithmetic below with a two-line value). Read grep's own count instead
+  # and only substitute a default when it printed nothing at all.
+  bare_lines=$(grep -cv '\.status: ' "$buf" 2>/dev/null)
+  [ -n "$status_segments" ] || status_segments=0
+  [ -n "$bare_lines" ] || bare_lines=0
+  echo $(( status_segments + bare_lines ))
+}
+
+# Best-effort "<D> done, <O> other" split for the pointer-line header. A rough
+# line-level count (a multi-task line with two done: segments still counts
+# once here), informational only - the pointer file is the ground truth.
+_escalate_done_other_counts() {  # <buf> <task-total> -> "<done> <other>"
+  local buf=$1 total=$2 done_n other_n
+  # Same zero-match/exit-1 double-fallback pitfall as _escalate_task_count.
+  done_n=$(grep -c -- 'done:' "$buf" 2>/dev/null)
+  [ -n "$done_n" ] || done_n=0
+  other_n=$(( total - done_n ))
+  [ "$other_n" -ge 0 ] || other_n=0
+  printf '%s %s' "$done_n" "$other_n"
+}
+
+# Flush the escalation buffer as ONE batched, single-line POINTER to the
+# supervisor pane - never the raw buffer content. The full digest (every
+# buffered item, verbatim) is written to a durable file firstmate reads on its
+# own turn; the injected line only names it. This is the fix for the
+# 2026-07-09 afk-prompt-dump-s3 incident: a burst of near-simultaneous
+# captain-relevant finishes used to be joined into one uncapped multi-KB
+# `send-keys -l` line with no length limit, which a swallowed Enter could then
+# strand in the composer verbatim. Returns 0 on successful inject (or empty
+# buffer), non-zero on inject failure (buffer preserved for retry / catch-up;
+# the pointer file is rewritten on every flush attempt, successful or not, so
+# a firstmate turn that reads it mid-retry still sees the current buffer).
 escalate_flush() {  # <state>
-  local state=$1 buf item n msg
+  local state=$1 buf pointer n done_n other_n msg
   buf="$state/.subsuper-escalations"
   [ -s "$buf" ] || return 0
-  n=$(wc -l < "$buf" 2>/dev/null || echo 0)
-  # Join buffered items with the literal " | " separator into one digest line.
-  msg=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf" 2>/dev/null)
-  # Single-line wrapper: no embedded newlines (inject_msg also collapses as a
-  # safety net, but keeping the source single-line makes the intent explicit).
-  msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
+  pointer="$state/.subsuper-escalation-latest.md"
+  n=$(_escalate_task_count "$buf")
+  read -r done_n other_n <<<"$(_escalate_done_other_counts "$buf" "$n")"
+  {
+    printf '# AFK escalate digest\n\n'
+    printf '%s task(s) (%s done, %s other), flushed %s\n\n' \
+      "$n" "$done_n" "$other_n" "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    cat "$buf" 2>/dev/null
+  } > "$pointer" 2>/dev/null
+  # Short pointer line only - never the joined buffer content. inject_msg's own
+  # FM_INJECT_MAX_CHARS cap is a second, unconditional backstop on top of this.
+  msg=$(printf 'Supervisor escalate (%s task(s): %s done, %s other): read %s and act. (pre-read; re-arm not needed — watcher daemon-managed)' \
+    "$n" "$done_n" "$other_n" "$pointer")
   if inject_msg "$msg" "$state"; then : > "$buf"; rm -f "${buf}.since" "$state/.subsuper-inject-wedged"; return 0; fi
   return 1
 }
@@ -1136,6 +1209,18 @@ inject_msg() {  # <message> [state]
   # them. Then prepend the sentinel marker - firstmate's afk-exit contract
   # keys off its presence at the start of the message.
   msg=$(_collapse_newlines "$msg")
+  # (2b) Hard length cap, UNCONDITIONAL regardless of caller. escalate_flush's
+  # pointer-line messages stay far under this in normal operation; this is the
+  # backstop that guarantees no caller can ever type a multi-KB body into the
+  # composer, so an unconfirmed submit (verdict=pending, below) can never
+  # strand more than this many characters - the fix for the afk-prompt-dump-s3
+  # incident, where a swallowed Enter left a full multi-KB digest stuck in the
+  # composer for the returning captain to find.
+  local inject_max_chars="${FM_INJECT_MAX_CHARS:-$INJECT_MAX_CHARS_DEFAULT}"
+  case "$inject_max_chars" in ''|*[!0-9]*) inject_max_chars=$INJECT_MAX_CHARS_DEFAULT ;; esac
+  if [ "$inject_max_chars" -gt 0 ] && [ "${#msg}" -gt "$inject_max_chars" ]; then
+    msg="${msg:0:$((inject_max_chars - 3))}..."
+  fi
   msg="${FM_INJECT_MARK}${msg}"
   target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
   # BACKEND-AWARE (previously a raw `tmux display-message` pane-exists probe):

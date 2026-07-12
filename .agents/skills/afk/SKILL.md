@@ -143,7 +143,19 @@ Classify each wake this way:
 
 Escalations are buffered up to `FM_ESCALATE_BATCH_SECS` (default 90s; 0 =
 immediate) and flushed as one single-line digest prefixed with the sentinel
-marker, carrying pre-read status summaries and a recommended action.
+marker.
+The injected line is a short pointer, not the buffered content itself: the
+full digest (every buffered item, verbatim, with a task-count/done/other
+header) is written to `state/.subsuper-escalation-latest.md`, and the
+injected line only names that file and gives a compact count - e.g.
+`Supervisor escalate (5 task(s): 3 done, 2 other): read
+state/.subsuper-escalation-latest.md and act.`
+A burst of near-simultaneous captain-relevant finishes (a scout-completion
+storm) is common enough to be a design case, not an edge case: joining every
+buffered item into one uncapped inject line used to produce a multi-KB
+single-line "prompt dump" (the 2026-07-09 afk-prompt-dump-s3 incident); the
+pointer file carries that volume instead, and the composer only ever sees the
+short line.
 The single-line format makes the submission unambiguous across harnesses, and
 the marker lets firstmate distinguish it from a real captain message.
 
@@ -152,6 +164,13 @@ the marker lets firstmate distinguish it from a real captain message.
 - **Single-line digest** - embedded newlines are collapsed to a literal
   separator before injection, so submission is unambiguous regardless of
   harness.
+- **Pointer-file flush, hard length cap** - `escalate_flush` never joins the
+  raw buffer into the injected message; it writes the full digest to
+  `state/.subsuper-escalation-latest.md` and injects only a short pointer
+  line. `inject_msg` additionally enforces its own unconditional cap
+  (`FM_INJECT_MAX_CHARS`, default 400 characters) on top of that, regardless
+  of caller, so an unconfirmed submit (`verdict=pending`) can never leave
+  more than a few hundred characters stranded in the composer.
 - **Composer guard on the supervisor pane** - before injecting, the daemon checks `pane_is_busy` (harness busy footer means agent mid-turn) and reads `fm_backend_composer_state` directly.
   Only `empty` permits injection; `pending` protects half-typed or swallowed input, and `unknown` protects unreadable panes and bare dead-shell prompts.
   Every other result preserves the buffer for retry, so the daemon never merges its digest into the captain's half-typed line or types it into a shell.
