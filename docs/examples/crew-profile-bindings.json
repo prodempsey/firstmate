@@ -1,0 +1,21 @@
+{
+  "_comment": "EXAMPLE ONLY. Copy to state/crew-profile-bindings.json and edit. Never commit the real file.",
+  "scout_fast":           { "harness": "codex",  "model": "gpt-5.4" },
+  "scout_balanced":       { "harness": "codex",  "model": "gpt-5.5" },
+  "implementer_balanced": {
+    "harness": "claude",
+    "model": "claude-opus-4-8",
+    "effort": "high",
+    "backups": [
+      { "harness": "grok", "model": "grok-4.5", "effort": "high" },
+      { "harness": "codex", "model": "gpt-5.5", "effort": "high" }
+    ]
+  },
+  "reviewer_deep":        { "harness": "claude", "model": "claude-opus-4-8", "effort": "high" },
+  "reviewer_independent": {
+    "counterpart": {
+      "anthropic": { "harness": "codex",  "model": "gpt-5.5" },
+      "openai":    { "harness": "claude", "model": "claude-opus-4-8", "effort": "high" }
+    }
+  }
+}

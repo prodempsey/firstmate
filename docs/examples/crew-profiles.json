@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "default_profile": "implementer_balanced",
+  "task_classes": {
+    "file_discovery": "scout_fast",
+    "ui_inventory": "scout_fast",
+    "docs": "scout_balanced",
+    "simple_refactor": "scout_balanced",
+    "codebase_sweep": "scout_balanced",
+    "test_authoring": "scout_balanced",
+    "release_scribe": "scout_fast",
+    "review_candidates": "scout_balanced",
+    "normal_code_change": "implementer_balanced",
+    "architecture_review": "reviewer_deep",
+    "final_governance_review": "reviewer_independent",
+    "grok_build": "grok_build"
+  },
+  "constraints": {
+    "final_governance_review": { "provider_independent_of_implementer": true },
+    "file_discovery": { "read_only": true },
+    "ui_inventory": { "read_only": true },
+    "codebase_sweep": { "read_only": true },
+    "review_candidates": { "read_only": true }
+  },
+  "providers": { "claude": "anthropic", "codex": "openai", "opencode": "mixed", "pi": "unknown", "grok": "xai" }
+}
