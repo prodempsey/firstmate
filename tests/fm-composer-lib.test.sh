@@ -125,8 +125,64 @@ test_real_text_is_pending() {
   pass "fm_composer_classify_content: real unsubmitted text reads pending (including a popup argument-hint fill)"
 }
 
+# --- Non-breaking-space padding (task fm-send-submit-fix) -------------------
+#
+# The claude build captured live on 2026-07-13 draws its idle composer as a `❯`
+# glyph between two U+2500 rules, with the rest of the row a single U+00A0
+# NO-BREAK SPACE (real captured bytes: \xe2\x9d\xaf \xc2\xa0). U+00A0 is not
+# ASCII whitespace, so the row used to trim to "❯<U+00A0>", miss the bare
+# agent-glyph case, and classify as `pending` - the false "Enter swallowed" that
+# made fm-send report failure on messages it had delivered. The U+00A0 is written
+# as an escape here on purpose: a raw byte would make this fixture file binary to
+# git and invisible in review.
+
+test_nbsp_padded_agent_glyph_is_empty() {
+  local nbsp row out
+  nbsp=$(printf '\xc2\xa0')
+  # The real captured composer row: prompt glyph + NO-BREAK SPACE, nothing else.
+  row=$(printf '\xe2\x9d\xaf\xc2\xa0')
+  out=$(classify 0 "$row")
+  [ "$out" = empty ] \
+    || fail "claude's idle '❯'+U+00A0 composer must read empty, got '$out'"
+  # Same row reached through the ghost-stripped/plain-content path.
+  out=$(classify 0 '' '' sensitive "$row")
+  [ "$out" = empty ] \
+    || fail "a ghost-stripped '❯'+U+00A0 composer must read empty, got '$out'"
+  # Codex's glyph and a trailing narrow no-break space (U+202F) fold too.
+  out=$(classify 0 "$(printf '\xe2\x80\xba\xe2\x80\xaf')")
+  [ "$out" = empty ] || fail "'›'+U+202F should read empty, got '$out'"
+  # An ordinary-space-padded glyph keeps reading empty (unchanged behavior).
+  out=$(classify 0 '❯   ')
+  [ "$out" = empty ] || fail "'❯' padded with ASCII spaces should read empty, got '$out'"
+  # And an all-NBSP row with no glyph at all is just an empty row.
+  out=$(classify 1 "$nbsp$nbsp")
+  [ "$out" = empty ] || fail "an all-NBSP bordered row should read empty, got '$out'"
+  pass "fm_composer_classify_content: a non-breaking-space-padded agent composer reads empty"
+}
+
+test_nbsp_does_not_loosen_the_safety_verdicts() {
+  local out
+  # A bare shell prompt padded the same way is STILL a dead shell, not a composer.
+  out=$(classify 0 "$(printf '\x24\xc2\xa0')")
+  [ "$out" = unknown ] \
+    || fail "a bare shell prompt padded with U+00A0 must stay unknown, got '$out'"
+  out=$(classify 0 '' '' sensitive "$(printf '\x24\xc2\xa0')")
+  [ "$out" = unknown ] \
+    || fail "a ghost-stripped bare shell prompt with U+00A0 must stay unknown, got '$out'"
+  # Real unsubmitted text separated from the glyph by a U+00A0 is STILL pending.
+  out=$(classify 0 "$(printf '\xe2\x9d\xaf\xc2\xa0fix findings 1 and 3')")
+  [ "$out" = pending ] \
+    || fail "real text after a U+00A0 must stay pending, got '$out'"
+  # Inside a composer box, the harness's own shell-style glyph stays empty.
+  out=$(classify 1 "$(printf '\x3e\xc2\xa0')")
+  [ "$out" = empty ] || fail "a bordered '>'+U+00A0 prompt should read empty, got '$out'"
+  pass "fm_composer_classify_content: NBSP folding keeps unknown/pending verdicts intact"
+}
+
 test_bare_shell_glyphs_are_unknown
 test_stripped_unbordered_content_uses_plain_content
+test_nbsp_padded_agent_glyph_is_empty
+test_nbsp_does_not_loosen_the_safety_verdicts
 test_bare_shell_prompt_with_command_is_not_empty
 test_bordered_shell_glyph_is_empty
 test_agent_glyphs_are_empty_bordered_and_bare

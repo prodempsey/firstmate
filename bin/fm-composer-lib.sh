@@ -49,6 +49,60 @@
 # below. Re-sourcing is a cheap idempotent redefinition, so this file needs no
 # include guard (matching bin/fm-tmux-lib.sh).
 
+# NON-BREAKING SPACE PADDING is the third hazard this owner handles (task
+# fm-send-submit-fix): a harness may pad an EMPTY composer row with a
+# non-breaking space rather than an ASCII one. The claude build verified live on
+# 2026-07-13 draws its idle composer as a `❯` glyph between two U+2500 rules,
+# with the rest of the row a single U+00A0 NO-BREAK SPACE (captured bytes:
+# `M-bM-^]M-/ M-BM- `). U+00A0 is NOT ASCII whitespace: it does not match
+# [[:space:]] in bash's parameter-expansion trims or in most regex contexts, so
+# the row trimmed to "❯<U+00A0>" instead of "❯", missed the bare-agent-glyph
+# case, and classified as `pending` - a real, unsubmitted-looking composer. That
+# false `pending` is what made bin/fm-send.sh report "Enter swallowed" on
+# messages it had actually delivered, and what would make the away-mode daemon
+# fail to confirm its own injected digest. fm_composer_normalize_ws folds the
+# non-breaking spaces to ASCII spaces before any trim or emptiness test, so a
+# padded-but-empty composer reads as empty. The three-verdict contract is
+# untouched: this only decides what counts as WHITESPACE, never what counts as a
+# composer, so a bare shell prompt stays `unknown` and real typed text stays
+# `pending`.
+
+# The non-breaking spaces a TUI may pad a composer row with. Built with printf
+# octal escapes (bash 3.2 safe: no \u escapes, no multibyte character classes).
+FM_COMPOSER_NBSP=$(printf '\302\240')       # U+00A0 NO-BREAK SPACE (claude's composer pad)
+FM_COMPOSER_NNBSP=$(printf '\342\200\257')  # U+202F NARROW NO-BREAK SPACE
+
+# fm_composer_normalize_ws: fold non-breaking spaces to ASCII spaces so the
+# trims and emptiness tests below (and every adapter's structural row matching)
+# see them as the whitespace they visually are.
+fm_composer_normalize_ws() {  # <string> -> normalized string on stdout
+  local s=$1
+  s=${s//"$FM_COMPOSER_NBSP"/ }
+  s=${s//"$FM_COMPOSER_NNBSP"/ }
+  printf '%s' "$s"
+}
+
+# fm_composer_trim_into: normalize non-breaking spaces in <string>, trim leading
+# and trailing whitespace, and assign the result to <varname>. Fork-free (this
+# runs on the watcher/daemon poll path), and the ONE place adapters should trim a
+# candidate composer row, so no adapter can re-introduce the U+00A0 blind spot.
+fm_composer_trim_into() {  # <varname> <string>
+  local s=$2
+  s=${s//"$FM_COMPOSER_NBSP"/ }
+  s=${s//"$FM_COMPOSER_NNBSP"/ }
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf -v "$1" '%s' "$s"
+}
+
+# fm_composer_trim: stdout form of fm_composer_trim_into, for tests and callers
+# that want the value inline.
+fm_composer_trim() {  # <string> -> normalized, trimmed string on stdout
+  local out
+  fm_composer_trim_into out "$1"
+  printf '%s' "$out"
+}
+
 # fm_composer_strip_ansi: drop every CSI escape sequence, leaving plain text.
 # Used for STRUCTURAL row/shape detection, where ghost text must be KEPT so the
 # composer box border or bare prompt glyph is still visible; content extraction
@@ -182,6 +236,11 @@ fm_composer_idle_matches() {
 fm_composer_classify_content() {  # <bordered> <content> [idle_re] [idle_case] [plain_content]
   local bordered=$1 content=$2 idle_re=${3:-} idle_case=${4:-sensitive} plain_content
   plain_content=${5:-$content}
+  # Fold non-breaking-space padding and re-trim before any emptiness test, so a
+  # composer padded with U+00A0 (claude's idle `❯ ` row) is not mistaken for real
+  # unsubmitted text. Idempotent for an already-trimmed ASCII row.
+  fm_composer_trim_into content "$content"
+  fm_composer_trim_into plain_content "$plain_content"
   if [ "$bordered" != 1 ] && [ -z "$content" ] && [ -n "$plain_content" ]; then
     case "$plain_content" in
       '❯'|'›') printf 'empty'; return 0 ;;
@@ -210,8 +269,7 @@ fm_composer_classify_content() {  # <bordered> <content> [idle_re] [idle_case] [
     '❯ '*|'› '*|'> '*|'$ '*|'% '*|'# '*) content=${content#??} ;;
     '❯'*|'›'*|'>'*|'$'*|'%'*|'#'*) content=${content#?} ;;
   esac
-  content="${content#"${content%%[![:space:]]*}"}"
-  content="${content%"${content##*[![:space:]]}"}"
+  fm_composer_trim_into content "$content"
   [ -n "$content" ] || { printf 'empty'; return 0; }
   # Known idle placeholder (matched again after the leading glyph was stripped,
   # e.g. "❯ Type a message...").

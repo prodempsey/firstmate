@@ -87,36 +87,61 @@ fm_tmux_strip_ghost() { fm_composer_strip_ghost; }
 # (bin/fm-composer-lib.sh). The bordered flag is what lets a bordered `│ > │`
 # (claude's own idle composer) read empty while a bare, unbordered `$ ` dead-shell
 # prompt reads unknown.
-fm_tmux_composer_state() {  # <target> -> empty|pending|unknown
+# Set by fm_tmux_composer_probe on every call, so a caller that needs BOTH the
+# verdict and the row's real typed content (the submit core's duplicate-submit
+# guard) pays for one capture, not two.
+FM_TMUX_COMPOSER_STATE=unknown
+FM_TMUX_COMPOSER_CONTENT=""
+
+# fm_tmux_composer_probe: read <target>'s composer row once and set
+# FM_TMUX_COMPOSER_STATE (empty|pending|unknown) and FM_TMUX_COMPOSER_CONTENT
+# (the ghost-stripped, border-stripped, non-breaking-space-normalized real typed
+# content of the row; empty string when the pane could not be read). Always
+# returns 0. fm_tmux_composer_state is the thin printing wrapper.
+#
+# Every trim here routes through the shared fm_composer_trim_into
+# (bin/fm-composer-lib.sh), which folds non-breaking spaces to ASCII spaces: the
+# claude build verified on 2026-07-13 pads its idle `❯` composer with a U+00A0,
+# which bash's [[:space:]] trims do NOT strip, so a plain trim left "❯<U+00A0>"
+# and the row misread as pending (the false "Enter swallowed" this fixed).
+fm_tmux_composer_probe() {  # <target>
   local target=$1 cy raw plain stripped bordered=0
-  cy=$(tmux display-message -p -t "$target" '#{cursor_y}' 2>/dev/null) || { printf 'unknown'; return 0; }
-  case "$cy" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
-  raw=$(tmux capture-pane -e -p -t "$target" -S "$cy" -E "$cy" 2>/dev/null) || { printf 'unknown'; return 0; }
+  FM_TMUX_COMPOSER_STATE=unknown
+  FM_TMUX_COMPOSER_CONTENT=""
+  cy=$(tmux display-message -p -t "$target" '#{cursor_y}' 2>/dev/null) || return 0
+  case "$cy" in ''|*[!0-9]*) return 0 ;; esac
+  raw=$(tmux capture-pane -e -p -t "$target" -S "$cy" -E "$cy" 2>/dev/null) || return 0
   # bordered: from the plain row (borders survive an all-ANSI strip).
   plain=$(printf '%s\n' "$raw" | fm_composer_strip_ansi)
-  plain="${plain#"${plain%%[![:space:]]*}"}"
-  plain="${plain%"${plain##*[![:space:]]}"}"
+  fm_composer_trim_into plain "$plain"
   case "$plain" in
     '│'*'│'|'┃'*'┃'|'|'*'|') bordered=1 ;;
   esac
   # content: from the ghost-stripped row (real typed text only).
   stripped=$(printf '%s\n' "$raw" | fm_composer_strip_ghost)
-  stripped="${stripped#"${stripped%%[![:space:]]*}"}"
-  stripped="${stripped%"${stripped##*[![:space:]]}"}"
+  fm_composer_trim_into stripped "$stripped"
   case "$stripped" in
     '│'*'│') stripped=${stripped#│}; stripped=${stripped%│} ;;
     '┃'*'┃') stripped=${stripped#┃}; stripped=${stripped%┃} ;;
     '|'*'|') stripped=${stripped#|}; stripped=${stripped%|} ;;
   esac
-  stripped="${stripped#"${stripped%%[![:space:]]*}"}"
-  stripped="${stripped%"${stripped##*[![:space:]]}"}"
+  fm_composer_trim_into stripped "$stripped"
+  FM_TMUX_COMPOSER_CONTENT=$stripped
   # A busy footer landing on the cursor line is not pending input (tmux-specific:
   # only tmux captures the raw cursor row, which may BE the footer).
   if [ -n "$stripped" ] \
      && printf '%s' "$stripped" | grep -qiE "${FM_BUSY_REGEX:-$FM_TMUX_BUSY_REGEX_DEFAULT}"; then
-    printf 'empty'; return 0
+    FM_TMUX_COMPOSER_STATE=empty
+    return 0
   fi
-  fm_composer_classify_content "$bordered" "$stripped" "${FM_COMPOSER_IDLE_RE:-}" insensitive "$plain"
+  FM_TMUX_COMPOSER_STATE=$(fm_composer_classify_content \
+    "$bordered" "$stripped" "${FM_COMPOSER_IDLE_RE:-}" insensitive "$plain")
+  return 0
+}
+
+fm_tmux_composer_state() {  # <target> -> empty|pending|unknown
+  fm_tmux_composer_probe "$1"
+  printf '%s' "$FM_TMUX_COMPOSER_STATE"
 }
 
 # fm_pane_input_pending: 0 (pending) if the cursor line holds real unsubmitted
@@ -154,13 +179,34 @@ fm_pane_is_busy() {  # <target>
 #     not be mistaken for a delivered escalation).
 #   - fm-send fails only on "pending" (lenient: a positively-confirmed swallow),
 #     so an unreadable pane never turns a normal steer into a false error.
-fm_tmux_submit_enter_core() {  # <target> <retries> <enter-sleep>
-  local target=$1 retries=$2 sleep_s=$3 i=0 state
+# DUPLICATE-SUBMIT GUARD (task fm-send-submit-fix). A retry only ever presses
+# Enter again, never retypes, so it cannot concatenate text - but a retry pressed
+# against a composer that no longer holds our text is a blind Enter into whatever
+# the harness put there next, and the whole point of this fix is that the
+# composer read CAN be wrong. So when the caller supplies <expected-pending>, the
+# content the composer held right after we typed, a retry fires only while the
+# row still holds EXACTLY that content: our text, still sitting there unsubmitted.
+# The moment the row's content differs (our text left the composer, i.e. the
+# submit landed even if it was not classified as such), the loop stops pressing
+# Enter and reports `unknown` - honest ("we could not confirm"), and by
+# construction incapable of producing a second turn. fm-send treats `unknown` as
+# delivered (lenient: never turn a normal steer into a false error), while the
+# away-mode daemon treats it as undelivered and keeps its buffer (strict).
+# Without <expected-pending> the loop keeps its original retry-while-pending
+# behavior.
+fm_tmux_submit_enter_core() {  # <target> <retries> <enter-sleep> [expected-pending]
+  local target=$1 retries=$2 sleep_s=$3 expected=${4-} guard=0 i=0 state
+  [ "$#" -ge 4 ] && guard=1
   while :; do
     tmux send-keys -t "$target" Enter 2>/dev/null || true
     sleep "$sleep_s"
-    state=$(fm_tmux_composer_state "$target")
+    fm_tmux_composer_probe "$target"
+    state=$FM_TMUX_COMPOSER_STATE
     [ "$state" = pending ] || { printf '%s' "$state"; return 0; }
+    if [ "$guard" = 1 ] && [ "$FM_TMUX_COMPOSER_CONTENT" != "$expected" ]; then
+      # Pending, but no longer OUR text: never press Enter at it again.
+      printf 'unknown'; return 0
+    fi
     i=$((i + 1))
     [ "$i" -lt "$retries" ] || { printf 'pending'; return 0; }
   done
@@ -170,5 +216,15 @@ fm_tmux_submit_core() {  # <target> <text> <retries> <enter-sleep> <settle>
   local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5
   tmux send-keys -t "$target" -l "$text" 2>/dev/null || { printf 'send-failed'; return 0; }
   sleep "$settle"
+  # Snapshot what the composer holds now, BEFORE the first Enter: that is the
+  # only content a retry may ever be pressed against (see the guard above). If
+  # the typed text is not readable back as pending content (an unreadable pane, a
+  # harness that hides the composer), fall back to the unguarded retry loop - it
+  # only ever sends Enter, so it is no worse than before.
+  fm_tmux_composer_probe "$target"
+  if [ "$FM_TMUX_COMPOSER_STATE" = pending ] && [ -n "$FM_TMUX_COMPOSER_CONTENT" ]; then
+    fm_tmux_submit_enter_core "$target" "$retries" "$sleep_s" "$FM_TMUX_COMPOSER_CONTENT"
+    return 0
+  fi
   fm_tmux_submit_enter_core "$target" "$retries" "$sleep_s"
 }

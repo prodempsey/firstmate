@@ -185,6 +185,28 @@ active=alive
 bare-active=alive
 ```
 
+## Incident (2026-07-13): false "Enter swallowed" on claude's `❯` + U+00A0 composer
+
+`bin/fm-send.sh` reported `error: text not submitted ... (Enter swallowed; text left in composer)` and exited non-zero on messages the crew had actually received and answered - at least five times in one day, on long and short messages alike.
+The delivery path was never broken; the SUBMIT VERIFICATION was a false negative, so firstmate took recovery actions for steers that had already landed.
+
+**Root cause.**
+A submit is confirmed by reading the composer back as empty.
+The claude build in use draws its idle composer as the prompt glyph `❯` (U+276F) between two U+2500 rules, and pads the rest of that row with a single U+00A0 NO-BREAK SPACE (captured with `tmux capture-pane` + `cat -A`: `M-bM-^]M-/` then `M-BM- `) - no `│ > … │` box at all.
+U+00A0 is not ASCII whitespace and does not match `[[:space:]]`, so the row trimmed to `❯<U+00A0>` rather than `❯`, never matched the bare-agent-glyph case in the shared classifier, and read as `pending`: real, unsubmitted text.
+
+**Fix.**
+`bin/fm-composer-lib.sh`, the one fleet-wide owner, now folds non-breaking spaces (U+00A0, U+202F) to ASCII spaces before any trim or emptiness test (`fm_composer_trim_into`), and every trim on the tmux composer path routes through it.
+This changes only what counts as WHITESPACE, never what counts as a composer: a bare shell prompt still reads `unknown` (the away-mode injection safety rule), and real typed text still reads `pending`, so `fm-send` stays fail-closed on a genuinely unsubmitted message.
+The away-mode daemon shares the same primitive, so its own submit confirmation - and the spurious wedge alarm a failed confirmation raises - is fixed by the same change.
+
+**Duplicate-submit guard.**
+Because the retry loop presses Enter until the composer clears, an unconfirmable submit used to mean blind Enters at a composer that no longer held our text.
+`fm_tmux_submit_core` now snapshots the composer content right after typing, and `fm_tmux_submit_enter_core` re-presses Enter only while the row still holds exactly that content; the moment it differs, the loop stops and reports `unknown` (fm-send treats that as delivered, the daemon as unconfirmed).
+An Enter retry can therefore never produce a second turn.
+
+Regression coverage: `tests/fm-composer-lib.test.sh` (the U+00A0 verdicts, written as escapes), `tests/fm-send-submit-verify.test.sh` (submit confirmation, fail-closed swallow, the duplicate-submit guard), and `tests/fm-send-claude-composer-e2e.test.sh` (real `bin/fm-send.sh` over a real tmux pane drawing the captured shape: exit 0, delivered exactly once).
+
 ## Limitations
 
 None specific to tmux for the reference path itself - it is the fully verified reference backend, while Orca and cmux are the backends without secondmate support.
