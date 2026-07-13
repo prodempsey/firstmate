@@ -11,6 +11,14 @@
 # (AGENTS.md section 9, docs/captain-attention.md). The task must currently show
 # a terminal signal (done:, blocked:, failed:, needs-decision:); a decision with
 # no such card gets a captain-gated backlog item or a captain order instead.
+#
+# Because it is that sole writer, it also leaves a local receipt at state/.nf-to-captain
+# (open_item_id, task_id, status_fingerprint, ts), appended only AFTER the Bridge write is
+# read back and verified. That receipt is what lets bin/fm-guard.sh's dropped-captain-decision
+# alarm prove, without calling the Bridge on every wake, that a captain-gated order actually
+# reached the board - the rule above can still be skipped, and the receipt is how the skip is
+# detected. It records a card the Bridge CONFIRMED, never an intent to write one: a receipt
+# for a failed write would silence the very alarm that exists to catch the missing card.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -72,4 +80,9 @@ BODY=$(jq -nc --arg event "$EVENT" --arg fp "$FINGERPRINT" --arg actor firstmate
 curl -fsS -H 'content-type: application/json' -d "$BODY" "$URL" >/dev/null || { echo "fm-nf-ack: attention API write failed; task remains open" >&2; exit 1; }
 READBACK=$(curl -fsS "$URL") || { echo "fm-nf-ack: attention API read-back failed; task remains open" >&2; exit 1; }
 printf '%s' "$READBACK" | jq -e --arg event "$EVENT" --arg value "$EXTRA_VALUE" --arg name "$EXTRA_NAME" '.event==$event and ($name=="" or .[$name]==$value)' >/dev/null || { echo "fm-nf-ack: attention API read-back mismatch; task remains open" >&2; exit 1; }
+# Local receipt for a CONFIRMED needs_human card, per the header. Written last, so nothing
+# reaches it that the Bridge did not read back.
+if [ "$EVENT" = to_captain ]; then
+  printf '%s\t%s\t%s\t%s\n' "$EXTRA_VALUE" "$ID" "$FINGERPRINT" "$TS" >> "$STATE/.nf-to-captain"
+fi
 printf 'still open; %s receipt recorded for %s at %s\n' "$EVENT" "$ID" "$TS"

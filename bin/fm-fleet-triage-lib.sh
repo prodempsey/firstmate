@@ -272,6 +272,43 @@ fm_triage_pass_result() {  # <trigger> <scope>
   printf '%s' "$base" | jq -c --arg fp "$fp" 'del(.fingerprint_input) + {fingerprint: $fp}'
 }
 
+# Print the captain-gate detail bin/fm-guard.sh's dropped-captain-decision alarm reads,
+# from one fm-fleet-triage/v2 JSON blob on stdin, as a compact JSON object:
+#
+#   {orders_total, orders: [{item_id, order_id, title, task}],
+#    other_total,  other:  [{item_id, lane, source_id, title}]}
+#
+# WHY THE TWO GROUPS ARE NOT ONE. The captain is kept in the loop by exactly one durable
+# mechanism: a card in the Fleet Bridge's needs_human column, whose sole writer is
+# bin/fm-nf-ack.sh --to-captain <open-item-id> <task-id>. A card is therefore keyed to an
+# OPEN ITEM, and only the captain_orders lane has one. A captain-gated ORDER with no card
+# is a provably dropped decision - the thing the guard alarms on. A captain-gated item in
+# any other lane (a visibility umbrella row) has nothing to key a card to, so no card
+# contract exists to violate yet; it is carried here as context the guard can name, never
+# as a dropped decision. Collapsing the two would make the alarm fire on standing product
+# work forever, and an alarm that always fires is one nobody reads.
+#
+# The lists are capped so the cache this feeds stays small; the totals stay exact, so a
+# capped list can never read as a shorter one.
+fm_triage_captain_gates() {  # [max-items]
+  local max=${1:-10}
+  jq -c --argjson max "$max" '
+    [.items[] | select(.actionable and .action_class == "CAPTAIN_GATE")] as $gated
+    | ($gated | map(select(.lane == "captain_orders"))) as $orders
+    | ($gated | map(select(.lane != "captain_orders"))) as $other
+    | {orders_total: ($orders | length),
+       orders: ($orders[:$max]
+                | map({item_id,
+                       order_id: .source_id,
+                       title: ((.title // "") | gsub("[[:space:]]+"; " ")),
+                       task: (((.task_links // []) | first) // null)})),
+       other_total: ($other | length),
+       other: ($other[:$max]
+               | map({item_id, lane, source_id,
+                      title: ((.title // "") | gsub("[[:space:]]+"; " "))}))}
+  '
+}
+
 # True when this session owns the per-home firstmate session lock.
 # The lock file holds the harness PID (see bin/fm-lock.sh). This session owns it only
 # when that PID is in our own process ancestry, which is what distinguishes the locked

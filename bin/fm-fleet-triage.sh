@@ -319,6 +319,13 @@ elif ORDERS_RAW=$(FM_ROOT_OVERRIDE="$FM_ROOT" FM_HOME="$FM_HOME" \
          owner: (.owner // null),
          links: (((.linked_task_ids // []) + (.linked_scout_ids // [])
                   + (.linked_bug_ids // []) + (.related_order_ids // [])) | sort),
+         # Task links are ALSO carried on their own, unmerged. links is the evidence-version
+         # input and deliberately flattens every lineage kind together, but a needs_human
+         # card is keyed to a TASK (bin/fm-nf-ack.sh --to-captain <open-item-id> <task-id>),
+         # and a flattened list cannot say which id is a task. Carrying them separately is
+         # what lets the dropped-captain-decision guard print a runnable fix command instead
+         # of a guess. It does not participate in the evidence version, so it never churns.
+         task_links: ((.linked_task_ids // []) | sort),
          review_after: (.review_after // null),
          attention: (.attention // "ok"),
          attention_reasons: (.attention_reasons // []),

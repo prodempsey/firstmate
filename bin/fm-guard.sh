@@ -5,6 +5,8 @@
 # First, always warn if the firstmate primary checkout (FM_ROOT) is on a named
 # non-default branch, because that means firstmate-on-itself work landed in the
 # primary instead of an isolated worktree.
+# Then warn if a captain-gated order has no card in the Bridge's needs_human column,
+# because a decision the captain cannot see is a decision that gets dropped.
 # Then, if any task is in flight (a state/<id>.meta exists) and the watcher's
 # liveness beacon (state/.last-watcher-beat, touched every poll cycle) is
 # missing or older than FM_GUARD_GRACE seconds, prints a loud, clearly delimited
@@ -25,6 +27,11 @@ queue_pending=false
 READ_ONLY=${FM_GUARD_READ_ONLY:-0}
 case "$READ_ONLY" in 1|true|TRUE|yes|YES) READ_ONLY=1 ;; *) READ_ONLY=0 ;; esac
 CONTINUE_LINE=${FM_GUARD_CONTINUE_LINE:-This is a supervision warning only; the guarded operation WILL still run.}
+# ASCII unit separator, the repo's existing in-band field delimiter (see fm-marker-lib.sh).
+# The dropped-captain-decision alarm below renders its jq result with this rather than a
+# tab, because `read` collapses runs of IFS whitespace and would silently drop an empty
+# field - a captain order with no linked task - shifting every field after it.
+US=$'\x1f'
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
@@ -73,12 +80,17 @@ fi
 # bug, an unreconciled report, a captain-gated backlog row) are fleet-wide, not tied to
 # whether any task happens to be in flight right now.
 triage_last="$STATE/.triage-duty-last.json"
+trule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+triage_ok=''
+triage_readable=false
+# Read the cache's one gating field ONCE, here, because two alarms below consume it. jq's
+# `//` treats `false` as no-value (same as null), so a plain `.ok // empty` would silently
+# discard a genuine `ok: false` failure record. Read it with `tostring` so false survives.
 if [ -f "$triage_last" ] && command -v jq >/dev/null 2>&1; then
-  # jq's `//` treats `false` as no-value (same as null), so a plain `.ok // empty`
-  # would silently discard a genuine `ok: false` failure record. Read it with
-  # `tostring` instead so false survives.
+  triage_readable=true
   triage_ok=$(jq -r '.ok | tostring' "$triage_last" 2>/dev/null)
-  trule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+fi
+if [ "$triage_readable" = true ]; then
   if [ "$triage_ok" = false ]; then
     t_trigger=$(jq -r '.trigger // "unknown"' "$triage_last" 2>/dev/null)
     t_ts=$(jq -r '.ts // "unknown"' "$triage_last" 2>/dev/null)
@@ -114,6 +126,133 @@ if [ -f "$triage_last" ] && command -v jq >/dev/null 2>&1; then
         printf '●%s\n' "$trule"
       } >&2
     fi
+  fi
+fi
+
+# --- Dropped-captain-decision alarm, checked THIRD and also independent of in-flight
+# tasks. -------------------------------------------------------------------------------
+# AGENTS.md section 9 requires every captain decision to be marked on the board before it is
+# asked for in chat, and docs/captain-attention.md owns why. This is the detector for that
+# rule: an unmarked decision is an unasked decision, and a rule that can be silently skipped
+# eventually is. The rule tells firstmate what to do; this says so when it did not.
+#
+# WHAT IS PROVABLE. A card is keyed to an OPEN ITEM, so a captain-gated ORDER with no
+# receipt is a decision the captain demonstrably cannot see. Captain-gated items in lanes
+# with no open item (a standing visibility umbrella row) have nothing to key a card to, so
+# they are named as context inside a firing banner and never alarm on their own: an alarm
+# that fires forever on standing work is one nobody reads.
+#
+# CHEAP. Like the preflight above, this reads the cached last triage pass (its captain_gates
+# block, recorded by bin/fm-triage-duty.sh) and one small append-only receipt ledger
+# (state/.nf-to-captain, written by fm-nf-ack.sh only after the Bridge reads the card back).
+# One jq invocation over two small local files. It never enumerates and never calls the
+# Bridge, because fm-guard.sh runs on every single wake.
+#
+# READ-ONLY. It names the gap and prints the exact command; firstmate decides and marks.
+# It must never route a decision to the captain's board itself: a false card on that board
+# is worse than the bug this catches.
+if [ -f "$triage_last" ] && [ "$triage_readable" = false ]; then
+  # Could not check is not the same as all clear, and must never be reported as it.
+  printf 'WARNING: cannot check for dropped captain decisions - jq is unavailable, so %s is unreadable.\n' \
+    "$triage_last" >&2
+elif [ "$triage_ok" = true ]; then
+  gate_src=/dev/null
+  [ -f "$STATE/.nf-to-captain" ] && gate_src="$STATE/.nf-to-captain"
+  # One pass, emitting a tiny delimited rendering rather than JSON the shell would have to
+  # re-enter jq to read. stdin is the receipt ledger (tab-separated, written by fm-nf-ack.sh);
+  # --slurpfile is the triage cache.
+  #
+  # The rendering is separated by the ASCII unit separator, NOT by a tab: `read` treats tab
+  # as IFS whitespace and collapses a run of them into one delimiter, so an order with no
+  # linked task would silently shift its title into the task field and print a fix command
+  # naming a task that does not exist. A non-whitespace delimiter preserves the empty field.
+  gate_lines=$(jq -Rrn --arg us "$US" --slurpfile cache "$triage_last" '
+    [inputs | split("\t")[0] | select(. != "")] as $marked
+    | ($cache[0].captain_gates // null) as $g
+    | if ($g | type) != "object" then ["STATE" + $us + "unavailable"]
+      else
+        # Bind the order before testing it: inside `$marked | index(...)` a bare .order_id
+        # would be read against $marked (the receipt array), not against the order.
+        (($g.orders // [])
+         | map(. as $o | select(($marked | index($o.order_id)) == null))) as $unmarked
+        | ["STATE" + $us + "ok",
+           "COUNTS" + $us + (($g.orders_total // 0) | tostring)
+                    + $us + ((($g.orders // []) | length) | tostring)
+                    + $us + (($g.other_total // 0) | tostring)]
+          + [$unmarked[]
+             | "UNMARKED" + $us + .order_id + $us + (.task // "") + $us + (.title // "")]
+          + [(($g.other // [])[])
+             | "OTHER" + $us + .lane + $us + .source_id + $us + (.title // "")]
+      end
+    | .[]
+  ' < "$gate_src" 2>/dev/null) || gate_lines="STATE${US}unavailable"
+
+  gate_state=unavailable
+  gate_orders_total=0 gate_orders_listed=0 gate_other_total=0
+  gate_unmarked=()
+  gate_other=()
+  while IFS="$US" read -r kind f1 f2 f3; do
+    case "$kind" in
+      STATE) gate_state=$f1 ;;
+      COUNTS) gate_orders_total=$f1; gate_orders_listed=$f2; gate_other_total=$f3 ;;
+      UNMARKED) gate_unmarked+=("$f1$US$f2$US$f3") ;;
+      OTHER) gate_other+=("$f1$US$f2$US$f3") ;;
+    esac
+  done <<EOF
+$gate_lines
+EOF
+  # A corrupt cache must not turn an arithmetic comparison below into a shell error on a
+  # wake. Same defense the ownerless count above uses.
+  case "$gate_orders_total" in ''|*[!0-9]*) gate_orders_total=0 ;; esac
+  case "$gate_orders_listed" in ''|*[!0-9]*) gate_orders_listed=0 ;; esac
+  case "$gate_other_total" in ''|*[!0-9]*) gate_other_total=0 ;; esac
+
+  if [ "$gate_state" != ok ]; then
+    # The pass predates captain-gate recording (or wrote a null gate block). Missing
+    # evidence, reported as missing - never folded into silence.
+    printf 'WARNING: cannot check for dropped captain decisions - the last fleet-triage pass recorded no captain-gate detail; refresh it with bin/fm-triage-duty.sh session-start.\n' >&2
+  elif [ "${#gate_unmarked[@]}" -gt 0 ]; then
+    {
+      printf '●%s\n' "$trule"
+      printf '●  DROPPED CAPTAIN DECISION - GATED ON THE CAPTAIN, NOT ON HIS BOARD\n'
+      printf '●  %s captain-gated order(s) have no card in the Bridge needs_human column, so the\n' "${#gate_unmarked[@]}"
+      printf '●  captain cannot see that they are waiting on him. Escalating in chat alone is how\n'
+      printf '●  a decision gets lost; the card is the only durable channel.\n'
+      for row in "${gate_unmarked[@]}"; do
+        IFS="$US" read -r g_order g_task g_title <<EOF
+$row
+EOF
+        printf '●    %s: %s\n' "$g_order" "$(printf '%s' "$g_title" | cut -c1-90)"
+        if [ -n "$g_task" ]; then
+          printf '●      bin/fm-nf-ack.sh --to-captain %s %s\n' "$g_order" "$g_task"
+        else
+          printf '●      bin/fm-nf-ack.sh --to-captain %s <task-id>   (no linked task; link one first:\n' "$g_order"
+          printf '●      bin/fm-order.sh link %s --task <id>)\n' "$g_order"
+        fi
+      done
+      if [ "$gate_orders_total" -gt "$gate_orders_listed" ]; then
+        printf '●  (%s of %s captain-gated orders listed; run bin/fm-fleet-triage.sh --json for the rest.)\n' \
+          "$gate_orders_listed" "$gate_orders_total"
+      fi
+      if [ "$gate_other_total" -gt 0 ]; then
+        printf '●  Also captain-gated, but with no open item to key a card to (record an order for\n'
+        printf '●  one with bin/fm-order.sh add before it can reach the board):\n'
+        for row in "${gate_other[@]}"; do
+          IFS="$US" read -r g_lane g_src g_title <<EOF
+$row
+EOF
+          printf '●    [%s] %s: %s\n' "$g_lane" "$g_src" "$(printf '%s' "$g_title" | cut -c1-70)"
+        done
+      fi
+      if [ "$READ_ONLY" -eq 1 ]; then
+        printf '●  This read-only session must not write the board; the session holding the fleet\n'
+        printf '●  lock owns this.\n'
+      else
+        printf '●  %s\n' "$CONTINUE_LINE"
+        printf '●  Mark each one, then tell the captain. Marking is yours; deciding is his.\n'
+      fi
+      printf '●%s\n' "$trule"
+    } >&2
   fi
 fi
 

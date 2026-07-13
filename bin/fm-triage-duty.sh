@@ -77,6 +77,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 LAST_RESULT="$STATE/.triage-duty-last.json"
 MAX_ITEMS=${FM_FLEET_TRIAGE_DIGEST_MAX_ITEMS:-8}
+GATE_MAX=${FM_FLEET_TRIAGE_GATE_MAX_ITEMS:-10}
 
 # shellcheck disable=SC1091 # Dynamic sibling path is resolved from BASH_SOURCE.
 . "$SCRIPT_DIR/fm-fleet-triage-lib.sh"
@@ -177,7 +178,16 @@ ACTIONABLE=$(printf '%s' "$RESULT_LINE" | jq -r '.actionable')
 case "$ACTIONABLE" in ''|*[!0-9]*) ACTIONABLE=0 ;; esac
 
 NOW=$(fm_triage_now)
-write_last_result "$(printf '%s' "$RESULT_LINE" | jq -c --arg ts "$NOW" '. + {ok: true, ts: $ts}')"
+# The captain-gate detail rides in the CACHE only, never in RESULT_LINE: bin/fm-guard.sh's
+# dropped-captain-decision alarm needs the gated items by id to prove a needs_human card is
+# missing, but the banner below already lists actionable items in its digest, and putting
+# them in the printed result line too would pay for the same items twice in the agent's
+# context. A gate list this pass cannot compute is recorded as null, which the guard reports
+# as unavailable rather than as an all-clear.
+GATES=$(printf '%s' "$JSON_OUT" | fm_triage_captain_gates "$GATE_MAX" 2>/dev/null) || GATES=''
+[ -n "$GATES" ] || GATES=null
+write_last_result "$(printf '%s' "$RESULT_LINE" \
+  | jq -c --arg ts "$NOW" --argjson gates "$GATES" '. + {ok: true, ts: $ts, captain_gates: $gates}')"
 
 # Digest only when actionable state exists. A clear fleet stays exactly as silent as
 # every other diagnostic in this codebase ("silence means all good"); a caller's
