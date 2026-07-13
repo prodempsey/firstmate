@@ -276,7 +276,13 @@ for item in "${ITEMS[@]}"; do
   # presenting as active FirstMate attention on the captain's board until teardown runs,
   # which is how reviewed-and-landed work piled up there. Reconciling here is what makes
   # this automatic rather than a step firstmate has to remember; bin/fm-nf-attention.sh
-  # owns the mapping, and clears ATTENTION only - never closure, which stays teardown's.
+  # owns the mapping, and it moves ATTENTION only - never closure, which stays teardown's.
+  #
+  # The OUTCOME TYPE decides how attention moves, and only an outcome meaning firstmate is
+  # finished with the item clears the card: resolved, rejected, and successor_created do.
+  # captain_batch TRANSFERS the decision to the captain and held parks it, so neither
+  # clears - a captain batch that cleared the card silently deleted a decision the captain
+  # still owed, which is the whole reason the mapping is by type and not by terminality.
   case "$item" in
     needs_firstmate:*)
       if [ -x "$SCRIPT_DIR/fm-nf-attention.sh" ]; then

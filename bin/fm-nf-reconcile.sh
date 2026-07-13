@@ -99,6 +99,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Records are separated by the ASCII unit separator, NOT by a tab: `read` treats tab as IFS
+# whitespace and collapses a run of them into one delimiter, so a disposition with no reason
+# (every outcome but a hold has none) would silently shift its later fields left and report a
+# confirmed captain hand-off as an unconfirmed one. A non-whitespace delimiter preserves the
+# empty field. bin/fm-guard.sh's captain-gate rendering carries the same rule for the same
+# reason.
+US=$'\037'
+
 collect_unhandled() {
   local meta id fingerprint fold detail
   : > "$PENDING"
@@ -111,14 +119,15 @@ collect_unhandled() {
     # acknowledgement, and not closure evidence - is what stops a terminal signal from
     # counting as unhandled here, and even then the item stays listed.
     detail=$(fm_nf_attention_desired "$STATE" "$DATA" "$id" "$fold" \
-      | jq -r '[.state, .outcome, .review_after, (.reason | gsub("[\t\n]"; " "))] | @tsv')
-    printf '%s\t%s\t%s\n' "$id" "$fingerprint" "$detail" >> "$PENDING"
+      | jq -r '[.state, .outcome, .review_after, (.reason | gsub("[\t\n\u001f]"; " ")), .link,
+                (if .confirmed then "confirmed" else "unconfirmed" end)] | join("\u001f")')
+    printf '%s%s%s%s%s\n' "$id" "$US" "$fingerprint" "$US" "$detail" >> "$PENDING"
   done
   LC_ALL=C sort -o "$PENDING" "$PENDING"
 }
 
 count_state() {  # <state>
-  awk -F '\t' -v want="$1" '$3 == want {n++} END {print n + 0}' "$PENDING"
+  awk -F '\037' -v want="$1" '$3 == want {n++} END {print n + 0}' "$PENDING"
 }
 
 meta_detail() {  # <meta-file> <key>
@@ -128,25 +137,30 @@ meta_detail() {  # <meta-file> <key>
 }
 
 print_header() {  # <total>
-  local total=$1 open held terminal extra=''
+  local total=$1 open held captain terminal extra=''
   open=$(count_state open)
   held=$(count_state held)
+  captain=$(count_state captain)
   terminal=$(count_state terminal)
   if [ "$total" -eq 0 ]; then
     printf 'NEEDS FIRSTMATE: none\n'
     return 0
   fi
   if [ "$held" -gt 0 ]; then extra="$extra, $held held"; fi
+  # A captain batch is dispositioned as far as firstmate is concerned, but the decision is
+  # still owed - by the captain. It is counted apart so it never reads as finished work.
+  if [ "$captain" -gt 0 ]; then extra="$extra, $captain with the captain"; fi
   if [ "$terminal" -gt 0 ]; then extra="$extra, $terminal dispositioned"; fi
   printf 'NEEDS FIRSTMATE: %s unhandled%s\n' "$open" "$extra"
 }
 
 print_list() {
-  local count id fingerprint state outcome review_after reason meta status line verb
+  local count id fingerprint state outcome review_after reason link confirmed
+  local meta status line verb
   count=$(wc -l < "$PENDING" | tr -d ' ')
   print_header "$count"
   if [ "$count" -eq 0 ]; then return 0; fi
-  while IFS=$'\t' read -r id fingerprint state outcome review_after reason; do
+  while IFS="$US" read -r id fingerprint state outcome review_after reason link confirmed; do
     [ -n "$id" ] || continue
     meta="$STATE/$id.meta"
     status="$STATE/$id.status"
@@ -161,6 +175,14 @@ print_list() {
       held)
         printf '  held-until: %s\n' "$review_after"
         printf '  hold-reason: %s\n' "$reason"
+        ;;
+      captain)
+        printf '  disposition: %s\n' "$outcome"
+        if [ "$confirmed" = confirmed ]; then
+          printf '  with-the-captain: still owed, in batch %s\n' "$link"
+        else
+          printf '  with-the-captain: HAND-OFF NOT CONFIRMED on the board, batch %s\n' "$link"
+        fi
         ;;
       terminal)
         printf '  disposition: %s\n' "$outcome"
@@ -183,7 +205,7 @@ print_list() {
 print_check_line() {
   local count shown=0 remaining id fingerprint state summary=""
   count=$(count_state open)
-  while IFS=$'\t' read -r id fingerprint state _; do
+  while IFS="$US" read -r id fingerprint state _; do
     [ -n "$id" ] || continue
     [ "$state" = open ] || continue
     if [ "$shown" -lt 8 ]; then
@@ -198,6 +220,26 @@ print_check_line() {
     summary="$summary, and $remaining more"
   fi
   printf 'NEEDS FIRSTMATE: %s unhandled - %s (run bin/fm-nf-reconcile.sh list; ack with bin/fm-nf-ack.sh <id>)\n' \
+    "$count" "$summary"
+}
+
+# A captain batch whose hand-off the board never confirmed is the one thing worse than an
+# unhandled item: firstmate believes the captain has the decision and the captain cannot see
+# it. The convergence pass above retries the hand-off every cycle, so this line fires only
+# while that retry is still failing - and then it must fire, because nobody else is watching.
+print_unconfirmed_handoffs() {
+  local count summary='' id state confirmed
+  count=0
+  while IFS="$US" read -r id _ state _ _ _ _ confirmed; do
+    [ -n "$id" ] || continue
+    [ "$state" = captain ] || continue
+    [ "$confirmed" != confirmed ] || continue
+    count=$((count + 1))
+    [ -z "$summary" ] || summary="$summary, "
+    summary="$summary$id"
+  done < "$PENDING"
+  [ "$count" -gt 0 ] || return 0
+  printf 'NEEDS FIRSTMATE: %s captain hand-off(s) never reached the board - %s (retry with bin/fm-nf-attention.sh sync; the captain cannot see these decisions)\n' \
     "$count" "$summary"
 }
 
@@ -216,4 +258,5 @@ if [ "$MODE" = list ]; then
 fi
 
 print_check_line
+print_unconfirmed_handoffs
 exit 0

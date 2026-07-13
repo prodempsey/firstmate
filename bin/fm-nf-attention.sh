@@ -17,14 +17,25 @@
 # takes a task out of `visibility audit`. A task with no closure evidence stays un-closable
 # and stays in the audit; that gate is teardown's, through bin/fm-task-events.sh.
 #
+# THE OUTCOME TYPE DECIDES WHETHER ATTENTION IS CLEARED, TRANSFERRED, OR HELD
+# Every terminal outcome used to clear the card. That is right only for the outcomes meaning
+# firstmate is FINISHED with the item, and it silently deleted the ones that are not: a
+# captain batch is the outcome that TRANSFERS the decision to the captain, so clearing it
+# dropped a decision he still owed off his board. bin/fm-nf-attention-lib.sh maps each outcome
+# to one of the states below; this command applies them.
+#
 # HOW A CARD IS MOVED
-# terminal - state/<id>.meta gains attentionOwner=none, which the board honors ahead of every
-#            derived signal (crew status, turn-end, PR), so the card stops presenting as
-#            active FirstMate attention while staying on the board and in the audit. A
-#            durable board event follows as the receipt: a captain batch hands the card to
-#            the captain through bin/fm-nf-ack.sh --to-captain, the one writer of the board's
-#            captain-attention column; a successor posts `reworking`; anything else posts
-#            `reviewed`.
+# terminal - resolved, rejected, or reworking in a successor. state/<id>.meta gains
+#            attentionOwner=none, which the board honors ahead of every derived signal (crew
+#            status, turn-end, PR), so the card stops presenting as active FirstMate attention
+#            while staying on the board and in the audit. A durable board event follows as the
+#            receipt: a successor posts `reworking`, anything else posts `reviewed`.
+# captain  - a captain batch. Attention is TRANSFERRED, never cleared: no attentionOwner
+#            override is written, and the hand-off goes through bin/fm-nf-ack.sh --to-captain,
+#            the one writer of the board's captain-attention column, naming the item's real
+#            lane-qualified id as the open item. The card must land in Needs Human with the
+#            captain owning it. If that write fails the card stays FirstMate-owned and the
+#            next pass retries - a decision the captain owes is never dropped on a bad write.
 # held     - the card stays FirstMate-owned and visible, but presents as HELD: a durable
 #            `reviewed` board event plus a card note carrying the reason and the review date,
 #            so "firstmate parked this until X" reads differently from "nobody has touched
@@ -115,28 +126,35 @@ post_event() {  # <task-id> <event> <fingerprint> [<extra-key> <extra-value>]
     "$BRIDGE/api/card/$HOME_NAME/$id/attention" >/dev/null
 }
 
-# Record what firstmate did with a dispositioned card, in the richest form the board will
-# take. `to_captain` and `reworking` are gated on the task already having a durable
-# TaskRecord, which a live crew usually does not have until teardown records one, so they are
-# attempted and not required; `reviewed` is accepted for any task and is the receipt that
-# always lands. The card is already cleared by its meta override either way - this only
-# decides how much the board can say about WHERE the work went.
-#
-# A captain batch hands the card to the captain, so it goes through bin/fm-nf-ack.sh, which
-# is the one writer of the board's captain-attention column (AGENTS.md section 9). This
-# command never writes that column itself.
+# Record what firstmate did with a card it is FINISHED with, in the richest form the board
+# will take. `reworking` is gated on the task already having a durable TaskRecord, which a
+# live crew usually does not have until teardown records one, so it is attempted and not
+# required; `reviewed` is accepted for any task and is the receipt that always lands. The card
+# is already cleared by its meta override either way - this only decides how much the board
+# can say about WHERE the work went.
 post_terminal_event() {  # <task-id> <outcome> <fingerprint> <link>
   local id=$1 outcome=$2 fingerprint=$3 link=$4
   case "$outcome" in
-    captain_batch)
-      FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_BRIDGE_URL="$BRIDGE" \
-        "$SCRIPT_DIR/fm-nf-ack.sh" --to-captain "$link" "$id" >/dev/null 2>&1 && return 0
-      ;;
     successor_created)
       post_event "$id" reworking "$fingerprint" successor_id "$link" 2>/dev/null && return 0
       ;;
   esac
   post_event "$id" reviewed "$fingerprint"
+}
+
+# Hand a captain-batched card to the captain. bin/fm-nf-ack.sh --to-captain is the one writer
+# of the board's captain-attention column (AGENTS.md section 9), so this drives that path
+# rather than writing the column - or, worse, clearing the card - itself. The open item is the
+# item's real lane-qualified triage id, which is what the captain's board opens against; the
+# batch the decision was packaged into stays in the triage ledger, where its lineage lives.
+#
+# Unlike a terminal disposition, this write is not a receipt for something the meta override
+# already did: it IS the disposition. A failure must therefore leave the card asking firstmate,
+# so the retry on the next pass is what the captain's board is waiting on.
+hand_to_captain() {  # <task-id>
+  local id=$1
+  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_BRIDGE_URL="$BRIDGE" \
+    "$SCRIPT_DIR/fm-nf-ack.sh" --to-captain "needs_firstmate:$id" "$id" >/dev/null
 }
 
 current_event() {  # <task-id>
@@ -207,6 +225,19 @@ apply_one() {  # <task-id> <fold-json>
       meta_unset "$meta" attention_state attention_hold_reason attention_hold_review_after
       if [ "$signature" != "$applied" ]; then
         post_terminal_event "$id" "$outcome" "$fp" "$link" || rc=1
+      fi
+      ;;
+    captain)
+      # Attention TRANSFERS here; it is not cleared. No attentionOwner override is written,
+      # because that override is exactly what took the captain's own decision off his board.
+      # The card stays visible and the hand-off itself moves it to the captain's column.
+      meta_unset "$meta" attentionOwner attention_state attention_hold_reason \
+        attention_hold_review_after
+      if [ "$signature" != "$applied" ]; then
+        hand_to_captain "$id" || {
+          warn "$id: hand-off to the captain failed; the card keeps asking firstmate and the next pass retries"
+          rc=1
+        }
       fi
       ;;
     held)

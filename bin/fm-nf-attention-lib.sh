@@ -63,6 +63,17 @@ fm_nf_attention_hold_expired() {  # <review-after>
   [ "$now" -ge "$epoch" ]
 }
 
+# True when a captain hand-off actually reached the board. bin/fm-nf-ack.sh appends to
+# state/.nf-to-captain only AFTER the Bridge reads the card back, so a receipt for this task
+# against THIS evidence is the one durable proof the captain can see the decision. Without it
+# the hand-off is still owed, and firstmate - not the captain - is who owes it.
+fm_nf_attention_captain_confirmed() {  # <state-dir> <task-id> <fingerprint>
+  local receipts="$1/.nf-to-captain"
+  [ -f "$receipts" ] || return 1
+  [ -n "$3" ] || return 1
+  awk -F '\t' -v id="$2" -v fp="$3" '$2 == id && $3 == fp {found = 1} END {exit !found}' "$receipts"
+}
+
 # True when the successor task named by a successor_created outcome still exists in this
 # home, as a live task or as a backlog row. A successor that vanished makes the disposition
 # a lie, so the item is owed firstmate's attention again - the enumerator calls the same
@@ -76,16 +87,26 @@ fm_nf_attention_successor_present() {  # <state-dir> <data-dir> <link>
 }
 
 # Print the desired board attention for one task as compact JSON:
-#   {state, outcome, link, reason, review_after, fingerprint, evidence_version, why}
-# where state is one of:
-#   terminal - dispositioned and still healthy; the card must stop asking for firstmate.
+#   {state, outcome, link, reason, review_after, fingerprint, evidence_version, confirmed, why}
+# where confirmed says whether a captain hand-off actually reached the board, and state is one
+# of:
+#   terminal - firstmate is FINISHED with it (resolved, rejected, reworking in a successor);
+#              the card must stop asking for firstmate.
+#   captain  - firstmate is not finished with it, but the captain is: a captain batch does not
+#              end the decision, it TRANSFERS it. The card must stay visible and land in the
+#              captain's column, so this state clears nothing - clearing it is what silently
+#              dropped decisions the captain still owed.
 #   held     - parked with a reason and a review date; the card stays visible, but as held.
 #   open     - never dispositioned, or the disposition no longer holds (evidence moved, the
 #              hold expired, the lineage dangles, the successor is gone). The natural signal
 #              owns the card, which is also the fail-safe direction for anything unknown.
+#
+# The outcome TYPE decides which of those it is. A terminal outcome is not automatically a
+# cleared card: only an outcome that means firstmate is done with the work may clear one.
 fm_nf_attention_desired() {  # <state-dir> <data-dir> <task-id> <fold-json>
   local state=$1 data=$2 id=$3 fold=$4
   local fp entry outcome recorded_ev link reason review_after ev='' want=open why=''
+  local confirmed=false
 
   fp=$(fm_nf_current_fingerprint "$state" "$id" 2>/dev/null) || fp=''
   entry=$(printf '%s' "$fold" | jq -c --arg k "needs_firstmate:$id" '.[$k] // {}')
@@ -129,7 +150,20 @@ fm_nf_attention_desired() {  # <state-dir> <data-dir> <task-id> <fold-json>
             why="successor $link no longer exists"
           fi
           ;;
-        resolved|rejected|captain_batch)
+        captain_batch)
+          # The decision is still owed; it is simply owed by the captain now. Presenting this
+          # as terminal is what made the card vanish from his board.
+          want=captain
+          if fm_nf_attention_captain_confirmed "$state" "$id" "$fp"; then
+            confirmed=true
+            why="handed to the captain in $link"
+          else
+            # Recorded, but the board never confirmed the card. The captain cannot see a
+            # decision that never reached him, so this stays firstmate's to finish.
+            why="hand-off to the captain not confirmed on the board (batch $link)"
+          fi
+          ;;
+        resolved|rejected)
           want=terminal
           why=$outcome
           ;;
@@ -143,9 +177,10 @@ fm_nf_attention_desired() {  # <state-dir> <data-dir> <task-id> <fold-json>
   jq -cn --arg state "$want" --arg outcome "$outcome" --arg link "$link" \
     --arg reason "$reason" --arg review_after "$review_after" \
     --arg fingerprint "$fp" --arg evidence_version "$ev" --arg why "$why" \
+    --argjson confirmed "$confirmed" \
     '{state: $state, outcome: $outcome, link: $link, reason: $reason,
       review_after: $review_after, fingerprint: $fingerprint,
-      evidence_version: $evidence_version, why: $why}'
+      evidence_version: $evidence_version, confirmed: $confirmed, why: $why}'
 }
 
 # True for the TURN-END GATE when a captain_batch hand-off verifiably reached the captain's
@@ -156,11 +191,14 @@ fm_nf_attention_desired() {  # <state-dir> <data-dir> <task-id> <fold-json>
 # gate's own check of that lifecycle evidence; the BOARD-side presentation of a captain
 # batch stays owned elsewhere (see captain-batch-drop-b6) and is deliberately not decided
 # here.
+#
+# The predicate itself is fm_nf_attention_captain_confirmed above - ONE reading of the receipt
+# ledger, so the gate and the board card can never disagree about whether the captain can
+# actually see a decision. The two names are kept because they answer different questions of
+# the same evidence: this one asks whether the GATE is discharged, that one asks what the CARD
+# should present.
 fm_nf_unattended_captain_confirmed() {  # <state-dir> <task-id> <fingerprint>
-  local receipts="$1/.nf-to-captain"
-  [ -f "$receipts" ] || return 1
-  [ -n "$3" ] || return 1
-  awk -F '\t' -v id="$2" -v fp="$3" '$2 == id && $3 == fp {found = 1} END {exit !found}' "$receipts"
+  fm_nf_attention_captain_confirmed "$@"
 }
 
 # Print the id of every needs_firstmate item that still holds the TURN-END GATE, one per

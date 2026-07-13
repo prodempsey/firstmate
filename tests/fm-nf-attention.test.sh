@@ -2,8 +2,13 @@
 # Behavior tests for reconciling a recorded fleet-triage disposition into board attention.
 #
 # The load-bearing properties:
-#   - a terminal disposition stops the item presenting as active FirstMate attention, and
-#     stops it waking firstmate, without anyone remembering to do it;
+#   - the OUTCOME TYPE decides whether attention is cleared, transferred, or held: only an
+#     outcome meaning firstmate is FINISHED with the item may clear its card;
+#   - a disposition that finishes the item (resolved, rejected, successor_created) stops it
+#     presenting as active FirstMate attention, and stops it waking firstmate, without anyone
+#     remembering to do it;
+#   - a captain batch TRANSFERS the decision: the card stays visible and lands with the
+#     captain, through the one writer of the captain-attention column;
 #   - a held item stays visible but presents as held, with its reason and review date;
 #   - a disposition is bound to the evidence it was decided against, so it can never suppress
 #     a fresh terminal signal;
@@ -42,9 +47,16 @@ if [ -n "$body" ]; then
   printf '%s\t%s\n' "$url" "$body" >> "$FM_TEST_BOARD_LOG"
 else
   # A GET is a read-back: answer with the last thing written to this card, which is what
-  # bin/fm-nf-ack.sh verifies its own write against.
+  # bin/fm-nf-ack.sh verifies its own write against. The real Bridge TAKES the event in
+  # snake_case and READS IT BACK in camelCase, so this stand-in must too - a read-back keyed
+  # to the spelling we sent matched nothing on the real board, and every confirmed hand-off
+  # was reported as a failed one.
   awk -F '\t' -v url="$url" '$1 == url {last = $2} END {print (last == "" ? "{}" : last)}' \
-    "$FM_TEST_BOARD_LOG" 2>/dev/null || printf '{}\n'
+    "$FM_TEST_BOARD_LOG" 2>/dev/null \
+    | jq -c 'with_entries(.key |= (if . == "open_item_id" then "openItemId"
+                                   elif . == "successor_id" then "successorId"
+                                   elif . == "status_fingerprint" then "statusFingerprint"
+                                   else . end))'
 fi
 SH
   chmod +x "$home/fakebin/curl"
@@ -160,6 +172,11 @@ test_held_presents_as_held_with_reason_and_date() {
 # A captain batch hands the card to the captain, and the board's captain-attention column has
 # exactly one writer (AGENTS.md section 9). This reconciliation must go through it, not around
 # it, or an item could clear firstmate's attention without ever reaching the captain's.
+#
+# It must also not clear the card on the way. A captain batch is the outcome that TRANSFERS a
+# decision, not one that ends it: the attentionOwner=none override the other terminal outcomes
+# write outranks every derived signal, so writing it here took a decision the captain still
+# owed straight off his board and left it in `stale` with no owner at all.
 test_captain_batch_hands_the_card_to_the_captain() {
   local home body
   home=$(new_home captain-batch)
@@ -169,16 +186,134 @@ test_captain_batch_hands_the_card_to_the_captain() {
   disposition "$home" captain-batch decide-k2 --link order-ORD-041 > /dev/null \
     || fail "recording a captain batch should succeed"
 
-  assert_grep 'attentionOwner=none' "$home/state/decide-k2.meta" \
-    "a captain batch should stop asking firstmate"
+  assert_no_grep 'attentionOwner=' "$home/state/decide-k2.meta" \
+    "a captain batch must not clear the card; the decision is still owed, by the captain"
   body=$(grep '/api/card/' "$home/board.log" | cut -f2 | tail -n 1)
   [ "$(printf '%s' "$body" | jq -r '.event')" = to_captain ] \
     || fail "a captain batch should transfer board attention to the captain, got: $body"
-  [ "$(printf '%s' "$body" | jq -r '.open_item_id')" = order-ORD-041 ] \
-    || fail "the hand-off should name the batch it went into"
+  # The open item is the item's real lane-qualified triage id: that is what the captain's
+  # board opens the decision against, and it is what the attention API takes.
+  [ "$(printf '%s' "$body" | jq -r '.open_item_id')" = needs_firstmate:decide-k2 ] \
+    || fail "the hand-off should name the item's lane-qualified id, got: $body"
   assert_grep 'decide-k2' "$home/state/.nf-handled" \
     "the hand-off should go through the one writer of the captain-attention column"
-  pass "a captain batch hands the card to the captain through its one writer"
+  assert_grep 'needs_firstmate:decide-k2' "$home/state/.nf-to-captain" \
+    "a confirmed hand-off should leave the captain-attention receipt bin/fm-guard.sh reads"
+  pass "a captain batch hands the card to the captain without clearing it"
+}
+
+# The regression this whole fix exists for. Every terminal outcome used to clear the card, so
+# nothing distinguished "firstmate is finished with it" from "the captain now owes it" - and a
+# recorded captain batch silently deleted a decision the captain still owed. The end-state of
+# EACH outcome is asserted here, because the bug was that no test told them apart.
+test_each_outcome_moves_attention_its_own_way() {
+  local home last out
+  home=$(new_home outcomes)
+  own_lock "$home"
+  write_task "$home" resolved-m1 'done: ready in branch fm/resolved-m1'
+  write_task "$home" rejected-m2 'failed: not worth doing'
+  write_task "$home" successor-m3 'failed: wrong approach'
+  write_task "$home" successor-heir-m3 'working: redoing it properly'
+  write_task "$home" captain-m4 'needs-decision: two viable designs'
+  write_task "$home" held-m5 'blocked: needs an upstream fix'
+
+  disposition "$home" resolve resolved-m1 --link local-main-abc1234 > /dev/null
+  disposition "$home" reject rejected-m2 --reason 'superseded by the rewrite' > /dev/null
+  disposition "$home" successor successor-m3 --link successor-heir-m3 > /dev/null
+  disposition "$home" captain-batch captain-m4 --link captain-away-20260713 > /dev/null
+  disposition "$home" hold held-m5 --reason 'upstream fix lands in v2.4' \
+    --review-after 2026-08-01 > /dev/null
+
+  # 1-3. FirstMate is finished with these three, so they stop presenting as its attention.
+  #      This is the behavior the fix must not weaken.
+  assert_grep 'attentionOwner=none' "$home/state/resolved-m1.meta" \
+    "resolved should clear firstmate attention"
+  assert_grep 'attentionOwner=none' "$home/state/rejected-m2.meta" \
+    "rejected should clear firstmate attention"
+  assert_grep 'attentionOwner=none' "$home/state/successor-m3.meta" \
+    "successor_created should clear firstmate attention"
+
+  # 4. A captain batch TRANSFERS: the card stays on the board and lands with the captain.
+  assert_no_grep 'attentionOwner=' "$home/state/captain-m4.meta" \
+    "captain_batch must not clear the card"
+  last=$(grep "/api/card/[^/]*/captain-m4/attention" "$home/board.log" | cut -f2 | tail -n 1)
+  [ "$(printf '%s' "$last" | jq -r '.event')" = to_captain ] \
+    || fail "captain_batch should hand the card to the captain, got: $last"
+
+  # 5. A hold PARKS: the card stays firstmate's, visible, presenting as held with its reason
+  #    and review date - it must not vanish either.
+  assert_no_grep 'attentionOwner=' "$home/state/held-m5.meta" \
+    "held must not clear the card"
+  assert_grep 'attention_state=held' "$home/state/held-m5.meta" "held should present as held"
+  assert_grep 'attention_hold_reason=upstream fix lands in v2.4' "$home/state/held-m5.meta" \
+    "a hold should carry its reason"
+  assert_grep 'attention_hold_review_after=2026-08-01' "$home/state/held-m5.meta" \
+    "a hold should carry its review date"
+
+  # And the two non-clearing outcomes never post the board event that says firstmate reviewed
+  # and finished with the card, which is what the clearing outcomes post.
+  [ "$(grep -c "/api/card/[^/]*/captain-m4/attention" "$home/board.log")" = 1 ] \
+    || fail "a captain batch should post exactly the hand-off, nothing that walks it back"
+
+  # Firstmate is done with all five, so none of them keeps waking it - but the two the fleet
+  # still owes are reported apart from the three it has finished with, and the captain batch
+  # names the batch the decision went into rather than reading as an unconfirmed hand-off.
+  [ -z "$(run_in_home "$home" "$RECONCILE")" ] \
+    || fail "a confirmed hand-off, a hold, and three finished items must not wake firstmate"
+  out=$(run_in_home "$home" "$RECONCILE" list)
+  assert_contains "$out" '0 unhandled, 1 held, 1 with the captain, 3 dispositioned' \
+    "each outcome should be counted as what it is"
+  assert_contains "$out" '  with-the-captain: still owed, in batch captain-away-20260713' \
+    "a captain batch should name the batch the decision is waiting in"
+  pass "each outcome type moves attention its own way: cleared, transferred, or held"
+}
+
+# A hand-off the board refused is not a hand-off. The card must keep asking firstmate so the
+# next pass retries it - the one thing it must never do is disappear from both columns.
+test_a_refused_hand_off_keeps_the_card() {
+  local home
+  home=$(new_home captain-batch-refused)
+  own_lock "$home"
+  write_task "$home" refused-n7 'needs-decision: which of the two designs'
+  # A curl that always fails is a board that refused the write (or a cockpit that is down).
+  printf '#!/usr/bin/env bash\nexit 22\n' > "$home/fakebin/curl"
+  chmod +x "$home/fakebin/curl"
+
+  disposition "$home" captain-batch refused-n7 --link captain-away-20260713 > /dev/null 2>&1 \
+    || true
+  assert_no_grep 'attentionOwner=' "$home/state/refused-n7.meta" \
+    "a refused hand-off must never clear the card"
+  assert_contains "$(run_in_home "$home" "$RECONCILE" 2>/dev/null)" 'refused-n7' \
+    "a decision that never reached the captain must keep asking firstmate"
+
+  # The board comes back; the next pass completes the hand-off it owed.
+  cat > "$home/fakebin/curl" <<'SH'
+#!/usr/bin/env bash
+url= body=
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    -d) body=$2; shift 2 ;;
+    -H) shift 2 ;;
+    -*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+if [ -n "$body" ]; then
+  printf '%s\t%s\n' "$url" "$body" >> "$FM_TEST_BOARD_LOG"
+else
+  awk -F '\t' -v url="$url" '$1 == url {last = $2} END {print (last == "" ? "{}" : last)}' \
+    "$FM_TEST_BOARD_LOG" 2>/dev/null \
+    | jq -c 'with_entries(.key |= (if . == "open_item_id" then "openItemId"
+                                   elif . == "successor_id" then "successorId"
+                                   elif . == "status_fingerprint" then "statusFingerprint"
+                                   else . end))'
+fi
+SH
+  chmod +x "$home/fakebin/curl"
+  run_in_home "$home" "$ATTENTION" sync > /dev/null
+  assert_contains "$(board_events "$home")" 'to_captain' \
+    "the retry should complete the hand-off the failed write owed"
+  pass "a refused hand-off keeps the card and retries"
 }
 
 test_hold_expiry_restores_attention() {
@@ -385,9 +520,53 @@ test_board_outage_still_clears_the_card() {
 test_terminal_disposition_clears_board_attention
 test_held_presents_as_held_with_reason_and_date
 test_captain_batch_hands_the_card_to_the_captain
+test_each_outcome_moves_attention_its_own_way
+test_a_refused_hand_off_keeps_the_card
 test_hold_expiry_restores_attention
 test_legacy_unreviewable_hold_presents_as_open
+# The seam between the board card and the turn-end gate. They read the SAME captain-batch
+# disposition and the SAME receipt, and they must agree: a confirmed hand-off puts the card in
+# the captain's column AND stops the gate re-blocking the primary on a decision only the
+# captain can make; an unconfirmed one leaves BOTH asking firstmate. A captain batch that
+# discharged the gate without landing the card would be the original bug wearing a new hat.
+test_captain_batch_satisfies_the_board_and_the_gate_together() {
+  local home out body
+  home=$(new_home captain-batch-gate)
+  own_lock "$home"
+  write_task "$home" decide-p9 'needs-decision: which of the two designs'
+
+  disposition "$home" captain-batch decide-p9 --link captain-away-20260714 > /dev/null \
+    || fail "recording a captain batch should succeed"
+
+  # Board side: the card is handed over, never cleared.
+  assert_no_grep 'attentionOwner=' "$home/state/decide-p9.meta" \
+    "a captain batch must not clear the card"
+  body=$(grep '/api/card/' "$home/board.log" | cut -f2 | tail -n 1)
+  [ "$(printf '%s' "$body" | jq -r '.event')" = to_captain ] \
+    || fail "the card should be handed to the captain, got: $body"
+
+  # Gate side: the hand-off is confirmed by the fingerprint-bound receipt, so the gate lets
+  # the primary end its turn instead of re-blocking on the captain's own decision.
+  out=$(bash -c '. "$1/bin/fm-nf-attention-lib.sh"; fm_nf_unattended_ids "$2/state" "$2/data"' \
+    _ "$ROOT" "$home")
+  printf '%s\n' "$out" | grep -qxF 'decide-p9' \
+    && fail "a CONFIRMED captain batch must not hold the turn-end gate, got: $out"
+
+  # Now the same item with its receipt gone: the hand-off is no longer provable, so the card
+  # goes back to asking firstmate and the gate blocks again. Neither side may take the ledger
+  # row alone as proof the captain can see the decision.
+  rm -f "$home/state/.nf-to-captain"
+  out=$(bash -c '. "$1/bin/fm-nf-attention-lib.sh"; fm_nf_unattended_ids "$2/state" "$2/data"' \
+    _ "$ROOT" "$home")
+  printf '%s\n' "$out" | grep -qxF 'decide-p9' \
+    || fail "an UNCONFIRMED captain batch must still hold the turn-end gate, got: $out"
+  assert_contains "$(run_in_home "$home" "$RECONCILE")" 'decide-p9' \
+    "an unconfirmed hand-off must keep asking firstmate"
+  pass "a captain batch discharges the gate and lands the card, or neither"
+}
+
 test_unattended_ids_apply_the_gate_discharge_rule
+test_captain_batch_satisfies_the_board_and_the_gate_together
 test_new_signal_reopens_a_dispositioned_card
 test_resurface_restores_attention
 test_dangling_successor_reopens_the_card

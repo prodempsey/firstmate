@@ -105,7 +105,13 @@ BODY=$(jq -nc --arg event "$EVENT" --arg fp "$FINGERPRINT" --arg actor firstmate
 # can act on - a wrong home name and a down Bridge read identically otherwise.
 curl -fsS -H 'content-type: application/json' -d "$BODY" "$URL" >/dev/null || { printf 'fm-nf-ack: attention API write failed (%s); task remains open\n' "$URL" >&2; exit 1; }
 READBACK=$(curl -fsS "$URL") || { printf 'fm-nf-ack: attention API read-back failed (%s); task remains open\n' "$URL" >&2; exit 1; }
-printf '%s' "$READBACK" | jq -e --arg event "$EVENT" --arg value "$EXTRA_VALUE" --arg name "$EXTRA_NAME" '.event==$event and ($name=="" or .[$name]==$value)' >/dev/null || { echo "fm-nf-ack: attention API read-back mismatch; task remains open" >&2; exit 1; }
+# The Bridge takes the event in snake_case and reads it back in camelCase (open_item_id ->
+# openItemId), so the write is verified against BOTH spellings. Checking only the one we sent
+# failed every read-back of a --to-captain write: the card landed on the captain's board and
+# the receipt below - the proof bin/fm-guard.sh's dropped-decision alarm and the turn-end
+# gate both read - was never written, so a confirmed hand-off still looked like a dropped one.
+CAMEL_NAME=$(printf '%s' "$EXTRA_NAME" | awk -F_ '{out=$1; for (i=2; i<=NF; i++) out = out toupper(substr($i,1,1)) substr($i,2); print out}')
+printf '%s' "$READBACK" | jq -e --arg event "$EVENT" --arg value "$EXTRA_VALUE" --arg name "$EXTRA_NAME" --arg camel "$CAMEL_NAME" '.event==$event and ($name=="" or .[$name]==$value or .[$camel]==$value)' >/dev/null || { printf 'fm-nf-ack: attention API read-back mismatch (%s); task remains open\n' "$URL" >&2; exit 1; }
 # Local receipt for a CONFIRMED needs_human card, per the header. Written last, so nothing
 # reaches it that the Bridge did not read back.
 if [ "$EVENT" = to_captain ]; then
