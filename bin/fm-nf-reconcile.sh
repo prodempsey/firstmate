@@ -7,18 +7,28 @@
 #   fm-nf-reconcile.sh install   Install the persistent watcher check shim.
 #
 # Local state/<id>.meta plus the matching state/<id>.status are authoritative.
-# The ledger format is one tab-separated task id and signal fingerprint per line.
-# This Phase 1 command does not read or mutate board ownership.
+#
+# A terminal signal is unhandled until firstmate DISPOSITIONS it in the fleet-triage ledger,
+# and only an unhandled one is worth a wake. A dispositioned item stays listed - the triage
+# enumerator reads this list, and an item that vanished from it could never be re-surfaced,
+# re-audited, or reopened - but it is reported as dispositioned rather than counted as work
+# nobody has touched. A held item is reported as held, with its reason and review date.
+#
+# The check pass also converges board attention through bin/fm-nf-attention.sh, so a
+# disposition recorded while the cockpit was down, or one recorded before that reconciler
+# existed, still reaches the captain's board on the next watcher cycle without anyone
+# remembering to do it. Clearing attention is never closure: see bin/fm-nf-attention.sh.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 MODE=${1:-check}
 
 # shellcheck disable=SC1091 # Dynamic sibling path is resolved from BASH_SOURCE.
-. "$SCRIPT_DIR/fm-nf-lib.sh"
+. "$SCRIPT_DIR/fm-nf-attention-lib.sh"
 
 usage() {
   cat <<'EOF'
@@ -90,17 +100,25 @@ cleanup() {
 trap cleanup EXIT
 
 collect_unhandled() {
-  local meta id fingerprint
+  local meta id fingerprint fold detail
   : > "$PENDING"
+  fold=$(fm_nf_attention_fold "$DATA")
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] || continue
     id=$(basename "$meta" .meta)
     fingerprint=$(fm_nf_current_fingerprint "$STATE" "$id") || continue
-    # Review receipts are informational only. Closure evidence, not acknowledgement,
-    # is what removes an unresolved terminal signal from this level-triggered list.
-    printf '%s\t%s\n' "$id" "$fingerprint" >> "$PENDING"
+    # Review receipts are informational only. A recorded triage disposition - not an
+    # acknowledgement, and not closure evidence - is what stops a terminal signal from
+    # counting as unhandled here, and even then the item stays listed.
+    detail=$(fm_nf_attention_desired "$STATE" "$DATA" "$id" "$fold" \
+      | jq -r '[.state, .outcome, .review_after, (.reason | gsub("[\t\n]"; " "))] | @tsv')
+    printf '%s\t%s\t%s\n' "$id" "$fingerprint" "$detail" >> "$PENDING"
   done
   LC_ALL=C sort -o "$PENDING" "$PENDING"
+}
+
+count_state() {  # <state>
+  awk -F '\t' -v want="$1" '$3 == want {n++} END {print n + 0}' "$PENDING"
 }
 
 meta_detail() {  # <meta-file> <key>
@@ -109,15 +127,26 @@ meta_detail() {  # <meta-file> <key>
   [ -n "$value" ] && printf '%s' "$value" || printf '-'
 }
 
-print_list() {
-  local count id fingerprint meta status line verb
-  count=$(wc -l < "$PENDING" | tr -d ' ')
-  if [ "$count" -eq 0 ]; then
+print_header() {  # <total>
+  local total=$1 open held terminal extra=''
+  open=$(count_state open)
+  held=$(count_state held)
+  terminal=$(count_state terminal)
+  if [ "$total" -eq 0 ]; then
     printf 'NEEDS FIRSTMATE: none\n'
     return 0
   fi
-  printf 'NEEDS FIRSTMATE: %s unhandled\n' "$count"
-  while IFS=$'\t' read -r id fingerprint; do
+  if [ "$held" -gt 0 ]; then extra="$extra, $held held"; fi
+  if [ "$terminal" -gt 0 ]; then extra="$extra, $terminal dispositioned"; fi
+  printf 'NEEDS FIRSTMATE: %s unhandled%s\n' "$open" "$extra"
+}
+
+print_list() {
+  local count id fingerprint state outcome review_after reason meta status line verb
+  count=$(wc -l < "$PENDING" | tr -d ' ')
+  print_header "$count"
+  if [ "$count" -eq 0 ]; then return 0; fi
+  while IFS=$'\t' read -r id fingerprint state outcome review_after reason; do
     [ -n "$id" ] || continue
     meta="$STATE/$id.meta"
     status="$STATE/$id.status"
@@ -127,6 +156,16 @@ print_list() {
     printf '  signal: %s\n' "$line"
     printf '  verb: %s\n' "$verb"
     printf '  fingerprint: %s\n' "$fingerprint"
+    printf '  triage: %s\n' "$state"
+    case "$state" in
+      held)
+        printf '  held-until: %s\n' "$review_after"
+        printf '  hold-reason: %s\n' "$reason"
+        ;;
+      terminal)
+        printf '  disposition: %s\n' "$outcome"
+        ;;
+    esac
     printf '  kind: %s\n' "$(meta_detail "$meta" kind)"
     printf '  project: %s\n' "$(meta_detail "$meta" project)"
     printf '  mode: %s\n' "$(meta_detail "$meta" mode)"
@@ -138,17 +177,22 @@ print_list() {
   done < "$PENDING"
 }
 
+# The check line is the wake, so it names only what nobody has dispositioned yet. A held or
+# dispositioned item still appears in `list`, and the triage enumerator still audits it; what
+# it must never do is keep waking firstmate about work firstmate already decided.
 print_check_line() {
-  local count shown=0 remaining id fingerprint summary=""
-  count=$(wc -l < "$PENDING" | tr -d ' ')
-  while IFS=$'\t' read -r id fingerprint; do
+  local count shown=0 remaining id fingerprint state summary=""
+  count=$(count_state open)
+  while IFS=$'\t' read -r id fingerprint state _; do
     [ -n "$id" ] || continue
+    [ "$state" = open ] || continue
     if [ "$shown" -lt 8 ]; then
       [ -z "$summary" ] || summary="$summary, "
       summary="$summary$id"
       shown=$((shown + 1))
     fi
   done < "$PENDING"
+  [ "$count" -gt 0 ] || return 0
   remaining=$((count - shown))
   if [ "$remaining" -gt 0 ]; then
     summary="$summary, and $remaining more"
@@ -157,6 +201,13 @@ print_check_line() {
     "$count" "$summary"
 }
 
+# Converge the board with the ledger before reporting. Best effort by design: a cockpit that
+# is down must never break the watcher's check, and the next pass retries what it missed.
+if [ "$MODE" = check ] && [ -x "$SCRIPT_DIR/fm-nf-attention.sh" ]; then
+  FM_ROOT_OVERRIDE="$FM_ROOT" FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+    FM_DATA_OVERRIDE="$DATA" "$SCRIPT_DIR/fm-nf-attention.sh" sync >/dev/null 2>&1 || true
+fi
+
 collect_unhandled
 
 if [ "$MODE" = list ]; then
@@ -164,7 +215,5 @@ if [ "$MODE" = list ]; then
   exit 0
 fi
 
-if [ -s "$PENDING" ]; then
-  print_check_line
-fi
+print_check_line
 exit 0

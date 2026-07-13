@@ -225,4 +225,19 @@ for item in "${ITEMS[@]}"; do
   [ -n "$OUTCOME" ] && printf ' -> %s' "$OUTCOME"
   [ -n "$LINK" ] && printf ' (%s)' "$LINK"
   printf '\n'
+
+  # A disposition that only reaches the ledger is half a disposition: the item keeps
+  # presenting as active FirstMate attention on the captain's board until teardown runs,
+  # which is how reviewed-and-landed work piled up there. Reconciling here is what makes
+  # this automatic rather than a step firstmate has to remember; bin/fm-nf-attention.sh
+  # owns the mapping, and clears ATTENTION only - never closure, which stays teardown's.
+  case "$item" in
+    needs_firstmate:*)
+      if [ -x "$SCRIPT_DIR/fm-nf-attention.sh" ]; then
+        "$SCRIPT_DIR/fm-nf-attention.sh" apply "${item#needs_firstmate:}" \
+          || printf 'fm-fleet-triage-record: board attention for %s not reconciled yet; the next reconciler pass retries it\n' \
+            "$item" >&2
+      fi
+      ;;
+  esac
 done

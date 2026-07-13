@@ -99,7 +99,8 @@ Treat a re-surfaced item as live work again, not as a duplicate.
 Age and repeated appearances raise an item's priority and demand a recorded reason for the delay; they are never themselves a reason to escalate to the captain.
 Escalate on the decision's content, per the action classes above.
 
-For a `needs_firstmate` item, also complete the existing Needs FirstMate acknowledgement procedure, because the triage ledger does not replace that lane's own handling state.
+For a `needs_firstmate` item, recording the disposition is the whole procedure: `bin/fm-fleet-triage-record.sh` reconciles the item's board attention through `bin/fm-nf-attention.sh`, so a terminal outcome stops the card presenting as active FirstMate attention and a hold presents as held with its reason and review date.
+Do not hand-clear a card, and do not treat a cleared card as a closed task: attention is not closure, closure evidence is still teardown's to write, and a task without it stays un-closable and stays in the visibility audit.
 
 ## Recording a disposition, and the one mechanical auto-action
 
