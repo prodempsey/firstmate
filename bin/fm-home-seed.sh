@@ -492,7 +492,13 @@ ensure_home() {
     [ -d "$home" ] || { echo "error: $home exists and is not a directory" >&2; return 1; }
   else
     mkdir -p "$(dirname "$home")"
-    git clone --quiet "$FM_ROOT" "$home"
+    # --no-local: a local clone copies the source's loose objects one file at a
+    # time whenever it cannot hardlink them (any clone onto a different
+    # filesystem - a tmpfs test root, another volume), which turns a ~7MB repo
+    # into a 33MB home holding ~3000 files. The regular transport packs them
+    # instead: same content, ~280 files. Home clones are rare, so the small cost
+    # on a same-filesystem clone is worth never amplifying inode pressure again.
+    git clone --quiet --no-local "$FM_ROOT" "$home"
   fi
   verify_firstmate_home "$home"
 }

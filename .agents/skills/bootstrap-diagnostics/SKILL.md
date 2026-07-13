@@ -2,7 +2,7 @@
 name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
-  Use whenever the session-start digest's bootstrap section prints any diagnostic or capability line - MISSING, NEEDS_GH_AUTH, TANGLE, CREW_HARNESS_OVERRIDE, CREW_DISPATCH, FLEET_SYNC, SECONDMATE_SYNC, SECONDMATE_LIVENESS, LEASE_RECLAIM, TASKS_AXI, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one.
+  Use whenever the session-start digest's bootstrap section prints any diagnostic or capability line - MISSING, NEEDS_GH_AUTH, TANGLE, CREW_HARNESS_OVERRIDE, CREW_DISPATCH, FLEET_SYNC, SECONDMATE_SYNC, SECONDMATE_LIVENESS, LEASE_RECLAIM, TASKS_AXI, TEST_TMP_SWEEP, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one.
   A silent bootstrap section means all good and needs no skill load.
 user-invocable: false
 metadata:
@@ -45,6 +45,10 @@ The inline rules in `AGENTS.md` section 3 still bind: detect, then consent, then
   Bring them to the captain in outcome language: unfinished work is sitting in an abandoned workspace, summarize what is in it (inspect with `git -C <path> status` and `git -C <path> log --oneline @{u}..` - read-only), and ask whether to keep it (have a crewmate salvage the change) or let it go.
   Only on the captain's explicit word to discard, free the slot with `treehouse return --force <path>` run from the project dir; never do it on your own judgment, and never under `yolo` (discarding unlanded work is destructive and always escalates).
   If the pool is at or near exhaustion and every remaining lease is parked, say so plainly - new work cannot be dispatched into that project until slots are freed.
+- `TEST_TMP_SWEEP: reclaimed <n> orphaned test temp root(s)` - the session-start sweep reclaimed temp roots left behind by firstmate's own test suites, listing each one's footprint underneath.
+  Not a problem and not an action item: it is the designed recovery from a test killed by a SIGKILL (which no cleanup trap can ever catch), and it is reported only so the reclaim is never silent.
+  A root whose owning test process is still alive is never reclaimed, so this line can never mean a running test was disturbed.
+  It is worth a look only if it recurs every session with large footprints, which would mean suites are being killed routinely; `bin/fm-test-tmp-sweep.sh` owns the staleness proof.
 - `TASKS_AXI: available` - a default-backend capability fact, not a problem; record it silently and use `AGENTS.md` section 10 for backlog mutations.
   It prints only when `config/backlog-backend` is absent or set to `tasks-axi` and the shared compatibility probe passes (`docs/configuration.md` "Backlog backend").
   If the backend is not opted out and `tasks-axi` is missing or incompatible, bootstrap reports the `MISSING: tasks-axi` line but firstmate still hand-edits routine backlog updates and never blocks work.

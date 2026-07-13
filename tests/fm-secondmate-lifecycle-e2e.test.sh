@@ -27,6 +27,12 @@ set -u
 # shellcheck source=tests/secondmate-helpers.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/secondmate-helpers.sh"
 
+# This suite seeds real firstmate homes into TMPDIR. On a TMPDIR that is already
+# near exhaustion it would be the process that tips the box into ENOSPC, so it
+# refuses to start (after trying to reclaim its own orphans) rather than take the
+# fleet down. See tests/lib.sh and bin/fm-test-tmp-sweep.sh.
+fm_test_require_tmp_headroom 50000 2000
+
 TMP_ROOT=$(fm_test_tmproot fm-secondmate-lifecycle)
 export FM_BACKEND=tmux
 

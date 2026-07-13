@@ -9,6 +9,7 @@
 #                 "CREW_DISPATCH: active config/crew-dispatch.json" plus indented rules,
 #                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK: <detail>",
 #                 "TASKS_AXI: available", "TANGLE: <remediation>",
+#                 "TEST_TMP_SWEEP: reclaimed <n> orphaned test temp root(s)" plus indented detail,
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: fm-<id>...",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: already-live|respawned|skipped: <reason>|respawn failed: <reason>",
@@ -83,9 +84,9 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the five MUTATING sweeps
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the six MUTATING sweeps
 #          (secondmate_sync, secondmate_liveness_sweep, x_mode_setup,
-#          fleet_sync, lease_reclaim) while still printing every read-only detect line
+#          fleet_sync, lease_reclaim, test_tmp_sweep) while still printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
 #          checkout command. Used by
 #          fm-session-start.sh's read-only path when another live session holds
@@ -164,6 +165,24 @@ fleet_sync_relay_all_output() {
     [ -n "$line" ] || continue
     echo "FLEET_SYNC: $line"
   done < "$tmp"
+}
+
+# Reclaim temp roots orphaned by firstmate's own test suites. An EXIT trap cannot
+# fire on SIGKILL, so a killed suite leaks its entire root - and the secondmate
+# suites seed real firstmate homes, so enough leaks exhaust /tmp's inodes and every
+# write on the box starts failing with ENOSPC. Session start is where that gets
+# noticed and undone. Reclaimed roots are always reported; a clean sweep is silent.
+# bin/fm-test-tmp-sweep.sh owns the staleness proof and never touches a live root.
+test_tmp_sweep() {
+  [ -x "$FM_ROOT/bin/fm-test-tmp-sweep.sh" ] || return 0
+
+  local out reclaimed
+  out=$("$FM_ROOT/bin/fm-test-tmp-sweep.sh" 2>/dev/null | grep '^reclaimed ' || true)
+  [ -n "$out" ] || return 0
+
+  reclaimed=$(printf '%s\n' "$out" | wc -l | tr -d ' ')
+  echo "TEST_TMP_SWEEP: reclaimed $reclaimed orphaned test temp root(s)"
+  printf '%s\n' "$out" | sed 's/^/  /'
 }
 
 fleet_sync() {
@@ -652,5 +671,6 @@ if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   x_mode_setup
   fleet_sync
   lease_reclaim
+  test_tmp_sweep
 fi
 exit 0

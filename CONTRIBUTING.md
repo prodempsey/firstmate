@@ -76,6 +76,9 @@ for test_script in tests/*.test.sh; do bash "$test_script"; done   # behavior te
 tmp=$(mktemp -d) && printf 'done: smoke\n' > "$tmp/smoke.status" && FM_STATE_OVERRIDE="$tmp" FM_SIGNAL_GRACE=1 FM_POLL=1 FM_HEARTBEAT=999999 bin/fm-watch-arm.sh  # watcher re-arm smoke test (prints arm status, then an actionable signal)
 ```
 
+Take temp files from `fm_test_tmproot` (`tests/lib.sh`) rather than a bare `mktemp -d`: it stamps the root with its owning process, so `bin/fm-test-tmp-sweep.sh` can reclaim it at session start if the suite is ever killed by a signal no trap can catch.
+A suite that seeds anything heavy (a firstmate home is ~13MB and hundreds of inodes per clone) should also pre-flight `fm_test_require_tmp_headroom`, so it fails legibly instead of exhausting `/tmp` for the whole box.
+
 Discover tests by listing `tests/*.test.sh`: each is a self-contained bash script named `<subject>.test.sh`, and its header comment describes what it covers, so run one directly to focus on a subject.
 Tests that need a real optional backend or an explicit opt-in (real herdr/zellij/cmux smoke tests, the live Pi regression) skip themselves and print the tool or environment gate needed to enable them, so the run-all loop above is always safe.
 
