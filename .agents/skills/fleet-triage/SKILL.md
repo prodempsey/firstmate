@@ -120,6 +120,7 @@ Create a new backlog item only when no current item owns the follow-up.
 Route a known-shape fix when project, scope, acceptance criteria, and non-overlap are clear.
 Route uncertainty to a bounded scout instead of guessing an implementation.
 Present captain gates as a compact decision batch with the options, evidence, tradeoff, and recommended choice.
+Mark every gate as captain attention before presenting it, per AGENTS.md section 9; a gate that exists only in the batch prose was never asked.
 Record the outcome for each item the disposition actually covers, and leave the rest actionable.
 
 Two separate switches exist; do not confuse them.

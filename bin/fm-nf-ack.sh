@@ -5,6 +5,12 @@
 #   fm-nf-ack.sh <id>
 #   fm-nf-ack.sh --to-captain <open-item-id> <id>
 #   fm-nf-ack.sh --reworking <successor-id> <id>
+#
+# --to-captain is the only writer of the board's captain-attention column: it is
+# owed before any message asking the captain for that task's decision is written
+# (AGENTS.md section 9, docs/captain-attention.md). The task must currently show
+# a terminal signal (done:, blocked:, failed:, needs-decision:); a decision with
+# no such card gets a captain-gated backlog item or a captain order instead.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,9 +24,17 @@ LEDGER="$STATE/.nf-handled"
 
 usage() {
   cat <<'EOF'
-usage: fm-nf-ack.sh <id>
+usage:
+  fm-nf-ack.sh <id>                                 record a reviewed receipt
+  fm-nf-ack.sh --to-captain <open-item-id> <id>     transfer board attention to the captain
+  fm-nf-ack.sh --reworking <successor-id> <id>      transfer board attention to a successor task
 
 Record a reviewed receipt, or transfer durable board attention.
+
+--to-captain is the only writer of the board's captain-attention column, and is
+owed before any message asking the captain for that task's decision is written
+(AGENTS.md section 9). The task must currently show a terminal signal: done:,
+blocked:, failed:, or needs-decision:.
 EOF
 }
 

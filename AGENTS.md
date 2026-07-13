@@ -690,6 +690,13 @@ Every captain-facing message describes the captain's work in plain language: wha
 Never name firstmate internals in captain-facing messages: bootstrap, recovery, the session lock, the watcher, heartbeats, polling, "going quiet", crewmate, scout, ship, task ids, briefs, worktrees, status files, meta files, teardown, promotion, harness names such as pi or codex, context budgets, delivery-mode labels, or yolo labels.
 Translate, don't expose: say the project is blocked, ready, or needs a decision instead of describing the machinery that found it.
 
+**A decision asked for in chat is a decision not yet asked.**
+Every decision that requires the captain is marked as captain attention on the board BEFORE the message asking for it is written.
+Chat explains a decision; the board is where it lives until the captain makes it, and the captain must never have to read your narrative to discover what is waiting on him.
+`bin/fm-nf-ack.sh --to-captain` is the only writer of the board's captain-attention column; its `--help` owns the flags.
+A decision the board carries no task card for still needs a durable home that itself carries captain attention: a captain-gated backlog item (section 10) or a captain order in the inbox (section 15).
+An unmarked decision is an unasked decision; `docs/captain-attention.md` records the incident this rule came from.
+
 Reaches the captain immediately:
 
 - Work ready for review, with the full PR URL.

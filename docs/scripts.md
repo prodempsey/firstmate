@@ -19,7 +19,7 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-triage-duty.sh`      | Prompt (and prove consultation of) the triage duty at every fleet-state change                    |
 | `fm-order-lib.sh`        | Shared captain-order inbox parsing, validation, and record helpers                                 |
 | `fm-nf-reconcile.sh`     | Reconcile needs-firstmate terminal signals and keep unhandled firstmate cards noisy                |
-| `fm-nf-ack.sh`           | Acknowledge a needs-firstmate card so it stops resurfacing                                         |
+| `fm-nf-ack.sh`           | Acknowledge a needs-firstmate card so it stops resurfacing, or transfer its board attention (`--to-captain`, `--reworking`) |
 | `fm-nf-lib.sh`           | Shared needs-firstmate card parsing and lane-state helpers                                        |
 | `fm-fleet-sync.sh`       | Refresh project clones with safe fast-forwards, self-heals, `STUCK:` reports, branch pruning, and bounded recovery from an orphaned `.git/packed-refs.lock` |
 | `fm-fleet-snapshot.sh`   | Print the read-only structured fleet snapshot JSON (schema `fm-fleet-snapshot.v1`)   |
