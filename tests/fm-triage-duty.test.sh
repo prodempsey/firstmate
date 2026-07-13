@@ -381,9 +381,18 @@ test_local_only_merge_prompts_the_duty() {
   git -C "$home/wt" -c user.email=t@t -c user.name=t commit -qm work
   fm_write_meta "$home/state/task-x1.meta" \
     "window=fm-task-x1" "worktree=$home/wt" "project=$home/project" "kind=ship" "mode=local-only"
+  # The landing gate requires a canonical-trunk declaration (absence is an error,
+  # never a pass) and writes durable closure evidence through the visibility CLI;
+  # declare the fixture project's trunk and stub the CLI so the landing is hermetic.
+  mkdir -p "$home/config"
+  cat > "$home/config/canonical-trunk.json" <<EOF
+{"schema":"firstmate/canonical-trunk/1","projects":{"project":{"trunk_branch":"main","trunk_checkout":"$home/project","provisioning_base":"main","serving":{"source":"none","why":"test fixture"}}}}
+EOF
+  printf '%s\n' '#!/usr/bin/env node' 'process.exit(0);' > "$home/visibility.mjs"
 
   stderr="$home/merge.err"
-  FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" FM_FLEET_TRIAGE_BUG_CLI=off \
+  FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" FM_CONFIG_OVERRIDE="$home/config" \
+  FM_VISIBILITY_CLI="$home/visibility.mjs" FM_FLEET_TRIAGE_BUG_CLI=off \
     "$ROOT/bin/fm-merge-local.sh" task-x1 > "$home/merge.out" 2> "$stderr" \
     || fail "local-only merge failed"
   assert_grep 'FLEET TRIAGE DUTY - SHIP WORK LANDED' "$stderr" \

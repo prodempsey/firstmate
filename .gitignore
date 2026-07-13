@@ -17,3 +17,4 @@ config/backend
 config/x-mode.env
 config/cmux-socket-password
 config/wedge-alarm
+config/canonical-trunk.json

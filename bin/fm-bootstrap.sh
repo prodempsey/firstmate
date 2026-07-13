@@ -12,6 +12,7 @@
 #                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK: <detail>",
 #                 "TASKS_AXI: available", "TANGLE: <remediation>",
 #                 "TEST_TMP_SWEEP: reclaimed <n> orphaned test temp root(s)" plus indented detail,
+#                 "TRUNK: <project>: error|drift|note: <message> - fix: <fix>",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: fm-<id>...",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: already-live|respawned|skipped: <reason>|respawn failed: <reason>",
@@ -700,6 +701,15 @@ if [ -n "$tangle_branch" ]; then
     echo "TANGLE: primary checkout on feature branch '$tangle_branch' (expected '$tangle_default'); the work is safe on that ref - restore the primary with: git -C $FM_ROOT checkout $tangle_default, then re-validate the branch in a proper worktree"
   fi
 fi
+# Canonical trunk invariant: the declared trunk, the GitHub default, the running
+# process, the primary checkout, and the crewmate provisioning base must agree,
+# and the serving commit must be at or behind trunk. Silent when they do; loud on
+# drift, and loud when the declaration itself is missing or malformed, because a
+# verifier that cannot read its input must never report health. This is the
+# STARTUP half of the invariant - bin/fm-merge-local.sh is the closed gate half.
+# bin/fm-trunk-check.sh owns the line format and never mutates a ref.
+"$FM_ROOT/bin/fm-trunk-check.sh" --all --lines || true
+
 crew=
 [ -f "$CONFIG/crew-harness" ] && crew=$(tr -d '[:space:]' < "$CONFIG/crew-harness" || true)
 [ -n "$crew" ] && [ "$crew" != "default" ] && echo "CREW_HARNESS_OVERRIDE: $crew"

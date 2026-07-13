@@ -2,7 +2,7 @@
 name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
-  Use whenever the session-start digest's bootstrap section prints any diagnostic or capability line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CREW_HARNESS_OVERRIDE, CREW_DISPATCH, FLEET_SYNC, SECONDMATE_SYNC, SECONDMATE_LIVENESS, LEASE_RECLAIM, TASKS_AXI, TEST_TMP_SWEEP, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one.
+  Use whenever the session-start digest's bootstrap section prints any diagnostic or capability line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, TRUNK, CREW_HARNESS_OVERRIDE, CREW_DISPATCH, FLEET_SYNC, SECONDMATE_SYNC, SECONDMATE_LIVENESS, LEASE_RECLAIM, TASKS_AXI, TEST_TMP_SWEEP, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one.
   A silent bootstrap section means all good and needs no skill load.
 user-invocable: false
 metadata:
@@ -26,6 +26,12 @@ The inline rules in `AGENTS.md` section 3 still bind: detect, then consent, then
 - `TANGLE: <remediation>` - the primary checkout is stranded on a feature branch instead of its default branch; `AGENTS.md` section 8 explains why this guard exists and what it protects.
   The work is safe on that branch ref; restore the primary to its default branch with the printed `git -C <root> checkout <default>`, then re-validate that branch in a proper worktree.
   This is the only sanctioned firstmate-initiated git write to the primary, and it is a non-destructive branch switch that strands nothing.
+- `TRUNK: <project>: error|drift|note: <message> - fix: <fix>` - the canonical trunk invariant for a governed project (`docs/configuration.md` "Canonical trunk declaration").
+  `drift` means the serving lineage is AHEAD of, or divergent from, the declared canonical trunk, the trunk checkout is parked off trunk, the crew provisioning base is stale, or the GitHub default disagrees with the declaration.
+  This is the failure that let a project's `main` sit frozen for sixteen days unnoticed, so treat it as a stop-and-fix before landing more work: run the printed fix, or dispatch a crewmate to converge the lineages, and never leave it reported-but-ignored.
+  `error` means the invariant is UNVERIFIABLE - the declaration is missing or malformed, a governed project has no entry, or the serving lineage cannot be read - which is never a pass; write or repair `config/canonical-trunk.json` (the verifier prints the schema) before dispatching work whose landing depends on it.
+  `note` is a deploy lag (serving behind trunk), which is the tolerable direction: report it to the captain if a deploy is expected, and otherwise carry on.
+  The verifier never mutates a ref; `bin/fm-merge-local.sh` refuses local landings while any `error` or `drift` stands, so a refused merge is this line telling you the same thing twice.
 - `CREW_HARNESS_OVERRIDE: <name>` - record and use the override silently; surface a harness fact only if it actually blocks work or the captain asks.
 - `CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>` - the optional dispatch profile file exists but failed low-cost bootstrap validation; continue with the normal fallback chain, resolve and pass the chosen fallback harness explicitly while the file remains present, fix the malformed schema, unverified harness name, unknown selector, or invalid harness/effort pair when convenient, and do not select a bad profile.
 - `CREW_DISPATCH: active config/crew-dispatch.json` - bootstrap validated the optional dispatch profile file and printed its active rules and `default:` when present.

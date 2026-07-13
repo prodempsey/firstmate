@@ -1,0 +1,26 @@
+{
+  "schema": "firstmate/canonical-trunk/1",
+  "_comment": "Copy to config/canonical-trunk.json in this firstmate home (local, gitignored) and edit. docs/configuration.md 'Canonical trunk declaration' owns the schema; bin/fm-trunk-check.sh verifies it and bin/fm-merge-local.sh gates on it.",
+  "projects": {
+    "fleet-bridge": {
+      "trunk_branch": "main",
+      "trunk_checkout": "~/fleet/fleet-bridge",
+      "github_repo": "prodempsey/fleet-bridge",
+      "provisioning_base": "main",
+      "serving": {
+        "source": "command",
+        "command": "~/fleet/.fb-redesign/bin/serving-root.sh identity",
+        "why": "a long-running process serves this repo; it publishes its own branch/SHA identity"
+      }
+    },
+    "firstmate": {
+      "trunk_branch": "main",
+      "trunk_checkout": "~/fleet/firstmate-runtime",
+      "provisioning_base": "main",
+      "serving": {
+        "source": "none",
+        "why": "no long-running process serves this repo"
+      }
+    }
+  }
+}

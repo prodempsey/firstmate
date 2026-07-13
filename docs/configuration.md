@@ -92,6 +92,52 @@ That evidence policy is specific to the firstmate repo: target projects may legi
 That command requires `tmux` on `PATH`, prints `tmux -V`, runs every `tests/*.test.sh` with `bash`, and fails if any script exits non-zero.
 It intentionally mirrors the behavior-test baseline in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) instead of delegating the test step to an agent.
 
+## Canonical trunk declaration (config/canonical-trunk.json)
+
+The canonical trunk of every governed project is declared in one machine-readable file: `config/canonical-trunk.json` in the firstmate home (local, gitignored; `FM_CANONICAL_TRUNK` overrides the path).
+`bin/fm-trunk-check.sh` verifies the declaration and owns the verification contract; `bin/fm-merge-local.sh` gates local landings on it; `bin/fm-bootstrap.sh` reports it at session start as `TRUNK:` lines; `bin/fm-fleet-view.sh` renders it as the fleet's audit surface.
+Copy `docs/examples/canonical-trunk.json` to start.
+
+The declaration lives in the firstmate home rather than in the governed repo on purpose.
+A repo cannot be the authority on its own canonicity: a declaration that rides the governed lineage drifts with it, is rewritten by the same reset or force-push it is meant to catch, and dies with the very failure it guards against.
+The firstmate home is a different repository from every project clone, and its `config/` is untracked even when firstmate governs itself, so no ref operation inside a governed repo can move, stale, or orphan the declaration.
+
+```json
+{
+  "schema": "firstmate/canonical-trunk/1",
+  "projects": {
+    "<registry name from data/projects.md>": {
+      "trunk_branch": "main",
+      "trunk_checkout": "~/fleet/<project>",
+      "github_repo": "owner/repo",
+      "github_default": "main",
+      "provisioning_base": "main",
+      "serving": { "source": "command", "command": "~/fleet/<serving root>/bin/serving-root.sh identity" }
+    }
+  }
+}
+```
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `trunk_branch` | yes | The canonical trunk branch name; the landing target and the reference every other observation is compared against. |
+| `trunk_checkout` | yes | The checkout that holds the canonical trunk branch. A leading `~` means `$HOME`. |
+| `serving` | yes | How to read the running process's branch and SHA. Required even when nothing serves the repo, because an omitted key is exactly the silent gap this file exists to close. |
+| `serving.source` | yes | `command` (run the project's own identity command), `worktree` (read a checkout's git HEAD directly), or `none` (nothing serves this repo). |
+| `serving.command` | with `source: command` | A command whose stdout is a JSON object carrying `sha` and, ideally, `branch` and `dirty`; fleet-bridge's `bin/serving-root.sh identity` is the reference producer. Bounded by `FM_TRUNK_SERVING_TIMEOUT` (default 5s). |
+| `serving.worktree` | with `source: worktree` | A checkout whose git HEAD is what is being served. |
+| `provisioning_base` | no | The branch new crewmate worktrees are cut from; defaults to `trunk_branch`. A base off trunk quietly bases every new task on stale code. |
+| `github_repo`, `github_default`, `why` | no | Documentation and an optional expected GitHub default branch, cross-checked against the clone's `origin/HEAD`. |
+
+**The rule:** the serving commit must be equal to, or an ancestor of, canonical trunk.
+Serving behind trunk is a deploy lag: tolerable, reported, exit 0.
+Serving ahead of, or divergent from, trunk is the drift bug: exit 1.
+
+**Absence is an error, never a pass.**
+A missing file, a project registered in `data/projects.md` but absent from the declaration, a malformed entry, or an unreadable serving source all exit 2 with a loud error and print the schema; a verifier that cannot read its input must say so rather than report health.
+The `data/projects.md` registry is the independent list of what must be declared, so deleting the declaration does not quietly disable verification.
+Nothing here mutates a ref, branch, or config: the verifier and the merge gate detect, refuse, and name the exact fix.
+
 ## Captain preferences (data/captain.md)
 
 Personal preferences for one captain's fleet live locally in `data/captain.md`; it is gitignored and printed in the session-start context digest after `data/projects.md` and optional `data/secondmates.md`.

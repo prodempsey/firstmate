@@ -3,7 +3,9 @@
 #
 # This command intentionally does not parse fleet state itself.
 # It shells out to fm-fleet-snapshot.sh --json and renders that stable
-# structured contract for humans.
+# structured contract for humans, plus bin/fm-trunk-check.sh --json for the
+# canonical trunk section: this is the fleet's audit surface, so the branch, SHA,
+# and canonical status of every governed project belong on it. Both are read-only.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -94,3 +96,35 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
   "## Secondmates",
   .secondmate_guidance.note
 '
+
+# Canonical trunk. The verifier's exit code is a status (1 drift, 2 declaration or
+# observation error), not a failure of this renderer, so its report is rendered
+# either way and never suppressed.
+TRUNK=$("$SCRIPT_DIR/fm-trunk-check.sh" --all --json 2>/dev/null || true)
+printf '\n'
+if [ -z "$TRUNK" ]; then
+  printf '## Canonical Trunk\n\nUNVERIFIED - bin/fm-trunk-check.sh produced no report.\n'
+else
+  printf '%s\n' "$TRUNK" | jq -r '
+    def dash($v): if $v == null or $v == "" then "-" else $v end;
+    def sha($v): if $v == null or $v == "" then "-" else $v[0:12] end;
+    def row($p):
+      "| \($p.project) | \(dash($p.trunk.branch)) | \(sha($p.trunk.sha)) | \(dash($p.github_default)) | \(dash($p.primary_checkout.branch)) | \(dash($p.serving.branch)) | \(sha($p.serving.sha)) | \($p.serving.relation) |";
+    "## Canonical Trunk",
+    "",
+    "Status: \(.status)  (declaration: \(.declaration))",
+    "",
+    (if ([.projects[]? | select(.declared)] | length) == 0 then
+      "No governed project has a canonical-trunk declaration."
+     else
+      "| Project | Trunk | Trunk SHA | GitHub default | Primary checkout | Serving | Serving SHA | Serving vs trunk |",
+      "| --- | --- | --- | --- | --- | --- | --- | --- |",
+      (.projects[] | select(.declared) | row(.))
+     end),
+    (if (.findings | length) == 0 then empty else
+      "",
+      "### Findings",
+      (.findings[] | "- **\(.severity | ascii_upcase)** [\(.project)] \(.message)\n  - fix: \(.fix)")
+     end)
+  '
+fi

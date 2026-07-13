@@ -45,15 +45,21 @@ printf 'process.exit(0);\n' > "$VIS_STUB"
 run_merge() {  # <home> <id>
   local home=$1 id=$2
   env FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
-    FM_VISIBILITY_CLI="$VIS_STUB" \
+    FM_CONFIG_OVERRIDE="$home/config" FM_VISIBILITY_CLI="$VIS_STUB" \
     "$MERGE" "$id" 2>&1
 }
 
 setup_task() {  # <home> <id> <proj>
   local home=$1 id=$2 proj=$3
-  mkdir -p "$home/state"
+  mkdir -p "$home/state" "$home/config"
   fm_write_meta "$home/state/$id.meta" \
     "project=$proj" "mode=local-only" "kind=ship" "yolo=off"
+  # The landing gate requires a canonical-trunk declaration (absence is an
+  # error, never a pass); declare the fixture project's trunk so the merge
+  # reaches the destructive-merge backstop under test.
+  cat > "$home/config/canonical-trunk.json" <<EOF
+{"schema":"firstmate/canonical-trunk/1","projects":{"proj":{"trunk_branch":"main","trunk_checkout":"$proj","provisioning_base":"main","serving":{"source":"none","why":"test fixture"}}}}
+EOF
 }
 
 # T1: the live bug. A branch based on the stale base, made a fast-forwardable
@@ -118,7 +124,7 @@ test_allows_deliberate_deletion() {
   out=$(run_merge "$home" "$id"); status=$?
 
   expect_code 0 "$status" "deliberate deletion must still merge"$'\n'"$out"
-  assert_contains "$out" "merged fm/$id into local main" "expected the merge to land"
+  assert_contains "$out" "merged fm/$id into canonical trunk main" "expected the merge to land"
   assert_absent "$proj/tooling-b.sh" "the deliberately deleted file should be gone"
   assert_present "$proj/tooling-b2.sh" "the replacement should be present"
   assert_present "$proj/tooling-a.sh" "untouched tooling must survive"
