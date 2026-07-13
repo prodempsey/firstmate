@@ -106,9 +106,10 @@ BASE_REF=$(resolve_base_ref) \
 # "$FM_ROOT/bin/fm-project-mode.sh" (etc.) resolve correctly.
 #
 # The sibling set is SWEPT from bin/, never hand-listed. A hardcoded list rots
-# silently the moment one of the five gains a dependency: the missing sibling
-# surfaces only as a `. "$SCRIPT_DIR/<lib>.sh"` abort under set -eu, deep inside
-# an unrelated-looking conformance case. Sweeping keeps the fixture correct by
+# silently the moment one of the five gains a dependency (fm-gate-refuse-lib.sh
+# is a recent example): the missing sibling surfaces only as a
+# `. "$SCRIPT_DIR/<lib>.sh"` abort under set -eu, deep inside an
+# unrelated-looking conformance case. Sweeping keeps the fixture correct by
 # construction as bin/ grows.
 OLD_BIN_REFACTORED="fm-send.sh fm-peek.sh fm-watch.sh fm-spawn.sh fm-teardown.sh"
 
