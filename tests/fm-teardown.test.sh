@@ -50,6 +50,11 @@
 #   (x) transient lock cleared after first failed return      -> retry ALLOW
 #   (y) persistent lock (never clears, not provably stale)    -> REFUSE loudly
 #   (z) recorded worktree == project's own checkout            -> return skipped, ALLOW (graceful)
+#
+# Also covers the durable-closeout gate (bin/fm-task-events.sh), which teardown refuses on:
+#   (aa) closeout fails outright                     -> REFUSE, volatile state preserved
+#   (ab) no TaskRecord exists (task predates the CLI) -> record backfilled, then ALLOW
+#   (ac) record already terminal with valid evidence  -> ALLOW on the existing trail
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -1492,6 +1497,65 @@ test_closeout_failure_preserves_volatile_state() {
   pass "closure-evidence failure preserves volatile task state"
 }
 
+# The gate must not trap tasks whose durable record is merely absent: every task that ran
+# before the visibility CLI existed has no TaskRecord, and refusing them all is a bug, not
+# safety. The writer backfills the record from meta and then closes.
+test_missing_task_record_is_backfilled_and_teardown_proceeds() {
+  local case_dir rc=0
+  case_dir=$(make_case closeout-backfill)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "landed work"
+  add_fork_with_pushed_branch "$case_dir"
+  printf '%s\n' 'done: ready' > "$case_dir/state/task-x1.status"
+  # A visibility CLI that only closes tasks it has a record for, exactly like the real one.
+  cat > "$case_dir/visibility.mjs" <<'JS'
+#!/usr/bin/env node
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+const argv = process.argv.slice(2);
+const marker = `${process.env.FM_STATE_OVERRIDE}/fake-record`;
+appendFileSync(`${process.env.FM_STATE_OVERRIDE}/fake-visibility.log`, `${argv.join(' ')}\n`);
+if (argv[0] === 'record') { writeFileSync(marker, 'recorded'); process.exit(0); }
+if (argv[0] === 'close' && !existsSync(marker)) {
+  console.error(`✗ unknown task: home/${argv[1]}`);
+  process.exit(1);
+}
+process.exit(0);
+JS
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "a task with no durable record must still be tearable down"
+  assert_grep 'record task-x1' "$case_dir/state/fake-visibility.log" "the missing record should be backfilled"
+  assert_grep 'close task-x1' "$case_dir/state/fake-visibility.log" "the backfilled record should then be closed"
+  assert_absent "$case_dir/state/task-x1.meta" "teardown should clear volatile state once the trail is durable"
+  pass "task with no durable record is backfilled, closed, and torn down"
+}
+
+# An out-of-band closeout carrying valid evidence is the property the gate protects, so it
+# must let teardown through rather than trap the task forever behind its own success.
+test_already_terminal_record_allows_teardown() {
+  local case_dir rc=0
+  case_dir=$(make_case closeout-terminal)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "landed work"
+  add_fork_with_pushed_branch "$case_dir"
+  printf '%s\n' 'done: ready' > "$case_dir/state/task-x1.status"
+  # Record already closed out of band; audit reports its closure evidence is valid.
+  cat > "$case_dir/visibility.mjs" <<'JS'
+#!/usr/bin/env node
+const argv = process.argv.slice(2);
+if (argv[0] === 'audit') { console.log('{"ok":true,"diagnostics":[]}'); process.exit(0); }
+if (argv[0] === 'close') {
+  console.error(`✗ terminal task cannot accept closure_evidence: home/${argv[1]}`);
+  process.exit(1);
+}
+process.exit(0);
+JS
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "an already-closed record with valid evidence must not block teardown"
+  assert_no_grep 'durable visibility closeout failed' "$case_dir/stderr" "teardown should not refuse a valid existing trail"
+  assert_absent "$case_dir/state/task-x1.meta" "teardown should proceed on the existing durable trail"
+  pass "already-terminal record with valid evidence lets teardown proceed"
+}
+
 test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
@@ -1504,6 +1568,8 @@ test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_herdr_teardown_clears_escalation_marker
 test_closeout_failure_preserves_volatile_state
+test_missing_task_record_is_backfilled_and_teardown_proceeds
+test_already_terminal_record_allows_teardown
 test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows
