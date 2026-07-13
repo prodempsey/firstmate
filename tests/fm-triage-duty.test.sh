@@ -8,7 +8,8 @@
 # primary at each of the eleven named triggers when (and only when) something is
 # actionable, it stays silent for everyone who does not owe the duty (no lock, away
 # mode, kill switch) regardless of what is actionable, it never touches a caller's
-# stdout or exit status, it never writes the outcome ledger, it surfaces its own
+# stdout or exit status, it records no disposition (it stamps first sight and nothing
+# else, so age is real and stale_unprocessed can fire), it surfaces its own
 # machine-readable pass result (trigger, scope, actionable, ownerless, unhealthy,
 # captain_gated, fingerprint) in both the banner and a volatile state cache, and an
 # enumerator crash is a visible FAILED finding rather than indistinguishable silence.
@@ -242,14 +243,47 @@ test_banner_never_pollutes_stdout() {
   pass "the banner goes to stderr only"
 }
 
-test_duty_writes_no_ledger_but_caches_its_own_result() {
-  local home
+# The duty pass records NO DISPOSITION - no claim, no outcome, no judgment about any item.
+# It does stamp first sight, because nothing else ever did: without a persisted first_seen_at
+# every item reported an age of zero forever and stale_unprocessed could never fire, so an
+# item ignored for thirteen hours was indistinguishable from one that appeared this instant.
+# The line this pins is therefore not "writes nothing" but "writes only surface".
+test_duty_stamps_first_sight_but_records_no_disposition() {
+  local home ledger
   home=$(make_home)
   seed_actionable "$home"
   run_duty "$home" teardown >/dev/null
-  assert_absent "$home/data/fleet-triage.jsonl" "the duty pass wrote to the triage OUTCOME ledger; it must only read and cache its own result"
+  ledger="$home/data/fleet-triage.jsonl"
   assert_present "$(cache_of "$home")" "the duty pass did not cache its own result for bin/fm-guard.sh's preflight to read"
-  pass "the duty pass never writes the outcome ledger, but does cache its own pass result"
+  assert_present "$ledger" "the duty pass stamped no first sight at all; stale_unprocessed can never fire without it"
+  [ "$(jq -r 'select(.event != "surface") | .event' "$ledger" | wc -l)" -eq 0 ] \
+    || fail "the duty pass recorded a disposition; it may only stamp first sight: $(cat "$ledger")"
+  [ "$(jq -r 'select(.item_id == "backlog_hygiene:ready-q1") | .first_seen_at // empty' "$ledger" | wc -l)" -eq 1 ] \
+    || fail "the surfaced item carries no persisted first_seen_at"
+  pass "the duty pass stamps first sight through the sanctioned writer, and records no disposition"
+}
+
+# The stamp must be safe to run on EVERY pass, which means it must never clear a disposition
+# firstmate already recorded. surface --new is confined to items the ledger has never seen,
+# so a held item stays held across any number of passes; --all would have re-opened it.
+test_duty_stamp_never_reopens_a_recorded_disposition() {
+  local home ev out
+  home=$(make_home)
+  seed_actionable "$home"
+  run_duty "$home" teardown >/dev/null
+  ev=$(FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" FM_FLEET_TRIAGE_BUG_CLI=off \
+    "$ROOT/bin/fm-fleet-triage.sh" --json 2>/dev/null \
+    | jq -r '.items[] | select(.item_id == "backlog_hygiene:ready-q1") | .evidence_version')
+  FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" FM_FLEET_TRIAGE_BUG_CLI=off \
+    "$ROOT/bin/fm-fleet-triage-record.sh" hold backlog_hygiene:ready-q1 \
+    --reason 'waiting on upstream' --review-after '2099-01-01' --evidence-version "$ev" >/dev/null
+
+  run_duty "$home" heartbeat >/dev/null
+  out=$(FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" FM_FLEET_TRIAGE_BUG_CLI=off \
+    "$ROOT/bin/fm-fleet-triage.sh" --json 2>/dev/null)
+  [ "$(printf '%s' "$out" | jq -r '.items[] | select(.item_id == "backlog_hygiene:ready-q1") | .processing_state')" = held ] \
+    || fail "a later duty pass re-opened a recorded hold; the stamp must only touch unseen items"
+  pass "the first-sight stamp never re-opens an item the ledger already carries a disposition for"
 }
 
 test_enumeration_failure_is_a_visible_finding_not_swallowed_silence() {
@@ -377,7 +411,8 @@ test_kill_switch_silences_everything
 test_enumerate_only_reports_but_refuses_writes_clear_fleet_stays_silent_regardless
 test_unknown_trigger_fails_loudly
 test_banner_never_pollutes_stdout
-test_duty_writes_no_ledger_but_caches_its_own_result
+test_duty_stamps_first_sight_but_records_no_disposition
+test_duty_stamp_never_reopens_a_recorded_disposition
 test_enumeration_failure_is_a_visible_finding_not_swallowed_silence
 test_wake_drain_prompts_the_duty_and_keeps_records_clean
 test_drained_heartbeat_asks_for_a_full_pass

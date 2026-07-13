@@ -14,6 +14,19 @@ On 2026-07-04, that exact gap left a parked no-mistakes gate unwatched for about
 `bin/fm-turnend-guard.sh` closes the gap by checking the primary's own turn-end path.
 When tasks are in flight and there is no live identity-matched watcher with a fresh beacon, a harness hook must either block the turn end or force a bounded follow-up turn that tells the primary to resume the session-start supervision protocol for its harness.
 
+## Gap Closed: finished work left unhandled
+
+The guard blocks on a second, independent condition: **the `needs_firstmate` lane is non-empty**.
+
+This guard was, for a long time, the only mechanism in the system that could actually compel the primary, and its predicate read supervision liveness only.
+Every fleet-triage mechanism printed to stderr and exited 0 - the duty banner, `bin/fm-guard.sh`'s preflight, the `fleet-triage` skill, AGENTS.md section 8.
+So arming the watcher was a complete and sufficient turn exit however much finished work was piled up, and the primary, correctly reading which constraint was real, took it: on 2026-07-13 a session ended cleanly holding 61 actionable and 61 ownerless triage items, with five finished crew branches unlanded and the oldest unhandled signal 13.3 hours old.
+A hard rule against ending a turn with supervision off, and a printf against ending a turn with the fleet's work undone, is not a discipline failure to exhort away; it is the predictable equilibrium of the incentives as built.
+
+The block is scoped to the `needs_firstmate` lane and deliberately **not** to the full actionable set.
+That lane is bounded by the number of live tasks, cannot be flooded by an audit backfill, and is level-triggered off `state/<id>.meta` plus `state/<id>.status`, so it is discharged by landing or tearing down the work rather than by any paper exit.
+Gating on all actionable items would make the guard a flood-wedge liability the next session simply disables.
+
 ## Shared Predicate
 
 The guard first scopes itself to the real primary checkout.
@@ -21,12 +34,25 @@ It is inert in secondmate homes because `.fm-secondmate-home` exists there.
 It is inert in crewmate and scout worktrees because firstmate provisions them as linked git worktrees, where `git rev-parse --git-dir` differs from `git rev-parse --git-common-dir`.
 It also requires `AGENTS.md`, `bin/`, and the effective state directory to exist.
 
-For an in-scope primary checkout, it counts in-flight work from `state/*.meta`.
-If no task is in flight, it exits silently.
+For an in-scope primary checkout it evaluates two independent conditions, and blocks when either holds.
+It exits silently when neither does, so the healthy path stays completely quiet.
+
+**Supervision is off.**
+It counts in-flight work from `state/*.meta`.
 If work is in flight, it requires `fm_watcher_healthy <state-dir> <watch-path> [grace-seconds] [home]` from `bin/fm-wake-lib.sh`.
 That is the same identity-matched live lock and fresh beacon check used by `bin/fm-watch-arm.sh`.
 A stale beacon blocks even if a watcher pid is still live.
 A fresh leftover beacon blocks if the watcher lock is missing, dead, or identity-mismatched.
+
+**Finished work is unhandled.**
+It reads the `needs_firstmate` count from `state/.triage-duty-last.json`, the small volatile cache `bin/fm-triage-duty.sh` writes on every pass and `bin/fm-guard.sh`'s preflight already reads.
+A non-empty lane blocks, whether or not any task is in flight and whether or not the watcher is healthy.
+This is a plain file read: the guard runs on the primary's turn-end path and must never pay for an enumeration there.
+
+**Fail-open is mandatory, and applies to the whole predicate.**
+A missing, unreadable, corrupt, or old-format cache yields a count of 0 and blocks nothing; the guard then behaves exactly as it did before this lane existed.
+Away mode (`state/.afk`) and the duty kill switch (`FM_TRIAGE_DUTY=off`) also yield 0, because in both the duty pass deliberately does not run: the cache would go stale with no pass left to clear it, and a block that can never be discharged is worse than the bug it catches.
+The `stop_hook_active` loop guard bounds this, like every other block, to at most one forced continuation per turn, so neither condition can produce an un-endable session.
 
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repo-root `state/`.
 `FM_GUARD_GRACE` controls the beacon freshness window and defaults to 300 seconds.

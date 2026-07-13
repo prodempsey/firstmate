@@ -640,11 +640,15 @@ RESULT=$(jq -n \
   --slurpfile raw "$RAW_ITEMS" \
   --slurpfile fold "$FOLD_FILE" \
   --slurpfile health "$HEALTH_FILE" \
-  --slurpfile ev "$EV_FILE" '
+  --slurpfile ev "$EV_FILE" "$FM_TRIAGE_REVIEW_AGE_JQ"'
   # Seconds since an ISO-8601 stamp, or null when absent or unparseable.
   def age($ts; $now_epoch):
     if ($ts // "") == "" then null
     else ($ts | try (fromdateiso8601 | $now_epoch - .) catch null) end;
+
+  # review_age (what a review date is, and which forms are readable) is defined once in
+  # bin/fm-fleet-triage-lib.sh and embedded above, because the writer validates holds
+  # against the same definition. See FM_TRIAGE_REVIEW_AGE_JQ there.
 
   # A terminal outcome is only real with its lineage attached. This mirrors the writers
   # refusal, and catches any ledger row that bypassed it (a hand-append, an old format).
@@ -675,8 +679,14 @@ RESULT=$(jq -n \
          elif ($f.evidence_version // "") != "" and $f.evidence_version != $cur
            then "evidence_changed"
          elif $ps == "held"
-           and (age($f.review_after; $now_epoch) as $a | $a != null and $a >= 0)
+           and (review_age($f.review_after; $now_epoch) as $a | $a != null and $a >= 0)
            then "hold_expired"
+         # A hold whose review date cannot be read can never come due, so it is not a
+         # disposition - it is silence with paperwork. Fail it back into the queue rather
+         # than let an unreadable date park work forever.
+         elif $ps == "held"
+           and (review_age($f.review_after; $now_epoch) == null)
+           then "hold_unreviewable"
          elif $ps == "claimed"
            and (age($f.claimed_at; $now_epoch) as $a | $a != null and $a > $claim_ttl)
            then "claim_abandoned"

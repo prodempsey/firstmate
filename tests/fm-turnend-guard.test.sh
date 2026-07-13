@@ -166,6 +166,152 @@ record_watcher_lock() {
   printf '%s\n' "$identity" > "$dir/state/.watch.lock/pid-identity"
 }
 
+# --- HOOK: the second, independent block reason - finished work left unhandled ------
+#
+# The guard's whole point is that it is the only thing in this system that can say no. For a
+# long time it said no to exactly one thing (supervision off), so arming the watcher was a
+# complete turn exit however much finished crew work was piled up - and the primary took that
+# exit, holding 61 ownerless items and five unlanded branches. These cases pin the second
+# reason: a non-empty needs_firstmate lane blocks too.
+#
+# The cache is written directly rather than by running a real duty pass, the same way
+# tests/fm-triage-guard.test.sh pins fm-guard.sh's preflight: this suite is about the guard's
+# file-read contract and its fail-open behavior, not about the enumerator.
+
+write_triage_cache() {  # <dir> <json>
+  printf '%s\n' "$2" > "$1/state/.triage-duty-last.json"
+}
+
+# A primary with healthy supervision: one task in flight, a live identity-matched watcher
+# lock, and a fresh beacon. Anything this guard says from here is about the WORK, not the
+# watcher. Prints the watcher pid; the caller must kill it.
+start_healthy_watcher() {  # <dir>
+  local dir=$1 pid identity
+  : > "$dir/state/task1.meta"
+  # stdout MUST be closed off: this helper runs inside a command substitution, and a
+  # background job holding that pipe open makes $(...) wait out the whole sleep - which
+  # would hand the caller a pid that is already dead, i.e. exactly the unhealthy watcher
+  # these cases exist to rule out.
+  sleep 60 >/dev/null 2>&1 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live watcher holder"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  printf '%s\n' "$pid"
+}
+
+stop_watcher() {  # <pid>
+  kill "$1" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
+}
+
+# The acceptance case, and the one the incident is about: supervision is perfectly healthy,
+# and the turn still must not end, because finished crew work is sitting unhandled.
+test_hook_blocks_on_unhandled_finished_work() {
+  local dir pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-block")
+  pid=$(start_healthy_watcher "$dir")
+  write_triage_cache "$dir" '{"ok":true,"needs_firstmate":3,"actionable":9,"ownerless":9}'
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 2 "$status" "hook must block when finished crew work is unhandled, even with supervision healthy"
+  assert_contains "$out" "TURN WOULD END WITH FINISHED WORK UNHANDLED" "block banner must name the unhandled work"
+  assert_contains "$out" "3 crew signal(s)" "block banner must say how much work is unhandled"
+  assert_not_contains "$out" "SUPERVISION IS OFF" "a healthy watcher must not be reported as down"
+  pass "fm-turnend-guard: blocks on a non-empty needs_firstmate lane despite a live, fresh watcher"
+}
+
+# The healthy path must stay completely silent: a new alarm that fires on a clear fleet is a
+# new alarm nobody reads.
+test_hook_silent_when_lane_is_clear() {
+  local dir pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-clear")
+  pid=$(start_healthy_watcher "$dir")
+  write_triage_cache "$dir" '{"ok":true,"needs_firstmate":0,"actionable":7,"ownerless":7}'
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "hook must stay silent with a clear needs_firstmate lane and a live watcher"
+  [ -z "$out" ] || fail "hook produced output on the healthy path: $out"
+  pass "fm-turnend-guard: silent with a clear lane and a live watcher (actionable work in OTHER lanes never blocks)"
+}
+
+test_hook_blocks_on_both_reasons_at_once() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-both")
+  : > "$dir/state/task1.meta"
+  write_triage_cache "$dir" '{"ok":true,"needs_firstmate":2}'
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "hook must block when supervision is off AND work is unhandled"
+  assert_contains "$out" "TURN WOULD END BLIND" "the watcher alarm must still fire"
+  assert_contains "$out" "TURN WOULD END WITH FINISHED WORK UNHANDLED" "the unhandled-work alarm must fire alongside it"
+  pass "fm-turnend-guard: the two block reasons are independent and both report"
+}
+
+# FAIL OPEN. A guard on the live supervision path that can wedge the primary is worse than
+# the bug it catches, so every unreadable cache shape must permit the turn to end.
+test_hook_fails_open_on_unusable_cache() {
+  local dir pid out status shape
+  for shape in '{not json' '' '{"ok":false,"error":"enumerator crashed"}' \
+    '{"ok":true,"actionable":5,"ownerless":5}' '{"ok":true,"needs_firstmate":"lots"}'; do
+    dir=$(make_primary_dir "$TMP_ROOT/hook-nf-failopen-$RANDOM")
+    pid=$(start_healthy_watcher "$dir")
+    write_triage_cache "$dir" "$shape"
+    out=$(run_hook "$dir" false); status=$?
+    stop_watcher "$pid"
+    expect_code 0 "$status" "hook must fail open on an unusable cache, not wedge the primary (cache: $shape)"
+    [ -z "$out" ] || fail "hook produced output on an unusable cache ($shape): $out"
+  done
+  pass "fm-turnend-guard: corrupt, empty, failed-pass, old-format, and non-numeric caches all fail open"
+}
+
+# Away mode and the kill switch both stop the duty pass from running, so the cache would go
+# stale with nothing left to clear it. A block that can never be discharged is a wedge.
+test_hook_triage_block_is_off_while_away() {
+  local dir pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-afk")
+  pid=$(start_healthy_watcher "$dir")
+  write_triage_cache "$dir" '{"ok":true,"needs_firstmate":4}'
+  : > "$dir/state/.afk"
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "hook must not block on triage state while away mode owns supervision"
+  [ -z "$out" ] || fail "hook produced triage output while away: $out"
+  pass "fm-turnend-guard: the unhandled-work block stands down in away mode (the duty pass does not run there)"
+}
+
+test_hook_triage_block_is_off_when_duty_is_disabled() {
+  local dir home pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-dutyoff")
+  home=$(cd "$dir" && pwd)
+  pid=$(start_healthy_watcher "$dir")
+  write_triage_cache "$dir" '{"ok":true,"needs_firstmate":4}'
+  out=$(printf '{"stop_hook_active":false}' \
+    | CLAUDECODE=1 FM_HOME="$home" FM_TRIAGE_DUTY=off bash "$dir/bin/fm-turnend-guard.sh" 2>&1)
+  status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "FM_TRIAGE_DUTY=off must disable the duty's block, not just its banner"
+  [ -z "$out" ] || fail "hook produced triage output with the duty kill switch engaged: $out"
+  pass "fm-turnend-guard: the duty kill switch also disables the unhandled-work block"
+}
+
+# The loop guard bounds the new reason exactly as it bounds the old one: at most one forced
+# continuation per turn, never an un-endable session.
+test_hook_loop_guard_bounds_the_triage_block() {
+  local dir pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-loopguard")
+  pid=$(start_healthy_watcher "$dir")
+  write_triage_cache "$dir" '{"ok":true,"needs_firstmate":9}'
+  out=$(run_hook "$dir" true); status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "stop_hook_active=true must allow the stop even with work unhandled"
+  [ -z "$out" ] || fail "hook produced output on the loop-guarded retry: $out"
+  pass "fm-turnend-guard: the unhandled-work block never fires twice in one turn"
+}
+
 test_hook_silent_when_no_work_in_flight() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-idle")
@@ -718,6 +864,13 @@ test_predicate_unhealthy_stale_beacon
 test_predicate_healthy_fresh_beacon
 test_predicate_queue_pending_flag
 test_hook_silent_when_no_work_in_flight
+test_hook_blocks_on_unhandled_finished_work
+test_hook_silent_when_lane_is_clear
+test_hook_blocks_on_both_reasons_at_once
+test_hook_fails_open_on_unusable_cache
+test_hook_triage_block_is_off_while_away
+test_hook_triage_block_is_off_when_duty_is_disabled
+test_hook_loop_guard_bounds_the_triage_block
 test_hook_blocks_when_fresh_beacon_has_no_live_lock
 test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon

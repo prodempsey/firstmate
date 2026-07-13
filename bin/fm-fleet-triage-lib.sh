@@ -92,6 +92,43 @@ fm_triage_evidence_version() {
   ' | fm_triage_hash
 }
 
+# THE ONE DEFINITION OF A REVIEW DATE, as a jq fragment both the enumerator's health ladder
+# (fm-fleet-triage.sh) and the writer's hold validation (fm-fleet-triage-record.sh, through
+# fm_triage_review_date_ok below) embed verbatim. It is shared rather than written twice
+# because the two must agree exactly: a date the writer accepts but the ladder cannot read
+# is a hold that can never expire, which is precisely the defect this closes.
+#
+# Bare fromdateiso8601 accepts ONLY a full instant, and no hold ever written to the ledger
+# carried one - every review_after was a calendar date ("2026-07-12") or an unblock
+# condition in prose. All of them failed the parse, so age() went null, so hold_expired
+# never fired: `hold` was a one-command permanent mute button. Accepted forms are therefore
+# a full ISO-8601 instant, a bare calendar date (read as that day at 00:00:00Z - the day the
+# review comes due), and a date with a wall-clock time. Prose is not a date and does not
+# become one here; the ladder fails it back into the queue as hold_unreviewable.
+# shellcheck disable=SC2016 # A jq program: $ts and $now_epoch are jq variables, not shell ones.
+FM_TRIAGE_REVIEW_AGE_JQ='
+  def review_age($ts; $now_epoch):
+    ($ts // "" | tostring) as $t
+    | if $t == "" then null
+      else
+        ( if ($t | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")) then $t + "T00:00:00Z"
+          elif ($t | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?Z?$"))
+            then ($t | sub(" "; "T")
+                     | (if test("T[0-9]{2}:[0-9]{2}:[0-9]{2}") then . else . + ":00" end)
+                     | (if endswith("Z") then . else . + "Z" end))
+          else $t end)
+        | try (fromdateiso8601 | $now_epoch - .) catch null
+      end;
+'
+
+# True when a review date is one a clock can actually read, and therefore one that can come
+# due. A hold whose review date fails this is not a disposition; it is silence with paperwork.
+fm_triage_review_date_ok() {  # <review-after>
+  jq -e -n --arg ts "$1" "$FM_TRIAGE_REVIEW_AGE_JQ"'
+    review_age($ts; 0) != null
+  ' >/dev/null 2>&1
+}
+
 # Print the ledger path for a home.
 fm_triage_ledger_path() {  # <data-dir>
   printf '%s/fleet-triage.jsonl' "$1"
@@ -245,8 +282,17 @@ fm_triage_render_digest() {  # <max-items>
 }
 
 # Print machine-readable pass results for one fm-fleet-triage/v2 JSON blob on stdin:
-# actionable, ownerless, unhealthy (actionable but health != ok), and captain_gated
-# counts, plus a deterministic fingerprint over the current actionable set. The
+# actionable, ownerless, unhealthy (actionable but health != ok), needs_firstmate, and
+# captain_gated counts, plus a deterministic fingerprint over the current actionable set.
+#
+# needs_firstmate - the count of ACTIONABLE items in the needs_firstmate lane - is the one
+# field the turn-end guard blocks on (bin/fm-turnend-guard.sh, docs/turnend-guard.md). It is
+# carried in the cache this result feeds so the guard can read it with one jq over one small
+# local file instead of re-running the enumerator on the primary's turn-end path. Only that
+# lane: it is bounded by the number of live tasks, it cannot be flooded by an audit backfill,
+# and it is level-triggered off state/<id>.meta plus state/<id>.status, so it is discharged by
+# landing or tearing down the work rather than by any paper exit.
+# The
 # fingerprint changes only when the actionable set's membership or disposition
 # changes (item_id, processing_state, health), never on a title or prose edit, so a
 # caller can tell "still the same open items" from "something actually moved."
@@ -262,6 +308,7 @@ fm_triage_pass_result() {  # <trigger> <scope>
        actionable: $m.actionable,
        ownerless: $m.ownerless,
        unhealthy: ($m.actionable - ($m.health.ok // 0)),
+       needs_firstmate: (($m.by_lane.needs_firstmate.actionable) // 0),
        captain_gated: $m.captain_gated,
        fingerprint_input: ([.items[] | select(.actionable)
                             | (.item_id + ":" + .processing_state + ":" + .health)]

@@ -952,6 +952,114 @@ test_hold_expiry_and_successor_disappearance() {
   pass "an expired hold and a vanished successor both return the work"
 }
 
+# A hold is the cheapest way to silence an item, so it is the one disposition that MUST be
+# able to come due. It could not: the health ladder read review_after with bare
+# fromdateiso8601, which accepts only a full instant, and no hold ever written carried one -
+# every value was a calendar date or an unblock condition in prose. age() went null,
+# hold_expired never fired once across 42 holds, and `hold` was a permanent mute button. On
+# 2026-07-13 eight finished-work items were muted with it in 137 seconds.
+test_a_calendar_date_review_comes_due() {
+  local pair root home snap out yesterday tomorrow
+  pair=$(new_world holddate)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  own_lock "$home"
+  snap=$(one_item_snapshot 'Ready work')
+  yesterday=$(date -u -d '1 day ago' +%Y-%m-%d 2>/dev/null || date -u -v-1d +%Y-%m-%d)
+  tomorrow=$(date -u -d '2 days' +%Y-%m-%d 2>/dev/null || date -u -v+2d +%Y-%m-%d)
+
+  # The form every real hold in the ledger actually used: a bare calendar date.
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" hold backlog_hygiene:ready-q1 \
+    --reason 'waiting on upstream' --review-after "$yesterday" >/dev/null
+  out=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+  [ "$(printf '%s' "$out" | jq -r '.items[0].health')" = hold_expired ] \
+    || fail "a calendar-date review that has arrived must expire the hold"
+  [ "$(printf '%s' "$out" | jq -r '.items[0].actionable')" = true ] \
+    || fail "a hold whose review date arrived must be actionable again"
+
+  # ...and a date that has NOT arrived still holds, or the hold would be useless.
+  : > "$(ledger_of "$home")"
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" hold backlog_hygiene:ready-q1 \
+    --reason 'waiting on upstream' --review-after "$tomorrow" >/dev/null
+  out=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+  [ "$(printf '%s' "$out" | jq -r '.items[0].health')" = ok ] \
+    || fail "a review date still in the future must not expire the hold"
+  [ "$(printf '%s' "$out" | jq -r '.items[0].actionable')" = false ] \
+    || fail "a live hold must stay parked"
+  pass "a hold with a calendar review date comes due when that date arrives, and not before"
+}
+
+# Both doors on the mute button. The writer refuses a review date no clock can read, and the
+# ladder fails a legacy row carrying one back into the queue rather than honoring a hold that
+# can never expire.
+test_an_unreadable_review_date_cannot_park_work() {
+  local pair root home snap out ev
+  pair=$(new_world holdprose)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  own_lock "$home"
+  snap=$(one_item_snapshot 'Ready work')
+
+  out=$(FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" hold backlog_hygiene:ready-q1 \
+    --reason 'waiting on upstream' --review-after 'next bug-triage pass' 2>&1) \
+    && fail "the writer accepted a review date that can never come due"
+  assert_contains "$out" 'never expires' "the refusal must say why an unreadable date is refused"
+  assert_absent "$(ledger_of "$home")" "a refused hold must not reach the ledger"
+
+  # A legacy row that predates the refusal, or a hand-append that bypassed it.
+  ev=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json | jq -r '.items[0].evidence_version')
+  seed_ledger "$home" "{\"item_id\":\"backlog_hygiene:ready-q1\",\"processing_state\":\"held\",\"outcome_type\":\"held\",\"outcome_reason\":\"waiting\",\"review_after\":\"next bug-triage pass\",\"evidence_version\":\"$ev\"}"
+  out=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+  [ "$(printf '%s' "$out" | jq -r '.items[0].health')" = hold_unreviewable ] \
+    || fail "a hold whose review date cannot be read must be flagged, not honored"
+  [ "$(printf '%s' "$out" | jq -r '.items[0].actionable')" = true ] \
+    || fail "a hold that can never come due must not park work"
+  pass "an unreadable review date is refused at the writer and re-opened by the self-audit"
+}
+
+# Age was fiction: first_seen_at is persisted only by a surface row, nothing wrote one
+# automatically, so every actionable item reported age 0 forever and stale_unprocessed - the
+# model's only escalator - was unreachable code. surface --new is what the duty pass runs on
+# every pass to make age real, and it must survive later passes to be worth anything.
+test_first_seen_at_persists_and_stale_unprocessed_can_fire() {
+  local pair root home snap out first second ev
+  pair=$(new_world firstseen)
+  root=${pair%%|*}
+  home=${pair#*|}
+  write_snapshot_stub "$root"
+  own_lock "$home"
+  snap=$(one_item_snapshot 'Ready work')
+
+  out=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+  [ "$(printf '%s' "$out" | jq -r '.items[0].processing_state')" = new ] \
+    || fail "an item the ledger has never seen should read as new"
+
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" surface --new >/dev/null
+  first=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json | jq -r '.items[0].first_seen_at')
+  [ -n "$first" ] && [ "$first" != null ] || fail "surface --new stamped no first_seen_at"
+
+  # The stamp is what has to survive: a second pass must not reset the clock, or age can
+  # never accumulate and the item stays permanently "new".
+  FM_TEST_SNAPSHOT="$snap" run_record "$root" "$home" surface --new >/dev/null
+  second=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json | jq -r '.items[0].first_seen_at')
+  [ "$second" = "$first" ] || fail "a later pass re-stamped first_seen_at ($first -> $second); age would never accumulate"
+  [ "$(jq -rc 'select(.event == "surface" and .item_id == "backlog_hygiene:ready-q1")' "$(ledger_of "$home")" | wc -l)" -eq 1 ] \
+    || fail "surface --new stamped an already-seen item a second time"
+
+  # With a real first_seen_at, age becomes real - and the escalator can finally fire.
+  : > "$(ledger_of "$home")"
+  ev=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json | jq -r '.items[0].evidence_version')
+  seed_ledger "$home" "{\"item_id\":\"backlog_hygiene:ready-q1\",\"processing_state\":\"surfaced\",\"first_seen_at\":\"2020-01-01T00:00:00Z\",\"evidence_version\":\"$ev\"}"
+  out=$(FM_TEST_SNAPSHOT="$snap" run_triage "$root" "$home" --json)
+  [ "$(printf '%s' "$out" | jq -r '.items[0].health')" = stale_unprocessed ] \
+    || fail "an item sitting unprocessed far past the stale threshold must be flagged stale_unprocessed"
+  [ "$(printf '%s' "$out" | jq -r '.items[0].age_seconds')" -gt 0 ] \
+    || fail "age_seconds is still zero despite a persisted first_seen_at"
+  pass "first sight is persisted once, survives later passes, and lets stale_unprocessed fire"
+}
+
 test_enumerator_does_not_mutate_operational_inputs() {
   local pair root home before after
   pair=$(new_world readonly)
@@ -1087,6 +1195,9 @@ test_resurfacing_clears_the_stale_disposition
 test_ledger_preserves_prior_decisions_as_history
 test_surface_all_does_not_reopen_dispositioned_work
 test_hold_expiry_and_successor_disappearance
+test_a_calendar_date_review_comes_due
+test_an_unreadable_review_date_cannot_park_work
+test_first_seen_at_persists_and_stale_unprocessed_can_fire
 test_repeat_scans_do_not_duplicate_or_wake
 test_terminal_outcome_requires_lineage
 test_surfacing_does_not_handle_an_item

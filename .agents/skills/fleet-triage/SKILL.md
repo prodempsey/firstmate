@@ -94,7 +94,7 @@ Claim an item with `claim` before working it so a second session does not pick i
 Never record an outcome before its disposition is durable in the domain system that owns it: the bug CLI for bugs, `tasks-axi` for backlog, the normal ship and scout lifecycle for tasks.
 The triage ledger records that the work was converted, never the work itself.
 
-The enumerator re-surfaces an item whose recorded disposition stopped holding, reporting why in its `health` field: the evidence moved, a linked successor does not exist, a hold's review date arrived, a claim went stale, or a terminal outcome lost its lineage.
+The enumerator re-surfaces an item whose recorded disposition stopped holding, reporting why in its `health` field: the evidence moved, a linked successor does not exist, a hold's review date arrived (`hold_expired`) or cannot be read at all (`hold_unreviewable`), a claim went stale, an item sat unprocessed past the stale threshold, or a terminal outcome lost its lineage.
 Treat a re-surfaced item as live work again, not as a duplicate.
 Age and repeated appearances raise an item's priority and demand a recorded reason for the delay; they are never themselves a reason to escalate to the captain.
 Escalate on the decision's content, per the action classes above.
@@ -114,7 +114,7 @@ It deliberately never dispatches the newly-ready item - the moved evidence retur
 ## Action loop
 
 For each actionable item, verify its current source and overlap with in-flight or queued work.
-Classify it as automatic reversible coordination, a captain gate, a bounded scout, or a hold with a concrete recheck condition.
+Classify it as automatic reversible coordination, a captain gate, a bounded scout, or a hold with a review DATE the item comes back on (`--review-after 2026-07-14`; the unblock condition goes in `--reason`, because a hold whose date no clock can read is a mute button, not a disposition, and the writer refuses it).
 Prefer one batch for related bugs or reports over several overlapping tasks.
 Promote a report finding into an existing umbrella item when that lineage already owns the gap.
 Create a new backlog item only when no current item owns the follow-up.
@@ -132,4 +132,5 @@ Two separate switches exist; do not confuse them.
 
 After action, rerun targeted triage for the affected lane.
 Run a full pass when closeout unblocks queued work or changes shared visibility history.
-Resume normal supervision once every remaining item has an owner, an active claim, a successor, a hold with a review condition, a captain batch, or a recorded rejection or resolution, and every unavailable lane has been accounted for.
+Resume normal supervision once every remaining item has an owner, an active claim, a successor, a hold with a review date, a captain batch, or a recorded rejection or resolution, and every unavailable lane has been accounted for.
+The `needs_firstmate` lane is not advisory: while it is non-empty the turn-end guard blocks the turn end (`docs/turnend-guard.md`), and only landing the work or tearing it down clears it.

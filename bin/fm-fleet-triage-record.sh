@@ -5,6 +5,8 @@
 # Usage:
 #   fm-fleet-triage-record.sh surface <item-id>...        Stamp first sight, durably.
 #   fm-fleet-triage-record.sh surface --all               Stamp every ACTIONABLE item.
+#   fm-fleet-triage-record.sh surface --new               Stamp only items the ledger has
+#                                                         never seen. Safe on every pass.
 #   fm-fleet-triage-record.sh claim <item-id> --owner <who>
 #   fm-fleet-triage-record.sh release <item-id> [--reason <why>]
 #   fm-fleet-triage-record.sh successor <item-id> --link <task-id> [--reason <note>]
@@ -57,6 +59,7 @@ case "$EVENT" in
 esac
 
 ALL=false
+NEW_ONLY=false
 OWNER=''
 LINK=''
 REASON=''
@@ -67,6 +70,7 @@ ITEMS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --all) ALL=true; shift ;;
+    --new) NEW_ONLY=true; shift ;;
     --owner) [ "$#" -ge 2 ] || die 'missing value for --owner' 2; OWNER=$2; shift 2 ;;
     --link) [ "$#" -ge 2 ] || die 'missing value for --link' 2; LINK=$2; shift 2 ;;
     --reason) [ "$#" -ge 2 ] || die 'missing value for --reason' 2; REASON=$2; shift 2 ;;
@@ -111,7 +115,12 @@ if OUTCOME=$(outcome_for "$EVENT"); then
     hold)
       [ -n "$REASON" ] || die 'refused: a hold requires --reason'
       [ -n "$REVIEW_AFTER" ] \
-        || die 'refused: a hold requires --review-after (a date or an explicit unblock condition); silent indefinite holds are not allowed'
+        || die 'refused: a hold requires --review-after (a date the review comes due); silent indefinite holds are not allowed'
+      # A review date no clock can read is a hold that can never come due - the permanent
+      # mute button this refusal closes. The unblock CONDITION belongs in --reason, where it
+      # is read by a human; --review-after is when the item comes back regardless.
+      fm_triage_review_date_ok "$REVIEW_AFTER" \
+        || die "refused: --review-after must be a date the review comes due (2026-07-14, or 2026-07-14T09:00:00Z), not '$REVIEW_AFTER'; a hold whose date cannot be read never expires. Put the unblock condition in --reason."
       ;;
   esac
   PROCESSING_STATE=terminal
@@ -131,9 +140,23 @@ fi
 # --- Resolve the item set and its current evidence versions. -----------------------
 # An outcome is bound to the evidence it was decided against, so a later scan can tell
 # that the evidence moved and invalidate the stale processing assumption.
+#
+# FM_TRIAGE_JSON_FILE lets a caller that has ALREADY paid for a full enumeration hand it in
+# rather than making this command re-run the whole snapshot/NF/bug/ledger pipeline a second
+# time. bin/fm-triage-duty.sh uses it for its per-pass `surface --new` stamp, which would
+# otherwise double the cost of every duty pass. An unusable file is a caller bug, not a
+# fleet condition, so it is reported rather than silently re-enumerated behind the caller's
+# back with state it did not decide against.
 TRIAGE_JSON=''
 load_triage() {
   [ -n "$TRIAGE_JSON" ] && return 0
+  if [ -n "${FM_TRIAGE_JSON_FILE:-}" ]; then
+    TRIAGE_JSON=$(cat "$FM_TRIAGE_JSON_FILE" 2>/dev/null) \
+      || die "could not read FM_TRIAGE_JSON_FILE: $FM_TRIAGE_JSON_FILE"
+    printf '%s' "$TRIAGE_JSON" | jq -e '.schema == "fm-fleet-triage/v2"' >/dev/null 2>&1 \
+      || die "FM_TRIAGE_JSON_FILE is not an fm-fleet-triage/v2 result: $FM_TRIAGE_JSON_FILE"
+    return 0
+  fi
   TRIAGE_JSON=$("$SCRIPT_DIR/fm-fleet-triage.sh" --json) \
     || die 'could not enumerate current triage items'
 }
@@ -151,6 +174,29 @@ if [ "$ALL" = true ]; then
     [ -n "$id" ] && ITEMS+=("$id")
   done < <(printf '%s' "$TRIAGE_JSON" | jq -r '.items[] | select(.actionable) | .item_id')
   [ "${#ITEMS[@]}" -gt 0 ] || { printf 'nothing to surface: no actionable items\n'; exit 0; }
+fi
+
+# --new stamps first sight of the items the LEDGER HAS NEVER SEEN (processing_state "new":
+# no ledger row exists for them at all). That is what makes age real: first_seen_at is only
+# ever persisted by a surface row, nothing was writing one automatically, so every item
+# reported age 0 forever and stale_unprocessed - the one escalator in the model - was dead
+# code that could never fire.
+#
+# It is deliberately NARROWER than --all, which surfaces every actionable item including
+# ones that are actionable BECAUSE their recorded disposition stopped holding. A surface
+# re-opens an item and clears the disposition it re-opens, so running --all automatically on
+# every duty pass would wipe holds and rejections the moment the self-audit flagged them.
+# An item with no ledger row has no disposition to clear, so --new is safe to run on a
+# schedule, which is exactly what bin/fm-triage-duty.sh does with it.
+if [ "$NEW_ONLY" = true ]; then
+  [ "$EVENT" = surface ] || die '--new is only supported for the surface event' 2
+  [ "$ALL" = false ] || die '--new and --all are mutually exclusive' 2
+  load_triage
+  while IFS= read -r id; do
+    [ -n "$id" ] && ITEMS+=("$id")
+  done < <(printf '%s' "$TRIAGE_JSON" \
+    | jq -r '.items[] | select(.processing_state == "new") | .item_id')
+  [ "${#ITEMS[@]}" -gt 0 ] || { printf 'nothing to surface: no unseen items\n'; exit 0; }
 fi
 
 [ "${#ITEMS[@]}" -gt 0 ] || die 'no item id given' 2

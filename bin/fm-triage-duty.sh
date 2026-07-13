@@ -50,11 +50,23 @@
 # readable summary (trigger, scope, actionable, ownerless, unhealthy, captain_gated,
 # fingerprint) so a caller can act on it without re-parsing prose.
 #
-# THIS COMMAND STAYS READ-ONLY. It runs the read-only enumerator (bin/fm-fleet-triage.sh
-# --json) and renders its digest; it never records an outcome, never mutates the
-# backlog, bugs, or any task, and never writes the triage ledger - only
-# state/.triage-duty-last.json, a volatile cache of this pass's OWN result for the
-# supervision preflight in bin/fm-guard.sh to read cheaply without re-enumerating.
+# THIS COMMAND RECORDS NO DISPOSITION. It runs the read-only enumerator
+# (bin/fm-fleet-triage.sh --json) and renders its digest; it never records an outcome, never
+# claims, never mutates the backlog, bugs, or any task. It writes exactly two things, and
+# neither is a judgment about any item:
+#   state/.triage-duty-last.json  a volatile cache of this pass's OWN result, read cheaply by
+#                                 the supervision preflight in bin/fm-guard.sh and by the
+#                                 turn-end guard in bin/fm-turnend-guard.sh, so neither has to
+#                                 re-enumerate.
+#   a `surface` row per UNSEEN item, through the sanctioned writer
+#                                 (bin/fm-fleet-triage-record.sh surface --new), which stamps
+#                                 first_seen_at. Nothing else ever wrote one, so no item had a
+#                                 persisted first-sight time, every item reported an age of
+#                                 zero forever, and stale_unprocessed - the only escalator in
+#                                 the model - was dead code. An item ignored for thirteen hours
+#                                 read exactly like one that appeared this instant. The stamp
+#                                 is confined to items the ledger has never seen, so it can
+#                                 never clear a disposition; see --new in that writer.
 # THIS COMMAND IS NON-BLOCKING FOR CALLERS. A known trigger always exits 0, whether the
 # pass found nothing, found actionable state, or the enumerator itself failed - a caller
 # wrapping this in `|| true` is defense in depth, never the only thing standing between
@@ -188,6 +200,23 @@ GATES=$(printf '%s' "$JSON_OUT" | fm_triage_captain_gates "$GATE_MAX" 2>/dev/nul
 [ -n "$GATES" ] || GATES=null
 write_last_result "$(printf '%s' "$RESULT_LINE" \
   | jq -c --arg ts "$NOW" --argjson gates "$GATES" '. + {ok: true, ts: $ts, captain_gates: $gates}')"
+
+# --- Stamp first sight of anything the ledger has never seen. -----------------------
+# This is what makes age real (see the header). It runs through the sanctioned writer rather
+# than appending here, so the ledger keeps exactly one writer, and it hands that writer the
+# enumeration this pass already paid for instead of making it run a second one. Best-effort
+# and non-fatal in both directions: a failed stamp costs age accuracy, never the duty pass or
+# the caller it wraps, and the writer refuses under enumerate_only, which is why that mode
+# skips it rather than printing a refusal on every pass.
+if ! fm_triage_enumerate_only; then
+  TMP_JSON=$(mktemp "${TMPDIR:-/tmp}/fm-triage-duty.json.XXXXXX") || TMP_JSON=''
+  if [ -n "$TMP_JSON" ]; then
+    printf '%s\n' "$JSON_OUT" > "$TMP_JSON"
+    FM_TRIAGE_JSON_FILE="$TMP_JSON" "$SCRIPT_DIR/fm-fleet-triage-record.sh" surface --new \
+      >/dev/null 2>&1 || true
+    rm -f "$TMP_JSON"
+  fi
+fi
 
 # Digest only when actionable state exists. A clear fleet stays exactly as silent as
 # every other diagnostic in this codebase ("silence means all good"); a caller's
