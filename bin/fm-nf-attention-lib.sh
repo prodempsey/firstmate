@@ -51,12 +51,14 @@ fm_nf_attention_lineage_ok() {  # <outcome> <link> <reason> <review-after>
   esac
 }
 
-# True when a hold's review date has arrived. A review condition that is prose rather than a
-# date never expires on a clock, which is the enumerator's behavior too: an unparseable
-# review_after leaves the hold standing rather than silently reopening it.
+# True when a hold's review date has arrived, read through the ONE review-date parser
+# (fm_triage_review_epoch), so this and the enumerator's health ladder can never disagree
+# about whether a hold has come due. A review date no clock can read is handled by the
+# caller below, and it does NOT leave the hold standing: an unexpirable hold is a mute
+# button, which the enumerator fails back into the queue as hold_unreviewable.
 fm_nf_attention_hold_expired() {  # <review-after>
   local epoch now
-  epoch=$(fm_triage_epoch "$1" 2>/dev/null) || return 1
+  epoch=$(fm_triage_review_epoch "$1" 2>/dev/null) || return 1
   now=$(date -u +%s)
   [ "$now" -ge "$epoch" ]
 }
@@ -106,7 +108,13 @@ fm_nf_attention_desired() {  # <state-dir> <data-dir> <task-id> <fold-json>
     else
       case "$outcome" in
         held)
-          if fm_nf_attention_hold_expired "$review_after"; then
+          if ! fm_triage_review_date_ok "$review_after"; then
+            # A hold whose review date cannot be read can never come due, so it is not a
+            # disposition - it is silence with paperwork, and the item is still open. The
+            # writer refuses these now; this catches legacy rows, mirroring the
+            # enumerator's hold_unreviewable.
+            why="hold review date cannot be read ($review_after)"
+          elif fm_nf_attention_hold_expired "$review_after"; then
             why="hold expired (review after $review_after)"
           else
             want=held
@@ -138,4 +146,31 @@ fm_nf_attention_desired() {  # <state-dir> <data-dir> <task-id> <fold-json>
     '{state: $state, outcome: $outcome, link: $link, reason: $reason,
       review_after: $review_after, fingerprint: $fingerprint,
       evidence_version: $evidence_version, why: $why}'
+}
+
+# Print the id of every UNATTENDED needs_firstmate item in a home, one per line. Unattended
+# means exactly what fm_nf_attention_desired above calls `open`: a live terminal signal
+# (done/blocked/failed/needs-decision) that firstmate has never dispositioned, or whose
+# recorded disposition no longer holds. That decision stays owned by fm_nf_attention_desired;
+# this is only the sweep over the home.
+#
+# LEVEL-TRIGGERED, DIRECT FROM SOURCE. It reads state/<id>.meta plus state/<id>.status and
+# the triage ledger, every call. It reads no cached summary of them - a cache reflects the
+# last duty pass, not the present, so a gate built on one both misses fresh work and blocks
+# on work already discharged. This is what bin/fm-turnend-guard.sh gates the turn end on,
+# and the same per-item decision bin/fm-nf-reconcile.sh reports as unhandled; nothing about
+# "is this work unattended" is decided anywhere else.
+fm_nf_unattended_ids() {  # <state-dir> <data-dir>
+  local state=$1 data=$2 fold meta id
+  [ -d "$state" ] || return 1
+  fold=$(fm_nf_attention_fold "$data") || return 1
+  for meta in "$state"/*.meta; do
+    [ -f "$meta" ] || continue
+    id=$(basename "$meta" .meta)
+    # No live terminal signal (still working, or a secondmate) - nothing is owed.
+    fm_nf_current_fingerprint "$state" "$id" >/dev/null 2>&1 || continue
+    [ "$(fm_nf_attention_desired "$state" "$data" "$id" "$fold" \
+      | jq -r '.state' 2>/dev/null)" = open ] || continue
+    printf '%s\n' "$id"
+  done
 }

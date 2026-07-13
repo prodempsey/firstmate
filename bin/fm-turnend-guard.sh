@@ -2,9 +2,11 @@
 # Primary turn-end guard for the firstmate PRIMARY session only.
 #
 # It blocks a turn end for either of two independent reasons: supervision is off (tasks in
-# flight, no live watcher), or finished crew work is still unhandled (the needs_firstmate
-# lane is non-empty). See "the actual predicate" below for why the second one exists and why
-# it is scoped to that one lane.
+# flight, no live watcher), or finished crew work is still unattended (the needs_firstmate
+# lane is non-empty, read live from local task state at the moment of evaluation). See "the
+# actual predicate" below for why the second one exists and why it is scoped to that one
+# lane. Every primary evaluation - permitted or blocked - is recorded in the decision log
+# at state/.turnend-guard.log (see "decision log" below).
 #
 # fm-guard.sh (bin/fm-guard.sh) is pull-based: it only warns when some other
 # supervision script happens to run. A primary session that ends a turn without
@@ -40,9 +42,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 GRACE=${FM_GUARD_GRACE:-300}
 WATCH="$SCRIPT_DIR/fm-watch.sh"
+# The decision log: one JSON line per primary turn-end evaluation, permitted ones included.
+LOG="${FM_TURNEND_LOG:-$STATE/.turnend-guard.log}"
+LOG_MAX=${FM_TURNEND_LOG_MAX:-2000}
+LOG_IDS=8
+SHOW_IDS=10
 
 # shellcheck source=bin/fm-supervision-lib.sh
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
@@ -57,8 +65,11 @@ PAYLOAD=$(cat 2>/dev/null || true)
 # loop-guard field, so we must never block - fail open, not noisy.
 command -v jq >/dev/null 2>&1 || exit 0
 
+# The loop-guard exit itself moves BELOW the predicate evaluation: a stop permitted only
+# because one continuation was already forced this turn is exactly the event the decision
+# log must record (a permitted turn end with work possibly still unattended), so it cannot
+# short-circuit before the predicates and the log run.
 STOP_HOOK_ACTIVE=$(printf '%s' "$PAYLOAD" | jq -r '.stop_hook_active // false' 2>/dev/null) || exit 0
-[ "$STOP_HOOK_ACTIVE" = "true" ] && exit 0
 
 # --- scope precisely to the PRIMARY checkout --------------------------------
 # Excludes secondmate homes (the .fm-secondmate-home marker is written at seed
@@ -82,7 +93,11 @@ GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null) || ex
 #
 #   1. SUPERVISION IS OFF - tasks in flight with no live watcher. The original predicate,
 #      unchanged below.
-#   2. FINISHED WORK IS UNHANDLED - the needs_firstmate lane is non-empty. New.
+#   2. FINISHED WORK IS UNATTENDED - the needs_firstmate lane is non-empty, read LIVE from
+#      state/<id>.meta plus state/<id>.status and the triage ledger at the moment of this
+#      evaluation, never from a cached summary of them. A cache reflects the last duty
+#      pass, not the present: it would miss work that finished since, and hold the turn
+#      hostage for work already discharged.
 #
 # Why (2) exists. Before it, arming the watcher was a complete and sufficient way to end any
 # turn, no matter how much finished-but-unhandled work was piled up, because supervision
@@ -110,38 +125,114 @@ if [ "$FM_SUP_IN_FLIGHT" -gt 0 ] \
   blind=1
 fi
 
-# The needs_firstmate count comes from state/.triage-duty-last.json, the small volatile cache
-# bin/fm-triage-duty.sh writes on every pass (bin/fm-guard.sh's preflight already reads the
-# same file). It is a plain file read: this runs on the primary's turn-end path, so it must
-# never pay for an enumeration, and it must never wedge the primary.
+# UNATTENDED FINISHED WORK, READ LEVEL-TRIGGERED FROM SOURCE. fm_nf_unattended_ids walks
+# state/<id>.meta plus state/<id>.status and the triage ledger on every call
+# (bin/fm-nf-attention-lib.sh, the one owner of what "unattended" means, and the same
+# per-item decision bin/fm-nf-reconcile.sh reports as unhandled). The sweep is bounded by
+# the number of live tasks, so its cost on the turn-end path stays proportional to the
+# fleet, never to any audit backlog. An item leaves this list only when the work is landed,
+# torn down, or dispositioned with lineage - never by arming the watcher.
 #
-# FAIL OPEN, ALWAYS. A missing, unreadable, corrupt, or old-format cache yields 0 and blocks
-# nothing - the guard falls back to the supervision predicate alone, exactly as it behaved
-# before this lane existed. Away mode and the duty kill switch also yield 0, because in both
-# of those the duty pass deliberately does not run, so the cache would go stale with no pass
-# left to clear it and the block could never be discharged. A guard that can wedge the
-# primary is worse than the bug it catches.
+# FAIL OPEN, ALWAYS. Any failure to read the live state - a missing or broken library, a
+# jq error, an unreadable state dir - yields an empty list and blocks nothing: the guard
+# falls back to the supervision predicate alone, exactly as it behaved before this lane
+# existed. A guard that can wedge the primary is worse than the bug it catches.
+#
+# Two deliberate stand-downs, both logged via nf_gate below:
+#   away mode      the away daemon owns supervision and escalation while state/.afk exists;
+#                  a turn-end block would fight the daemon's own batching loop.
+#   FM_TRIAGE_DUTY=off  the captain-sanctioned kill switch for the whole fleet-triage duty;
+#                  the gate is part of the duty, so the switch stands it down too - the
+#                  operator escape hatch if the gate itself ever misbehaves.
 nf=0
-case "${FM_TRIAGE_DUTY:-on}" in
-  off|OFF|0|false|FALSE) : ;;
-  *)
-    if [ ! -e "$STATE/.afk" ] && [ -f "$STATE/.triage-duty-last.json" ]; then
-      nf=$(jq -r 'if .ok == true then (.needs_firstmate // 0) else 0 end' \
-        "$STATE/.triage-duty-last.json" 2>/dev/null) || nf=0
-      case "$nf" in ''|*[!0-9]*) nf=0 ;; esac
-    fi
-    ;;
-esac
+nf_ids=''
+nf_gate=on
+if [ -e "$STATE/.afk" ]; then
+  nf_gate=afk
+else
+  case "${FM_TRIAGE_DUTY:-on}" in
+    off|OFF|0|false|FALSE) nf_gate=duty-off ;;
+  esac
+fi
+if [ "$nf_gate" = on ]; then
+  # shellcheck source=bin/fm-nf-attention-lib.sh
+  . "$SCRIPT_DIR/fm-nf-attention-lib.sh" 2>/dev/null || true
+  if command -v fm_nf_unattended_ids >/dev/null 2>&1; then
+    nf_ids=$(fm_nf_unattended_ids "$STATE" "$DATA" 2>/dev/null) || nf_ids=''
+  fi
+  [ -n "$nf_ids" ] && nf=$(printf '%s\n' "$nf_ids" | grep -c .)
+  case "$nf" in ''|*[!0-9]*) nf=0; nf_ids='' ;; esac
+fi
 
-[ "$blind" -eq 1 ] || [ "$nf" -gt 0 ] || exit 0
+# Bounded id digest carried in both the block message and the decision log, so the primary
+# sees WHICH items it is being held for without a second command.
+nf_digest=''
+if [ "$nf" -gt 0 ]; then
+  nf_digest=$(printf '%s\n' "$nf_ids" | head -n "$LOG_IDS" | paste -sd, -)
+  [ "$nf" -gt "$LOG_IDS" ] && nf_digest="$nf_digest,+$((nf - LOG_IDS)) more"
+fi
+
+watcher_desc=healthy
+[ "$FM_SUP_IN_FLIGHT" -eq 0 ] && watcher_desc=no-tasks-in-flight
+[ "$blind" -eq 1 ] && watcher_desc=down
+
+# --- decision log ------------------------------------------------------------
+# Every primary turn-end evaluation is recorded, permitted ones included: the acceptance
+# metric for this gate is "zero permitted turn ends while unattended needs-firstmate work
+# exists", and that is only measurable if the permits are on the record too. One JSON line
+# per evaluation - timestamp, watcher status, lane count, bounded item digest, the decision,
+# the block reason, and whether loop protection was active. NO TRANSCRIPT CONTENT, ever:
+# ids, counts, and decisions, nothing the model said or read.
+# Best-effort: a log that cannot be written must never change the decision or wedge the turn.
+log_decision() {  # <allowed|blocked> <reason>
+  local line
+  line=$(jq -cn \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg watcher "$watcher_desc" \
+    --argjson in_flight "$FM_SUP_IN_FLIGHT" \
+    --argjson nf "$nf" \
+    --arg nf_items "$nf_digest" \
+    --arg nf_gate "$nf_gate" \
+    --arg decision "$1" \
+    --arg reason "$2" \
+    --argjson loop_protection "$([ "$STOP_HOOK_ACTIVE" = true ] && echo true || echo false)" \
+    '{ts: $ts, watcher: $watcher, in_flight: $in_flight, needs_firstmate: $nf,
+      nf_items: $nf_items, nf_gate: $nf_gate, decision: $decision, reason: $reason,
+      loop_protection: $loop_protection}' 2>/dev/null) || return 0
+  printf '%s\n' "$line" >> "$LOG" 2>/dev/null || return 0
+  # Bounded: this is an operational trail, not an archive.
+  if [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt "$LOG_MAX" ]; then
+    if tail -n "$((LOG_MAX / 2))" "$LOG" > "$LOG.tmp.$$" 2>/dev/null; then
+      mv -f "$LOG.tmp.$$" "$LOG" 2>/dev/null || rm -f "$LOG.tmp.$$" 2>/dev/null
+    else
+      rm -f "$LOG.tmp.$$" 2>/dev/null
+    fi
+  fi
+  return 0
+}
+
+# Loop protection: never block twice in one turn (see the header). Recorded, because a
+# permitted turn end with work still unattended is exactly the event the acceptance metric
+# counts, and it must not be invisible just because the loop guard is why it was permitted.
+if [ "$STOP_HOOK_ACTIVE" = true ]; then
+  log_decision allowed 'loop protection: already forced one continuation this turn'
+  exit 0
+fi
+
+if [ "$blind" -eq 0 ] && [ "$nf" -eq 0 ]; then
+  log_decision allowed 'supervision healthy, no unattended needs-firstmate work'
+  exit 0
+fi
 
 afk=0
 [ -e "$STATE/.afk" ] && afk=1
 x_mode=0
 [ -f "$CONFIG/x-mode.env" ] && x_mode=1
 rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+block_reason=''
 
 if [ "$blind" -eq 1 ]; then
+  block_reason='watcher-down'
   REASON=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_mode" --repair-line 2>/dev/null \
     || printf '%s\n' 'tasks in flight, no live watcher - resume supervision according to the session-start operating block before ending the turn')
   {
@@ -154,17 +245,27 @@ if [ "$blind" -eq 1 ]; then
 fi
 
 if [ "$nf" -gt 0 ]; then
+  if [ -z "$block_reason" ]; then
+    block_reason=unattended-needs-firstmate
+  else
+    block_reason="$block_reason+unattended-needs-firstmate"
+  fi
   {
     printf '●%s\n' "$rule"
-    printf '●  TURN WOULD END WITH FINISHED WORK UNHANDLED\n'
-    printf '●  %s crew signal(s) that reported done, blocked, failed, or needs-decision are\n' "$nf"
-    printf '●  still sitting unhandled. Arming the watcher does not discharge them; only\n'
-    printf '●  landing the work, or tearing it down, takes them off this list.\n'
-    printf '●  Handle them before ending the turn:\n'
-    printf '●    bin/fm-nf-reconcile.sh list        what is unhandled, and why\n'
+    printf '●  TURN WOULD END WITH FINISHED WORK UNATTENDED\n'
+    printf '●  %s crew signal(s) reported done, blocked, failed, or needs-decision and\n' "$nf"
+    printf '●  nobody has attended to them:\n'
+    printf '%s\n' "$nf_ids" | head -n "$SHOW_IDS" | sed 's/^/●    /'
+    [ "$nf" -gt "$SHOW_IDS" ] && printf '●    ... and %s more\n' "$((nf - SHOW_IDS))"
+    printf '●  RE-ARMING THE WATCHER DOES NOT SATISFY THIS CONDITION. Supervision liveness\n'
+    printf '●  is a separate check, and a live watcher discharges none of the work above.\n'
+    printf '●  An item leaves this list only when its work is landed, torn down, or\n'
+    printf '●  dispositioned with lineage:\n'
+    printf '●    bin/fm-nf-reconcile.sh list        each item, and why it is still open\n'
     printf '●    bin/fm-fleet-triage.sh --json      full item detail\n'
     printf '●    bin/fm-fleet-triage-record.sh      record each disposition, with its lineage\n'
     printf '●%s\n' "$rule"
   } >&2
 fi
+log_decision blocked "$block_reason"
 exit 2

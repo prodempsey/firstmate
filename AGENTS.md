@@ -111,7 +111,8 @@ state/               volatile runtime signals; gitignored
   .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .last-* .heartbeat-streak   watcher internals; never touch
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
   .last-watcher-beat watcher liveness beacon, touched every poll (including while absorbing benign wakes); guard scripts read it
-  .triage-duty-last.json   volatile cache of the last bin/fm-triage-duty.sh pass (trigger, scope, actionable/ownerless/unhealthy/captain_gated counts, fingerprint, ok); overwritten every pass; read by bin/fm-guard.sh's fleet-triage supervision preflight, never hand-edited
+  .triage-duty-last.json   volatile cache of the last bin/fm-triage-duty.sh pass (trigger, scope, actionable/ownerless/unhealthy/captain_gated counts, fingerprint, ok); overwritten every pass; read by bin/fm-guard.sh's fleet-triage supervision preflight, never hand-edited; the turn-end guard deliberately does not read it (docs/turnend-guard.md)
+  .turnend-guard.log turn-end guard decision log (size-capped): one JSON line per primary turn-end evaluation, permitted or blocked, ids and counts only, never transcript content (docs/turnend-guard.md); never touch
   .subsuper-* .supervise-daemon.*   sub-supervisor internals; never touch
 .no-mistakes/        local validation state and evidence; gitignored
 ```

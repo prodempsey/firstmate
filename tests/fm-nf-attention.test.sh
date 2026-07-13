@@ -197,6 +197,52 @@ test_hold_expiry_restores_attention() {
   pass "an expired hold returns to unhandled"
 }
 
+# The writer refuses a review date no clock can read, but the ledger holds legacy rows that
+# predate that refusal. Such a hold can never come due, so it is not a disposition - the
+# item must present as open, exactly as the enumerator's hold_unreviewable does, instead of
+# staying muted forever.
+test_legacy_unreviewable_hold_presents_as_open() {
+  local home ev out
+  home=$(new_home unreviewable)
+  own_lock "$home"
+  write_task "$home" muted-d4 'done: ready in branch fm/muted-d4'
+  ev=$(evidence_version "$home" muted-d4) || fail "no evidence version for muted-d4"
+  # Appended by hand: the real writer refuses this date now, which is the point.
+  jq -nc --arg ev "$ev" \
+    '{item_id: "needs_firstmate:muted-d4", event: "outcome", outcome_type: "held",
+      outcome_reason: "muted long ago", review_after: "next bug-triage pass", evidence_version: $ev}' \
+    >> "$home/data/fleet-triage.jsonl"
+  out=$(run_in_home "$home" "$RECONCILE")
+  assert_contains "$out" 'muted-d4' \
+    "a hold whose review date no clock can read must keep asking for firstmate"
+  # And the guard's sweep sees the same thing: the one owner of "unattended" is shared.
+  out=$(bash -c '. "$1/bin/fm-nf-attention-lib.sh"; fm_nf_unattended_ids "$2/state" "$2/data"' \
+    _ "$ROOT" "$home")
+  assert_contains "$out" 'muted-d4' "fm_nf_unattended_ids must agree with the reconciler"
+  pass "a legacy unreviewable hold cannot park work forever"
+}
+
+# The turn-end guard's sweep is a thin, level-triggered view over fm_nf_attention_desired:
+# open items and only open items, one id per line, straight from live task state.
+test_unattended_ids_lists_open_items_only() {
+  local home out
+  home=$(new_home unattended-ids)
+  own_lock "$home"
+  write_task "$home" open-e5 'done: ready in branch fm/open-e5'
+  write_task "$home" busy-f6 'working: still implementing'
+  write_task "$home" landed-g7 'done: ready in branch fm/landed-g7'
+  disposition "$home" resolve landed-g7 --link 'local-main-1234abc' > /dev/null \
+    || fail "recording a resolution should succeed"
+  write_task "$home" parked-h8 'blocked: waiting on vendor window'
+  disposition "$home" hold parked-h8 --reason 'vendor maintenance' --review-after 2999-01-01 \
+    > /dev/null || fail "recording a hold should succeed"
+  out=$(bash -c '. "$1/bin/fm-nf-attention-lib.sh"; fm_nf_unattended_ids "$2/state" "$2/data"' \
+    _ "$ROOT" "$home")
+  [ "$out" = 'open-e5' ] \
+    || fail "expected exactly the one open item, got: $(printf '%s' "$out" | tr '\n' ' ')"
+  pass "fm_nf_unattended_ids reports open items only, one id per line"
+}
+
 test_new_signal_reopens_a_dispositioned_card() {
   local home
   home=$(new_home reopened)
@@ -336,6 +382,8 @@ test_terminal_disposition_clears_board_attention
 test_held_presents_as_held_with_reason_and_date
 test_captain_batch_hands_the_card_to_the_captain
 test_hold_expiry_restores_attention
+test_legacy_unreviewable_hold_presents_as_open
+test_unattended_ids_lists_open_items_only
 test_new_signal_reopens_a_dispositioned_card
 test_resurface_restores_attention
 test_dangling_successor_reopens_the_card

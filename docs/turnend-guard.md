@@ -14,7 +14,7 @@ On 2026-07-04, that exact gap left a parked no-mistakes gate unwatched for about
 `bin/fm-turnend-guard.sh` closes the gap by checking the primary's own turn-end path.
 When tasks are in flight and there is no live identity-matched watcher with a fresh beacon, a harness hook must either block the turn end or force a bounded follow-up turn that tells the primary to resume the session-start supervision protocol for its harness.
 
-## Gap Closed: finished work left unhandled
+## Gap Closed: finished work left unattended
 
 The guard blocks on a second, independent condition: **the `needs_firstmate` lane is non-empty**.
 
@@ -26,6 +26,9 @@ A hard rule against ending a turn with supervision off, and a printf against end
 The block is scoped to the `needs_firstmate` lane and deliberately **not** to the full actionable set.
 That lane is bounded by the number of live tasks, cannot be flooded by an audit backfill, and is level-triggered off `state/<id>.meta` plus `state/<id>.status`, so it is discharged by landing or tearing down the work rather than by any paper exit.
 Gating on all actionable items would make the guard a flood-wedge liability the next session simply disables.
+
+The acceptance metric is captain-set and binary: **zero permitted turn ends while unattended Needs FirstMate work exists.**
+The decision log below is what makes that metric measurable.
 
 ## Shared Predicate
 
@@ -44,15 +47,27 @@ That is the same identity-matched live lock and fresh beacon check used by `bin/
 A stale beacon blocks even if a watcher pid is still live.
 A fresh leftover beacon blocks if the watcher lock is missing, dead, or identity-mismatched.
 
-**Finished work is unhandled.**
-It reads the `needs_firstmate` count from `state/.triage-duty-last.json`, the small volatile cache `bin/fm-triage-duty.sh` writes on every pass and `bin/fm-guard.sh`'s preflight already reads.
+**Finished work is unattended.**
+It reads the `needs_firstmate` lane LIVE, at the moment of the turn-end evaluation, through `fm_nf_unattended_ids <state-dir> <data-dir>` from `bin/fm-nf-attention-lib.sh` - the same level-triggered per-item decision `bin/fm-nf-reconcile.sh` reports as unhandled, computed from `state/<id>.meta`, `state/<id>.status`, and the triage ledger.
+It deliberately does NOT read `state/.triage-duty-last.json`, the duty pass's volatile cache: a cache reflects the last pass, not the present, so it would both miss work that finished since and hold the turn hostage for work already discharged.
 A non-empty lane blocks, whether or not any task is in flight and whether or not the watcher is healthy.
-This is a plain file read: the guard runs on the primary's turn-end path and must never pay for an enumeration there.
+The sweep's cost is bounded by the number of live tasks, so the turn-end path stays proportional to the fleet, never to any audit backlog.
+When it blocks, the message lists the unattended item ids (bounded) and states plainly that re-arming the watcher does not satisfy the condition: an item leaves the lane only when its work is landed, torn down, or dispositioned with lineage.
 
 **Fail-open is mandatory, and applies to the whole predicate.**
-A missing, unreadable, corrupt, or old-format cache yields a count of 0 and blocks nothing; the guard then behaves exactly as it did before this lane existed.
-Away mode (`state/.afk`) and the duty kill switch (`FM_TRIAGE_DUTY=off`) also yield 0, because in both the duty pass deliberately does not run: the cache would go stale with no pass left to clear it, and a block that can never be discharged is worse than the bug it catches.
+Any failure to read the live state - a missing or broken `bin/fm-nf-attention-lib.sh`, a `jq` error, an unreadable state dir - yields an empty lane and blocks nothing; the guard then behaves exactly as it did before this lane existed.
+The reverse direction is not open: the ledger fold skips malformed rows, so ledger corruption reverts its items to unattended (they keep blocking) rather than silently discharging them.
+Away mode (`state/.afk`) stands the lane down because the away daemon owns supervision and escalation there, and the duty kill switch (`FM_TRIAGE_DUTY=off`) stands it down because the gate is part of the fleet-triage duty - the operator escape hatch if the gate itself ever misbehaves.
+Both stand-downs are recorded honestly in the decision log's `nf_gate` field.
 The `stop_hook_active` loop guard bounds this, like every other block, to at most one forced continuation per turn, so neither condition can produce an un-endable session.
+
+## Decision Log
+
+Every primary turn-end evaluation - permitted or blocked - appends one JSON line to `state/.turnend-guard.log`: timestamp, watcher status, in-flight count, `needs_firstmate` count, a bounded item-id digest, the `nf_gate` state, the decision, the block reason, and whether loop protection was active.
+Permits are on the record too, because "zero permitted turn ends while unattended Needs FirstMate work exists" is only a measurable claim if the permits are recorded - including a stop permitted only by loop protection while work was still unattended, which is exactly the event the metric counts.
+The log carries ids, counts, and decisions only - never transcript content.
+It is best-effort (a log that cannot be written never changes the decision or wedges the turn) and size-capped (`FM_TURNEND_LOG_MAX`, default 2000 lines, trimmed to half when exceeded).
+`FM_TURNEND_LOG` overrides the path.
 
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repo-root `state/`.
 `FM_GUARD_GRACE` controls the beacon freshness window and defaults to 300 seconds.

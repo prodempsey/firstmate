@@ -57,7 +57,12 @@ EOF
 run_duty() {  # <home> <args...>
   local home=$1
   shift
+  # FM_VISIBILITY_CLI pins the visibility lane to "unavailable" the same way
+  # tests/fm-fleet-triage.test.sh does: without it the enumerator auto-detects a LIVE
+  # cockpit CLI on machines that have one, and this suite's hermetic homes leak real
+  # visibility-history items into their "clear fleet" fixtures.
   FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_VISIBILITY_CLI="$home/visibility-unavailable.mjs" \
     FM_FLEET_TRIAGE_BUG_CLI=off "$DUTY" "$@" 2>&1
 }
 

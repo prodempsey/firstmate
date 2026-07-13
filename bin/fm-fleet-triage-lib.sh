@@ -121,12 +121,26 @@ FM_TRIAGE_REVIEW_AGE_JQ='
       end;
 '
 
+# Print the epoch seconds a review date comes due, or fail when it names no readable date.
+# The one parser: every caller that asks "has this hold come due?" goes through it, so the
+# enumerator's health ladder, the writer's refusal, and the board's held/open decision can
+# never disagree about what a review date means. (date(1) is deliberately NOT used here:
+# GNU date reads far more prose than the ladder's jq does, and BSD date far less, so a
+# date-1-based caller drifts from the ladder per platform - the exact split this closes.)
+fm_triage_review_epoch() {  # <review-after>
+  local out
+  out=$(jq -rn --arg ts "$1" "$FM_TRIAGE_REVIEW_AGE_JQ"'
+    (review_age($ts; 0)) as $a
+    | if $a == null then empty else (0 - $a) end
+  ' 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
 # True when a review date is one a clock can actually read, and therefore one that can come
 # due. A hold whose review date fails this is not a disposition; it is silence with paperwork.
 fm_triage_review_date_ok() {  # <review-after>
-  jq -e -n --arg ts "$1" "$FM_TRIAGE_REVIEW_AGE_JQ"'
-    review_age($ts; 0) != null
-  ' >/dev/null 2>&1
+  fm_triage_review_epoch "$1" >/dev/null 2>&1
 }
 
 # Print the ledger path for a home.
@@ -285,13 +299,13 @@ fm_triage_render_digest() {  # <max-items>
 # actionable, ownerless, unhealthy (actionable but health != ok), needs_firstmate, and
 # captain_gated counts, plus a deterministic fingerprint over the current actionable set.
 #
-# needs_firstmate - the count of ACTIONABLE items in the needs_firstmate lane - is the one
-# field the turn-end guard blocks on (bin/fm-turnend-guard.sh, docs/turnend-guard.md). It is
-# carried in the cache this result feeds so the guard can read it with one jq over one small
-# local file instead of re-running the enumerator on the primary's turn-end path. Only that
-# lane: it is bounded by the number of live tasks, it cannot be flooded by an audit backfill,
-# and it is level-triggered off state/<id>.meta plus state/<id>.status, so it is discharged by
-# landing or tearing down the work rather than by any paper exit.
+# needs_firstmate - the count of ACTIONABLE items in the needs_firstmate lane - is the lane
+# the turn-end guard blocks on (bin/fm-turnend-guard.sh, docs/turnend-guard.md). The guard
+# does NOT read it from the cache this result feeds: a cache reflects the last duty pass,
+# not the moment the turn ends, so the guard reads the lane live through
+# fm_nf_unattended_ids (bin/fm-nf-attention-lib.sh). The count is still carried here for
+# the fm-guard.sh preflight banner and for auditing duty passes against the guard's own
+# decision log.
 # The
 # fingerprint changes only when the actionable set's membership or disposition
 # changes (item_id, processing_state, health), never on a title or prose edit, so a

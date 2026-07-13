@@ -55,9 +55,11 @@
 # claims, never mutates the backlog, bugs, or any task. It writes exactly two things, and
 # neither is a judgment about any item:
 #   state/.triage-duty-last.json  a volatile cache of this pass's OWN result, read cheaply by
-#                                 the supervision preflight in bin/fm-guard.sh and by the
-#                                 turn-end guard in bin/fm-turnend-guard.sh, so neither has to
-#                                 re-enumerate.
+#                                 the supervision preflight in bin/fm-guard.sh so it does not
+#                                 re-enumerate. The turn-end guard deliberately does NOT read
+#                                 it: a cache reflects the last pass, not the moment the turn
+#                                 ends, so bin/fm-turnend-guard.sh reads the needs_firstmate
+#                                 lane live (docs/turnend-guard.md).
 #   a `surface` row per UNSEEN item, through the sanctioned writer
 #                                 (bin/fm-fleet-triage-record.sh surface --new), which stamps
 #                                 first_seen_at. Nothing else ever wrote one, so no item had a
