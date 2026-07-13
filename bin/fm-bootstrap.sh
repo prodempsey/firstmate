@@ -12,7 +12,23 @@
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: fm-<id>...",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: already-live|respawned|skipped: <reason>|respawn failed: <reason>",
+#                 "LEASE_RECLAIM: pool <repo>: reclaimed <n>, parked <m>" plus one
+#                 indented "reclaimed|PARKED <holder> <path>: <reason>" line each,
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
+#          LEASE_RECLAIM lines report the treehouse worktree-lease sweep
+#          (bin/fm-lease-reclaim.sh). A treehouse lease is released only by an
+#          explicit `treehouse return`, so a crewmate that dies without reaching
+#          bin/fm-teardown.sh holds its pool slot forever and `treehouse prune`
+#          will not take it back either - left alone, the pool fills with ghost
+#          leases until it hits exhaustion and blocks all new dispatch. The sweep
+#          frees a lease ONLY when its owning task is provably gone (no live agent
+#          process AND no task meta in this home or any secondmate home) AND its
+#          worktree provably holds no work (clean, and landed in the default
+#          branch or on a remote). Anything else is PARKED, never returned, and
+#          re-reported every run until the captain rules on it - freeing a lease
+#          resets the worktree, so a dead lease still holding uncommitted or
+#          unlanded work is the captain's call alone (prime directive #3).
+#          Silence means no dead lease was found.
 #          A NUDGE_SECONDMATES line lists the RUNNING secondmate task selectors
 #          (fm-<id>) whose worktree was fast-forwarded to firstmate's own
 #          current default-branch commit (a purely LOCAL fast-forward, never an
@@ -67,9 +83,9 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the four MUTATING sweeps
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the five MUTATING sweeps
 #          (secondmate_sync, secondmate_liveness_sweep, x_mode_setup,
-#          fleet_sync) while still printing every read-only detect line
+#          fleet_sync, lease_reclaim) while still printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
 #          checkout command. Used by
 #          fm-session-start.sh's read-only path when another live session holds
@@ -180,6 +196,33 @@ fleet_sync() {
   [ "$monitor_was_on" -eq 1 ] || set +m 2>/dev/null || true
 
   fleet_sync_relay_filtered_output "$tmp"
+  rm -f "$tmp"
+}
+
+# Reclaim leaked treehouse worktree leases (bin/fm-lease-reclaim.sh owns the
+# safety model). Session start is the right home for this sweep: it is the one
+# point that holds the per-home session lock, so two sessions cannot race the
+# pool; it runs before any dispatch, so the pool is healthy when work is handed
+# out rather than exhausted mid-flight; and it is already the place mutating
+# sweeps live. It runs AFTER fleet_sync deliberately - a freshly fast-forwarded
+# default branch is what the landed check reads, so a stale clone cannot make
+# landed work look unlanded and needlessly park a slot.
+# Bounded and non-fatal: a wedged pool must never block a session from starting.
+lease_reclaim() {
+  local tmp
+  [ -x "$FM_ROOT/bin/fm-lease-reclaim.sh" ] || return 0
+  command -v treehouse >/dev/null 2>&1 || return 0
+  tmp=$(mktemp "${TMPDIR:-/tmp}/fm-lease-reclaim.XXXXXX" 2>/dev/null) || return 0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${FM_LEASE_RECLAIM_TIMEOUT:-60}" "$FM_ROOT/bin/fm-lease-reclaim.sh" >"$tmp" 2>/dev/null || true
+  else
+    "$FM_ROOT/bin/fm-lease-reclaim.sh" >"$tmp" 2>/dev/null || true
+  fi
+  # fm-lease-reclaim.sh already prefixes every line with LEASE_RECLAIM:.
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    echo "$line"
+  done < "$tmp"
   rm -f "$tmp"
 }
 
@@ -608,5 +651,6 @@ if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   secondmate_liveness_sweep
   x_mode_setup
   fleet_sync
+  lease_reclaim
 fi
 exit 0

@@ -2,7 +2,7 @@
 name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
-  Use whenever the session-start digest's bootstrap section prints any diagnostic or capability line - MISSING, NEEDS_GH_AUTH, TANGLE, CREW_HARNESS_OVERRIDE, CREW_DISPATCH, FLEET_SYNC, SECONDMATE_SYNC, SECONDMATE_LIVENESS, TASKS_AXI, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one.
+  Use whenever the session-start digest's bootstrap section prints any diagnostic or capability line - MISSING, NEEDS_GH_AUTH, TANGLE, CREW_HARNESS_OVERRIDE, CREW_DISPATCH, FLEET_SYNC, SECONDMATE_SYNC, SECONDMATE_LIVENESS, LEASE_RECLAIM, TASKS_AXI, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one.
   A silent bootstrap section means all good and needs no skill load.
 user-invocable: false
 metadata:
@@ -36,6 +36,15 @@ The inline rules in `AGENTS.md` section 3 still bind: detect, then consent, then
 - `SECONDMATE_SYNC: secondmate <id>: skipped: <reason>` - the local-HEAD secondmate sync left a live secondmate home on its existing checkout because the home was dirty, diverged, unsafe, on the wrong branch, missing the primary target commit, or otherwise not fast-forwardable, or because inheritable-config propagation failed; bootstrap continued, but inspect the reason because the secondmate's tracked instructions or inherited settings may be stale after a primary update.
 - `SECONDMATE_LIVENESS: secondmate <id>: already-live|respawned|skipped: <reason>|respawn failed: <reason>` - the session-start liveness sweep checked a live secondmate's recorded endpoint for a real agent process.
   Treat `already-live` and `respawned` as handled; investigate `skipped` or `respawn failed` because that secondmate is not guaranteed live.
+- `LEASE_RECLAIM: pool <repo>: reclaimed <n>, parked <m>` plus its indented per-lease lines - the session-start sweep found treehouse pool slots still leased to tasks that no longer exist (`bin/fm-lease-reclaim.sh`).
+  A `reclaimed <holder> <path>: <reason>` line is done and needs no action: that slot's owner was provably gone and its worktree provably held no work, so the slot is back in the pool.
+  Report reclaimed slots to the captain only as a brief outcome ("freed N stale worktree slots") if they ask or if the pool had been blocking work; never name the internals.
+  A `PARKED <holder> <path>: <reason>` line is the one that needs you.
+  The lease's owner is gone but its worktree still holds UNCOMMITTED CHANGES or UNLANDED WORK, so the sweep refused to return it - returning a lease resets the worktree, and discarding that work is the captain's call alone (prime directive #3).
+  Parked leases are re-reported every session start and never expire on their own, so they will keep accumulating and eating pool slots until the captain rules on each one.
+  Bring them to the captain in outcome language: unfinished work is sitting in an abandoned workspace, summarize what is in it (inspect with `git -C <path> status` and `git -C <path> log --oneline @{u}..` - read-only), and ask whether to keep it (have a crewmate salvage the change) or let it go.
+  Only on the captain's explicit word to discard, free the slot with `treehouse return --force <path>` run from the project dir; never do it on your own judgment, and never under `yolo` (discarding unlanded work is destructive and always escalates).
+  If the pool is at or near exhaustion and every remaining lease is parked, say so plainly - new work cannot be dispatched into that project until slots are freed.
 - `TASKS_AXI: available` - a default-backend capability fact, not a problem; record it silently and use `AGENTS.md` section 10 for backlog mutations.
   It prints only when `config/backlog-backend` is absent or set to `tasks-axi` and the shared compatibility probe passes (`docs/configuration.md` "Backlog backend").
   If the backend is not opted out and `tasks-axi` is missing or incompatible, bootstrap reports the `MISSING: tasks-axi` line but firstmate still hand-edits routine backlog updates and never blocks work.
