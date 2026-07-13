@@ -21,8 +21,10 @@
 # terminal - state/<id>.meta gains attentionOwner=none, which the board honors ahead of every
 #            derived signal (crew status, turn-end, PR), so the card stops presenting as
 #            active FirstMate attention while staying on the board and in the audit. A
-#            durable board event follows as the receipt: `to_captain` for a captain batch,
-#            `reworking` for a successor, `reviewed` otherwise.
+#            durable board event follows as the receipt: a captain batch hands the card to
+#            the captain through bin/fm-nf-ack.sh --to-captain, the one writer of the board's
+#            captain-attention column; a successor posts `reworking`; anything else posts
+#            `reviewed`.
 # held     - the card stays FirstMate-owned and visible, but presents as HELD: a durable
 #            `reviewed` board event plus a card note carrying the reason and the review date,
 #            so "firstmate parked this until X" reads differently from "nobody has touched
@@ -119,11 +121,16 @@ post_event() {  # <task-id> <event> <fingerprint> [<extra-key> <extra-value>]
 # attempted and not required; `reviewed` is accepted for any task and is the receipt that
 # always lands. The card is already cleared by its meta override either way - this only
 # decides how much the board can say about WHERE the work went.
+#
+# A captain batch hands the card to the captain, so it goes through bin/fm-nf-ack.sh, which
+# is the one writer of the board's captain-attention column (AGENTS.md section 9). This
+# command never writes that column itself.
 post_terminal_event() {  # <task-id> <outcome> <fingerprint> <link>
   local id=$1 outcome=$2 fingerprint=$3 link=$4
   case "$outcome" in
     captain_batch)
-      post_event "$id" to_captain "$fingerprint" open_item_id "$link" 2>/dev/null && return 0
+      FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_BRIDGE_URL="$BRIDGE" \
+        "$SCRIPT_DIR/fm-nf-ack.sh" --to-captain "$link" "$id" >/dev/null 2>&1 && return 0
       ;;
     successor_created)
       post_event "$id" reworking "$fingerprint" successor_id "$link" 2>/dev/null && return 0

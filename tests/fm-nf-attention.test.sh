@@ -41,7 +41,10 @@ done
 if [ -n "$body" ]; then
   printf '%s\t%s\n' "$url" "$body" >> "$FM_TEST_BOARD_LOG"
 else
-  printf '%s\n' "${FM_TEST_BOARD_GET:-{\}}"
+  # A GET is a read-back: answer with the last thing written to this card, which is what
+  # bin/fm-nf-ack.sh verifies its own write against.
+  awk -F '\t' -v url="$url" '$1 == url {last = $2} END {print (last == "" ? "{}" : last)}' \
+    "$FM_TEST_BOARD_LOG" 2>/dev/null || printf '{}\n'
 fi
 SH
   chmod +x "$home/fakebin/curl"
@@ -152,6 +155,30 @@ test_held_presents_as_held_with_reason_and_date() {
   assert_contains "$out" '  held-until: 2026-08-01' "list should name the review date"
   assert_contains "$out" '  hold-reason: upstream fix lands in v2.4' "list should name the reason"
   pass "a held item presents as held, distinctly from untouched attention"
+}
+
+# A captain batch hands the card to the captain, and the board's captain-attention column has
+# exactly one writer (AGENTS.md section 9). This reconciliation must go through it, not around
+# it, or an item could clear firstmate's attention without ever reaching the captain's.
+test_captain_batch_hands_the_card_to_the_captain() {
+  local home body
+  home=$(new_home captain-batch)
+  own_lock "$home"
+  write_task "$home" decide-k2 'needs-decision: two viable designs'
+
+  disposition "$home" captain-batch decide-k2 --link order-ORD-041 > /dev/null \
+    || fail "recording a captain batch should succeed"
+
+  assert_grep 'attentionOwner=none' "$home/state/decide-k2.meta" \
+    "a captain batch should stop asking firstmate"
+  body=$(grep '/api/card/' "$home/board.log" | cut -f2 | tail -n 1)
+  [ "$(printf '%s' "$body" | jq -r '.event')" = to_captain ] \
+    || fail "a captain batch should transfer board attention to the captain, got: $body"
+  [ "$(printf '%s' "$body" | jq -r '.open_item_id')" = order-ORD-041 ] \
+    || fail "the hand-off should name the batch it went into"
+  assert_grep 'decide-k2' "$home/state/.nf-handled" \
+    "the hand-off should go through the one writer of the captain-attention column"
+  pass "a captain batch hands the card to the captain through its one writer"
 }
 
 test_hold_expiry_restores_attention() {
@@ -307,6 +334,7 @@ test_board_outage_still_clears_the_card() {
 
 test_terminal_disposition_clears_board_attention
 test_held_presents_as_held_with_reason_and_date
+test_captain_batch_hands_the_card_to_the_captain
 test_hold_expiry_restores_attention
 test_new_signal_reopens_a_dispositioned_card
 test_resurface_restores_attention
