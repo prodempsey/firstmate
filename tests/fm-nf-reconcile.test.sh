@@ -154,7 +154,42 @@ test_attention_flags_call_api() {
   pass "attention ownership flags call and verify the API"
 }
 
+# The card is keyed by HOME NAME, so this command cannot address a card for a home it cannot
+# name. A home that basenames into a garbage path segment produced a malformed URL, and the
+# 404 that came back read as "the board rejected the write" rather than "firstmate built a
+# bad URL" - an invisible failure in the ONE writer of the captain's attention column, which
+# is how a captain decision gets dropped. It must fail loudly instead, and say where it was
+# writing when it failed.
+test_ack_refuses_a_home_it_cannot_name() {
+  local home out status
+  home=$(new_home ack-badhome)
+  write_task "$home" phase-g9 'done: ready in branch fm/phase-g9'
+  out=$(FM_HOME=relative/path "$ACK" phase-g9 2>&1); status=$?
+  expect_code 2 "$status" "a relative FM_HOME must be refused, not turned into a malformed URL"
+  assert_contains "$out" 'FM_HOME must be an absolute path' "the refusal must name the problem"
+  out=$(FM_HOME=/ "$ACK" phase-g9 2>&1); status=$?
+  expect_code 2 "$status" "a home with no derivable name must be refused"
+  assert_contains "$out" 'cannot derive a board home name' "the refusal must name the problem"
+  pass "fm-nf-ack: refuses loudly rather than emitting a malformed card URL"
+}
+
+test_ack_failure_names_the_url_it_tried() {
+  local home out status
+  home=$(new_home ack-failurl)
+  write_task "$home" phase-g9 'done: ready in branch fm/phase-g9'
+  mkdir -p "$home/failbin"
+  printf '#!/usr/bin/env bash\nexit 22\n' > "$home/failbin/curl"
+  chmod +x "$home/failbin/curl"
+  out=$(PATH="$home/failbin:$PATH" FM_HOME="$home" "$ACK" phase-g9 2>&1); status=$?
+  expect_code 1 "$status" "an attention write that fails must fail the command"
+  assert_contains "$out" "/api/card/$(basename "$home")/phase-g9/attention" \
+    "a failed attention write must report the URL it tried, or a wrong home reads exactly like a down board"
+  pass "fm-nf-ack: a failed attention write names the card URL it tried"
+}
+
 test_unhandled_terminal_reemits_until_acked
+test_ack_refuses_a_home_it_cannot_name
+test_ack_failure_names_the_url_it_tried
 test_reviewed_unchanged_remains_open
 test_changed_fingerprint_reemits
 test_local_state_without_board_data

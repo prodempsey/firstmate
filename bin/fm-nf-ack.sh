@@ -64,6 +64,29 @@ case "$ID" in
     ;;
 esac
 
+# The board card is keyed by HOME NAME, so a home this command cannot name is a card it
+# cannot address. FM_HOME resolves the same way it does in every other bin/ script (explicit
+# FM_HOME, then FM_ROOT_OVERRIDE, then this repo root), but a home that is relative, empty,
+# or a filesystem root basenames into a garbage path segment, and a request to a garbage path
+# comes back 404 - which an operator reads as "the board rejected the write", not "firstmate
+# built a malformed URL". This command is the ONLY writer of the captain's attention column,
+# so a write that fails invisibly here is precisely a dropped captain decision, the failure
+# this whole path exists to prevent. Refuse loudly, and refuse before touching any state.
+case "$FM_HOME" in
+  /*) : ;;
+  *)
+    printf 'fm-nf-ack: FM_HOME must be an absolute path to a firstmate home, got: %s\n' "$FM_HOME" >&2
+    exit 2
+    ;;
+esac
+HOME_NAME=$(basename "$FM_HOME")
+case "$HOME_NAME" in
+  ''|.|..|/)
+    printf 'fm-nf-ack: cannot derive a board home name from FM_HOME=%s; set FM_HOME to the firstmate home directory\n' "$FM_HOME" >&2
+    exit 2
+    ;;
+esac
+
 FINGERPRINT=$(fm_nf_current_fingerprint "$STATE" "$ID") || {
   printf 'fm-nf-ack: no current local terminal signal for %s\n' "$ID" >&2
   exit 1
@@ -75,10 +98,13 @@ if ! [ -f "$LEDGER" ] || ! awk -F '\t' -v id="$ID" -v fp="$FINGERPRINT" '$1==id 
   printf '%s\t%s\t%s\treviewed\n' "$ID" "$FINGERPRINT" "$TS" >> "$LEDGER"
 fi
 BASE=${FM_BRIDGE_URL:-http://127.0.0.1:8787}
-URL="$BASE/api/card/$(basename "$FM_HOME")/$ID/attention"
+URL="$BASE/api/card/$HOME_NAME/$ID/attention"
 BODY=$(jq -nc --arg event "$EVENT" --arg fp "$FINGERPRINT" --arg actor firstmate --arg name "$EXTRA_NAME" --arg value "$EXTRA_VALUE" '{event:$event,status_fingerprint:$fp,actor:$actor} + if $name=="" then {} else {($name):$value} end')
-curl -fsS -H 'content-type: application/json' -d "$BODY" "$URL" >/dev/null || { echo "fm-nf-ack: attention API write failed; task remains open" >&2; exit 1; }
-READBACK=$(curl -fsS "$URL") || { echo "fm-nf-ack: attention API read-back failed; task remains open" >&2; exit 1; }
+# The URL rides in every failure message: an attention write that fails is a captain decision
+# on the floor, and "it failed" without the address it failed against is not a report anyone
+# can act on - a wrong home name and a down Bridge read identically otherwise.
+curl -fsS -H 'content-type: application/json' -d "$BODY" "$URL" >/dev/null || { printf 'fm-nf-ack: attention API write failed (%s); task remains open\n' "$URL" >&2; exit 1; }
+READBACK=$(curl -fsS "$URL") || { printf 'fm-nf-ack: attention API read-back failed (%s); task remains open\n' "$URL" >&2; exit 1; }
 printf '%s' "$READBACK" | jq -e --arg event "$EVENT" --arg value "$EXTRA_VALUE" --arg name "$EXTRA_NAME" '.event==$event and ($name=="" or .[$name]==$value)' >/dev/null || { echo "fm-nf-ack: attention API read-back mismatch; task remains open" >&2; exit 1; }
 # Local receipt for a CONFIRMED needs_human card, per the header. Written last, so nothing
 # reaches it that the Bridge did not read back.
