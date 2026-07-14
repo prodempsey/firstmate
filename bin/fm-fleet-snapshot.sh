@@ -48,6 +48,19 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 BACKLOG="$DATA/backlog.md"
 
+# THE SNAPSHOT'S PAYLOADS ARE UNBOUNDED, SO THEY REACH jq BY FILE, NEVER BY ARGUMENT LIST.
+# The backlog, the task list, the scout reports, and the secondmates' landed work all grow
+# with the fleet, and `jq -n --argjson backlog "$BACKLOG_JSON"` pushed every byte of them
+# through execve. That works on a young fleet and dies with "Argument list too long" on a
+# real one - which is exactly how the captain-order reader died (bin/fm-order.sh), and this
+# script took the whole fleet-triage scan down with it the same way. --slurpfile reads the
+# same JSON from a file with no such limit. Only bounded scalars go in argv.
+SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/fm-fleet-snapshot.XXXXXX") || {
+  printf 'fm-fleet-snapshot: cannot create a scratch directory\n' >&2
+  exit 1
+}
+trap 'rm -rf "$SCRATCH"' EXIT
+
 # shellcheck source=bin/fm-backend.sh
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-backend.sh"
@@ -442,33 +455,46 @@ task_json_lines() {
 FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME=${FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME:-10}
 case "$FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME" in ''|*[!0-9]*) FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME=10 ;; esac
 secondmate_landed_json() {
-  local reg="$DATA/secondmates.md" id home backlog bj rows n
-  local records='[]' truncated='[]' unreadable='[]'
+  local reg="$DATA/secondmates.md" id home backlog n
+  # The record set accumulates across homes, so it is unbounded and lives in files, not in
+  # --argjson. The home lists stay small, but keeping all three on the same footing means the
+  # next home added to the fleet cannot quietly reintroduce the argument-list limit here.
+  local acc="$SCRATCH/sm-records.json" rows="$SCRATCH/sm-rows.json"
+  local bj="$SCRATCH/sm-backlog.json" homes="$SCRATCH/sm-homes.json"
+  printf '[]\n' > "$acc"
+  local truncated='[]' unreadable='[]'
   while IFS='|' read -r id home _; do
     [ -n "$id" ] || continue
     [ -n "$home" ] || continue
     backlog="$home/data/backlog.md"
     [ -f "$backlog" ] || continue
-    bj=$(backlog_json "$backlog") \
-      || { unreadable=$(jq -n --argjson a "$unreadable" --arg h "$home" '$a + [$h]'); continue; }
-    rows=$(printf '%s' "$bj" | jq --arg home "$home" --arg id "$id" '
+    backlog_json "$backlog" > "$bj" \
+      || { unreadable=$(printf '%s' "$unreadable" | jq -c --arg h "$home" '. + [$h]'); continue; }
+    jq --arg home "$home" --arg id "$id" '
       [ .records[] | select(.state == "done" and .structured)
         | {id, title, pr_url, report_path, local_note, completion, home:$home, home_id:$id} ]
-      | sort_by([(.completion.date // ""), .id]) | reverse') \
-      || { unreadable=$(jq -n --argjson a "$unreadable" --arg h "$home" '$a + [$h]'); continue; }
-    n=$(printf '%s' "$rows" | jq 'length')
+      | sort_by([(.completion.date // ""), .id]) | reverse' "$bj" > "$rows" \
+      || { unreadable=$(printf '%s' "$unreadable" | jq -c --arg h "$home" '. + [$h]'); continue; }
+    n=$(jq 'length' "$rows")
     if [ "$FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME" -gt 0 ] \
       && [ "$n" -gt "$FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME" ]; then
-      truncated=$(jq -n --argjson a "$truncated" --arg h "$home" '$a + [$h]')
+      truncated=$(printf '%s' "$truncated" | jq -c --arg h "$home" '. + [$h]')
     fi
-    records=$(jq -n --argjson a "$records" --argjson b "$rows" \
+    jq -n --slurpfile a "$acc" --slurpfile b "$rows" \
       --argjson cap "$FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME" \
-      '$a + (if $cap == 0 then $b else $b[:$cap] end)')
+      '($a[0] // []) + (($b[0] // []) | if $cap == 0 then . else .[:$cap] end)' \
+      > "$acc.next" \
+      || { unreadable=$(printf '%s' "$unreadable" | jq -c --arg h "$home" '. + [$h]'); continue; }
+    mv -f "$acc.next" "$acc"
   done <<EOF
 $(live_secondmate_meta_records "$STATE" "$reg")
 EOF
-  jq -n --argjson records "$records" --argjson truncated "$truncated" --argjson unreadable "$unreadable" \
-    '{records:$records, truncated:$truncated, unreadable:$unreadable}'
+  printf '%s\n' "$truncated" > "$homes.truncated"
+  printf '%s\n' "$unreadable" > "$homes.unreadable"
+  jq -n --slurpfile records "$acc" --slurpfile truncated "$homes.truncated" \
+    --slurpfile unreadable "$homes.unreadable" \
+    '{records: ($records[0] // []), truncated: ($truncated[0] // []),
+      unreadable: ($unreadable[0] // [])}'
 }
 
 scout_report_lines() {
@@ -486,10 +512,25 @@ scout_report_lines() {
     | jq -s 'sort_by(.id)'
 }
 
-BACKLOG_JSON=$(backlog_json)
-TASKS_JSON=$(task_json_lines)
-SCOUT_REPORTS_JSON=$(scout_report_lines)
-SECONDMATE_LANDED_JSON=$(secondmate_landed_json)
+# Each aggregate goes straight to a file; a failure to build one is fatal, because a
+# snapshot that silently omitted the backlog or the task list would be read as a fleet that
+# has neither.
+backlog_json > "$SCRATCH/backlog.json" || {
+  printf 'fm-fleet-snapshot: could not build the backlog view of %s\n' "$BACKLOG" >&2
+  exit 1
+}
+task_json_lines > "$SCRATCH/tasks.json" || {
+  printf 'fm-fleet-snapshot: could not build the task view of %s\n' "$STATE" >&2
+  exit 1
+}
+scout_report_lines > "$SCRATCH/scout_reports.json" || {
+  printf 'fm-fleet-snapshot: could not enumerate scout reports under %s\n' "$DATA" >&2
+  exit 1
+}
+secondmate_landed_json > "$SCRATCH/secondmate_landed.json" || {
+  printf 'fm-fleet-snapshot: could not build the secondmate landed-work view\n' >&2
+  exit 1
+}
 
 jq -n \
   --arg fm_home "$FM_HOME" \
@@ -498,11 +539,15 @@ jq -n \
   --arg data "$DATA" \
   --arg config "$CONFIG" \
   --arg projects "$PROJECTS" \
-  --argjson backlog "$BACKLOG_JSON" \
-  --argjson tasks "$TASKS_JSON" \
-  --argjson scout_reports "$SCOUT_REPORTS_JSON" \
-  --argjson secondmate_landed "$SECONDMATE_LANDED_JSON" \
-  'def backlog_by_id($id): ($backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
+  --slurpfile backlogf "$SCRATCH/backlog.json" \
+  --slurpfile tasksf "$SCRATCH/tasks.json" \
+  --slurpfile scout_reportsf "$SCRATCH/scout_reports.json" \
+  --slurpfile secondmate_landedf "$SCRATCH/secondmate_landed.json" \
+  '($backlogf[0] // {records:[]}) as $backlog
+   | ($tasksf[0] // []) as $tasks
+   | ($scout_reportsf[0] // []) as $scout_reports
+   | ($secondmate_landedf[0] // {}) as $secondmate_landed
+   | def backlog_by_id($id): ($backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
    def task_by_id($id): ($tasks[]? | select(.id == $id) | .) // null;
    def report_kind($id): (task_by_id($id).kind // backlog_by_id($id).kind // "scout");
    {

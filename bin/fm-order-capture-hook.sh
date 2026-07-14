@@ -77,8 +77,16 @@ FILE="$PENDING_DIR/$CAPTURE_ID.json"
 [ -f "$FILE" ] && exit 0
 
 TMP="$FILE.tmp.$$"
-if jq -cn --arg text "$TEXT" --arg ts "$(fm_triage_now)" --arg source "$SOURCE" \
+TEXTFILE="$FILE.txt.$$"
+# The captain's message reaches jq by FILE, never as an argv value. A pasted spec, a stack
+# trace, a diff - a prompt is not bounded by anything an argument list is, and a capture
+# that exceeded the kernel's argument limit would fail HERE, silently (this hook is
+# best-effort by design), which is precisely a lost captain request. The same argv habit
+# had already killed every read path in bin/fm-order.sh.
+printf '%s' "$TEXT" > "$TEXTFILE" 2>/dev/null || exit 0
+if jq -cn --rawfile text "$TEXTFILE" --arg ts "$(fm_triage_now)" --arg source "$SOURCE" \
   '{captured_at: $ts, source: $source, text: $text}' > "$TMP" 2>/dev/null; then
   mv -f "$TMP" "$FILE" 2>/dev/null || rm -f "$TMP" 2>/dev/null
 fi
+rm -f "$TEXTFILE" "$TMP" 2>/dev/null || true
 exit 0

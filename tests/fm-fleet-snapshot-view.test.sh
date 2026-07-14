@@ -568,9 +568,66 @@ test_event_hints_follow_reconciled_current_state
 test_open_decision_survives_later_unrelated_event
 test_secondmate_open_decision_survives_live_endpoint
 test_open_decision_clears_on_keyed_resolution
+# THE FLEET-SIZED SNAPSHOT. Every other test in this file builds a fixture with a handful of
+# records, which is exactly why the snapshot shipped broken on a real fleet: it passed the
+# whole backlog, task list, scout-report inventory, and secondmate landed-work roll-up to jq
+# as ARGUMENTS, and died with "Argument list too long" once the backlog outgrew the kernel's
+# 128KB per-argument limit - taking bin/fm-fleet-triage.sh --json (exit 126) and the whole
+# captain-orders lane down with it. The fixture here is generated large enough to reach that
+# limit, and asserted to still be that large, because a fixture that quietly shrinks below it
+# is a test that quietly stops testing this.
+test_snapshot_survives_a_fleet_sized_backlog() {
+  local home fakebin snap backlog_bytes limit i
+  home=$(make_home bigfleet)
+  fakebin=$(make_fakebin "$home")
+  limit=131072   # MAX_ARG_STRLEN: the per-argument ceiling this class of bug dies on
+
+  {
+    printf '## In flight\n'
+    i=1
+    while [ "$i" -le 60 ]; do
+      printf -- '- [ ] big-task-%03d - Big Task %03d with a long descriptive title that a real backlog entry carries (repo: alpha) (kind: ship) (since 2026-07-07)\n' "$i" "$i"
+      printf '  A carried-over note with enough prose to look like the real thing, because the real one is what overflowed the argument list in the first place.\n'
+      i=$((i + 1))
+    done
+    printf '\n## Queued\n'
+    i=1
+    while [ "$i" -le 60 ]; do
+      printf -- '- [ ] queued-%03d - Queued item %03d with a realistic one-line summary of the work it is waiting to do (repo: alpha) (kind: ship)\n' "$i" "$i"
+      i=$((i + 1))
+    done
+    printf '\n## Done\n'
+    i=1
+    while [ "$i" -le 120 ]; do
+      printf -- '- [x] done-%03d - Done item %03d with a realistic summary - https://github.com/kunchenguid/firstmate/pull/%d (merged 2026-07-06)\n' "$i" "$i" "$i"
+      i=$((i + 1))
+    done
+  } > "$home/data/backlog.md"
+
+  backlog_bytes=$(wc -c < "$home/data/backlog.md")
+  [ "$backlog_bytes" -gt 40000 ] \
+    || fail "the fleet-sized backlog fixture is only $backlog_bytes bytes: too small to fold into a jq argument past the $limit-byte limit that broke the snapshot"
+
+  snap=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json) \
+    || fail "the snapshot died on a fleet-sized backlog: the payloads still go through an argument list"
+
+  # The payload really is past the limit - i.e. this fixture would have killed the old code.
+  local backlog_json_bytes
+  backlog_json_bytes=$(printf '%s' "$snap" | jq -c '.backlog' | wc -c)
+  [ "$backlog_json_bytes" -gt "$limit" ] \
+    || fail "the folded backlog is only $backlog_json_bytes bytes, under the $limit-byte argument limit: this fixture no longer exercises the overflow"
+
+  [ "$(printf '%s' "$snap" | jq '[.backlog.records[] | select(.state == "in_flight")] | length')" = 60 ] \
+    || fail "the snapshot dropped in-flight records from a large backlog"
+  [ "$(printf '%s' "$snap" | jq '[.backlog.records[] | select(.state == "done")] | length')" = 120 ] \
+    || fail "the snapshot dropped done records from a large backlog"
+  pass "the snapshot reads a fleet-sized backlog instead of dying on the argument limit"
+}
+
 test_completed_scout_report_is_pointer_not_pending
 test_parked_scout_decision_stays_pending
 test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
 test_view_renders_dead_secondmate_agent_status
+test_snapshot_survives_a_fleet_sized_backlog

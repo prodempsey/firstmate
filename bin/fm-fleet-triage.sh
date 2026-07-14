@@ -337,11 +337,17 @@ elif ORDERS_RAW=$(FM_ROOT_OVERRIDE="$FM_ROOT" FM_HOME="$FM_HOME" \
 else
   ORDERS_RC=$?
   # rc 3 is a missing inbox, which for a home that has never taken an order is normal.
-  # Anything else means the inbox exists and could not be read: that is a defect, and the
-  # lane says so loudly rather than pretending the captain has asked for nothing.
-  if [ "$ORDERS_RC" -ne 3 ]; then
-    ORDERS_NOTE="CAPTAIN ORDER INBOX UNREADABLE (bin/fm-order.sh list --json exited $ORDERS_RC) - treat as lost captain requests, not as an empty inbox"
-  fi
+  # rc 6 is a defect in the READER, not a defect in the captain's data: the ledger is intact
+  # and this lane says so, because reporting a reader bug as possible data loss is a false
+  # alarm - one that actually shipped, and fired at every session start while all 255 orders
+  # sat safely on disk. Anything else means the inbox itself could not be read, which really
+  # may mean lost requests, and the lane says THAT loudly rather than pretending the captain
+  # has asked for nothing.
+  case "$ORDERS_RC" in
+    3) : ;;
+    6) ORDERS_NOTE="CAPTAIN ORDER READER FAILED (bin/fm-order.sh list --json exited 6) - a defect in the reader, NOT lost orders; the inbox is intact. Fix the reader; do not rewrite the inbox" ;;
+    *) ORDERS_NOTE="CAPTAIN ORDER INBOX UNREADABLE (bin/fm-order.sh list --json exited $ORDERS_RC) - treat as lost captain requests, not as an empty inbox" ;;
+  esac
 fi
 
 NF_AVAILABLE=false

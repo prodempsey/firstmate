@@ -73,6 +73,11 @@ Firstmate adds this skill's load instruction to firstmate-repo briefs by hand in
 - Plain dash `-`, never an em dash.
 - Never add an agent name as a commit co-author.
 - `bin/*.sh` and `bin/backends/*.sh` must pass `shellcheck`.
+- Never pass an unbounded payload to a command as an ARGUMENT; stage it in a file and read it back (`jq --slurpfile` / `--rawfile`, or stdin).
+- Unbounded means it grows with the fleet or with what a captain typed: a folded ledger, a backlog, a task or PR list, an accumulator inside a loop, a captured chat message.
+- `jq -n --argjson fold "$(fold_the_ledger)"` is the shape to reject; it works on every small fixture and dies with `Argument list too long` (E2BIG, at the 128KB per-argument limit) once the real data arrives, which is how the captain-order reader, the fleet snapshot, and the whole fleet-triage scan shipped dead.
+- A bounded scalar (an id, a status, a timestamp, a count) is fine as an argument, as is any value that already arrived through argv.
+- Size the fixture to the failure: a regression test for this class must generate data past the argument limit, because a suite that only ever runs small fixtures is what let it ship.
 - Run `bin/fm-lint.sh` before treating a script change as done; it is the single owner of the lint definition (file set, config, and pinned shellcheck version) that CI and the no-mistakes pre-push gate both invoke, and it refuses to run under any other shellcheck version.
 - Colocate tests with the existing pattern in `tests/`, name them `<subject>.test.sh`, and extend an existing script rather than inventing a new runner.
 - A backend-verification doc (`docs/*-backend.md`) records empirical facts, not assumptions.

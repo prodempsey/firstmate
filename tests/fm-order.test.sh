@@ -253,3 +253,145 @@ pass "re-draining the same capture after a restart is idempotent"
 "$ORDER" claim ORD-001 --owner crew-bug-list-page-a1 >/dev/null
 [ -z "$("$DUTY" 2>&1 >/dev/null)" ] || fail "the duty banner still fires on a clear inbox"
 pass "the duty banner goes silent once every order is triaged, owned, and linked"
+
+# --- a real-sized inbox ----------------------------------------------------------------
+# THE TEST THAT WOULD HAVE CAUGHT IT. Every read path in fm-order.sh was dead on the real
+# inbox and green in this file, because this file only ever built a handful of orders. The
+# reader passed the folded ledger to jq as an ARGUMENT, so it worked until the fold outgrew
+# the kernel's per-argument limit (128KB on Linux) and then failed all at once with
+# "Argument list too long" - digest, list, metrics, the duty banner, and the fleet-triage
+# captain-orders lane, on an inbox whose data was perfectly intact.
+#
+# So the fixture is generated large enough to have tripped the original E2BIG, and asserted
+# to still be that large: a fixture that quietly shrinks below the limit is a test that
+# quietly stops testing this. It is generated, never committed - the inbox is real captain
+# data and the real one is never read, copied, or written by this suite.
+BIG=$(new_inbox big)
+export FM_ORDERS_PATH="$BIG"
+BIG_ORDERS=400
+PAD=$(printf 'x%.0s' $(seq 1 800))
+i=1
+while [ "$i" -le "$BIG_ORDERS" ]; do
+  printf '{"schema":"firstmate/captain-order/v1","order_id":"ORD-%03d","event":"received","ts":"2026-07-01T00:00:00Z","received_at":"2026-07-01T00:00:00Z","source":"chat","idempotency_key":"key-%03d","original_request":"captain request %03d %s","short_title":"request %03d","status":"received","priority":"normal","priority_source":"default","owner":null,"linked_task_ids":[],"linked_scout_ids":[],"linked_bug_ids":[],"related_order_ids":[],"dependency_ids":[],"captain_decision_required":false,"recorded_by":"captain","updated_at":"2026-07-01T00:00:00Z"}\n' \
+    "$i" "$i" "$i" "$PAD" "$i" >> "$BIG"
+  i=$((i + 1))
+done
+
+# The argv limit this class of bug dies on is MAX_ARG_STRLEN: 128KB for any SINGLE argument,
+# regardless of how much room ARG_MAX leaves overall. The fixture must exceed it, or it is
+# not exercising the failure.
+ARG_STRLEN_LIMIT=131072
+BIG_BYTES=$(wc -c < "$BIG")
+[ "$BIG_BYTES" -gt "$ARG_STRLEN_LIMIT" ] \
+  || fail "the large-inbox fixture is only $BIG_BYTES bytes: too small to reach the $ARG_STRLEN_LIMIT-byte argument limit that broke every read path, so it proves nothing"
+
+for verb in "list" "list --json" "list --actionable" "list --actionable --json" "metrics" "metrics --json" "digest" "health" "show ORD-200" "ack ORD-200"; do
+  # shellcheck disable=SC2086 # The verb and its flags are deliberately word-split.
+  "$ORDER" $verb >/dev/null 2>&1 \
+    || fail "'$verb' failed on a $BIG_BYTES-byte inbox: the reader still cannot read a real one"
+done
+pass "every read path survives an inbox far past the argument limit that killed them all"
+
+BIG_TOTAL=$("$ORDER" list --json | jq '.orders | length')
+[ "$BIG_TOTAL" = "$BIG_ORDERS" ] \
+  || fail "the large inbox folded to $BIG_TOTAL orders, not $BIG_ORDERS: the reader is dropping orders"
+[ "$("$ORDER" list --actionable | wc -l)" = "$BIG_ORDERS" ] \
+  || fail "--actionable did not surface every untriaged order in the large inbox"
+[ "$("$ORDER" metrics --json | jq '.metrics.untriaged')" = "$BIG_ORDERS" ] \
+  || fail "metrics undercounted a large inbox"
+"$ORDER" digest | grep -q "CAPTAIN ORDERS: $BIG_ORDERS needing action" \
+  || fail "the digest did not report every order in a large inbox"
+[ "$("$ORDER" show ORD-200 --json | jq -r '.original_request')" = "captain request 200 $PAD" ] \
+  || fail "a long captain request was not preserved verbatim in a large inbox"
+pass "a large inbox folds to every order, verbatim, across list, metrics, and the digest"
+
+# The duty banner is what the captain actually sees, and it is the thing that was crying
+# lost-orders. On a large, intact inbox it must report the orders, not a failure.
+BIGDUTY=$("$DUTY" 2>&1 >/dev/null)
+printf '%s' "$BIGDUTY" | grep -qi 'could not be read\|reader failed' \
+  && fail "the duty banner claimed a large but perfectly intact inbox was unreadable"
+printf '%s' "$BIGDUTY" | grep -q "$BIG_ORDERS order(s) still need action" \
+  || fail "the duty banner did not report the orders in a large inbox: $BIGDUTY"
+pass "the duty banner reads a large inbox truthfully instead of manufacturing a data-loss alarm"
+
+# A captain request is not bounded by an argument list either: a pasted spec arrives through
+# the capture hook and is drained into the ledger, and both once handed it to jq as argv.
+LONGTEXT=$(printf 'y%.0s' $(seq 1 200000))
+LONGBOX=$(new_inbox longtext)
+export FM_ORDERS_PATH="$LONGBOX"
+printf '{"prompt":"%s"}' "$LONGTEXT" | "$HOOK"
+[ "$("$ORDER" pending --json | jq 'length')" = 1 ] \
+  || fail "the capture hook silently dropped a captain message larger than the argument limit"
+LONGCAP=$("$ORDER" pending --json | jq -r '.[0].capture_id')
+"$ORDER" add --from-pending "$LONGCAP" >/dev/null 2>&1 \
+  || fail "a captain message larger than the argument limit could not be drained into an order"
+[ "$("$ORDER" show ORD-001 --json | jq -r '.original_request | length')" = "${#LONGTEXT}" ] \
+  || fail "a long captain request was truncated or lost on its way into the ledger"
+pass "a captain message far larger than the argument limit is captured and recorded verbatim"
+
+# --- honest failure modes ---------------------------------------------------------------
+# An inbox that cannot be READ and a READER that crashed are different conditions with
+# different remedies, and saying "treat this as lost captain requests" for both is how a
+# reader's own defect becomes a standing false alarm about the captain's data. The reader
+# reports them with different exit codes; the duty banner and the triage lane branch on them.
+UNREAD=$(new_inbox unreadable)
+export FM_ORDERS_PATH="$UNREAD"
+"$ORDER" add "an order that must not be reported as lost" >/dev/null 2>&1
+chmod 000 "$UNREAD"
+set +e
+UOUT=$(FM_ORDERS_PATH="$UNREAD" "$ORDER" list 2>&1)
+URC=$?
+UDUTY=$(FM_ORDERS_PATH="$UNREAD" "$DUTY" 2>&1 >/dev/null)
+set -e
+chmod 644 "$UNREAD"
+if [ "$URC" -eq 0 ]; then
+  # Running as root (or an fs that ignores the mode) makes this unenforceable, not passed.
+  pass "SKIPPED: an unreadable inbox cannot be simulated here (the mode did not deny the read)"
+else
+  [ "$URC" -eq 5 ] || fail "an unreadable inbox exited $URC, not the inbox-unreadable code 5"
+  printf '%s' "$UOUT" | grep -qi 'could not be read' \
+    || fail "an unreadable inbox did not say so: $UOUT"
+  printf '%s' "$UDUTY" | grep -qi 'lost captain requests' \
+    || fail "the duty banner did not raise the data alarm for a genuinely unreadable inbox"
+  pass "an inbox that cannot be read is reported as possible lost orders, loudly"
+fi
+
+# A crashed READER, with the ledger intact underneath it: exactly the shipped failure. The
+# reader is broken here by denying it the one jq mode its enrichment step needs, which
+# leaves the fold and the health scan working - so the inbox is provably readable and only
+# the reader is dead. It must say that, and must NOT cry lost orders.
+CRASH=$(new_inbox readercrash)
+export FM_ORDERS_PATH="$CRASH"
+"$ORDER" add "an order the reader must not disown" >/dev/null 2>&1
+SHIMDIR="$TMP_ROOT/shim"
+mkdir -p "$SHIMDIR"
+REALJQ=$(command -v jq)
+cat > "$SHIMDIR/jq" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  [ "\$a" = --slurpfile ] && { printf 'jq: simulated reader defect\n' >&2; exit 5; }
+done
+exec "$REALJQ" "\$@"
+SHIM
+chmod +x "$SHIMDIR/jq"
+set +e
+COUT=$(PATH="$SHIMDIR:$PATH" "$ORDER" list 2>&1)
+CRC=$?
+CDUTY=$(PATH="$SHIMDIR:$PATH" "$DUTY" 2>&1 >/dev/null)
+set -e
+[ "$CRC" -eq 6 ] || fail "a crashed reader exited $CRC, not the reader-failed code 6"
+printf '%s' "$COUT" | grep -qi 'READER FAILED' \
+  || fail "a crashed reader did not say the reader failed: $COUT"
+printf '%s' "$COUT" | grep -qi 'simulated reader defect' \
+  || fail "a crashed reader did not name the underlying error: $COUT"
+printf '%s' "$COUT" | grep -qi 'lost captain requests\|may be lost\|orders may be lost' \
+  && fail "a crashed reader claimed the captain's orders may be lost; the ledger was intact"
+printf '%s' "$COUT" | grep -qi 'NOT lost orders' \
+  || fail "a crashed reader did not say plainly that nothing was lost: $COUT"
+printf '%s' "$CDUTY" | grep -qi 'READER FAILED' \
+  || fail "the duty banner did not report a reader failure as a reader failure: $CDUTY"
+printf '%s' "$CDUTY" | grep -qi 'lost captain requests' \
+  && fail "the duty banner raised a false lost-orders alarm for a defect in its own reader"
+[ "$(PATH="$SHIMDIR:$PATH" "$ORDER" health | jq '.present')" = true ] \
+  || fail "the inbox was not actually readable underneath the simulated reader defect"
+pass "a crashed reader blames the reader and names the error, and never disowns the captain's orders"

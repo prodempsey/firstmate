@@ -87,6 +87,32 @@ PENDING_DIR=$(fm_order_pending_dir "$INBOX")
 DISMISSED=$(fm_order_dismissed_path "$INBOX")
 ACTOR=${FM_ORDER_ACTOR:-firstmate}
 
+# NOTHING THE INBOX HOLDS EVER TRAVELS THROUGH AN ARGUMENT LIST. The inbox grows without
+# bound - it is an append-only ledger of every captain request this home has ever taken -
+# so any read that passed the folded inbox, a captain's request text, or the inbox health
+# report to jq as an argv value (`--argjson fold "$(fold)"`) would work in every test and
+# then die with E2BIG on the real thing once the ledger outgrew the kernel's argument
+# limit. It did: a 180KB / 255-record inbox killed every read path at once, and the tools
+# downstream could not tell a dead reader from a lost inbox, so they reported the captain's
+# own orders as unreadable. Inbox-derived payloads therefore reach jq through a file
+# (--slurpfile / --rawfile) or stdin, never argv. Only bounded scalars - an id, a status, a
+# timestamp - are passed as arguments, and an argv value that came from the command line
+# already fit through execve to get here.
+#
+# The scratch directory is created here, in the top-level shell, and removed by the one
+# EXIT trap below. A read runs inside a command substitution, whose subshell does NOT run
+# an EXIT trap, so a lazily-created scratch dir would leak one directory per read; owning
+# it in the parent means a subshell can write into it and the parent still cleans it up.
+SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/fm-order.XXXXXX") || die 'cannot create a scratch directory'
+
+# shellcheck disable=SC2317,SC2329 # Invoked by the EXIT trap below.
+order_cleanup() {
+  fm_order_unlock
+  [ -n "$SCRATCH" ] && rm -rf "$SCRATCH"
+  SCRATCH=''
+}
+trap order_cleanup EXIT
+
 # A read of a missing inbox is ambiguous - a fresh home and a lost inbox look identical -
 # so it fails visibly instead of reporting zero orders. Writes may create it, and say so.
 require_inbox() {
@@ -111,7 +137,6 @@ ensure_inbox_for_write() {
 lock_or_die() {
   fm_order_lock "$INBOX" \
     || die "refused: another writer holds the inbox lock $(fm_order_lock_dir "$INBOX"); NOTHING was recorded" 4
-  trap fm_order_unlock EXIT
 }
 
 # Append one event and verify it landed. The verification is the point: an append that
@@ -129,26 +154,92 @@ now_ts() { fm_triage_now; }
 
 # --- folded reads -------------------------------------------------------------------
 
-fold_json() {
-  fm_order_fold "$INBOX"
+# TWO FAILURES, TWO MESSAGES. An inbox that cannot be PARSED and a READER that crashed are
+# different conditions with different remedies, and a reader that reports them identically
+# turns its own defect into a false alarm about the captain's orders. `read_failed` is a
+# defect in this script (exit 6): the ledger is intact, nothing is lost, fix the reader.
+# `inbox_unreadable` (exit 5) is the one that really may mean lost requests. Callers -
+# bin/fm-order-duty.sh and the fleet-triage captain_orders lane - branch on these codes.
+FM_ORDER_RC_INBOX_UNREADABLE=5
+FM_ORDER_RC_READER_FAILED=6
+
+read_failed() {  # <what> <error-file>
+  local what=$1 err=$2
+  {
+    printf 'fm-order: THE READER FAILED - this is a defect in bin/fm-order.sh, NOT lost orders.\n'
+    printf '  %s\n' "$what"
+    printf '  error: %s\n' "$(sed -e 's/^[[:space:]]*//' "$err" 2>/dev/null | grep -v '^$' | head -3 | tr '\n' ' ')"
+    printf '  The inbox at %s is untouched; every order it holds is still on disk.\n' "$INBOX"
+    printf '  Do NOT treat this as an empty inbox and do NOT rewrite the inbox to work around it.\n'
+  } >&2
+  exit "$FM_ORDER_RC_READER_FAILED"
 }
 
-# Print the enriched order list as JSON: every folded order plus its age, its attention
-# state, and the inbox's own health. The attention rules are the operational definition
-# of "still waiting on firstmate", and mirror the spec's rule that an order stays visible
-# until it has real lineage or a meaningful disposition.
-list_json() {
-  local fold now
-  fold=$(fold_json)
+inbox_unreadable() {  # <what> <error-file>
+  local what=$1 err=$2
+  {
+    printf 'fm-order: THE INBOX AT %s COULD NOT BE READ.\n' "$INBOX"
+    printf '  %s\n' "$what"
+    printf '  error: %s\n' "$(sed -e 's/^[[:space:]]*//' "$err" 2>/dev/null | grep -v '^$' | head -3 | tr '\n' ' ')"
+    printf '  Treat this as lost captain requests, not as an empty inbox. Repair it before\n'
+    printf '  telling the captain anything about what is or is not recorded.\n'
+  } >&2
+  exit "$FM_ORDER_RC_INBOX_UNREADABLE"
+}
+
+# THESE READERS RETURN A PATH IN A GLOBAL, NOT ON STDOUT, AND MUST BE CALLED AS PLAIN
+# COMMANDS - never inside $( ). bash does not carry errexit out of a command substitution:
+# a reader that exits 5 inside `x=$(reader)` leaves the enclosing function running with an
+# empty result, so the failure re-emerges later as a different, wronger error - which is
+# how an unreadable inbox came back reported as a reader crash while this fix was being
+# written. Failing in the top-level shell is what makes each failure exit as itself.
+FOLD_PATH=''
+HEALTH_PATH=''
+LIST_PATH=''
+
+# Fold the ledger into a scratch file. The fold reads the inbox as a file, so it streams; a
+# single malformed row is skipped and counted by fm_order_health, and only a failure to
+# read the file at all is fatal here.
+fold_file() {  # sets FOLD_PATH
+  [ -n "$FOLD_PATH" ] && return 0
+  fm_order_fold "$INBOX" > "$SCRATCH/fold.json" 2> "$SCRATCH/fold.err" \
+    || inbox_unreadable 'the append-only ledger could not be folded' "$SCRATCH/fold.err"
+  FOLD_PATH=$SCRATCH/fold.json
+}
+
+health_file() {  # sets HEALTH_PATH
+  [ -n "$HEALTH_PATH" ] && return 0
+  fm_order_health "$INBOX" > "$SCRATCH/health.json" 2> "$SCRATCH/health.err" \
+    || inbox_unreadable 'the inbox health scan could not read the ledger' "$SCRATCH/health.err"
+  HEALTH_PATH=$SCRATCH/health.json
+}
+
+# Build the enriched order list into a scratch file: every folded order plus its age, its
+# attention state, and the inbox's own health. The attention rules are the operational
+# definition of "still waiting on firstmate", and mirror the spec's rule that an order stays
+# visible until it has real lineage or a meaningful disposition.
+list_file() {  # sets LIST_PATH
+  local now
+  [ -n "$LIST_PATH" ] && return 0
   now=$(now_ts)
+  fold_file
+  health_file
+  pending_json > "$SCRATCH/pending.json" 2> "$SCRATCH/pending.err" \
+    || read_failed 'the pending chat-capture spool could not be listed' "$SCRATCH/pending.err"
+  # Every inbox-derived payload arrives by file. --slurpfile wraps each in an array, hence
+  # the [0]; the alternative - argv - is what broke every read path on a real inbox.
   jq -n \
     --arg schema 'fm-captain-orders/v1' \
     --arg inbox "$INBOX" \
     --arg now "$now" \
     --argjson stale "$STALE_SECS" \
-    --argjson pending "$(pending_json)" \
-    --argjson health "$(fm_order_health "$INBOX")" \
-    --argjson fold "$fold" '
+    --slurpfile pendingf "$SCRATCH/pending.json" \
+    --slurpfile healthf "$HEALTH_PATH" \
+    --slurpfile foldf "$FOLD_PATH" '
+    ($pendingf[0] // []) as $pending
+    | ($healthf[0] // {}) as $health
+    | ($foldf[0] // {}) as $fold
+    |
     # A review condition may be a full timestamp, a plain date, or an English condition
     # ("when the captain approves"). Only the first two can expire on their own; a
     # condition that cannot be parsed as a time never silently expires, it just never
@@ -236,7 +327,9 @@ list_json() {
                         | map({key: .[0], value: length}) | from_entries)
        },
        orders: $all}
-  '
+  ' > "$SCRATCH/list.json" 2> "$SCRATCH/list.err" \
+    || read_failed 'the folded inbox could not be enriched into the order list' "$SCRATCH/list.err"
+  LIST_PATH=$SCRATCH/list.json
 }
 
 pending_json() {
@@ -328,7 +421,8 @@ case "$VERB" in
     mkdir -p "$PENDING_DIR" 2>/dev/null || true
     lock_or_die
 
-    FOLD=$(fold_json)
+    fold_file
+    FOLD=$(cat "$FOLD_PATH")
     # Mint ids above every id the ledger has ever used, including one carried by a row the
     # fold had to skip: reusing an id from a malformed row would fuse two captain requests.
     MAX=$(
@@ -350,12 +444,17 @@ case "$VERB" in
         | jq -r --arg k "$ikey" 'to_entries[] | select(.value.idempotency_key == $k) | .key' \
         | head -1)
       rts=${RECEIVED_AT:-$NOW}
+      # A --from-pending request is FILE content, not a command-line argument: a captain who
+      # pastes a long spec into chat produces one, and it is not bounded by anything argv is.
+      # It reaches jq by file for the same reason the fold does.
+      printf '%s' "$req" > "$SCRATCH/request.txt" \
+        || die 'cannot stage the request text; NOTHING was recorded' 1
 
       if [ -n "$existing" ]; then
         # Duplicate delivery: link to the order that already holds this request and keep
         # the new arrival as evidence. Never mint a second order, never overwrite the first.
         row=$(jq -cn --arg schema "$FM_ORDER_SCHEMA" --arg id "$existing" \
-          --arg ts "$NOW" --arg source "$SOURCE" --arg req "$req" --arg by "$ACTOR" \
+          --arg ts "$NOW" --arg source "$SOURCE" --rawfile req "$SCRATCH/request.txt" --arg by "$ACTOR" \
           '{schema: $schema, order_id: $id, event: "duplicate_delivery", ts: $ts,
             source: $source, original_request: $req, recorded_by: $by}')
         if append_event "$row"; then
@@ -376,7 +475,7 @@ case "$VERB" in
         --arg updated "$NOW" \
         --arg source "$SOURCE" \
         --arg key "$ikey" \
-        --arg req "$req" \
+        --rawfile req "$SCRATCH/request.txt" \
         --arg title "$TITLE" \
         --arg project "$PROJECT" \
         --arg priority "$PRIORITY" \
@@ -397,7 +496,14 @@ case "$VERB" in
          recorded_by: $by, updated_at: $updated}')
       if append_event "$row"; then
         RECORDED+=("$oid")
-        FOLD=$(printf '%s' "$FOLD" | jq -c --arg id "$oid" --argjson row "$row" '. + {($id): $row}')
+        # The row carries the captain's request text, so it is as unbounded as the request
+        # is: --argjson here would put a pasted spec into an argument list and kill the
+        # intake it just durably recorded. The fold is updated in memory rather than
+        # re-folded, so a burst of N requests stays O(N) instead of O(N^2).
+        printf '%s\n' "$row" > "$SCRATCH/row.json" \
+          || die "recorded $oid but could not stage its row; re-run to re-fold" 1
+        FOLD=$(printf '%s' "$FOLD" \
+          | jq -c --arg id "$oid" --slurpfile row "$SCRATCH/row.json" '. + {($id): $row[0]}')
         printf 'recorded: %s\n' "$oid"
       else
         printf 'FAILED to record request: %s\n' "$(printf '%s' "$req" | cut -c1-60)" >&2
@@ -411,7 +517,6 @@ case "$VERB" in
     fi
 
     fm_order_unlock
-    trap - EXIT
 
     if [ "$FAILED" -ne 0 ]; then
       printf 'fm-order: INTAKE FAILED for at least one request; %d recorded (%s).\n' \
@@ -480,20 +585,25 @@ case "$VERB" in
         *) usage >&2; die "unknown option: $1" 2 ;;
       esac
     done
-    OUT=$(list_json)
+    list_file
+    # `$act | not or .actionable` parses as `($act | not) or ($act | .actionable)`: the
+    # whole pipe body sees $act, so with --actionable the second branch indexed a boolean
+    # and the filter died. Without --actionable the first branch was true and short-circuited,
+    # so the broken half never ran and the flag looked fine right up until someone used it.
     if [ "$JSON" = true ]; then
-      printf '%s' "$OUT" | jq --argjson act "$ONLY_ACTIONABLE" --arg status "$STATUS" '
-        .orders |= (map(select($act | not or .actionable))
-                    | map(select($status == "" or .status == $status)))'
+      jq --argjson act "$ONLY_ACTIONABLE" --arg status "$STATUS" '
+        .orders |= (map(select(($act | not) or .actionable))
+                    | map(select($status == "" or .status == $status)))' "$LIST_PATH"
       exit 0
     fi
-    printf '%s' "$OUT" | jq -r --argjson act "$ONLY_ACTIONABLE" --arg status "$STATUS" '
+    jq -r --argjson act "$ONLY_ACTIONABLE" --arg status "$STATUS" '
       .orders[]
-      | select($act | not or .actionable)
+      | select(($act | not) or .actionable)
       | select($status == "" or .status == $status)
       | "- " + .order_id + " [" + (.status // "received") + "]"
         + (if .attention != "ok" then " !" + .attention else "" end)
-        + " " + ((.short_title // .original_request) | gsub("[[:space:]]+"; " ") | .[0:80])'
+        + " " + ((.short_title // .original_request) | gsub("[[:space:]]+"; " ") | .[0:80])' \
+      "$LIST_PATH"
     exit 0
     ;;
 
@@ -511,7 +621,11 @@ case "$VERB" in
         *) usage >&2; die "unknown option: $1" 2 ;;
       esac
     done
-    REC=$(list_json | jq --arg id "$ID" '.orders[] | select(.order_id == $id)')
+    # Build the read, then filter it. A `list_json | jq` pipeline would swallow a reader
+    # failure into an empty result, and an empty result here means "no such order" - which is
+    # how a broken reader gets to say the captain never asked for anything.
+    list_file
+    REC=$(jq --arg id "$ID" '.orders[] | select(.order_id == $id)' "$LIST_PATH")
     [ -n "$REC" ] || die "no such order: $ID" 2
     if [ "$JSON" = true ]; then
       printf '%s\n' "$REC" | jq .
@@ -546,16 +660,17 @@ case "$VERB" in
   ack)
     require_inbox
     [ "$#" -gt 0 ] || die 'ack requires at least one order id' 2
-    OUT=$(list_json)
+    list_file
     printf 'Recorded:\n'
     for id in "$@"; do
-      line=$(printf '%s' "$OUT" | jq -r --arg id "$id" '
+      line=$(jq -r --arg id "$id" '
         .orders[] | select(.order_id == $id)
         | "- " + .order_id + " - "
           + ((.short_title // .original_request) | gsub("[[:space:]]+"; " ") | .[0:70])
           + " - " + (.status // "received")
           + (if (.priority // "normal") != "normal" then " - " + .priority else "" end)
-          + (if .captain_decision_required then " - needs your decision" else "" end)')
+          + (if .captain_decision_required then " - needs your decision" else "" end)' \
+        "$LIST_PATH")
       [ -n "$line" ] || die "cannot acknowledge $id: it is not in the inbox, so it is NOT recorded" 1
       printf '%s\n' "$line"
     done
@@ -564,7 +679,8 @@ case "$VERB" in
 
   digest)
     require_inbox
-    list_json | jq -r '
+    list_file
+    jq -r '
       def dur($s): if $s == null or $s < 60 then "new"
                    elif $s < 3600 then (($s / 60 | floor | tostring) + "m")
                    elif $s < 86400 then (($s / 3600 | floor | tostring) + "h")
@@ -596,17 +712,18 @@ case "$VERB" in
               + (if (.hold_reason // "") != "" then "; " + .hold_reason else "" end)
               + (if .attention != "ok" then "; NEEDS ATTENTION: " + (.attention_reasons | join(", ")) else "" end)
               + (if .captain_decision_required then "; CAPTAIN INPUT NEEDED" else "" end) ]
-      | .[]'
+      | .[]' "$LIST_PATH"
     exit 0
     ;;
 
   metrics)
     require_inbox
+    list_file
     if [ "${1:-}" = --json ]; then
-      list_json | jq '{inbox, generated_at, health, metrics}'
+      jq '{inbox, generated_at, health, metrics}' "$LIST_PATH"
     else
-      list_json | jq -r '.metrics | to_entries[] | select(.value | type != "object")
-                         | "  " + .key + ": " + (.value | tostring)'
+      jq -r '.metrics | to_entries[] | select(.value | type != "object")
+             | "  " + .key + ": " + (.value | tostring)' "$LIST_PATH"
     fi
     exit 0
     ;;
@@ -656,7 +773,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 require_inbox
-CURRENT=$(fold_json | jq -c --arg id "$ID" '.[$id] // empty')
+fold_file
+CURRENT=$(jq -c --arg id "$ID" '.[$id] // empty' "$FOLD_PATH")
 [ -n "$CURRENT" ] || die "no such order: $ID" 2
 
 STATUS=''
@@ -782,12 +900,10 @@ ROW=$(printf '%s' "$CURRENT" | jq -c \
 
 if ! append_event "$ROW"; then
   fm_order_unlock
-  trap - EXIT
   die "INTAKE/UPDATE FAILED: could not durably record '$VERB' for $ID; nothing was acknowledged" 1
 fi
 
 fm_order_unlock
-trap - EXIT
 
 printf 'recorded: %s %s' "$VERB" "$ID"
 [ -n "$STATUS" ] && printf ' -> %s' "$STATUS"

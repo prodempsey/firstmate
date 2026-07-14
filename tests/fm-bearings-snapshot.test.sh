@@ -260,7 +260,12 @@ test_perl_fallback_bounds_github_call() {
   fakebin=$(make_fakebin "$home")
   toolbin="$home/toolbin"
   mkdir -p "$toolbin"
-  for cmd in bash dirname basename jq date sed git grep tail cut tr head sort wc perl sleep cat find; do
+  # This toolbin deliberately omits `timeout` - bounding a stalled gh call without it is the
+  # whole point of the test - but it is not a claim that the fleet scripts run without
+  # coreutils. mktemp is as load-bearing here as date or wc: the snapshot, the triage scan,
+  # and the order reader all stage their unbounded payloads in a scratch dir rather than
+  # pushing them through an argument list.
+  for cmd in bash dirname basename jq date sed git grep tail cut tr head sort wc perl sleep cat find mktemp; do
     ln -s "$(command -v "$cmd")" "$toolbin/$cmd"
   done
   started=$(date +%s)

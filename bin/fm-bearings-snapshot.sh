@@ -144,8 +144,21 @@ HOME_LABEL=$(printf '%s' "$SNAP" | jq -er '.fm_home | strings | split("/") | (.[
 NOW=${FM_BEARINGS_NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
 
 # --- optional live PR enrichment (the ONLY network path) --------------------
+# The PR rows accumulate across every repo in the fleet (and with --all-pr-repos there is no
+# repo cap at all), so they are unbounded and reach jq through a FILE, never an argument
+# list. The same argv habit killed the captain-order reader and the fleet snapshot outright
+# once the real fleet outgrew the kernel's per-argument limit; a bearings report that dies
+# with "Argument list too long" the day the captain has enough open PRs is the same bug
+# waiting on a slower clock.
+SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/fm-bearings.XXXXXX") || {
+  echo "fm-bearings-snapshot: cannot create a scratch directory" >&2
+  exit 1
+}
+trap 'rm -rf "$SCRATCH"' EXIT
+CANDIDATE_PRS_FILE="$SCRATCH/candidate-prs.json"
+printf '[]\n' > "$CANDIDATE_PRS_FILE"
+
 PR_STATUS='not_requested (run: /bearings include PRs)'
-CANDIDATE_PRS='[]'
 PR_REPOS_TOTAL=0
 PR_REPOS_SHOWN=0
 PR_ROWS_CAPPED=0
@@ -193,7 +206,8 @@ $(printf '%s' "$SNAP" | jq -r '.tasks[] | select(.kind != "secondmate") | .paths
 EOF
 
     for repo in $repos; do PR_REPOS_TOTAL=$((PR_REPOS_TOTAL + 1)); done
-    nrepos=0; npr=0; nwarn=0; ncapped=0; rows='[]'
+    nrepos=0; npr=0; nwarn=0; ncapped=0
+    printf '[]\n' > "$CANDIDATE_PRS_FILE"
     pr_fetch_limit=$((FM_BEARINGS_PR_LIMIT + 1))
     for repo in $repos; do
       if [ "$ALL_PR_REPOS" != 1 ] && [ "$nrepos" -ge "$FM_BEARINGS_PR_REPOS" ]; then break; fi
@@ -222,12 +236,15 @@ EOF
       cnt=$(printf '%s' "$repo_rows" | jq 'length')
       [ "$returned" -gt "$FM_BEARINGS_PR_LIMIT" ] && ncapped=$((ncapped + 1))
       npr=$((npr + cnt))
-      rows=$(jq -n --argjson a "$rows" --argjson b "$repo_rows" '$a + $b')
+      # Accumulate through files: this list grows with every repo in the fleet.
+      printf '%s' "$repo_rows" > "$SCRATCH/repo-rows.json"
+      jq -n --slurpfile a "$CANDIDATE_PRS_FILE" --slurpfile b "$SCRATCH/repo-rows.json" \
+        '($a[0] // []) + ($b[0] // [])' > "$SCRATCH/candidate-prs.next" \
+        && mv -f "$SCRATCH/candidate-prs.next" "$CANDIDATE_PRS_FILE"
     done
     PR_REPOS_SHOWN=$nrepos
     PR_ROWS_CAPPED=$ncapped
     PR_ROWS_MIN_TOTAL=$((npr + ncapped))
-    CANDIDATE_PRS=$rows
     warnnote=""
     [ "$nwarn" -gt 0 ] && warnnote="; ${nwarn} repo(s) unavailable"
     cappednote=""
@@ -266,8 +283,9 @@ MODEL=$(printf '%s' "$SNAP" | jq \
   --argjson pr_repos_shown "$PR_REPOS_SHOWN" \
   --argjson pr_rows_capped "$PR_ROWS_CAPPED" \
   --argjson pr_rows_min_total "$PR_ROWS_MIN_TOTAL" \
-  --argjson candidate_prs "$CANDIDATE_PRS" '
-  def trunc($n): if . == null then null else
+  --slurpfile candidate_prsf "$CANDIDATE_PRS_FILE" '
+  ($candidate_prsf[0] // []) as $candidate_prs
+  | def trunc($n): if . == null then null else
     (tostring | gsub("\\s+"; " ") | if (length > $n) then (.[:$n] + "…") else . end) end;
   ($fields | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))) as $fl
   | (($fl | index("bodies")) != null) as $f_bodies
