@@ -99,6 +99,9 @@ HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-300}  # seconds between *.check.sh sweeps
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
+CHECK_ERROR_COOLDOWN=${FM_CHECK_ERROR_COOLDOWN:-3600}  # seconds a reported BROKEN check
+                                      # stays silenced (see run_check): loud once, then
+                                      # rate-limited, so it can never wake every cycle
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
                                       # turn-end hook) coalesce into one wake
@@ -414,16 +417,72 @@ scan_signals() {
   return 0
 }
 
+# A check that FAILS is not a check that wants to wake firstmate. Its outcomes:
+#
+#   exit 0, prints a line       -> a wake. This is the whole point of a check.
+#   exit 0, prints nothing      -> nothing to report. The common case.
+#   non-zero, prints nothing    -> also nothing to report. This is NOT treated as a
+#                                  failure, because the idiomatic silent-path check is
+#                                  `[ "$state" = MERGED ] && echo merged`, which exits
+#                                  1 precisely when it has nothing to say (see
+#                                  bin/fm-pr-check.sh). It could not wake anyone
+#                                  anyway: the wake is carried by the output.
+#   non-zero, prints something  -> BROKEN. The output is a diagnostic, not a signal,
+#                                  and must NOT be read as one.
+#
+# That last outcome used to be indistinguishable from the first: run_check discarded
+# the exit status entirely (`|| true`) and any stdout woke firstmate. So a check that
+# broke and printed its own error printed that error on EVERY sweep, woke the watcher
+# every time, and the watcher - which exits on a wake, releasing state/.watch.lock with
+# it - died within one poll cycle, over and over. One broken poll script took
+# supervision down completely, while the turn-end guard, correctly reporting no live
+# watcher, looked like it was crying wolf. A failing check must never be able to do that
+# again: it is reported once, loudly, then rate-limited (see report_check_failure).
+#
+# Writes stdout to $2 and stderr to $3, and returns the check's real exit status.
 run_check() {
-  local c=$1
+  local c=$1 out=$2 err=$3 rc=0
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$CHECK_TIMEOUT" bash "$c" 2>/dev/null || true
+    timeout "$CHECK_TIMEOUT" bash "$c" > "$out" 2> "$err" || rc=$?
   elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$CHECK_TIMEOUT" bash "$c" 2>/dev/null || true
+    gtimeout "$CHECK_TIMEOUT" bash "$c" > "$out" 2> "$err" || rc=$?
   else
     # shellcheck disable=SC2016  # single quotes are deliberate: Perl expands its own variables.
-    perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$CHECK_TIMEOUT" bash "$c" 2>/dev/null || true
+    perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$CHECK_TIMEOUT" bash "$c" > "$out" 2> "$err" || rc=$?
   fi
+  return "$rc"
+}
+
+# The first thing a broken check said, for the report: its stderr if it wrote any,
+# else its stdout, else the bare fact that it exited non-zero silently.
+check_failure_detail() {
+  local out=$1 err=$2 line
+  line=$(grep -m1 -v '^[[:space:]]*$' "$err" 2>/dev/null || true)
+  [ -n "$line" ] || line=$(grep -m1 -v '^[[:space:]]*$' "$out" 2>/dev/null || true)
+  [ -n "$line" ] || line='no output'
+  printf '%.200s\n' "$line"
+}
+
+# Loud once, then quiet: a broken check is worth exactly one wake, not one per sweep.
+# True (0) when this failure should be surfaced now - it is new, it CHANGED, or the
+# cooldown since the last report has elapsed - and false (1) when it is the same
+# failure already reported, which is absorbed. The marker is rewritten only when we
+# surface, so the cooldown measures time since the last REPORT, and a check that stays
+# broken re-surfaces at most once per CHECK_ERROR_COOLDOWN instead of being forgotten.
+report_check_failure() {
+  local c=$1 rc=$2 detail=$3 marker sig prev
+  marker=$(check_error_marker "$c")
+  sig="$rc:$detail"
+  prev=$(head -n 1 "$marker" 2>/dev/null || true)
+  if [ "$sig" = "$prev" ] && [ "$(age_of "$marker")" -lt "$CHECK_ERROR_COOLDOWN" ]; then
+    return 1
+  fi
+  printf '%s\n' "$sig" > "$marker" 2>/dev/null || true
+  return 0
+}
+
+check_error_marker() {
+  printf '%s\n' "$STATE/.check-error-$(basename "$1" | tr '.' '_')"
 }
 
 # Surfaced-marker bookkeeping for the heartbeat backstop. The watcher records the
@@ -644,7 +703,30 @@ while :; do
   if [ "$(age_of "$STATE/.last-check")" -ge "$CHECK_INTERVAL" ]; then
     for c in "$STATE"/*.check.sh; do
       [ -e "$c" ] || continue
-      out=$(run_check "$c")
+      check_out=$(mktemp "$STATE/.check-out.XXXXXX" 2>/dev/null) || continue
+      check_err=$(mktemp "$STATE/.check-err.XXXXXX" 2>/dev/null) || { rm -f "$check_out"; continue; }
+      check_rc=0
+      run_check "$c" "$check_out" "$check_err" || check_rc=$?
+      out=$(cat "$check_out" 2>/dev/null || true)
+      if [ "$check_rc" -ne 0 ] && [ -n "$out" ]; then
+        # BROKEN, not a wake. Report it once (and again only if it changes or the
+        # cooldown elapses); otherwise absorb it, so a failing poll can never take
+        # supervision down by waking the watcher every single cycle.
+        detail=$(check_failure_detail "$check_out" "$check_err")
+        if report_check_failure "$c" "$check_rc" "$detail"; then
+          reason="check: $c: BROKEN - exited $check_rc: $detail (a failing check, not a wake signal; its output is being ignored and this is silenced for ${CHECK_ERROR_COOLDOWN}s unless the failure changes - fix or remove the check)"
+          fm_wake_append check "$c" "$reason" || exit 1
+          rm -f "$check_out" "$check_err"
+          touch "$STATE/.last-check"
+          wake "$reason"
+        fi
+        triage_log "absorbed failing check (exit $check_rc, already reported): $c"
+        rm -f "$check_out" "$check_err"
+        continue
+      fi
+      # A clean run: a check that recovered gets its loud-once budget back.
+      rm -f "$(check_error_marker "$c")" 2>/dev/null || true
+      rm -f "$check_out" "$check_err"
       if [ -n "$out" ]; then
         reason="check: $c: $out"
         fm_wake_append check "$c" "$reason" || exit 1

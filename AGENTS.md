@@ -108,11 +108,11 @@ state/               volatile runtime signals; gitignored
   .wake-queue        durable queued wakes: epoch<TAB>seq<TAB>kind<TAB>key<TAB>payload
   .afk               durable away-mode flag; present = sub-supervisor may inject escalations (set by /afk, cleared on user return)
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
-  .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .last-* .heartbeat-streak   watcher internals; never touch
+  .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .check-error-* .last-* .heartbeat-streak   watcher internals; never touch
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
   .last-watcher-beat watcher liveness beacon, touched every poll (including while absorbing benign wakes); guard scripts read it
   .triage-duty-last.json   volatile cache of the last bin/fm-triage-duty.sh pass (trigger, scope, actionable/ownerless/unhealthy/captain_gated counts, fingerprint, ok); overwritten every pass; read by bin/fm-guard.sh's fleet-triage supervision preflight, never hand-edited; the turn-end guard deliberately does not read it (docs/turnend-guard.md)
-  .turnend-guard.log .turnend-guard-*  turn-end guard decision log (size-capped; one JSON line per primary turn-end evaluation, ids and counts only, never transcript content) plus its blocked-id-set and error-report markers (docs/turnend-guard.md); never touch
+  .turnend-guard.log .turnend-guard-*  turn-end guard decision log (size-capped; one JSON line per primary turn-end evaluation, ids and counts only, never transcript content, carrying the watcher observations behind each decision - lock pid, whether it was alive, each identity/home/path comparison, beacon age - so a block can explain itself) plus its blocked-id-set and error-report markers (docs/turnend-guard.md); never touch
   .subsuper-* .supervise-daemon.*   sub-supervisor internals; never touch
 .no-mistakes/        local validation state and evidence; gitignored
 ```
@@ -511,7 +511,8 @@ During the `ci` monitor phase, `bin/fm-crew-state.sh` also reads the ci step log
 For PR-based ship tasks, the ready signal depends on mode: `no-mistakes` reports `done: PR <url> checks green` after CI is green, while `direct-PR` reports `done: PR <url>` after opening the PR.
 Run `bin/fm-pr-check.sh <id> <PR url>` - it records `pr=` and GitHub's `pr_head=` when available in the task's meta and arms the watcher's merge poll.
 Tell the captain: the PR's full URL (always the complete `https://...` link, never a bare `#number` - the captain's terminal makes a full URL clickable), a one-paragraph summary, and, for `no-mistakes`, the risk level it emitted.
-(The check contract, for any custom `state/<id>.check.sh` you write yourself: print one line only when firstmate should wake, print nothing otherwise, and finish before `FM_CHECK_TIMEOUT`.)
+(The check contract, for any custom `state/<id>.check.sh` you write yourself: print one line and exit 0 only when firstmate should wake, print nothing otherwise, and finish before `FM_CHECK_TIMEOUT`.
+Printing while exiting non-zero means the check itself is broken, so the watcher treats that output as a diagnostic rather than a wake, reports it once, and then rate-limits it, because a broken check that printed on every sweep used to wake the watcher on every sweep and take supervision down with it; `bin/fm-watch.sh`'s `run_check` owns that path.)
 
 If the captain says "merge it", run `bin/fm-pr-merge.sh <id> <full GitHub PR URL>` yourself; that instruction is the explicit approval.
 If `yolo=on`, merge a green/approved PR yourself the same way and post the required FYI.

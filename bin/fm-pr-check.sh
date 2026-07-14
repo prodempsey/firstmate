@@ -2,7 +2,12 @@
 # Record a PR-ready task: appends pr=<url> and GitHub's pr_head=<sha> to
 # state/<id>.meta when available, then arms the watcher's merge poll by writing
 # state/<id>.check.sh, which prints one line iff the PR is merged (the watcher's
-# check contract: output = wake firstmate, silence = keep sleeping).
+# check contract: a printed line with exit 0 = wake firstmate, silence = keep
+# sleeping, and printing while exiting non-zero = a BROKEN check, whose output the
+# watcher reports once and then ignores rather than waking on; see bin/fm-watch.sh's
+# run_check). The generated poll below ends on `[ ... ] && echo`, so it exits 1 on its
+# normal not-yet-merged path - silently, which the contract allows precisely because a
+# check with no output cannot wake anyone.
 # Usage: fm-pr-check.sh <task-id> <pr-url>
 set -eu
 

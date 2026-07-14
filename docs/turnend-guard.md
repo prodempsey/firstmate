@@ -87,6 +87,16 @@ The log carries ids, counts, and decisions only - never transcript content.
 It is best-effort (a log that cannot be written never changes the decision or wedges the turn) and size-capped (`FM_TURNEND_LOG_MAX`, default 2000 lines, trimmed to half when exceeded).
 `FM_TURNEND_LOG` overrides the path.
 
+Each record also carries the OBSERVATIONS behind the watcher verdict, not just the verdict: `beacon_age`, `lock_pid`, `lock_pid_alive`, `identity_match`, `home_match`, `path_match`, and `watcher_fail` (the first check that failed, one of `no-lock-pid`, `lock-pid-dead`, `home-mismatch`, `path-mismatch`, `identity-unrecorded`, `identity-unreadable`, `identity-mismatch`, `beacon-stale`, or `none`).
+`bin/fm-wake-lib.sh` sets the same facts as `FM_WATCHER_DIAG_*` after every `fm_watcher_healthy` call, so any caller can record them, and the blocking banner prints the same `observed:` line.
+
+Those fields exist because `watcher: down` alone cannot explain a decision that a fresh beacon appears to contradict.
+"No live watcher (last beat: 1s ago)" is not a contradiction: the beacon outlives the watcher that touched it, so a fresh beacon with an ABSENT lock is both possible and normal right after a watcher exits on a wake.
+On 2026-07-14 a broken check script (`state/*.check.sh` printing while exiting non-zero) woke the watcher on every sweep; the watcher exits on a wake and releases `state/.watch.lock` with it, so supervision genuinely collapsed every cycle and every `blocked_watcher_down` was correct.
+It took three wrong diagnoses to find, because the record of the day logged the watcher only as `healthy`/`down` and left every explanatory field null.
+`watcher_fail=no-lock-pid` with a fresh `beacon_age` says it in one line.
+See `bin/fm-watch.sh`'s `run_check` for the check-failure path that fix produced.
+
 The decision taxonomy (outcome names per ORD-060), and what counts toward the acceptance metric ("zero permitted turn ends while unattended Needs FirstMate work exists"):
 
 - `allowed_needs_firstmate_empty` - the lane was genuinely empty and the watcher healthy. Compliant.

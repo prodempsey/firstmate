@@ -1065,6 +1065,78 @@ test_hook_runs_fast() {
   pass "fm-turnend-guard: runs well under the generous timing margin (${elapsed_s}s)"
 }
 
+# --- DECISION LOG: the guard must explain its own decision --------------------
+#
+# "No live watcher (last beat: 1s ago)" reads as impossible - and a log that records
+# only that verdict cannot settle it. The beacon outlives the watcher that touched it,
+# so a fresh beacon with an absent lock is perfectly consistent and perfectly real: a
+# broken check woke the watcher every cycle, it exited every cycle, and it released the
+# lock every cycle. Three wrong diagnoses came out of a decision record that could not
+# say WHICH check failed. Every evaluation now records the observations.
+
+log_field() {
+  local dir=$1 field=$2
+  tail -n 1 "$dir/state/.turnend-guard.log" 2>/dev/null \
+    | sed -n "s/.*\"$field\":\"\{0,1\}\([^,\"]*\)\"\{0,1\}.*/\1/p"
+}
+
+test_hook_logs_the_observations_behind_a_block() {
+  local dir dead out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-log-block")
+  : > "$dir/state/task1.meta"
+  dead=$(nonexistent_pid)
+  record_watcher_lock "$dir" "$dead" "dead watcher identity"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "hook must block on a dead watcher lock"
+  [ -s "$dir/state/.turnend-guard.log" ] || fail "the block wrote no decision record at all"
+  [ "$(log_field "$dir" decision)" = blocked_watcher_down ] || fail "decision was not recorded: $(tail -n1 "$dir/state/.turnend-guard.log")"
+  [ "$(log_field "$dir" lock_pid)" = "$dead" ] || fail "the lock pid it actually read was not recorded"
+  [ "$(log_field "$dir" lock_pid_alive)" = false ] || fail "whether the lock pid was alive was not recorded"
+  [ "$(log_field "$dir" watcher_fail)" = lock-pid-dead ] || fail "the failing check was not named: $(tail -n1 "$dir/state/.turnend-guard.log")"
+  case "$(log_field "$dir" beacon_age)" in
+    ''|*[!0-9]*) fail "beacon age was not recorded as a number: $(tail -n1 "$dir/state/.turnend-guard.log")" ;;
+  esac
+  # And on screen, so a blocked turn is readable without opening the log.
+  assert_contains "$out" "observed: lock pid=$dead alive=false" "the banner must state what it observed"
+  pass "fm-turnend-guard: a block records the lock pid, its liveness, the beacon age, and which check failed"
+}
+
+test_hook_logs_an_absent_lock_distinctly_from_a_mismatched_one() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-log-no-lock")
+  : > "$dir/state/task1.meta"
+  # The real production shape: the watcher woke, exited, and took the lock with it,
+  # leaving a FRESH beacon behind. Absent must not be logged as if it were a stale or
+  # mismatched lock - that distinction is what a diagnosis turns on.
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "hook must block when no watcher holds the lock"
+  [ "$(log_field "$dir" watcher_fail)" = no-lock-pid ] || fail "an absent lock was not recorded distinctly: $(tail -n1 "$dir/state/.turnend-guard.log")"
+  [ "$(log_field "$dir" lock_pid)" = none ] || fail "an absent lock pid was not recorded as none"
+  [ "$(log_field "$dir" identity_match)" = unknown ] || fail "an identity comparison that never ran must not be recorded as a result"
+  pass "fm-turnend-guard: an absent lock is recorded as absent, not as a failed identity match"
+}
+
+test_hook_logs_an_allowed_healthy_evaluation() {
+  local dir pid identity status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-log-allow")
+  : > "$dir/state/task1.meta"
+  sleep 300 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid")
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  run_hook "$dir" false >/dev/null; status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "hook must allow a live, identity-matched watcher"
+  [ "$(log_field "$dir" decision)" = allowed_needs_firstmate_empty ] || fail "a permitted turn end was not recorded"
+  [ "$(log_field "$dir" identity_match)" = true ] || fail "the identity comparison result was not recorded on the allow path"
+  [ "$(log_field "$dir" watcher_fail)" = none ] || fail "a healthy evaluation must record no failing check"
+  pass "fm-turnend-guard: permitted turn ends are recorded too, with the comparisons that permitted them"
+}
+
 test_grok_adapter_forces_one_resume_when_unhealthy() {
   local dir fakebin log out status
   dir=$(make_primary_dir "$TMP_ROOT/grok-adapter-block")
@@ -1449,6 +1521,9 @@ test_hook_silent_in_secondmate_home_with_unattended_work
 test_hook_missing_jq_is_a_loud_guard_error
 test_hook_silent_without_stdin
 test_hook_runs_fast
+test_hook_logs_the_observations_behind_a_block
+test_hook_logs_an_absent_lock_distinctly_from_a_mismatched_one
+test_hook_logs_an_allowed_healthy_evaluation
 test_grok_adapter_forces_one_resume_when_unhealthy
 test_grok_adapter_loop_guard_skips_resume
 test_settings_hook_uses_claude_project_dir

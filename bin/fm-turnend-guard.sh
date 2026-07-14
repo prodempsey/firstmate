@@ -340,9 +340,25 @@ watcher_desc=healthy
 #   allowed_duty_disabled            permitted because the FM_TRIAGE_DUTY=off kill switch
 #                                    is engaged (loud on stderr, never silent).
 #   allowed_afk_owner                permitted because away mode owns supervision.
+#
+# The watcher's verdict alone is NOT enough to explain a decision, so each record also
+# carries the OBSERVATIONS behind it: the lock pid, whether that pid was alive, each
+# identity/home/path comparison, the beacon age, and which check failed first
+# (FM_WATCHER_DIAG_*, set by fm_watcher_healthy in bin/fm-wake-lib.sh). Logging only
+# watcher=down left every field that could explain a block null, and "no live watcher
+# (last beat: 1s ago)" reads as impossible until you can see WHICH check failed - the
+# beacon outlives the watcher that touched it, so a fresh beacon with an ABSENT lock is
+# both real and normal after a watcher exits on a wake. That gap cost three wrong
+# diagnoses of a genuine supervision collapse (a broken check waking the watcher every
+# cycle, so it exited and released the lock every cycle). fail=no-lock-pid with a fresh
+# beacon_age says it in one line.
 # Best-effort: a log that cannot be written must never change the decision or wedge the turn.
 log_decision() {  # <decision> <reason>
-  local line
+  local line beacon_age
+  beacon_age=${FM_WATCHER_DIAG_BEACON_AGE:-}
+  case "$beacon_age" in
+    ''|*[!0-9]*) beacon_age=null ;;
+  esac
   line=$(jq -cn \
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg watcher "$watcher_desc" \
@@ -353,10 +369,20 @@ log_decision() {  # <decision> <reason>
     --arg nf_error "$nf_error" \
     --arg decision "$1" \
     --arg reason "$2" \
+    --argjson beacon_age "$beacon_age" \
+    --arg lock_pid "${FM_WATCHER_DIAG_LOCK_PID:-none}" \
+    --arg lock_pid_alive "${FM_WATCHER_DIAG_PID_ALIVE:-unknown}" \
+    --arg identity_match "${FM_WATCHER_DIAG_IDENTITY_MATCH:-unknown}" \
+    --arg home_match "${FM_WATCHER_DIAG_HOME_MATCH:-unknown}" \
+    --arg path_match "${FM_WATCHER_DIAG_PATH_MATCH:-unknown}" \
+    --arg watcher_fail "${FM_WATCHER_DIAG_FAIL:-unknown}" \
     --argjson loop_protection "$([ "$STOP_HOOK_ACTIVE" = true ] && echo true || echo false)" \
     '{ts: $ts, watcher: $watcher, in_flight: $in_flight, needs_firstmate: $nf,
       nf_items: $nf_items, nf_gate: $nf_gate, nf_error: $nf_error,
-      decision: $decision, reason: $reason, loop_protection: $loop_protection}' 2>/dev/null) \
+      decision: $decision, reason: $reason, loop_protection: $loop_protection,
+      beacon_age: $beacon_age, lock_pid: $lock_pid, lock_pid_alive: $lock_pid_alive,
+      identity_match: $identity_match, home_match: $home_match, path_match: $path_match,
+      watcher_fail: $watcher_fail}' 2>/dev/null) \
     || return 0
   printf '%s\n' "$line" >> "$LOG" 2>/dev/null || return 0
   # Bounded: this is an operational trail, not an archive.
@@ -509,7 +535,19 @@ if [ "$blind" -eq 1 ]; then
     printf '●%s\n' "$rule"
     printf '●  TURN WOULD END BLIND - SUPERVISION IS OFF\n'
     printf '●  %s task(s) in flight, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_IN_FLIGHT" "$FM_SUP_BEACON_DESC"
+    # Those two lines look self-contradictory on their own: the beacon outlives the
+    # watcher that touched it, so a fresh beacon with an ABSENT lock is real. Say what
+    # was actually observed, and which check decided it.
+    printf '●  observed: lock pid=%s alive=%s identity=%s home=%s path=%s beacon=%ss -> %s\n' \
+      "${FM_WATCHER_DIAG_LOCK_PID:-none}" \
+      "${FM_WATCHER_DIAG_PID_ALIVE:-unknown}" \
+      "${FM_WATCHER_DIAG_IDENTITY_MATCH:-unknown}" \
+      "${FM_WATCHER_DIAG_HOME_MATCH:-unknown}" \
+      "${FM_WATCHER_DIAG_PATH_MATCH:-unknown}" \
+      "${FM_WATCHER_DIAG_BEACON_AGE:-unknown}" \
+      "${FM_WATCHER_DIAG_FAIL:-unknown}"
     printf '●  %s\n' "$REASON"
+    printf '●  full decision record: %s\n' "$LOG"
     printf '●%s\n' "$rule"
   } >&2
 fi

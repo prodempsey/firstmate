@@ -50,16 +50,74 @@ fm_path_age() {
   echo $(( $(date +%s) - m ))
 }
 
+# --- what the watcher check actually SAW --------------------------------------
+#
+# fm_watcher_healthy is a single yes/no, and a guard that logs only that yes/no
+# cannot explain its own decision: "no live watcher" with a fresh beacon in the same
+# banner is not one fact, it is five (lock pid, is it alive, does its identity still
+# match, does the home match, does the path match) collapsed into one bit. Chasing a
+# false block without them took hours. Every call to fm_watcher_healthy therefore
+# leaves the raw observations behind in these vars, and callers log THEM, not just
+# the verdict. FM_WATCHER_DIAG_FAIL names the first check that failed, so a decision
+# record always says WHY.
+#
+# Exported because they are written here and read entirely by callers
+# (bin/fm-turnend-guard.sh's decision log and banner), never by this library.
+export FM_WATCHER_DIAG_LOCK_PID=
+export FM_WATCHER_DIAG_PID_ALIVE=
+export FM_WATCHER_DIAG_HOME_MATCH=
+export FM_WATCHER_DIAG_PATH_MATCH=
+export FM_WATCHER_DIAG_IDENTITY_MATCH=
+export FM_WATCHER_DIAG_BEACON_AGE=
+export FM_WATCHER_DIAG_FAIL=
+
+fm_watcher_diag_reset() {
+  FM_WATCHER_DIAG_LOCK_PID=
+  FM_WATCHER_DIAG_PID_ALIVE=unknown
+  FM_WATCHER_DIAG_HOME_MATCH=unknown
+  FM_WATCHER_DIAG_PATH_MATCH=unknown
+  FM_WATCHER_DIAG_IDENTITY_MATCH=unknown
+  FM_WATCHER_DIAG_BEACON_AGE=
+  FM_WATCHER_DIAG_FAIL=
+}
+fm_watcher_diag_reset
+
 fm_watcher_lock_matches_pid() {
   local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity current_identity
   lockdir="$state/.watch.lock"
   lock_home=$(cat "$lockdir/fm-home" 2>/dev/null || true)
   lock_path=$(cat "$lockdir/watcher-path" 2>/dev/null || true)
   lock_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
-  [ "$lock_home" = "$home" ] || return 1
-  [ "$lock_path" = "$watch_path" ] || return 1
-  [ -n "$lock_identity" ] || return 1
-  current_identity=$(fm_pid_identity "$pid") || return 1
+  if [ "$lock_home" = "$home" ]; then
+    FM_WATCHER_DIAG_HOME_MATCH=true
+  else
+    FM_WATCHER_DIAG_HOME_MATCH=false
+    FM_WATCHER_DIAG_FAIL=${FM_WATCHER_DIAG_FAIL:-home-mismatch}
+    return 1
+  fi
+  if [ "$lock_path" = "$watch_path" ]; then
+    FM_WATCHER_DIAG_PATH_MATCH=true
+  else
+    FM_WATCHER_DIAG_PATH_MATCH=false
+    FM_WATCHER_DIAG_FAIL=${FM_WATCHER_DIAG_FAIL:-path-mismatch}
+    return 1
+  fi
+  if [ -z "$lock_identity" ]; then
+    FM_WATCHER_DIAG_IDENTITY_MATCH=false
+    FM_WATCHER_DIAG_FAIL=${FM_WATCHER_DIAG_FAIL:-identity-unrecorded}
+    return 1
+  fi
+  if ! current_identity=$(fm_pid_identity "$pid"); then
+    FM_WATCHER_DIAG_IDENTITY_MATCH=false
+    FM_WATCHER_DIAG_FAIL=${FM_WATCHER_DIAG_FAIL:-identity-unreadable}
+    return 1
+  fi
+  if [ "$current_identity" = "$lock_identity" ]; then
+    FM_WATCHER_DIAG_IDENTITY_MATCH=true
+  else
+    FM_WATCHER_DIAG_IDENTITY_MATCH=false
+    FM_WATCHER_DIAG_FAIL=${FM_WATCHER_DIAG_FAIL:-identity-mismatch}
+  fi
   [ "$current_identity" = "$lock_identity" ]
 }
 
@@ -67,15 +125,30 @@ FM_WATCHER_HEALTHY_PID=
 fm_watcher_healthy() {
   local state=$1 watch_path=$2 grace=${3:-${FM_GUARD_GRACE:-300}} home=${4:-$FM_HOME} lockdir beat pid age
   FM_WATCHER_HEALTHY_PID=
+  fm_watcher_diag_reset
   lockdir="$state/.watch.lock"
   beat="$state/.last-watcher-beat"
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
-  fm_pid_alive "$pid" || return 1
-  fm_watcher_lock_matches_pid "$state" "$watch_path" "$pid" "$home" || return 1
+  FM_WATCHER_DIAG_LOCK_PID=$pid
   age=$(fm_path_age "$beat")
-  [ "$age" -lt "$grace" ] || return 1
+  # Recorded before any early return, so a decision record can always report the
+  # beacon age alongside the verdict - the two together are what made the false
+  # "fresh beacon, no watcher" banner unreadable.
+  FM_WATCHER_DIAG_BEACON_AGE=$age
+  if ! fm_pid_alive "$pid"; then
+    FM_WATCHER_DIAG_PID_ALIVE=false
+    [ -n "$pid" ] && FM_WATCHER_DIAG_FAIL=lock-pid-dead || FM_WATCHER_DIAG_FAIL=no-lock-pid
+    return 1
+  fi
+  FM_WATCHER_DIAG_PID_ALIVE=true
+  fm_watcher_lock_matches_pid "$state" "$watch_path" "$pid" "$home" || return 1
+  if [ "$age" -ge "$grace" ]; then
+    FM_WATCHER_DIAG_FAIL=beacon-stale
+    return 1
+  fi
   # shellcheck disable=SC2034 # Read by callers after fm_watcher_healthy returns.
   FM_WATCHER_HEALTHY_PID=$pid
+  FM_WATCHER_DIAG_FAIL=none
   return 0
 }
 
