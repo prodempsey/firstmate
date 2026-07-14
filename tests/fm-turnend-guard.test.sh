@@ -1337,6 +1337,53 @@ EOF
   pass ".opencode primary plugin: guard path is anchored to worktree, not directory"
 }
 
+# --- .pi extensions under bare node -----------------------------------------
+#
+# The Pi extensions are tracked as .ts because Pi loads them through its own
+# TypeScript loader. Tests that exercise their REAL logic import them under bare
+# node instead, and node's ability to load .ts varies by host: >= 22.18 strips
+# types natively, older ones reject the extension outright
+# (ERR_UNKNOWN_FILE_EXTENSION), and some distro builds ship without the stripper
+# altogether (ERR_NO_TYPESCRIPT). So probe this node once, then either import the
+# .ts directly or fall back to an equivalent type-stripped .mjs. The extension's
+# logic is exercised either way - only the type annotations differ - so the suite
+# stays green on any node without pinning one.
+NODE_IMPORTS_TS=""
+node_imports_ts() {
+  if [ -z "$NODE_IMPORTS_TS" ]; then
+    local probe="$TMP_ROOT/ts-probe.ts"
+    mkdir -p "$TMP_ROOT"
+    printf 'export const answer: number = 1;\n' > "$probe"
+    if TS_PROBE="$probe" node --input-type=module >/dev/null 2>&1 <<'EOF'
+import { pathToFileURL } from "node:url";
+const mod = await import(pathToFileURL(process.env.TS_PROBE).href);
+if (mod.answer !== 1) process.exit(1);
+EOF
+    then NODE_IMPORTS_TS=yes
+    else NODE_IMPORTS_TS=no
+    fi
+  fi
+  [ "$NODE_IMPORTS_TS" = yes ]
+}
+
+# Install the tracked pi turn-end extension into <ext-dir> in a form this node
+# can import, and echo the importable path. It must land in <repo>/.pi/extensions
+# either way: the extension resolves its repo root from its own directory (../..)
+# to find bin/fm-turnend-guard.sh.
+install_pi_turnend_extension() {  # <ext-dir> -> echoes plugin path
+  local dir=$1 src dest
+  src="$ROOT/.pi/extensions/fm-primary-turnend-guard.ts"
+  if node_imports_ts; then
+    dest="$dir/fm-primary-turnend-guard.ts"
+    cp "$src" "$dest"
+  else
+    dest="$dir/fm-primary-turnend-guard.mjs"
+    node "$ROOT/tests/lib/strip-ts-types.mjs" "$src" "$dest" \
+      || fail "could not type-strip the pi extension for a node that cannot import .ts"
+  fi
+  printf '%s\n' "$dest"
+}
+
 test_pi_extension_forces_followup() {
   local ext content
   ext="$ROOT/.pi/extensions/fm-primary-turnend-guard.ts"
@@ -1362,10 +1409,9 @@ test_pi_extension_injects_once_per_logical_agent_run() {
   local repo home ext log out status
   repo="$TMP_ROOT/pi-logical-run-root"
   home="$TMP_ROOT/pi-logical-run-home"
-  ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
   log="$TMP_ROOT/pi-logical-run-guard.log"
   mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home/state"
-  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
+  ext=$(install_pi_turnend_extension "$repo/.pi/extensions")
   cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
 #!/usr/bin/env bash
 cat >/dev/null
@@ -1424,9 +1470,8 @@ test_pi_extension_retries_after_followup_delivery_failure() {
   local repo home ext out status
   repo="$TMP_ROOT/pi-delivery-failure-root"
   home="$TMP_ROOT/pi-delivery-failure-home"
-  ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
   mkdir -p "$repo/.pi/extensions" "$repo/bin" "$home/state"
-  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
+  ext=$(install_pi_turnend_extension "$repo/.pi/extensions")
   cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
 #!/usr/bin/env bash
 cat >/dev/null

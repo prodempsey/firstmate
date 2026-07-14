@@ -98,30 +98,32 @@ BASE_REF=$(resolve_base_ref) \
 # --- shared: a pre-refactor bin/ shim --------------------------------------
 #
 # build_old_bin echoes a directory whose bin/ subdir holds the PRE-REFACTOR
-# fm-send.sh, fm-peek.sh, fm-watch.sh, fm-spawn.sh, and fm-teardown.sh
-# (extracted from BASE_REF), plus symlinks to every OTHER sibling script those
-# five source - all unchanged by this task, so the real files are exactly
-# what BASE_REF would have used too. FM_ROOT_OVERRIDE pointed at this dir's
-# root makes "$FM_ROOT/bin/fm-project-mode.sh" (etc.) resolve correctly.
-# fm-backend.sh (and its bin/backends/ adapters) is the dispatcher every one
-# of the five REFACTORED scripts sources; it must be a real, reachable file in
-# the old bin/ too or `. "$SCRIPT_DIR/fm-backend.sh"` aborts under set -eu -
-# hence it is a symlinked sibling, not an extracted-from-BASE_REF file: for a
-# tmux-only conformance run the tmux adapter's behavior is what is under test,
-# and that is unchanged by any later (e.g. non-tmux backend) addition to
-# fm-backend.sh's own dispatch surface.
-OLD_BIN_UNCHANGED_SIBLINGS="fm-guard.sh fm-lock-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-composer-lib.sh fm-marker-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-tasks-axi-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-backend.sh"
+# copies of OLD_BIN_REFACTORED (extracted from BASE_REF), plus symlinks to
+# every OTHER entry in bin/ - the sibling scripts and libs those five source or
+# exec, and the bin/backends/ adapter dir. Those siblings are unchanged by this
+# task, so the real current files are exactly what BASE_REF would have used
+# too. FM_ROOT_OVERRIDE pointed at this dir's root makes
+# "$FM_ROOT/bin/fm-project-mode.sh" (etc.) resolve correctly.
+#
+# The sibling set is SWEPT from bin/, never hand-listed. A hardcoded list rots
+# silently the moment one of the five gains a dependency: the missing sibling
+# surfaces only as a `. "$SCRIPT_DIR/<lib>.sh"` abort under set -eu, deep inside
+# an unrelated-looking conformance case. Sweeping keeps the fixture correct by
+# construction as bin/ grows.
 OLD_BIN_REFACTORED="fm-send.sh fm-peek.sh fm-watch.sh fm-spawn.sh fm-teardown.sh"
 
 build_old_bin() {  # <name> -> echoes root dir (root/bin/<script> is the entry point)
-  local name=$1 root bin f
+  local name=$1 root bin f base
   root="$TMP_ROOT/$name"
   bin="$root/bin"
   mkdir -p "$bin"
-  for f in $OLD_BIN_UNCHANGED_SIBLINGS; do
-    ln -s "$ROOT/bin/$f" "$bin/$f"
+  for f in "$ROOT"/bin/*; do
+    base=${f##*/}
+    case " $OLD_BIN_REFACTORED " in
+      *" $base "*) continue ;;  # replaced below by its BASE_REF copy
+    esac
+    ln -s "$f" "$bin/$base"
   done
-  ln -s "$ROOT/bin/backends" "$bin/backends"
   for f in $OLD_BIN_REFACTORED; do
     git -C "$ROOT" show "$BASE_REF:bin/$f" > "$bin/$f"
     chmod +x "$bin/$f"
@@ -964,12 +966,21 @@ SH
 # bin/fm-guard.sh is a symlink to the real, unchanged script, so the
 # worktree-tangle check runs identically (and silently) for both, regardless
 # of which fm-teardown.sh (old or new) is actually being invoked.
+#
+# FM_VISIBILITY_CLI is pinned to a stub for the same reason tests/fm-teardown.sh
+# pins it: teardown closes a durable TaskRecord through the fleet-bridge
+# visibility CLI, and bin/fm-task-events.sh finds that CLI by probing ABSOLUTE
+# paths (/home/prode/fleet/...) before any override root. Left unset, this test
+# is not hermetic - on a host where a real fleet-bridge exists it records and
+# closes its fixture task against the LIVE fleet database, and on a host without
+# one (CI) teardown refuses because no CLI is found. Pinning the stub makes the
+# case behave identically everywhere.
 run_teardown_case() {
   local script=$1 fmroot=$2 fb=$3 log=$4 state=$5 data=$6 config=$7 id=$8
   : > "$log"
   env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$fmroot" \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
-    FM_TMUX_LOG="$log" \
+    FM_TMUX_LOG="$log" FM_VISIBILITY_CLI="$TMP_ROOT/teardown-visibility.mjs" \
     "$script" "$id"
 }
 
@@ -990,6 +1001,10 @@ test_teardown_conformance_old_vs_new() {
   data="$TMP_ROOT/teardown-data"
   mkdir -p "$data/$id"
   printf 'scout findings\n' > "$data/$id/report.md"
+
+  # Stub visibility CLI: a successful durable closeout, with no live fleet-bridge
+  # anywhere in reach (see run_teardown_case).
+  printf '%s\n' '#!/usr/bin/env node' 'process.exit(0);' > "$TMP_ROOT/teardown-visibility.mjs"
 
   state_old="$TMP_ROOT/teardown-state-old"; state_new="$TMP_ROOT/teardown-state-new"
   config_old="$TMP_ROOT/teardown-config-old"; config_new="$TMP_ROOT/teardown-config-new"
