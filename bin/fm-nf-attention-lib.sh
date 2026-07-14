@@ -148,20 +148,29 @@ fm_nf_attention_desired() {  # <state-dir> <data-dir> <task-id> <fold-json>
       evidence_version: $evidence_version, why: $why}'
 }
 
-# Print the id of every UNATTENDED needs_firstmate item in a home, one per line. Unattended
-# means exactly what fm_nf_attention_desired above calls `open`: a live terminal signal
-# (done/blocked/failed/needs-decision) that firstmate has never dispositioned, or whose
-# recorded disposition no longer holds. That decision stays owned by fm_nf_attention_desired;
-# this is only the sweep over the home.
+# Print the id of every needs_firstmate item that still holds the TURN-END GATE, one per
+# line. The per-item classification stays owned by fm_nf_attention_desired above; this is
+# only the sweep over the home, plus the gate's own discharge rule (ORD-059 section 2):
+#
+#   The gate is discharged ONLY by a genuine terminal disposition - `resolved` or
+#   `rejected`, with valid lineage against current evidence - or by the work physically
+#   leaving the lane: landing then teardown, or the crew's status moving off a terminal
+#   verb (a steer to `paused:`, a `resolved:` follow-up, a relaunch).
+#
+#   Everything else keeps blocking, deliberately: an ack receipt, a claim, a `hold` (even a
+#   valid dated one - it parks the BOARD CARD, never this gate), `successor_created`, and
+#   `captain_batch`. Those are paper moves; the incident this gate exists for was eight
+#   holds recorded in 137 seconds to mute the lane, and a captain_batch row silently
+#   vanishing a decision (bug-20260713154240-10d127e0). The gate is therefore stricter
+#   than bin/fm-nf-reconcile.sh's "unhandled" count, which reports held and dispositioned
+#   items separately for the board.
 #
 # LEVEL-TRIGGERED, DIRECT FROM SOURCE. It reads state/<id>.meta plus state/<id>.status and
 # the triage ledger, every call. It reads no cached summary of them - a cache reflects the
 # last duty pass, not the present, so a gate built on one both misses fresh work and blocks
-# on work already discharged. This is what bin/fm-turnend-guard.sh gates the turn end on,
-# and the same per-item decision bin/fm-nf-reconcile.sh reports as unhandled; nothing about
-# "is this work unattended" is decided anywhere else.
+# on work already discharged. This is what bin/fm-turnend-guard.sh gates the turn end on.
 fm_nf_unattended_ids() {  # <state-dir> <data-dir>
-  local state=$1 data=$2 fold meta id
+  local state=$1 data=$2 fold meta id desired want outcome
   [ -d "$state" ] || return 1
   fold=$(fm_nf_attention_fold "$data") || return 1
   for meta in "$state"/*.meta; do
@@ -169,8 +178,14 @@ fm_nf_unattended_ids() {  # <state-dir> <data-dir>
     id=$(basename "$meta" .meta)
     # No live terminal signal (still working, or a secondmate) - nothing is owed.
     fm_nf_current_fingerprint "$state" "$id" >/dev/null 2>&1 || continue
-    [ "$(fm_nf_attention_desired "$state" "$data" "$id" "$fold" \
-      | jq -r '.state' 2>/dev/null)" = open ] || continue
+    desired=$(fm_nf_attention_desired "$state" "$data" "$id" "$fold") || continue
+    want=$(printf '%s' "$desired" | jq -r '.state' 2>/dev/null) || continue
+    outcome=$(printf '%s' "$desired" | jq -r '.outcome' 2>/dev/null) || continue
+    if [ "$want" = terminal ]; then
+      case "$outcome" in
+        resolved|rejected) continue ;;
+      esac
+    fi
     printf '%s\n' "$id"
   done
 }

@@ -222,9 +222,11 @@ test_legacy_unreviewable_hold_presents_as_open() {
   pass "a legacy unreviewable hold cannot park work forever"
 }
 
-# The turn-end guard's sweep is a thin, level-triggered view over fm_nf_attention_desired:
-# open items and only open items, one id per line, straight from live task state.
-test_unattended_ids_lists_open_items_only() {
+# The turn-end guard's sweep is a thin, level-triggered view over fm_nf_attention_desired,
+# with the GATE's discharge rule on top: only resolved and rejected discharge it. A valid
+# dated hold parks the board card, never the gate, so a held item still lists here even
+# though the reconciler reports it as held rather than unhandled.
+test_unattended_ids_apply_the_gate_discharge_rule() {
   local home out
   home=$(new_home unattended-ids)
   own_lock "$home"
@@ -238,9 +240,11 @@ test_unattended_ids_lists_open_items_only() {
     > /dev/null || fail "recording a hold should succeed"
   out=$(bash -c '. "$1/bin/fm-nf-attention-lib.sh"; fm_nf_unattended_ids "$2/state" "$2/data"' \
     _ "$ROOT" "$home")
-  [ "$out" = 'open-e5' ] \
-    || fail "expected exactly the one open item, got: $(printf '%s' "$out" | tr '\n' ' ')"
-  pass "fm_nf_unattended_ids reports open items only, one id per line"
+  printf '%s\n' "$out" | grep -qxF 'open-e5' || fail "an undispositioned item must list, got: $out"
+  printf '%s\n' "$out" | grep -qxF 'parked-h8' || fail "a held item must still hold the gate, got: $out"
+  printf '%s\n' "$out" | grep -qxF 'landed-g7' && fail "a resolved item must not hold the gate, got: $out"
+  printf '%s\n' "$out" | grep -qxF 'busy-f6' && fail "a working task is not a terminal signal, got: $out"
+  pass "fm_nf_unattended_ids lists gate-holding items: open and held in, resolved and non-terminal out"
 }
 
 test_new_signal_reopens_a_dispositioned_card() {
@@ -383,7 +387,7 @@ test_held_presents_as_held_with_reason_and_date
 test_captain_batch_hands_the_card_to_the_captain
 test_hold_expiry_restores_attention
 test_legacy_unreviewable_hold_presents_as_open
-test_unattended_ids_lists_open_items_only
+test_unattended_ids_apply_the_gate_discharge_rule
 test_new_signal_reopens_a_dispositioned_card
 test_resurface_restores_attention
 test_dangling_successor_reopens_the_card

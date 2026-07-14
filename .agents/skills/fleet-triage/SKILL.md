@@ -127,10 +127,12 @@ Record the outcome for each item the disposition actually covers, and leave the 
 Two separate switches exist; do not confuse them.
 `FLEET_TRIAGE_MODE=enumerate_only` is a REPORT-ONLY mode, not a way to silence anything: the enumerator and `bin/fm-triage-duty.sh` still run in full and still report - a duty pass can still print a banner and still cache its own result - but every ledger write and domain action is refused, enforced by `bin/fm-fleet-triage-record.sh` refusing to write.
 `FM_TRIAGE_DUTY=off` is the actual kill switch for the duty prompt itself: under it, `bin/fm-triage-duty.sh` produces no output and runs nothing at all - no enumeration, no state-file write, no banner. It does not affect `bin/fm-fleet-triage.sh` or `bin/fm-fleet-triage-record.sh` run directly.
+It also stands down the turn-end guard's unattended-work gate, but never silently: while engaged, the guard prints a loud `KILL SWITCH ENGAGED` banner on every primary turn end and logs the permit as `stood_down_duty_off` (`docs/turnend-guard.md`).
 
 ## Closeout
 
 After action, rerun targeted triage for the affected lane.
 Run a full pass when closeout unblocks queued work or changes shared visibility history.
 Resume normal supervision once every remaining item has an owner, an active claim, a successor, a hold with a review date, a captain batch, or a recorded rejection or resolution, and every unavailable lane has been accounted for.
-The `needs_firstmate` lane is not advisory: while it is non-empty the turn-end guard blocks the turn end (`docs/turnend-guard.md`), and only landing the work or tearing it down clears it.
+The `needs_firstmate` lane is not advisory: while it is non-empty the turn-end guard blocks the turn end (`docs/turnend-guard.md`).
+For that gate specifically, an owner, a claim, a hold, a successor, or a captain batch is NOT clearance: only landing the work, tearing it down, a crew status moving off its terminal verb, or a genuine `resolved`/`rejected` disposition with lineage clears it - `docs/turnend-guard.md` owns the discharge rule.
