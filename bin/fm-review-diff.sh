@@ -1,9 +1,21 @@
 #!/usr/bin/env bash
-# Review a crewmate branch against the authoritative base.
+# Review a crewmate branch against the base the work will actually land on.
 #
-# Pooled project clones do not keep their local default branch current, so this
-# helper compares remote-backed projects against origin/<default> after fetching
-# the default branch, and local-only projects against the local default branch.
+# The base is chosen by the task's DELIVERY MODE, not by whether an origin remote
+# happens to exist: a review that compares against a base nobody will merge into
+# is worse than useless. A local-only task lands on the project's LOCAL default
+# branch (bin/fm-merge-local.sh fast-forwards it), so that is its base even when
+# the project also has an origin whose default branch is a different lineage -
+# diffing such a task against origin/<default> reports the whole lineage gap as
+# the change set and hides what actually changed. A PR-based task (no-mistakes,
+# direct-PR) lands on origin/<default> via the merged PR, so that ref is its base
+# and is fetched fresh, because pooled clones keep stale local default refs.
+#
+# The mode comes from mode= in state/<id>.meta (recorded by fm-spawn), falling
+# back to the data/projects.md registry. If the mode - and therefore the landing
+# base - cannot be resolved, this script FAILS LOUDLY rather than guessing a base:
+# a confidently wrong diff is the failure this tool exists to prevent.
+#
 # When state/<id>.meta records pr= for an open PR, the compare side is the PR
 # head (recorded pr_head= when reachable, else refs/pull/<n>/head) so review
 # stays current after no-mistakes fix rounds push to the PR; if the PR head
@@ -115,21 +127,75 @@ if [ -n "$PR_URL" ]; then
   fi
 fi
 
-if git -C "$PROJ" remote get-url origin >/dev/null 2>&1; then
-  # Update the remote-tracking ref itself; a bare single-branch fetch can leave
-  # origin/<default> stale on some Git versions and only refresh FETCH_HEAD.
-  git -C "$WT" fetch origin "+refs/heads/$DEFAULT:refs/remotes/origin/$DEFAULT" --quiet
-  BASE="origin/$DEFAULT"
-else
-  BASE="$DEFAULT"
+# The landing base follows the delivery mode. mode= in meta is authoritative;
+# the registry is the fallback for a meta written before fm-spawn recorded it.
+mode_from_registry() {
+  local out mode
+  out=$("$FM_ROOT/bin/fm-project-mode.sh" "$(basename "$PROJ")" 2>&1 || true)
+  # fm-project-mode.sh warns and defaults to no-mistakes for an unknown project;
+  # that default is a guess, and a guessed base is exactly what must not happen.
+  case "$out" in *'warn:'*) return 1 ;; esac
+  mode=$(printf '%s\n' "$out" | tail -1 | cut -d' ' -f1)
+  [ -n "$mode" ] || return 1
+  printf '%s' "$mode"
+}
+
+MODE=$(grep '^mode=' "$META" | tail -1 | cut -d= -f2- || true)
+if [ -z "$MODE" ]; then
+  MODE=$(mode_from_registry) || {
+    echo "error: cannot resolve the delivery mode for task $ID, so the base it would land on is unknown." >&2
+    echo "       $META records no mode=, and $(basename "$PROJ") is not in the project registry." >&2
+    echo "       Refusing to diff against a guessed base; add mode=<no-mistakes|direct-PR|local-only> to the meta or register the project." >&2
+    exit 1
+  }
 fi
 
-git -C "$WT" rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || { echo "error: base $BASE does not exist in $WT" >&2; exit 1; }
+case "$MODE" in
+  local-only)
+    # fm-merge-local.sh fast-forwards the project's LOCAL default branch, so that
+    # branch - not origin/<default>, which may be an entirely different lineage -
+    # is what this work merges into.
+    BASE="refs/heads/$DEFAULT"
+    BASE_LABEL="$DEFAULT (local)"
+    git -C "$WT" rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || {
+      echo "error: task $ID is mode=local-only, so it lands on the local branch $DEFAULT, but $DEFAULT does not exist in $PROJ." >&2
+      echo "       Refusing to diff against a base the merge will not use." >&2
+      exit 1
+    }
+    ;;
+  no-mistakes|direct-PR)
+    # The PR merges into the remote default branch, so that is the base.
+    git -C "$PROJ" remote get-url origin >/dev/null 2>&1 || {
+      echo "error: task $ID is mode=$MODE (lands via a PR into origin/$DEFAULT), but $PROJ has no origin remote." >&2
+      echo "       Refusing to diff against a guessed base; fix the project remote or correct the task's mode=." >&2
+      exit 1
+    }
+    # Update the remote-tracking ref itself; a bare single-branch fetch can leave
+    # origin/<default> stale on some Git versions and only refresh FETCH_HEAD.
+    git -C "$WT" fetch origin "+refs/heads/$DEFAULT:refs/remotes/origin/$DEFAULT" --quiet || {
+      echo "error: cannot fetch origin/$DEFAULT for task $ID; the base its PR would merge into is unknown." >&2
+      echo "       Refusing to diff against a possibly stale base." >&2
+      exit 1
+    }
+    BASE="refs/remotes/origin/$DEFAULT"
+    BASE_LABEL="origin/$DEFAULT"
+    git -C "$WT" rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || {
+      echo "error: base origin/$DEFAULT does not exist in $WT after fetching it." >&2
+      exit 1
+    }
+    ;;
+  *)
+    echo "error: task $ID records mode=$MODE, which is not a reviewable ship mode; the base it would land on is unknown." >&2
+    echo "       Expected no-mistakes, direct-PR, or local-only. Refusing to diff against a guessed base." >&2
+    exit 1
+    ;;
+esac
+
 git -C "$WT" rev-parse --verify --quiet "$COMPARE_REF^{commit}" >/dev/null || { echo "error: compare ref $COMPARE_REF does not resolve in $WT" >&2; exit 1; }
 
-echo "diff base: $BASE"
+echo "diff base: $BASE_LABEL (mode=$MODE)"
 if git -C "$WT" diff --quiet "$BASE...$COMPARE_REF" --; then
-  echo "no changes vs $BASE"
+  echo "no changes vs $BASE_LABEL"
   exit 0
 fi
 
