@@ -882,6 +882,146 @@ test_hook_silent_in_crewmate_worktree() {
   pass "fm-turnend-guard: inert in a crewmate/scout task worktree (linked git worktree) even when unhealthy"
 }
 
+# THE DEPLOYED SHAPE, and the case whose absence let the gate ship dead
+# (bug-20260714023716-7c5e1bfb). Every fixture above is a git repo, because the template
+# is one. The home the gate is actually INSTALLED in is not: a rebaselined runtime home
+# is a plain directory tree with bin/ as an ordinary directory and no .git anywhere. The
+# old scoping opened with `git rev-parse --git-dir || exit 0`, so there - and only there -
+# the guard exited before evaluating anything, logged nothing, and could never block,
+# while this suite stayed green over a git fixture. A green suite over a mechanism that
+# cannot fire where it is deployed is not evidence. This test runs the guard in the
+# deployed shape.
+make_nongit_primary_dir() {  # <dir> - a rebaselined runtime home: NO .git, ever
+  local dir=$1
+  mkdir -p "$dir/state"
+  : > "$dir/AGENTS.md"
+  install_guard_scripts "$dir"
+  [ -e "$dir/.git" ] && fail "the non-git fixture must not contain a .git: $dir"
+  git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 \
+    && fail "the non-git fixture must not resolve as a git checkout: $dir"
+  printf '%s\n' "$dir"
+}
+
+test_hook_blocks_on_unattended_work_in_a_nongit_primary_home() {
+  local dir pid out status log
+  dir=$(make_nongit_primary_dir "$TMP_ROOT/hook-nongit-block")
+  pid=$(start_healthy_watcher "$dir")
+  write_nf_signal "$dir" ship-n1 'done: ready in branch fm/ship-n1'
+  write_nf_signal "$dir" probe-n2 'needs-decision: two rollout options'
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 2 "$status" "hook must block unattended work in a NON-GIT primary home - the shape it is actually deployed in"
+  assert_contains "$out" "TURN WOULD END WITH FINISHED WORK UNATTENDED" "the non-git primary must get the same block banner"
+  assert_contains "$out" "ship-n1" "the block banner must name the unattended items in a non-git home"
+  assert_contains "$out" "probe-n2" "the block banner must name the unattended items in a non-git home"
+  log=$(last_guard_log "$dir")
+  [ -n "$log" ] || fail "a non-git primary must still write the decision log (state/.turnend-guard.log was never created)"
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = blocked_needs_firstmate ] || fail "non-git primary must record blocked_needs_firstmate: $log"
+  [ "$(printf '%s' "$log" | jq -r '.needs_firstmate')" = 2 ] || fail "non-git primary must record the lane count: $log"
+  pass "fm-turnend-guard: blocks on unattended work in a non-git (rebaselined) primary home, and logs the decision"
+}
+
+# The other half of the deployed shape: a non-git primary with a clear lane still permits
+# and still records the permit, so "non-git" never means "unevaluated".
+test_hook_permits_and_logs_in_a_clear_nongit_primary_home() {
+  local dir pid out status log
+  dir=$(make_nongit_primary_dir "$TMP_ROOT/hook-nongit-clear")
+  pid=$(start_healthy_watcher "$dir")
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "a clear lane in a non-git primary must permit the turn end"
+  [ -z "$out" ] || fail "the healthy path in a non-git primary must stay silent: $out"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_needs_firstmate_empty ] || fail "a non-git primary must record its permit, not skip evaluation: $log"
+  pass "fm-turnend-guard: a clear non-git primary permits and records allowed_needs_firstmate_empty"
+}
+
+# Scoping's third exclusion: a session that lost the per-home session lock is read-only
+# (AGENTS.md section 3). It must not block and must not mutate fleet state - no decision
+# log, no block-id set.
+test_hook_inert_when_another_live_session_owns_the_lock() {
+  local dir pid holder out status
+  dir=$(make_nongit_primary_dir "$TMP_ROOT/hook-foreign-lock")
+  pid=$(start_healthy_watcher "$dir")
+  write_nf_signal "$dir" ship-o1 'done: ready in branch fm/ship-o1'
+  # A live process that is NOT in this test's ancestry: the session lock's holder.
+  sleep 60 >/dev/null 2>&1 &
+  holder=$!
+  printf '%s\n' "$holder" > "$dir/state/.lock"
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$holder"
+  stop_watcher "$pid"
+  expect_code 0 "$status" "a read-only session (another live session holds the lock) must not block"
+  [ -z "$out" ] || fail "a read-only session must stay silent: $out"
+  [ ! -e "$dir/state/.turnend-guard.log" ] || fail "a read-only session must not mutate fleet state (it wrote the decision log)"
+  [ ! -e "$dir/state/.turnend-guard-block-ids" ] || fail "a read-only session must not mutate fleet state (it wrote the block-id set)"
+  pass "fm-turnend-guard: inert and non-mutating when another live session holds the per-home lock"
+}
+
+# FAIL ARMED, not inert. A lock is only a stand-down when a live foreign holder proves it:
+# a stale lock (dead holder) must leave the gate fully armed, or an unreadable lock becomes
+# a second silent way for this gate not to exist.
+test_hook_blocks_when_the_session_lock_is_stale() {
+  local dir pid dead out status
+  dir=$(make_nongit_primary_dir "$TMP_ROOT/hook-stale-lock")
+  pid=$(start_healthy_watcher "$dir")
+  write_nf_signal "$dir" ship-p1 'done: ready in branch fm/ship-p1'
+  dead=$(nonexistent_pid)
+  printf '%s\n' "$dead" > "$dir/state/.lock"
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 2 "$status" "a stale session lock must leave the guard armed, never stand it down"
+  assert_contains "$out" "ship-p1" "the armed guard must still name the unattended work"
+  pass "fm-turnend-guard: a stale (dead-holder) session lock leaves the gate armed"
+}
+
+# The lock held by THIS session's own ancestry is the primary itself: fully armed.
+test_hook_blocks_when_this_session_owns_the_lock() {
+  local dir pid out status
+  dir=$(make_nongit_primary_dir "$TMP_ROOT/hook-own-lock")
+  pid=$(start_healthy_watcher "$dir")
+  write_nf_signal "$dir" ship-q1 'done: ready in branch fm/ship-q1'
+  printf '%s\n' "$$" > "$dir/state/.lock"
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 2 "$status" "the lock-owning session is the primary and must be guarded"
+  assert_contains "$out" "ship-q1" "the lock-owning primary must be told which work is unattended"
+  pass "fm-turnend-guard: armed when the session lock is held by this session's own ancestry"
+}
+
+# The linked-worktree exclusion must survive the scoping rewrite: a crewmate/scout worktree
+# of firstmate-on-itself carries a state/ dir and an inherited FM_HOME in the real fleet,
+# so git-ness is still the discriminator that keeps it inert. Pinned here WITH unattended
+# work present, which is the condition that would otherwise block.
+test_hook_silent_in_crewmate_worktree_with_unattended_work() {
+  local base dir pid out status
+  base="$TMP_ROOT/hook-crew-nf-base"
+  dir="$TMP_ROOT/hook-crew-nf-wt"
+  make_crewmate_worktree_dir "$base" "$dir" >/dev/null
+  pid=$(start_healthy_watcher "$dir")
+  write_nf_signal "$dir" ship-r1 'done: ready in branch fm/ship-r1'
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "a crewmate task worktree must stay inert even with unattended work in view"
+  [ -z "$out" ] || fail "hook produced output inside a crewmate task worktree: $out"
+  [ ! -e "$dir/state/.turnend-guard.log" ] || fail "a crewmate task worktree must not write the decision log"
+  pass "fm-turnend-guard: still inert in a linked crewmate worktree when unattended work is present"
+}
+
+# Same, for a secondmate home: the marker keeps it inert regardless of the lane.
+test_hook_silent_in_secondmate_home_with_unattended_work() {
+  local dir pid out status
+  dir=$(make_secondmate_dir "$TMP_ROOT/hook-secondmate-nf")
+  pid=$(start_healthy_watcher "$dir")
+  write_nf_signal "$dir" ship-s1 'done: ready in branch fm/ship-s1'
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "a secondmate home must stay inert even with unattended work in view"
+  [ -z "$out" ] || fail "hook produced output inside a secondmate home: $out"
+  [ ! -e "$dir/state/.turnend-guard.log" ] || fail "a secondmate home must not write the decision log"
+  pass "fm-turnend-guard: still inert in a secondmate home when unattended work is present"
+}
+
 test_hook_missing_jq_is_a_loud_guard_error() {
   local dir out status fakebin tool tool_path log
   dir=$(make_primary_dir "$TMP_ROOT/hook-nojq")
@@ -1299,6 +1439,13 @@ test_hook_uses_state_override
 test_hook_loop_guard_allows_retry
 test_hook_silent_in_secondmate_home
 test_hook_silent_in_crewmate_worktree
+test_hook_blocks_on_unattended_work_in_a_nongit_primary_home
+test_hook_permits_and_logs_in_a_clear_nongit_primary_home
+test_hook_inert_when_another_live_session_owns_the_lock
+test_hook_blocks_when_the_session_lock_is_stale
+test_hook_blocks_when_this_session_owns_the_lock
+test_hook_silent_in_crewmate_worktree_with_unattended_work
+test_hook_silent_in_secondmate_home_with_unattended_work
 test_hook_missing_jq_is_a_loud_guard_error
 test_hook_silent_without_stdin
 test_hook_runs_fast

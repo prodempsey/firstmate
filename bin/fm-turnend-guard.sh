@@ -38,12 +38,14 @@
 # See docs/turnend-guard.md for the per-harness mechanics, validation evidence,
 # the decision-outcome taxonomy, and fail-open tradeoffs.
 #
-# Ships with TRACKED harness hook files at the repo root, so this file is
-# checked out into every worktree of this repo: the primary checkout, any
-# crewmate/scout task worktree spawned to work on firstmate itself (the
-# recursive "firstmate improving itself" case), and every secondmate home
-# (treehouse-leased or git-cloned). It must therefore scope itself to the
-# PRIMARY at runtime and stay a silent, fast no-op everywhere else.
+# Ships with TRACKED harness hook files at the repo root, so this file lands in
+# every home and worktree of this repo: the primary home, any crewmate/scout task
+# worktree spawned to work on firstmate itself (the recursive "firstmate improving
+# itself" case), and every secondmate home (treehouse-leased or git-cloned). It must
+# therefore scope itself to the PRIMARY at runtime and stay a silent, fast no-op
+# everywhere else. A deployed primary home is NOT necessarily a git checkout - the
+# live runtime home is a rebaselined, non-git tree - so scoping identifies the
+# primary from what a home IS, never from git-ness. See the scoping block below.
 #
 # Loop-guard: never block twice in the same turn. Claude Code and codex Stop
 # payloads carry stop_hook_active=true when the CURRENT stop attempt was itself
@@ -84,24 +86,63 @@ BLOCK_IDS_FILE="$STATE/.turnend-guard-block-ids"
 PAYLOAD=$(cat 2>/dev/null || true)
 [ -n "$PAYLOAD" ] || exit 0
 
-# --- scope precisely to the PRIMARY checkout --------------------------------
-# Excludes secondmate homes (the .fm-secondmate-home marker is written at seed
-# time regardless of whether the home was treehouse-leased or git-cloned; see
-# bin/fm-home-seed.sh) and ordinary crewmate/scout task worktrees of
-# firstmate-on-itself (bin/fm-spawn.sh only ever hands those out as genuine
-# linked `git worktree`s - it aborts the spawn otherwise - so a plain,
-# non-worktree checkout is never one of those). A linked worktree's git-dir
-# lives under the main repo's .git/worktrees/<name> and differs from the common
-# (shared) git-dir; only the main, non-worktree checkout has the two equal.
-# Scoping runs BEFORE the jq dependency check so a guard-error alarm can only
-# ever fire in the one checkout that is actually a primary.
+# --- scope precisely to the PRIMARY home ------------------------------------
+# Identify the primary POSITIVELY, from what a firstmate home IS. Git-ness is a
+# DISCRIMINATOR APPLIED WHERE IT APPLIES, never a precondition for this gate to
+# exist at all.
+#
+# This scoping used to open with `git rev-parse --git-dir || exit 0`. A deployed
+# runtime home is a REBASELINED, NON-GIT tree - bin/ is a plain directory and there
+# is no .git - so in the one place the gate is actually installed, git rev-parse
+# failed and the guard exited before evaluating anything. It could never fire where
+# it was deployed, while every test suite (which builds a git fixture) stayed green
+# (bug-20260714023716-7c5e1bfb). Both deployment shapes must work: a git-checkout
+# home (the template/dev shape) AND a non-git rebaselined runtime home.
+#
+# A PRIMARY home is one that:
+#   - has the shape of a firstmate home: AGENTS.md, bin/, and a state/ dir (the
+#     state dir is the FM_HOME/FM_STATE_OVERRIDE one this evaluation would read);
+#   - does NOT carry the .fm-secondmate-home marker, which bin/fm-home-seed.sh
+#     writes into every secondmate home at seed time, treehouse-leased or
+#     git-cloned alike;
+#   - is NOT a crewmate/scout task worktree of firstmate-on-itself. bin/fm-spawn.sh
+#     only ever hands those out as genuine linked `git worktree`s - it aborts the
+#     spawn otherwise - so WHEN the root is a git checkout root the linked-worktree
+#     test still discriminates exactly: a linked worktree's git-dir lives under the
+#     main repo's .git/worktrees/<name> and differs from the common (shared)
+#     git-dir, while a main checkout has the two equal. A root that is not a git
+#     checkout root cannot be one of those worktrees, so it is not excluded;
+#   - is not a session that another live session has locked out (below).
+# Scoping runs BEFORE the jq dependency check so a guard-error alarm can only ever
+# fire in a home that is actually a primary.
 [ -f "$FM_ROOT/.fm-secondmate-home" ] && exit 0
-GIT_DIR=$(git -C "$FM_ROOT" rev-parse --git-dir 2>/dev/null) || exit 0
-GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null) || exit 0
-[ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || exit 0
+[ -f "$FM_HOME/.fm-secondmate-home" ] && exit 0
 [ -f "$FM_ROOT/AGENTS.md" ] || exit 0
 [ -d "$FM_ROOT/bin" ] || exit 0
 [ -d "$STATE" ] || exit 0
+
+# The linked-worktree exclusion, applied only where the concept exists. The toplevel
+# comparison keeps this precise: it fires on a task worktree (whose root IS the git
+# toplevel), not on a non-git home that merely happens to sit inside some unrelated
+# repo's tree.
+GIT_TOP=$(git -C "$FM_ROOT" rev-parse --show-toplevel 2>/dev/null || true)
+if [ -n "$GIT_TOP" ] && [ "$(cd "$GIT_TOP" 2>/dev/null && pwd -P)" = "$(cd "$FM_ROOT" && pwd -P)" ]; then
+  GIT_DIR=$(git -C "$FM_ROOT" rev-parse --git-dir 2>/dev/null || true)
+  GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null || true)
+  [ -n "$GIT_DIR" ] && [ "$GIT_DIR" != "$GIT_COMMON_DIR" ] && exit 0
+fi
+
+# A session that does not own this home must not act on it. The per-home session lock
+# (state/.lock, written by bin/fm-lock.sh) names the harness pid that holds the fleet;
+# a session that could not acquire it operates read-only (AGENTS.md section 3) and has
+# no supervision of its own to resume, so this guard must neither block it nor write
+# the decision log, the block-id set, or the wake queue from it.
+#
+# FAIL ARMED, never inert: only a PROVABLY foreign live holder stands the guard down.
+# An absent lock, a garbage lock, a dead holder, or an ancestry walk that cannot be
+# completed all leave the guard armed. An unreadable lock must never become a second
+# quiet way for this gate not to exist - that is the bug this scoping fix is for.
+[ "$(fm_session_lock_owner "$STATE")" = other ] && exit 0
 
 rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 

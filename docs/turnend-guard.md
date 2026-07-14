@@ -32,12 +32,19 @@ The decision log below is what makes that metric measurable.
 
 ## Shared Predicate
 
-The guard first scopes itself to the real primary checkout.
+The guard first scopes itself to the real primary home, and it identifies that home **positively**, from what a firstmate home is.
+It requires `AGENTS.md`, `bin/`, and the effective state directory to exist.
 It is inert in secondmate homes because `.fm-secondmate-home` exists there.
-It is inert in crewmate and scout worktrees because firstmate provisions them as linked git worktrees, where `git rev-parse --git-dir` differs from `git rev-parse --git-common-dir`.
-It also requires `AGENTS.md`, `bin/`, and the effective state directory to exist.
+It is inert in crewmate and scout worktrees because firstmate provisions them as linked git worktrees, where `git rev-parse --git-dir` differs from `git rev-parse --git-common-dir`; that test is applied only when the root is itself a git checkout root, so it discriminates a task worktree without excluding a home that merely sits inside some unrelated repo.
+It is inert, and writes nothing, in a session that another **live** session has locked out of the home (`state/.lock`, written by `bin/fm-lock.sh`): such a session is read-only and has no supervision of its own to resume.
 
-For an in-scope primary checkout it evaluates two independent conditions, and blocks when either holds.
+**Git-ness is a discriminator, never a precondition.**
+A deployed primary home is not necessarily a git checkout: the live runtime home is a rebaselined, non-git tree with `bin/` as a plain directory and no `.git` anywhere.
+Scoping once opened with `git rev-parse --git-dir || exit 0`, so in the one home the gate was actually installed in it exited before evaluating anything, blocked nothing, and never even created its decision log - while the suites, which all build git fixtures, stayed green (`bug-20260714023716-7c5e1bfb`).
+Both shapes must therefore be exercised, and `tests/fm-turnend-guard.test.sh` now runs the gate in a non-git home as well as a git one.
+The same fail-armed rule governs the lock: only a provably foreign live holder stands the guard down, while an absent, stale, or unreadable lock leaves it armed, so an unreadable lock can never become a second silent way for the gate not to exist.
+
+For an in-scope primary home it evaluates two independent conditions, and blocks when either holds.
 It exits silently when neither does, so the healthy path stays completely quiet.
 
 **Supervision is off.**
@@ -188,6 +195,6 @@ See `docs/arm-pretool-check.md`'s "Harness wiring" section for the same Grok exp
 
 ## Tests
 
-`tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping, `FM_HOME` and `FM_STATE_OVERRIDE` precedence, Pi logical-run latch behavior for no-tool and multi-tool runs, fail-open behavior without `jq`, tracked hook registration for all five harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
+`tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping in both a git-checkout home and a non-git rebaselined home, the secondmate-home and linked-worktree exclusions under a non-empty lane, session-lock ownership (armed when absent, stale, or ours; inert and non-mutating under a live foreign holder), `FM_HOME` and `FM_STATE_OVERRIDE` precedence, Pi logical-run latch behavior for no-tool and multi-tool runs, fail-open behavior without `jq`, tracked hook registration for all five harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
 The default behavior suite does not invoke live language-model harnesses.
 `FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh` opts into the isolated interactive Pi regression recorded above.

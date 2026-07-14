@@ -371,23 +371,13 @@ fm_triage_captain_gates() {  # [max-items]
 }
 
 # True when this session owns the per-home firstmate session lock.
-# The lock file holds the harness PID (see bin/fm-lock.sh). This session owns it only
-# when that PID is in our own process ancestry, which is what distinguishes the locked
-# primary from any other live session sharing the home.
+# The lock-identity read itself is owned by fm_session_lock_owner
+# (bin/fm-supervision-lib.sh); a triage write requires the strongest answer it gives,
+# so anything but `self` - no lock, a dead holder, another live session, or an
+# undeterminable ancestry - is not ownership and must not write.
+# shellcheck source=bin/fm-supervision-lib.sh
+. "$_FM_TRIAGE_LIB_DIR/fm-supervision-lib.sh"
+
 fm_triage_owns_lock() {  # <state-dir>
-  local state=$1 lock holder pid
-  lock="$state/.lock"
-  [ -f "$lock" ] || return 1
-  holder=$(cat "$lock" 2>/dev/null) || return 1
-  case "$holder" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  kill -0 "$holder" 2>/dev/null || return 1
-  pid=$$
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    [ "$pid" = "$holder" ] && return 0
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-    [ -n "$pid" ] && [ "$pid" -gt 1 ] || return 1
-  done
-  return 1
+  [ "$(fm_session_lock_owner "$1")" = self ]
 }

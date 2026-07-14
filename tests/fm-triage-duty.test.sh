@@ -296,7 +296,8 @@ test_enumeration_failure_is_a_visible_finding_not_swallowed_silence() {
   home=$(make_home)
   root="$TMP_ROOT/fail-root-$$"
   mkdir -p "$root/bin"
-  cp "$ROOT/bin/fm-fleet-triage-lib.sh" "$ROOT/bin/fm-fleet-triage-record.sh" "$ROOT/bin/fm-triage-duty.sh" "$root/bin/"
+  cp "$ROOT/bin/fm-fleet-triage-lib.sh" "$ROOT/bin/fm-supervision-lib.sh" \
+    "$ROOT/bin/fm-fleet-triage-record.sh" "$ROOT/bin/fm-triage-duty.sh" "$root/bin/"
   chmod +x "$root/bin/fm-triage-duty.sh"
   cat > "$root/bin/fm-fleet-triage.sh" <<'SH'
 #!/usr/bin/env bash
