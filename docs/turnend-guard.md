@@ -55,20 +55,23 @@ The sweep's cost is bounded by the number of live tasks, so the turn-end path st
 When it blocks, the message lists the unattended item ids (bounded) and states plainly that re-arming the watcher does not satisfy the condition.
 
 **What discharges the gate, and what deliberately does not.**
-The gate is discharged only by real state changes: landing the work and tearing the task down (its meta/status leave `state/`); the crew's status moving off a terminal verb (a steer to `paused:`, a `resolved:` follow-up after an answered decision, a relaunch); or a genuine terminal disposition - `resolved` or `rejected` recorded with valid lineage against the item's current evidence.
-Nothing else does: not an `fm-nf-ack` receipt, not re-arming the watcher, not a triage `claim`, not a `hold` (even a valid dated one - a hold parks the BOARD CARD, and the reconciler reports it as held, but it never parks this gate), not `successor_created`, not `captain_batch` (handing a decision to the captain transfers it; it does not end it), and never any cached triage summary.
+The gate is discharged only by real lifecycle changes: landing the work and tearing the task down (its meta/status leave `state/` - this covers merged ships, scout reports durably captured then torn down, and safe returns); the crew's status moving off a terminal verb (a steer to `paused:`, a `resolved:` follow-up after an answered decision, a relaunch); a genuine terminal disposition - `resolved` or `rejected` recorded with valid lineage against the item's current evidence; or a captain decision verifiably transferred to the captain's still-visible Needs You column - a `captain_batch` outcome whose hand-off is confirmed by the fingerprint-bound receipt `bin/fm-nf-ack.sh --to-captain` writes only after the Bridge reads the card back.
+That last one satisfies both halves of the captain-decision contract: the primary stops re-blocking on work only the captain can decide, and the decision cannot disappear through a mere acknowledgment - a bare `captain_batch` ledger row without the confirmed receipt keeps blocking, and a fresh terminal signal mints a new fingerprint the old receipt does not cover, re-opening the gate.
+Nothing else discharges: not a reviewed `fm-nf-ack` receipt, not re-arming the watcher, not a triage `surface` or `claim`, not a `hold` (even a valid dated one - a hold parks the BOARD CARD, and the reconciler reports it as held, but it never parks this gate), not `successor_created`, not a narrative "I handled it", and never any cached triage summary.
 The gate is therefore deliberately stricter than `bin/fm-nf-reconcile.sh`'s "unhandled" count, which reports held and dispositioned items separately for the board.
 This closes every paper exit the 2026-07-13 incident used: eight holds recorded in 137 seconds, a 181-to-1 successor fan-out, and a `captain_batch` row that made a captain decision vanish (`bug-20260713154240-10d127e0`).
 
 **Fail-open is mandatory, but a read failure is never a silent permit.**
-Any failure to read the live state - a missing or broken `bin/fm-nf-attention-lib.sh`, a missing `jq`, an unparseable hook payload - blocks nothing, so the primary can never be wedged by the gate's own tooling.
-But the permit is classified `guard_error`, not an ordinary empty lane: the guard prints a loud bordered banner naming the failed component, records the component in the decision log, and raises one durable bug through the sanctioned bug CLI (`FM_FLEET_TRIAGE_BUG_CLI` overrides the CLI; `off` disables the signal), deduped per component via `state/.turnend-guard-error-reported-*` markers that the next healthy evaluation clears.
+Any failure to read the live state - a missing or broken `bin/fm-nf-attention-lib.sh`, a missing `jq`, an unparseable hook payload, a hung sweep (the sweep runs in a subshell under `timeout(1)` where available, `FM_TURNEND_SWEEP_TIMEOUT`, default 30s) - blocks nothing, so the primary can never be wedged by the gate's own tooling.
+But the permit is classified `allowed_guard_error`, not an ordinary empty lane: the guard prints a loud bordered banner naming the failed component, records a bounded component classification in the decision log's `nf_error` field, and raises one durable bug through the sanctioned bug CLI (`FM_FLEET_TRIAGE_BUG_CLI` overrides the CLI; `off` disables the signal), deduped per component via `state/.turnend-guard-error-reported-*` markers that the next healthy evaluation clears.
+Diagnostics carry component names only - never transcript content or secrets.
 The reverse direction is not open: the ledger fold skips malformed rows, so ledger corruption reverts its items to unattended (they keep blocking) rather than silently discharging them.
 
 **Stand-downs are recorded as stand-downs.**
 Away mode (`state/.afk`) stands the gate down because the away daemon owns supervision and escalation there; the lane is still swept and logged, so the stand-down can never silently lose work, and the first evaluation after the flag clears blocks on the same untouched items again.
 The duty kill switch (`FM_TRIAGE_DUTY=off`) stands the gate down as the operator escape hatch if the gate itself ever misbehaves - and because an escape hatch in use must never look like a normal healthy path, it prints a loud `KILL SWITCH ENGAGED` banner on every primary turn end while engaged, naming any work it is suppressing.
-Both are logged as their own decisions (`stood_down_afk`, `stood_down_duty_off`), never as compliant permits.
+The switch is an environment variable only: nothing in this repo sets it, no config file carries it, and no documented workflow instructs it, so it cannot be engaged by ordinary firstmate operation - it must be deliberately exported into the session or hook environment by the operator, and it is restored by simply unsetting it.
+Both stand-downs are logged as their own decisions, never as compliant permits.
 
 ## Decision Log
 
@@ -77,17 +80,27 @@ The log carries ids, counts, and decisions only - never transcript content.
 It is best-effort (a log that cannot be written never changes the decision or wedges the turn) and size-capped (`FM_TURNEND_LOG_MAX`, default 2000 lines, trimmed to half when exceeded).
 `FM_TURNEND_LOG` overrides the path.
 
-The decision taxonomy, and what counts toward the acceptance metric ("zero permitted turn ends while unattended Needs FirstMate work exists"):
+The decision taxonomy (outcome names per ORD-060), and what counts toward the acceptance metric ("zero permitted turn ends while unattended Needs FirstMate work exists"):
 
-- `allowed_empty` - the lane was genuinely empty and the watcher healthy. Compliant.
-- `allowed_progress` - a loop-guarded stop after real progress: the id set recorded at the block (`state/.turnend-guard-block-ids`) actually shrank because work was discharged. Compliant.
-- `blocked` - the turn end was refused (exit 2).
-- `stood_down_loop_protection` - permitted ONLY because hook recursion protection forbids a second block in one turn; the unattended set did not shrink. An enforcement stand-down, NOT a compliant permit.
-- `stood_down_afk` / `stood_down_duty_off` - permitted because away mode or the kill switch stands the gate down. Not compliant permits.
-- `guard_error` - permitted because the guard could not inspect state. Not a compliant permit.
+- `allowed_needs_firstmate_empty` - the lane was genuinely empty and the watcher healthy. Compliant.
+- `allowed_after_valid_progress` - a loop-guarded stop after real progress: the id set recorded at the block (`state/.turnend-guard-block-ids`) actually shrank because work was discharged. Compliant.
+- `blocked_needs_firstmate` - refused (exit 2) with unattended work named; the reason records when the watcher was down too.
+- `blocked_watcher_down` - refused (exit 2) for the watcher alone.
+- `allowed_loop_protection_without_progress` - permitted ONLY because hook recursion protection forbids a second block in one turn; the unattended set did not shrink. NOT a compliant permit.
+- `allowed_afk_owner` / `allowed_duty_disabled` - permitted because away mode or the kill switch stands the gate down. NOT compliant permits.
+- `allowed_guard_error` - permitted because the guard could not inspect state. NOT a compliant permit.
 
-The loop guard is therefore progress-aware in the record: `bin/fm-turnend-guard.sh` writes the blocked id set to `state/.turnend-guard-block-ids` on every block, and the loop-guarded second stop attempt is classified against it.
-A session that blocks, resumes, handles nothing, and stops again ends its turn (the Claude hook contract forbids infinite recursion, and a wedged primary is worse than the bug), but the record says `stood_down_loop_protection` - the metric counts it, and it cannot be laundered into compliance by the recursion guard itself.
+**The second stop attempt, exactly.**
+The Claude Stop-hook contract forbids blocking when `stop_hook_active=true`: a hook that blocks its own forced continuation recurses, and an agent that cannot make progress would be wedged in an un-endable session.
+So the second stop IS allowed - and the honest record plus a bounded fallback is what prevents "do nothing and exit" from being free: the permit is logged as `allowed_loop_protection_without_progress` (never compliant), and the guard queues one durable `check` wake (`turnend-guard` key, deduped to one pending record) through the same `state/.wake-queue` every turn drains FIRST, so the unresolved items are forced to the front of the next primary turn.
+The unchanged unattended item does remain after the turn ends - that is the documented, bounded limitation of a non-recursive hook - but it remains VISIBLY: counted in the log, queued as the next turn's first work, and re-blocked at that turn's first stop attempt.
+
+## Anti-Evasion Metrics
+
+`bin/fm-turnend-metrics.sh [--json]` is the read-only reporter over the decision log and the live lane.
+Cumulative panel: every decision outcome counted by name, plus `permits_with_unattended_work` - permitted turn ends recorded while the lane counted more than zero, the direct complement of the acceptance metric.
+Live panel: `unattended` (items holding the gate now), `paper_parked` (items whose terminal signal remains while a non-discharging disposition sits on them - the evasion signature: holds, successors, unconfirmed captain batches, bare claims), and `discharged_pending_teardown` (genuinely dispositioned items whose signal awaits normal closeout).
+A drift of `paper_parked` upward while blocks go down is the gate being evaded, not obeyed - watch for another eight-holds-in-137-seconds burst.
 
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repo-root `state/`.
 `FM_GUARD_GRACE` controls the beacon freshness window and defaults to 300 seconds.

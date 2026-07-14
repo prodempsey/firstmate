@@ -8,15 +8,22 @@
 # lane. Every primary evaluation - permitted or blocked - is recorded in the decision log
 # at state/.turnend-guard.log (see "decision log" below).
 #
-# WHAT DISCHARGES THE UNATTENDED-WORK GATE (ORD-059 section 2). Only real state changes:
-#   - landing the work and tearing the task down (its meta/status leave state/);
+# WHAT DISCHARGES THE UNATTENDED-WORK GATE (ORD-060 section 2). Only real lifecycle
+# changes:
+#   - landing the work and tearing the task down (its meta/status leave state/), which
+#     covers merged ships, captured-then-torn-down scout reports, and safe returns;
 #   - the crew's status moving off a terminal verb (a steer to `paused:`, a `resolved:`
 #     follow-up after a decision, a relaunch);
 #   - a genuine terminal disposition: `resolved` or `rejected` recorded with valid lineage
-#     against the item's current evidence.
-# NOTHING ELSE DOES. Not an fm-nf-ack receipt, not re-arming the watcher, not a triage
-# `claim`, not a `hold` (even a valid dated one - holds park the BOARD CARD, never this
-# gate), not `successor_created`, not `captain_batch`, and never any cached triage summary.
+#     against the item's current evidence;
+#   - a captain decision VERIFIABLY transferred to the captain's still-visible Needs You
+#     column: a `captain_batch` outcome whose board hand-off is confirmed by the
+#     fingerprint-bound receipt fm-nf-ack.sh --to-captain writes only after Bridge
+#     read-back.
+# NOTHING ELSE DOES. Not a reviewed fm-nf-ack receipt, not re-arming the watcher, not a
+# triage `surface` or `claim`, not a `hold` (even a valid dated one - holds park the BOARD
+# CARD, never this gate), not `successor_created`, not an UNCONFIRMED `captain_batch`, not
+# a narrative "I handled it", and never any cached triage summary.
 # The rule lives in fm_nf_unattended_ids (bin/fm-nf-attention-lib.sh).
 #
 # fm-guard.sh (bin/fm-guard.sh) is pull-based: it only warns when some other
@@ -46,9 +53,9 @@
 # That bounds this to at most one forced continuation per turn - never a
 # wedged, un-endable session - while still nagging again on a later turn if the
 # problem persists. The permit is PROGRESS-AWARE in the record (ORD-059
-# section 1): a loop-guarded stop is logged as allowed_empty or allowed_progress
+# section 1): a loop-guarded stop is logged as allowed_needs_firstmate_empty or allowed_after_valid_progress
 # only when the lane is clear or the blocked id set actually shrank; otherwise
-# it is logged as stood_down_loop_protection, which is an enforcement stand-down,
+# it is logged as allowed_loop_protection_without_progress, which is an enforcement stand-down,
 # never a compliant permit.
 set -u
 
@@ -142,7 +149,7 @@ guard_error_banner() {  # <component> <detail>
 # Log a guard_error decision without jq (jq itself may be the failed component). Every
 # interpolated value here is guard-controlled text, never transcript content.
 log_guard_error_raw() {  # <component>
-  printf '{"ts":"%s","watcher":"unknown","in_flight":-1,"needs_firstmate":-1,"nf_items":"","nf_gate":"on","nf_error":"%s","decision":"guard_error","reason":"%s","loop_protection":false}\n' \
+  printf '{"ts":"%s","watcher":"unknown","in_flight":-1,"needs_firstmate":-1,"nf_items":"","nf_gate":"on","nf_error":"%s","decision":"allowed_guard_error","reason":"%s","loop_protection":false}\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$1" >> "$LOG" 2>/dev/null || true
 }
 
@@ -225,18 +232,32 @@ else
     off|OFF|0|false|FALSE) nf_gate=duty-off ;;
   esac
 fi
-if [ ! -f "$SCRIPT_DIR/fm-nf-attention-lib.sh" ]; then
+# The sweep runs in a subshell so a broken library can never poison this shell, and under
+# timeout(1) where available so a hung read is classified instead of hanging the hook (the
+# harness's own hook timeout would fail open anyway, but invisibly). Exit codes 3/4 are the
+# subshell's own bounded classification; 124 is timeout(1)'s.
+NF_LIB="$SCRIPT_DIR/fm-nf-attention-lib.sh"
+# shellcheck disable=SC2016 # A bash -c program: $1/$2/$3 are the subshell's args, not this shell's.
+NF_SWEEP='. "$1" 2>/dev/null || exit 3
+command -v fm_nf_unattended_ids >/dev/null 2>&1 || exit 4
+fm_nf_unattended_ids "$2" "$3"'
+if [ ! -f "$NF_LIB" ]; then
   nf_error='fm-nf-attention-lib.sh missing'
 else
-  # shellcheck source=bin/fm-nf-attention-lib.sh
-  if ! . "$SCRIPT_DIR/fm-nf-attention-lib.sh" 2>/dev/null; then
-    nf_error='fm-nf-attention-lib.sh failed to source'
-  elif ! command -v fm_nf_unattended_ids >/dev/null 2>&1; then
-    nf_error='fm_nf_unattended_ids undefined after source'
-  elif ! nf_ids=$(fm_nf_unattended_ids "$STATE" "$DATA" 2>/dev/null); then
-    nf_error='fm_nf_unattended_ids failed'
-    nf_ids=''
+  if command -v timeout >/dev/null 2>&1; then
+    nf_ids=$(timeout "${FM_TURNEND_SWEEP_TIMEOUT:-30}" bash -c "$NF_SWEEP" _ "$NF_LIB" "$STATE" "$DATA" 2>/dev/null)
+    sweep_rc=$?
+  else
+    nf_ids=$(bash -c "$NF_SWEEP" _ "$NF_LIB" "$STATE" "$DATA" 2>/dev/null)
+    sweep_rc=$?
   fi
+  case "$sweep_rc" in
+    0) : ;;
+    3) nf_error='fm-nf-attention-lib.sh failed to source'; nf_ids='' ;;
+    4) nf_error='fm_nf_unattended_ids undefined after source'; nf_ids='' ;;
+    124) nf_error='fm_nf_unattended_ids timed out'; nf_ids='' ;;
+    *) nf_error='fm_nf_unattended_ids failed'; nf_ids='' ;;
+  esac
 fi
 [ -n "$nf_ids" ] && nf=$(printf '%s\n' "$nf_ids" | grep -c .)
 case "$nf" in ''|*[!0-9]*) nf=0; nf_ids='' ;; esac
@@ -259,19 +280,25 @@ watcher_desc=healthy
 # the reason, and whether loop protection was active. NO TRANSCRIPT CONTENT, ever: ids,
 # counts, and decisions, nothing the model said or read.
 #
-# The decision taxonomy (ORD-059 section 1). Only the first two are compliant permits; the
-# acceptance metric "zero permitted turn ends while unattended Needs FirstMate work exists"
-# counts every other permitted outcome against it.
-#   allowed_empty               the lane was genuinely empty (and the watcher healthy).
-#   allowed_progress            loop-guarded stop after real progress: the id set the turn
-#                               was blocked on actually shrank.
-#   blocked                     the turn end was refused (exit 2).
-#   stood_down_loop_protection  permitted ONLY because hook recursion protection forbids a
-#                               second block; the unattended set did not shrink.
-#   stood_down_afk              permitted because away mode owns supervision.
-#   stood_down_duty_off         permitted because the FM_TRIAGE_DUTY=off kill switch is
-#                               engaged (loud on stderr, never silent).
-#   guard_error                 permitted because the guard could not inspect state.
+# The decision taxonomy (ORD-060 section 1, outcome names as prescribed there). Only the
+# first two are compliant permits; the acceptance metric "zero permitted turn ends while
+# unattended Needs FirstMate work exists" counts every other permitted outcome against it.
+#   allowed_needs_firstmate_empty    the lane was genuinely empty and the watcher healthy.
+#   allowed_after_valid_progress     loop-guarded stop after real progress: the id set the
+#                                    turn was blocked on actually shrank.
+#   blocked_needs_firstmate          refused (exit 2) with unattended work named; the
+#                                    watcher may be down too (the reason says so).
+#   blocked_watcher_down             refused (exit 2) for the watcher alone.
+#   allowed_loop_protection_without_progress  permitted ONLY because hook recursion
+#                                    protection forbids a second block in one turn and
+#                                    nothing was discharged; a durable check wake is queued
+#                                    so the work fronts the next primary turn. NOT proof
+#                                    the work was handled.
+#   allowed_guard_error              permitted because state could not be inspected. NOT
+#                                    proof of anything.
+#   allowed_duty_disabled            permitted because the FM_TRIAGE_DUTY=off kill switch
+#                                    is engaged (loud on stderr, never silent).
+#   allowed_afk_owner                permitted because away mode owns supervision.
 # Best-effort: a log that cannot be written must never change the decision or wedge the turn.
 log_decision() {  # <decision> <reason>
   local line
@@ -344,21 +371,21 @@ if [ "$STOP_HOOK_ACTIVE" = true ]; then
   # lane empty or the blocked id set to have shrunk, and a stand-down or error is recorded
   # as itself.
   case "$nf_gate" in
-    afk) log_decision stood_down_afk 'away mode owns supervision'; exit 0 ;;
-    duty-off) log_decision stood_down_duty_off 'FM_TRIAGE_DUTY=off kill switch engaged'; exit 0 ;;
+    afk) log_decision allowed_afk_owner 'away mode owns supervision'; exit 0 ;;
+    duty-off) log_decision allowed_duty_disabled 'FM_TRIAGE_DUTY=off kill switch engaged'; exit 0 ;;
   esac
   if [ -n "$nf_error" ]; then
     guard_error_banner "$nf_error" 'the loop-guarded stop is permitted, but the lane state is unknown.'
-    log_decision guard_error "$nf_error"
+    log_decision allowed_guard_error "$nf_error"
     signal_guard_error_bug "$nf_error" 'needs_firstmate lane read failed on the turn-end path'
     exit 0
   fi
   if [ "$nf" -eq 0 ]; then
     if [ "$blind" -eq 1 ]; then
-      log_decision stood_down_loop_protection 'loop protection forced the permit; the watcher is still down'
+      log_decision allowed_loop_protection_without_progress 'loop protection forced the permit; the watcher is still down'
     else
       mark_healthy
-      log_decision allowed_empty 'lane empty, supervision healthy'
+      log_decision allowed_needs_firstmate_empty 'lane empty, supervision healthy'
     fi
     exit 0
   fi
@@ -374,9 +401,20 @@ if [ "$STOP_HOOK_ACTIVE" = true ]; then
   fi
   if [ "$progress" -eq 1 ]; then
     rm -f "$BLOCK_IDS_FILE" 2>/dev/null || true
-    log_decision allowed_progress 'the unattended id set shrank since the blocked attempt'
+    log_decision allowed_after_valid_progress 'the unattended id set shrank since the blocked attempt'
   else
-    log_decision stood_down_loop_protection 'loop protection forced the permit; no unattended item was discharged'
+    # The turn is ending with unresolved terminal work and only recursion protection let it
+    # (the hook contract forbids a second block; a wedged primary is worse). The limitation
+    # is not hidden: beyond the honest decision record, queue one durable check wake so
+    # bin/fm-wake-drain.sh puts the unresolved items at the FRONT of the next primary turn.
+    # Deduped: one pending record at a time, or a stuck pile would flood the queue.
+    if command -v fm_wake_append >/dev/null 2>&1 \
+      && ! grep -q "	check	turnend-guard	" "$STATE/.wake-queue" 2>/dev/null; then
+      fm_wake_append check turnend-guard \
+        "turn ended with unresolved terminal work under loop protection: $nf_digest - handle these before any new work" \
+        >/dev/null 2>&1 || true
+    fi
+    log_decision allowed_loop_protection_without_progress 'loop protection forced the permit; no unattended item was discharged'
   fi
   exit 0
 fi
@@ -387,30 +425,30 @@ if [ "$blind" -eq 0 ]; then
   case "$nf_gate" in
     afk)
       if [ "$nf" -gt 0 ] || [ -n "$nf_error" ]; then
-        log_decision stood_down_afk 'away mode owns supervision'
+        log_decision allowed_afk_owner 'away mode owns supervision'
       else
-        log_decision allowed_empty 'lane empty, supervision healthy (away mode)'
+        log_decision allowed_needs_firstmate_empty 'lane empty, supervision healthy (away mode)'
       fi
       exit 0
       ;;
     duty-off)
       if [ "$nf" -gt 0 ] || [ -n "$nf_error" ]; then
-        log_decision stood_down_duty_off 'FM_TRIAGE_DUTY=off kill switch engaged'
+        log_decision allowed_duty_disabled 'FM_TRIAGE_DUTY=off kill switch engaged'
       else
-        log_decision allowed_empty 'lane empty, supervision healthy (kill switch engaged)'
+        log_decision allowed_needs_firstmate_empty 'lane empty, supervision healthy (kill switch engaged)'
       fi
       exit 0
       ;;
   esac
   if [ -n "$nf_error" ]; then
     guard_error_banner "$nf_error" 'this turn end is permitted fail-open; the lane state is unknown.'
-    log_decision guard_error "$nf_error"
+    log_decision allowed_guard_error "$nf_error"
     signal_guard_error_bug "$nf_error" 'needs_firstmate lane read failed on the turn-end path'
     exit 0
   fi
   if [ "$nf" -eq 0 ]; then
     mark_healthy
-    log_decision allowed_empty 'lane empty, supervision healthy'
+    log_decision allowed_needs_firstmate_empty 'lane empty, supervision healthy'
     exit 0
   fi
 fi
@@ -452,11 +490,12 @@ if [ "$nf" -gt 0 ] && [ "$nf_gate" = on ]; then
     [ "$nf" -gt "$SHOW_IDS" ] && printf '●    ... and %s more\n' "$((nf - SHOW_IDS))"
     printf '●  RE-ARMING THE WATCHER DOES NOT SATISFY THIS CONDITION. Supervision liveness\n'
     printf '●  is a separate check, and a live watcher discharges none of the work above.\n'
-    printf '●  Acks, claims, holds, successors, and captain batches do not either - they\n'
-    printf '●  park the board card, never this gate. An item leaves this list only when its\n'
-    printf '●  work is landed, torn down, genuinely resolved or rejected with lineage, or\n'
-    printf '●  its crew status moves off the terminal verb (a steer to paused:, a resolved:\n'
-    printf '●  follow-up):\n'
+    printf '●  Acks, surfaces, claims, holds, successors, and unconfirmed captain batches\n'
+    printf '●  do not either - they park the board card, never this gate. An item leaves\n'
+    printf '●  this list only when its work is landed, torn down, genuinely resolved or\n'
+    printf '●  rejected with lineage, verifiably handed to the captain (fm-nf-ack.sh\n'
+    printf '●  --to-captain, board-confirmed), or its crew status moves off the terminal\n'
+    printf '●  verb (a steer to paused:, a resolved: follow-up):\n'
     printf '●    bin/fm-nf-reconcile.sh list        each item, and its current disposition\n'
     printf '●    bin/fm-fleet-triage.sh --json      full item detail\n'
     printf '●    bin/fm-fleet-triage-record.sh      record each disposition, with its lineage\n'
@@ -479,5 +518,9 @@ if [ "$nf_blocking" -eq 1 ]; then
 else
   : > "$BLOCK_IDS_FILE" 2>/dev/null || true
 fi
-log_decision blocked "$block_reason"
+if [ "$nf_blocking" -eq 1 ]; then
+  log_decision blocked_needs_firstmate "$block_reason"
+else
+  log_decision blocked_watcher_down "$block_reason"
+fi
 exit 2

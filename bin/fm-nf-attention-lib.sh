@@ -148,39 +148,64 @@ fm_nf_attention_desired() {  # <state-dir> <data-dir> <task-id> <fold-json>
       evidence_version: $evidence_version, why: $why}'
 }
 
+# True for the TURN-END GATE when a captain_batch hand-off verifiably reached the captain's
+# board for this task's CURRENT terminal signal. bin/fm-nf-ack.sh --to-captain appends to
+# state/.nf-to-captain (open_item_id, task_id, status_fingerprint, ts) only AFTER the Bridge
+# write is read back and verified, and the receipt binds the fingerprint, so a fresh
+# terminal signal re-opens the gate no matter what was acknowledged before. This is the
+# gate's own check of that lifecycle evidence; the BOARD-side presentation of a captain
+# batch stays owned elsewhere (see captain-batch-drop-b6) and is deliberately not decided
+# here.
+fm_nf_unattended_captain_confirmed() {  # <state-dir> <task-id> <fingerprint>
+  local receipts="$1/.nf-to-captain"
+  [ -f "$receipts" ] || return 1
+  [ -n "$3" ] || return 1
+  awk -F '\t' -v id="$2" -v fp="$3" '$2 == id && $3 == fp {found = 1} END {exit !found}' "$receipts"
+}
+
 # Print the id of every needs_firstmate item that still holds the TURN-END GATE, one per
 # line. The per-item classification stays owned by fm_nf_attention_desired above; this is
-# only the sweep over the home, plus the gate's own discharge rule (ORD-059 section 2):
+# only the sweep over the home, plus the gate's own discharge rule (ORD-060 section 2):
 #
-#   The gate is discharged ONLY by a genuine terminal disposition - `resolved` or
-#   `rejected`, with valid lineage against current evidence - or by the work physically
-#   leaving the lane: landing then teardown, or the crew's status moving off a terminal
-#   verb (a steer to `paused:`, a `resolved:` follow-up, a relaunch).
+#   The gate is discharged ONLY by real lifecycle changes: the work landing and the task
+#   tearing down (its meta/status leave state/); the crew's status moving off a terminal
+#   verb (a steer to `paused:`, a `resolved:` follow-up, a relaunch); a genuine terminal
+#   disposition - `resolved` or `rejected` with valid lineage against current evidence; or
+#   a captain decision VERIFIABLY transferred to the captain's still-visible Needs You
+#   column (a captain_batch outcome whose board hand-off is confirmed by the
+#   fingerprint-bound receipt above) - so the primary stops re-blocking on work only the
+#   captain can decide, while the decision itself cannot disappear through a mere
+#   acknowledgment or ledger row.
 #
-#   Everything else keeps blocking, deliberately: an ack receipt, a claim, a `hold` (even a
-#   valid dated one - it parks the BOARD CARD, never this gate), `successor_created`, and
-#   `captain_batch`. Those are paper moves; the incident this gate exists for was eight
-#   holds recorded in 137 seconds to mute the lane, and a captain_batch row silently
-#   vanishing a decision (bug-20260713154240-10d127e0). The gate is therefore stricter
-#   than bin/fm-nf-reconcile.sh's "unhandled" count, which reports held and dispositioned
-#   items separately for the board.
+#   Everything else keeps blocking, deliberately: an ack receipt, a re-surface, a claim, a
+#   `hold` (even a valid dated one - it parks the BOARD CARD, never this gate),
+#   `successor_created`, and an UNCONFIRMED `captain_batch`. Those are paper moves; the
+#   incident this gate exists for was eight holds recorded in 137 seconds to mute the
+#   lane, and a captain_batch row silently vanishing a decision
+#   (bug-20260713154240-10d127e0). The gate is therefore stricter than
+#   bin/fm-nf-reconcile.sh's "unhandled" count, which reports held and dispositioned items
+#   separately for the board.
 #
 # LEVEL-TRIGGERED, DIRECT FROM SOURCE. It reads state/<id>.meta plus state/<id>.status and
 # the triage ledger, every call. It reads no cached summary of them - a cache reflects the
 # last duty pass, not the present, so a gate built on one both misses fresh work and blocks
 # on work already discharged. This is what bin/fm-turnend-guard.sh gates the turn end on.
 fm_nf_unattended_ids() {  # <state-dir> <data-dir>
-  local state=$1 data=$2 fold meta id desired want outcome
+  local state=$1 data=$2 fold meta id fp desired want outcome
   [ -d "$state" ] || return 1
   fold=$(fm_nf_attention_fold "$data") || return 1
   for meta in "$state"/*.meta; do
     [ -f "$meta" ] || continue
     id=$(basename "$meta" .meta)
     # No live terminal signal (still working, or a secondmate) - nothing is owed.
-    fm_nf_current_fingerprint "$state" "$id" >/dev/null 2>&1 || continue
+    fp=$(fm_nf_current_fingerprint "$state" "$id" 2>/dev/null) || continue
     desired=$(fm_nf_attention_desired "$state" "$data" "$id" "$fold") || continue
     want=$(printf '%s' "$desired" | jq -r '.state' 2>/dev/null) || continue
     outcome=$(printf '%s' "$desired" | jq -r '.outcome' 2>/dev/null) || continue
+    if [ "$outcome" = captain_batch ] \
+      && fm_nf_unattended_captain_confirmed "$state" "$id" "$fp"; then
+      continue
+    fi
     if [ "$want" = terminal ]; then
       case "$outcome" in
         resolved|rejected) continue ;;

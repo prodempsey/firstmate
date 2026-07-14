@@ -100,7 +100,8 @@ install_guard_scripts() {
   cp "$ROOT/bin/fm-backend.sh" "$dir/bin/fm-backend.sh"
   cp "$ROOT/bin/fm-fleet-triage-lib.sh" "$dir/bin/fm-fleet-triage-lib.sh"
   cp "$ROOT/bin/fm-nf-ack.sh" "$dir/bin/fm-nf-ack.sh"
-  chmod +x "$dir/bin/fm-nf-ack.sh"
+  cp "$ROOT/bin/fm-turnend-metrics.sh" "$dir/bin/fm-turnend-metrics.sh"
+  chmod +x "$dir/bin/fm-nf-ack.sh" "$dir/bin/fm-turnend-metrics.sh"
   mkdir -p "$dir/docs"
   cp -R "$ROOT/docs/supervision-protocols" "$dir/docs/supervision-protocols"
   chmod +x "$dir/bin/fm-turnend-guard.sh" "$dir/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-supervision-instructions.sh" "$dir/bin/fm-harness.sh"
@@ -264,7 +265,7 @@ test_hook_blocks_on_unattended_finished_work() {
   assert_not_contains "$out" "SUPERVISION IS OFF" "a healthy watcher must not be reported as down"
   local log
   log=$(last_guard_log "$dir")
-  [ "$(printf '%s' "$log" | jq -r '.decision')" = blocked ] || fail "decision log must record the block: $log"
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = blocked_needs_firstmate ] || fail "decision log must record the block: $log"
   [ "$(printf '%s' "$log" | jq -r '.reason')" = unattended-needs-firstmate ] || fail "decision log must record the block reason: $log"
   [ "$(printf '%s' "$log" | jq -r '.needs_firstmate')" = 2 ] || fail "decision log must record the lane count: $log"
   printf '%s' "$log" | jq -r '.nf_items' | grep -q 'ship-a1' || fail "decision log must carry the item digest: $log"
@@ -311,8 +312,8 @@ test_hook_silent_when_lane_is_clear() {
   expect_code 0 "$status" "hook must stay silent with no unattended terminal signal and a live watcher"
   [ -z "$out" ] || fail "hook produced output on the healthy path: $out"
   log=$(last_guard_log "$dir")
-  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_empty ] || fail "a genuinely-empty lane must be recorded as allowed_empty: $log"
-  pass "fm-turnend-guard: silent with a clear lane and a live watcher, and the permit is logged as allowed_empty"
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_needs_firstmate_empty ] || fail "a genuinely-empty lane must be recorded as allowed_needs_firstmate_empty: $log"
+  pass "fm-turnend-guard: silent with a clear lane and a live watcher, and the permit is logged as allowed_needs_firstmate_empty"
 }
 
 # Only a GENUINE terminal disposition - resolved or rejected, with lineage, against current
@@ -376,6 +377,17 @@ SH
   expect_code 2 "$status" "an ack receipt must not discharge the gate"
   assert_contains "$out" "open-p1" "the acked item must still be named"
 
+  # A FirstMate narrative acknowledgment: saying it was handled changes no state at all,
+  # so a re-evaluation with nothing else done must still block.
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "a narrative acknowledgment (no state change) must not discharge the gate"
+
+  # A triage surface: first-sight stamping re-opens items; it never closes one.
+  jq -nc '{item_id: "needs_firstmate:open-p1", event: "surface",
+           first_seen_at: "2026-07-13T00:00:00Z"}' >> "$dir/data/fleet-triage.jsonl"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "a surface must not discharge the gate"
+
   # A triage claim: ownership is not disposition.
   jq -nc '{item_id: "needs_firstmate:open-p1", event: "claim", owner: "firstmate",
            claimed_at: "2026-07-13T00:00:00Z"}' >> "$dir/data/fleet-triage.jsonl"
@@ -417,6 +429,117 @@ SH
   pass "fm-turnend-guard: ack, re-arm, claim, holds, successor_created, captain_batch, and the cache all fail to discharge the gate"
 }
 
+# A GENUINE captain decision (ORD-060 section 2): once verifiably transferred to the
+# captain's still-visible Needs You column - fm-nf-ack.sh --to-captain, whose receipt is
+# written only AFTER the Bridge reads the card back and binds the current fingerprint - the
+# primary stops re-blocking on work it cannot decide. A bare captain_batch ledger row is
+# not that transfer, and a fresh terminal signal re-opens the gate no matter what was
+# acknowledged before, so the decision can never disappear through acknowledgment.
+test_hook_verified_captain_transfer_discharges_without_hiding_the_decision() {
+  local dir home pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-captain")
+  home=$(cd "$dir" && pwd)
+  pid=$(start_healthy_watcher "$dir")
+  write_nf_signal "$dir" decide-q2 'needs-decision: rollout strategy'
+  record_nf_outcome "$dir" decide-q2 captain_batch batch-2026-07-13 '' ''
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "an unconfirmed captain_batch must keep blocking"
+  assert_contains "$out" "decide-q2" "the unconfirmed captain-batched item must be named"
+  # The verified hand-off: ack --to-captain against the board stub writes the receipt only
+  # after read-back.
+  mkdir -p "$dir/fakebin"
+  cat > "$dir/fakebin/curl" <<'SH'
+#!/usr/bin/env bash
+url= body=
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    -d) body=$2; shift 2 ;;
+    -H) shift 2 ;;
+    -*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+if [ -n "$body" ]; then
+  printf '%s\t%s\n' "$url" "$body" >> "$FM_TEST_BOARD_LOG"
+else
+  awk -F '\t' -v url="$url" '$1 == url {last = $2} END {print (last == "" ? "{}" : last)}' \
+    "$FM_TEST_BOARD_LOG" 2>/dev/null || printf '{}\n'
+fi
+SH
+  chmod +x "$dir/fakebin/curl"
+  FM_TEST_BOARD_LOG="$dir/board.log" PATH="$dir/fakebin:$PATH" FM_HOME="$home" \
+    FM_BRIDGE_URL='http://board.test' "$dir/bin/fm-nf-ack.sh" --to-captain 'needs_firstmate:decide-q2' decide-q2 \
+    >/dev/null 2>&1 || fail "fm-nf-ack.sh --to-captain should succeed against the board stub"
+  grep -q "decide-q2" "$dir/state/.nf-to-captain" || fail "the verified hand-off must leave its receipt"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 0 "$status" "a board-confirmed captain transfer must stop re-blocking the primary"
+  [ -z "$out" ] || fail "hook produced output after a verified captain transfer: $out"
+  # The decision cannot disappear through acknowledgment: a fresh terminal signal mints a
+  # new fingerprint the old receipt does not cover.
+  printf '%s\n' 'needs-decision: rollout strategy, revised options' >> "$dir/state/decide-q2.status"
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 2 "$status" "a fresh terminal signal must re-open the gate past the stale receipt"
+  assert_contains "$out" "decide-q2" "the re-opened decision must be named"
+  pass "fm-turnend-guard: a verified captain transfer discharges the gate; a bare row or stale receipt does not"
+}
+
+# When the turn ends under loop protection with nothing discharged, the limitation is not
+# silent: one durable check wake is queued (deduped) so the unresolved items front the next
+# primary turn through the normal wake-drain path.
+test_hook_no_progress_permit_queues_a_durable_wake() {
+  local dir pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-wakequeue")
+  pid=$(start_healthy_watcher "$dir")
+  write_nf_signal "$dir" still-open-r3
+  run_hook "$dir" false >/dev/null 2>&1
+  out=$(run_hook "$dir" true); status=$?
+  expect_code 0 "$status" "the loop-guarded stop is still permitted"
+  grep -q "	check	turnend-guard	" "$dir/state/.wake-queue" 2>/dev/null \
+    || fail "a no-progress permit must queue a durable turnend-guard check wake"
+  grep -q "still-open-r3" "$dir/state/.wake-queue" || fail "the queued wake must name the unresolved work"
+  # Deduped: a second identical stand-down does not stack a second record.
+  run_hook "$dir" false >/dev/null 2>&1
+  out=$(run_hook "$dir" true); status=$?
+  stop_watcher "$pid"
+  [ "$(grep -c "	check	turnend-guard	" "$dir/state/.wake-queue")" -eq 1 ] \
+    || fail "pending turnend-guard wakes must not stack: $(cat "$dir/state/.wake-queue")"
+  pass "fm-turnend-guard: a no-progress loop permit queues one durable check wake for the next turn"
+}
+
+# The anti-evasion metrics (ORD-060 section 8): the reporter folds the decision log and
+# the live lane so a paper-disposition escape pattern is countable, and a permit granted
+# with work outstanding can never hide inside the compliant counters.
+test_metrics_report_counts_outcomes() {
+  local dir home pid out
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-metrics")
+  home=$(cd "$dir" && pwd)
+  pid=$(start_healthy_watcher "$dir")
+  run_hook "$dir" false >/dev/null 2>&1          # allowed_needs_firstmate_empty
+  write_nf_signal "$dir" evade-s4
+  run_hook "$dir" false >/dev/null 2>&1          # blocked_needs_firstmate
+  run_hook "$dir" true >/dev/null 2>&1           # allowed_loop_protection_without_progress
+  record_nf_outcome "$dir" evade-s4 held '' 'parked on paper' 2999-01-01
+  run_hook "$dir" false >/dev/null 2>&1          # blocked again: paper does not discharge
+  out=$(FM_HOME="$home" bash "$dir/bin/fm-turnend-metrics.sh" --json)
+  stop_watcher "$pid"
+  [ "$(printf '%s' "$out" | jq -r '.cumulative.allowed_needs_firstmate_empty')" -ge 1 ] \
+    || fail "metrics must count the clean permit: $out"
+  [ "$(printf '%s' "$out" | jq -r '.cumulative.blocked_needs_firstmate')" -eq 2 ] \
+    || fail "metrics must count both blocks: $out"
+  [ "$(printf '%s' "$out" | jq -r '.cumulative.allowed_loop_protection_without_progress')" -eq 1 ] \
+    || fail "metrics must count the no-progress permit: $out"
+  [ "$(printf '%s' "$out" | jq -r '.cumulative.permits_with_unattended_work')" -eq 1 ] \
+    || fail "a permit with work outstanding must be counted against the gate: $out"
+  [ "$(printf '%s' "$out" | jq -r '.live.unattended')" -eq 1 ] \
+    || fail "metrics must report the live unattended count: $out"
+  [ "$(printf '%s' "$out" | jq -r '.live.paper_parked')" -eq 1 ] \
+    || fail "a held item whose signal remains is the paper-parked evasion signature: $out"
+  printf '%s' "$out" | jq -r '.live.paper_parked_ids' | grep -q 'evade-s4' \
+    || fail "the paper-parked item must be named: $out"
+  pass "fm-turnend-metrics: outcome counters, unattended-permit count, and the paper-parked signature all report"
+}
+
 test_hook_blocks_on_both_reasons_at_once() {
   local dir out status log
   dir=$(make_primary_dir "$TMP_ROOT/hook-nf-both")
@@ -455,7 +578,7 @@ test_hook_guard_error_fails_open_loudly() {
   assert_contains "$out" "TURN-END GUARD ERROR" "a failed inspection must be loud, never a silent permit"
   assert_contains "$out" "fm-nf-attention-lib.sh missing" "the failed component must be named"
   log=$(last_guard_log "$dir")
-  [ "$(printf '%s' "$log" | jq -r '.decision')" = guard_error ] || fail "a failed inspection must log guard_error, not an allowed permit: $log"
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_guard_error ] || fail "a failed inspection must log guard_error, not an allowed permit: $log"
   [ "$(printf '%s' "$log" | jq -r '.nf_error')" = 'fm-nf-attention-lib.sh missing' ] || fail "the log must record the failed component: $log"
   # The durable signal fires once, not once per turn end.
   printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
@@ -473,7 +596,7 @@ test_hook_guard_error_fails_open_loudly() {
   expect_code 0 "$status" "a broken attention lib must fail open, not wedge the primary"
   assert_contains "$out" "fm-nf-attention-lib.sh failed to source" "the broken component must be named"
   log=$(last_guard_log "$dir")
-  [ "$(printf '%s' "$log" | jq -r '.decision')" = guard_error ] || fail "a broken lib must log guard_error: $log"
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_guard_error ] || fail "a broken lib must log guard_error: $log"
   pass "fm-turnend-guard: read failures fail open with a loud banner, a guard_error record, and one deduped bug signal"
 }
 
@@ -507,7 +630,7 @@ test_hook_afk_stands_down_without_losing_work() {
   expect_code 0 "$status" "hook must not block on triage state while away mode owns supervision"
   [ -z "$out" ] || fail "hook produced triage output while away: $out"
   log=$(last_guard_log "$dir")
-  [ "$(printf '%s' "$log" | jq -r '.decision')" = stood_down_afk ] || fail "the away permit is a stand-down, never a compliant permit: $log"
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_afk_owner ] || fail "the away permit is a stand-down, never a compliant permit: $log"
   [ "$(printf '%s' "$log" | jq -r '.nf_gate')" = afk ] || fail "the stand-down must be honest in the log: $log"
   printf '%s' "$log" | jq -r '.nf_items' | grep -q 'waiting-k2' || fail "the stood-down work must still be on the record: $log"
   # AFK exit: the very next evaluation re-blocks on the same untouched work.
@@ -537,14 +660,14 @@ test_hook_duty_kill_switch_is_loud_and_logged() {
   assert_contains "$out" "KILL SWITCH ENGAGED" "the kill switch in use must be loud, never silent"
   assert_contains "$out" "waiting-l3" "the kill-switch banner must name the work it is suppressing"
   log=$(last_guard_log "$dir")
-  [ "$(printf '%s' "$log" | jq -r '.decision')" = stood_down_duty_off ] || fail "the kill-switch permit is a stand-down, never a compliant permit: $log"
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_duty_disabled ] || fail "the kill-switch permit is a stand-down, never a compliant permit: $log"
   [ "$(printf '%s' "$log" | jq -r '.nf_gate')" = duty-off ] || fail "the stand-down must be honest in the log: $log"
-  pass "fm-turnend-guard: the duty kill switch stands the gate down loudly and is logged as stood_down_duty_off"
+  pass "fm-turnend-guard: the duty kill switch stands the gate down loudly and is logged as allowed_duty_disabled"
 }
 
 # THE ORD-059 SECTION 1 CASE: block, resume, handle NOTHING, stop again. The loop guard
 # must still permit the second stop (never a wedged session), but the record must say
-# stood_down_loop_protection - an enforcement stand-down - never a compliant permit. The
+# allowed_loop_protection_without_progress - an enforcement stand-down - never a compliant permit. The
 # acceptance metric cannot be satisfied by recursion protection.
 test_hook_unchanged_second_stop_is_a_stand_down_not_a_permit() {
   local dir pid out status log
@@ -559,19 +682,20 @@ test_hook_unchanged_second_stop_is_a_stand_down_not_a_permit() {
   expect_code 0 "$status" "stop_hook_active=true must still permit the stop (never an un-endable session)"
   [ -z "$out" ] || fail "hook produced output on the loop-guarded retry: $out"
   log=$(last_guard_log "$dir")
-  [ "$(printf '%s' "$log" | jq -r '.decision')" = stood_down_loop_protection ] \
-    || fail "an unchanged second stop must be recorded as stood_down_loop_protection, got: $log"
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_loop_protection_without_progress ] \
+    || fail "an unchanged second stop must be recorded as allowed_loop_protection_without_progress, got: $log"
   [ "$(printf '%s' "$log" | jq -r '.loop_protection')" = true ] || fail "the log must say loop protection was active: $log"
   [ "$(printf '%s' "$log" | jq -r '.needs_firstmate')" = 1 ] || fail "the log must still count the unattended work: $log"
   case "$(printf '%s' "$log" | jq -r '.decision')" in
-    allowed*) fail "an unchanged second stop must never read as a compliant permit: $log" ;;
+    allowed_needs_firstmate_empty|allowed_after_valid_progress)
+      fail "an unchanged second stop must never read as a compliant permit: $log" ;;
   esac
   pass "fm-turnend-guard: an unchanged second stop is recorded as a loop-protection stand-down, not a compliant permit"
 }
 
 # The compliant loop-guarded permit: the blocked id set actually shrank before the second
 # stop attempt, because work was genuinely discharged.
-test_hook_second_stop_after_real_progress_is_allowed_progress() {
+test_hook_second_stop_after_real_progress_is_allowed_after_valid_progress() {
   local dir pid out status log
   dir=$(make_primary_dir "$TMP_ROOT/hook-nf-progress")
   pid=$(start_healthy_watcher "$dir")
@@ -584,10 +708,10 @@ test_hook_second_stop_after_real_progress_is_allowed_progress() {
   stop_watcher "$pid"
   expect_code 0 "$status" "the loop-guarded stop after real progress must be permitted"
   log=$(last_guard_log "$dir")
-  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_progress ] \
-    || fail "a shrunken blocked set must be recorded as allowed_progress: $log"
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_after_valid_progress ] \
+    || fail "a shrunken blocked set must be recorded as allowed_after_valid_progress: $log"
   [ "$(printf '%s' "$log" | jq -r '.needs_firstmate')" = 1 ] || fail "the remaining work must still be counted: $log"
-  pass "fm-turnend-guard: a second stop after the blocked set shrank is recorded as allowed_progress"
+  pass "fm-turnend-guard: a second stop after the blocked set shrank is recorded as allowed_after_valid_progress"
 }
 
 test_hook_silent_when_no_work_in_flight() {
@@ -774,7 +898,7 @@ test_hook_missing_jq_is_a_loud_guard_error() {
   assert_contains "$out" "jq" "the failed component must be named"
   log=$(tail -n 1 "$dir/state/.turnend-guard.log" 2>/dev/null)
   case "$log" in
-    *'"decision":"guard_error"'*) : ;;
+    *'"decision":"allowed_guard_error"'*) : ;;
     *) fail "a missing jq must still log a guard_error decision, got: $log" ;;
   esac
   pass "fm-turnend-guard: fails open on missing jq with a loud guard-error banner and record"
@@ -1153,13 +1277,16 @@ test_hook_reads_live_state_not_the_duty_cache
 test_hook_silent_when_lane_is_clear
 test_hook_genuine_terminal_dispositions_discharge
 test_hook_paper_dispositions_do_not_discharge
+test_hook_verified_captain_transfer_discharges_without_hiding_the_decision
+test_hook_no_progress_permit_queues_a_durable_wake
+test_metrics_report_counts_outcomes
 test_hook_blocks_on_both_reasons_at_once
 test_hook_guard_error_fails_open_loudly
 test_hook_malformed_ledger_rows_do_not_hide_work
 test_hook_afk_stands_down_without_losing_work
 test_hook_duty_kill_switch_is_loud_and_logged
 test_hook_unchanged_second_stop_is_a_stand_down_not_a_permit
-test_hook_second_stop_after_real_progress_is_allowed_progress
+test_hook_second_stop_after_real_progress_is_allowed_after_valid_progress
 test_hook_blocks_when_fresh_beacon_has_no_live_lock
 test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
