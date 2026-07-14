@@ -930,6 +930,44 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   spawn_send_text_line "$WT_TARGET" "cd $(shell_quote "$WT")"
 fi
 
+# Stale-base guard (bug-20260714043857-416f07b4). A pooled worktree can hand a
+# crew a base that does NOT contain the project's local default-branch tip: a
+# pool slot parked on an older commit, or on upstream while the local default
+# branch carries commits that never went upstream (the firstmate repo's own
+# local-only tooling is the live case). Everything present on the local default
+# branch but absent from that base then reads to git as "this branch deletes
+# those files" - a crew's nine-file change diffed as ~19.6k deletions across 154
+# files, in complete good faith, because it had no way to see its base was wrong.
+#
+# So a crew is never launched onto a base that does not contain the local default
+# branch. When the leased worktree is clean (a freshly leased pool slot always
+# is), re-place it onto that commit; when it is not clean, or the checkout does
+# not take, REFUSE the spawn loudly rather than launch onto a base that turns the
+# crew's work into a mass deletion. This is inside fm-spawn's existing sanctioned
+# write path for a disposable task worktree - it never touches the primary
+# checkout, and it never discards work (a clean worktree has none).
+if [ "$KIND" != secondmate ] && [ -n "${WT:-}" ]; then
+  base_branch=$(default_branch "$PROJ_ABS" 2>/dev/null || true)
+  base_commit=
+  if [ -n "$base_branch" ]; then
+    base_commit=$(git -C "$PROJ_ABS" rev-parse --verify --quiet "refs/heads/$base_branch^{commit}" 2>/dev/null || true)
+  fi
+  # No local default-branch ref means there is no local base to be stale against
+  # (a bare/unborn project); nothing to guard, so proceed.
+  if [ -n "$base_commit" ] && ! git -C "$WT" merge-base --is-ancestor "$base_commit" HEAD 2>/dev/null; then
+    if [ -n "$(git -C "$WT" status --porcelain 2>/dev/null | head -1)" ]; then
+      echo "error: leased worktree '$WT' is on a base that does not contain $PROJ_ABS's local '$base_branch' ($base_commit), and it has uncommitted changes, so it cannot be safely re-based. Refusing to launch: work from that base would diff against local '$base_branch' as a mass deletion of every file the base is missing. Inspect target $T" >&2
+      exit 1
+    fi
+    if ! git -C "$WT" checkout --detach --quiet "$base_commit" 2>/dev/null ||
+       ! git -C "$WT" merge-base --is-ancestor "$base_commit" HEAD 2>/dev/null; then
+      echo "error: leased worktree '$WT' is on a base that does not contain $PROJ_ABS's local '$base_branch' ($base_commit), and re-placing it onto that commit failed. Refusing to launch: work from that base would diff against local '$base_branch' as a mass deletion of every file the base is missing. Inspect target $T" >&2
+      exit 1
+    fi
+    echo "note: leased worktree '$WT' was on a base missing local '$base_branch'; re-placed it onto $base_commit before launch" >&2
+  fi
+fi
+
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't
 # create GOTMPDIR, so mkdir before it is used; fm-teardown removes the whole root.
 # Nested (not a bare /tmp/fm-<id>/gotmp) so other per-task temp can live alongside

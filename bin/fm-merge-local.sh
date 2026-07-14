@@ -62,6 +62,44 @@ if ! git -C "$PROJ" merge-base --is-ancestor "$DEFAULT" "$BRANCH"; then
   exit 1
 fi
 
+# Destructive-merge backstop (bug-20260714043857-416f07b4).
+#
+# Fast-forward-only is NOT enough to make this merge safe. A branch built on a
+# base that is missing part of $DEFAULT - a stale pool worktree, or a base that
+# predates local-only commits - carries a tree where those files simply do not
+# exist. If such a branch is later made an ancestor-descendant of $DEFAULT (a
+# merge that keeps the branch's tree, for instance), git will happily
+# fast-forward $DEFAULT to it and the missing files are silently DELETED. That
+# is how a nine-file change presented as 19,666 deletions across 154 files.
+#
+# So: every file this merge would delete must have been deleted DELIBERATELY, by
+# one of the branch's own commits. Cumulative deletions ($DEFAULT..$BRANCH) that
+# no branch commit ever recorded are collateral from a bad base, and they are
+# refused. --no-renames on both sides so a rename reads as delete+add
+# consistently and never lands in one set but not the other. Merge commits
+# contribute no diff to `git log` without -m, so a tree-swallowing merge commit
+# can never launder a deletion into the "intended" set - conservative by design.
+#
+# The failure modes are deliberately asymmetric: a false refusal costs one manual
+# review, a false accept costs the fleet its tooling.
+deleted_all=$(git -C "$PROJ" diff --no-renames --diff-filter=D --name-only "$DEFAULT..$BRANCH")
+if [ -n "$deleted_all" ]; then
+  deleted_intended=$(git -C "$PROJ" log --no-renames --diff-filter=D --name-only --pretty=format: "$DEFAULT..$BRANCH" | sed '/^$/d' | sort -u)
+  collateral=$(printf '%s\n' "$deleted_all" | sort -u | comm -23 - <(printf '%s\n' "$deleted_intended"))
+  if [ -n "$collateral" ]; then
+    count=$(printf '%s\n' "$collateral" | wc -l | tr -d ' ')
+    echo "REFUSED: merging $BRANCH into $DEFAULT would delete $count tracked file(s) that no commit on $BRANCH ever touched." >&2
+    echo "This is the signature of a branch built on a base that is missing part of $DEFAULT: those files are absent from the branch's base, so the merge reads as deleting them. Merging would erase them from $DEFAULT." >&2
+    echo "Files that would be deleted without any branch commit deleting them:" >&2
+    printf '%s\n' "$collateral" | head -20 | sed 's/^/  /' >&2
+    if [ "$count" -gt 20 ]; then
+      echo "  ... and $((count - 20)) more" >&2
+    fi
+    echo "Have the crewmate re-base $BRANCH onto the current $DEFAULT (keeping only its intended changes), then retry. If these deletions really are intended, land them as an explicit commit on $BRANCH that deletes them." >&2
+    exit 1
+  fi
+fi
+
 before=$(git -C "$PROJ" rev-parse --short "$DEFAULT")
 git -C "$PROJ" merge --ff-only "$BRANCH" >/dev/null
 after=$(git -C "$PROJ" rev-parse --short "$DEFAULT")
