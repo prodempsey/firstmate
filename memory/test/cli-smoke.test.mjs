@@ -10,7 +10,9 @@ test('CLI fixture smoke exercises PR-1 verbs on an isolated registry with valid 
   assert.equal(result.status, 0, result.stderr);
   const memId = JSON.parse(result.stdout).memId;
   // High-impact (dispatch/critical) memory needs captain authority to activate.
-  result = runMemIn(dir, ['activate', memId, '--actor-kind', 'captain', '--actor', 'captain', '--evidence', 'test:cli-smoke', '--method', 'test', '--json']);
+  // Captain authorization requires an explicit --validation reference; --evidence
+  // alone never authorizes (see the validation/evidence separation contract).
+  result = runMemIn(dir, ['activate', memId, '--actor-kind', 'captain', '--actor', 'captain', '--evidence', 'test:cli-smoke', '--method', 'test', '--validation', 'auth-cli-smoke', '--json']);
   assert.equal(result.status, 0, result.stderr);
   result = runMemIn(dir, ['show', memId, '--chain', '--json']);
   assert.equal(result.status, 0, result.stderr);
@@ -26,7 +28,7 @@ test('CLI fixture smoke exercises PR-1 verbs on an isolated registry with valid 
   // Valid supersession: propose + activate a successor, then supersede the original.
   const second = runMemIn(dir, ['propose', '--summary', 'Replacement smoke memory', '--json']);
   const successor = JSON.parse(second.stdout).memId;
-  result = runMemIn(dir, ['activate', successor, '--actor-kind', 'captain', '--actor', 'captain', '--evidence', 'test:cli-smoke', '--method', 'test', '--json']);
+  result = runMemIn(dir, ['activate', successor, '--actor-kind', 'captain', '--actor', 'captain', '--evidence', 'test:cli-smoke', '--method', 'test', '--validation', 'auth-cli-smoke-successor', '--json']);
   assert.equal(result.status, 0, result.stderr);
   result = runMemIn(dir, ['supersede', memId, '--successor', successor, '--reason', 'fixture supersession', '--json']);
   assert.equal(result.status, 0, result.stderr);
@@ -35,6 +37,75 @@ test('CLI fixture smoke exercises PR-1 verbs on an isolated registry with valid 
   assert.equal(chain.status, 'superseded');
   assert.equal(chain.supersededBy, successor);
   assert.ok(fs.readFileSync(registryPaths(dir).registry, 'utf8').includes('Replacement smoke memory'));
+});
+
+// Finding 1 (Captain contract decision): `--validation <ref>` is the ONLY CLI
+// source of the scalar `validation.ref`; `--evidence` is an ordered list that
+// never populates authorization. Evidence-only activation must not satisfy a
+// captain/independent-authorization requirement. Do NOT reintroduce a single-
+// evidence fallback as "backward compatibility".
+test('finding-1: validation/evidence separation and scalar authorization contract', () => {
+  const dir = tmpRegistry();
+  const reg = registryPaths(dir).registry;
+  const proposeStd = (s) => JSON.parse(runMemIn(dir, ['propose', '--summary', s, '--json']).stdout).memId;
+  const proposeHigh = (s) => JSON.parse(runMemIn(dir, ['propose', '--summary', s, '--kind', 'dispatch', '--risk-class', 'critical', '--json']).stdout).memId;
+  const recordOf = (id) => JSON.parse(runMemIn(dir, ['show', id, '--json']).stdout).record;
+  const bytes = () => fs.readFileSync(reg);
+
+  // (1) high-impact, no --validation, no --evidence -> rejected before append; bytes unchanged.
+  const g1 = proposeHigh('high no-validation no-evidence');
+  let before = bytes();
+  let r = runMemIn(dir, ['activate', g1, '--actor-kind', 'captain', '--actor', 'captain', '--method', 'test', '--json']);
+  assert.equal(r.status, 1);
+  assert.equal(bytes().equals(before), true, 'rejected activation (no evidence/validation) must not append');
+
+  // (2) one --evidence, no --validation -> low-impact activate records evidence but does NOT authorize.
+  const s2 = proposeStd('one evidence memory');
+  r = runMemIn(dir, ['activate', s2, '--actor-kind', 'firstmate', '--actor', 'mem-cli', '--evidence', 'test:one', '--method', 'test', '--json']);
+  assert.equal(r.status, 0, r.stderr || r.stdout);
+  let rec = recordOf(s2);
+  assert.deepEqual(rec.evidence.map((e) => e.ref), ['one']);
+  assert.equal(rec.activatedBy.authorizationRef, null, 'single evidence must not become the authorization ref');
+
+  // (3) multiple --evidence, no --validation -> governed activation rejects; evidence never enters validation.ref; bytes unchanged.
+  const g3 = proposeHigh('high multi-evidence no-validation');
+  before = bytes();
+  r = runMemIn(dir, ['activate', g3, '--actor-kind', 'captain', '--actor', 'captain', '--evidence', 'test:one', '--evidence', 'test:two', '--method', 'test', '--json']);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /authorization reference/);
+  assert.equal(bytes().equals(before), true, 'rejected high-impact activation must not append');
+
+  // (4) explicit --validation authorizes the previously-rejected high-impact activation.
+  r = runMemIn(dir, ['activate', g3, '--actor-kind', 'captain', '--actor', 'captain', '--evidence', 'test:one', '--method', 'test', '--validation', 'auth-g3', '--json']);
+  assert.equal(r.status, 0, r.stderr || r.stdout);
+  assert.equal(recordOf(g3).activatedBy.authorizationRef, 'auth-g3');
+
+  // (5)+(6) explicit --validation plus repeated --evidence: validation scalar, evidence list, stored independently.
+  const g5 = proposeHigh('validation plus repeated evidence');
+  r = runMemIn(dir, ['activate', g5, '--actor-kind', 'captain', '--actor', 'captain', '--evidence', 'test:e1', '--evidence', 'test:e2', '--method', 'test', '--validation', 'auth-g5', '--json']);
+  assert.equal(r.status, 0, r.stderr || r.stdout);
+  rec = recordOf(g5);
+  assert.equal(rec.activatedBy.authorizationRef, 'auth-g5');
+  assert.deepEqual(rec.evidence.map((e) => e.ref), ['e1', 'e2']);
+
+  // (9) invalid scalar shape: repeated --validation rejected before append; bytes unchanged.
+  const s9 = proposeStd('scalar validation enforcement');
+  before = bytes();
+  r = runMemIn(dir, ['activate', s9, '--evidence', 'test:one', '--method', 'test', '--validation', 'first', '--validation', 'second', '--json']);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /--validation accepts exactly one reference/);
+  assert.equal(bytes().equals(before), true);
+
+  // (7) revalidate path uses the identical rule (quarantine then revalidate).
+  runMemIn(dir, ['quarantine', g5, '--reason', 'test quarantine', '--json']);
+  before = bytes();
+  r = runMemIn(dir, ['revalidate', g5, '--evidence', 'test:one', '--method', 'test', '--validation', 'x', '--validation', 'y', '--json']);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /--validation accepts exactly one reference/);
+  assert.equal(bytes().equals(before), true, 'rejected revalidation must not append');
+  r = runMemIn(dir, ['revalidate', g5, '--evidence', 'test:one', '--method', 'test', '--validation', 'auth-reval', '--json']);
+  assert.equal(r.status, 0, r.stderr || r.stdout);
+  assert.equal(recordOf(g5).activatedBy.authorizationRef, 'auth-reval');
 });
 
 test('summary-only CLI update preserves omitted fields', () => {

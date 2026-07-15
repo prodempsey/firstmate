@@ -91,6 +91,22 @@ function actor(flags) {
   return { kind: flags['actor-kind'] || 'firstmate', id: flags.actor || 'mem-cli' };
 }
 
+// The validation block for activate/revalidate. `--validation <ref>` is the sole
+// source of the scalar authorization reference: it is NEVER seeded from
+// `--evidence`. Evidence is a list of supporting references; authorization is a
+// distinct, single reference. Conflating them let an evidence-only activation
+// silently satisfy the independent captain-authorization requirement. A repeated
+// or empty `--validation` is rejected here, before any event is built or appended.
+function validation(flags) {
+  const out = { method: flags.method || 'captain', by: flags.actor || 'mem-cli' };
+  if (flags.validation !== undefined) {
+    if (Array.isArray(flags.validation)) throw new Error('--validation accepts exactly one reference');
+    if (typeof flags.validation !== 'string' || flags.validation.length === 0) throw new Error('--validation requires a non-empty reference');
+    out.ref = flags.validation;
+  }
+  return out;
+}
+
 function print(value, json = false) {
   if (json) console.log(JSON.stringify(value, null, 2));
   else if (typeof value === 'string') console.log(value);
@@ -109,12 +125,12 @@ export async function main(args, options = {}) {
     } else if (verb === 'activate') {
       const memId = flags._[1];
       if (!memId) throw new Error('activate requires MEM id');
-      const result = await appendRegistryEvent(dir, { event: 'activated', memId, actor: actor(flags), fields: { confidence: flags.confidence || 'observed' }, evidence: evidence(flags), validation: { method: flags.method || 'captain', by: flags.actor || 'mem-cli', ref: flags.validation || flags.evidence }, reason: flags.reason });
+      const result = await appendRegistryEvent(dir, { event: 'activated', memId, actor: actor(flags), fields: { confidence: flags.confidence || 'observed' }, evidence: evidence(flags), validation: validation(flags), reason: flags.reason });
       print({ memId, eventId: result.event.eventId }, flags.json);
     } else if (verb === 'revalidate') {
       const memId = flags._[1];
       if (!memId) throw new Error('revalidate requires MEM id');
-      const result = await appendRegistryEvent(dir, { event: 'revalidated', memId, actor: actor(flags), evidence: evidence(flags), validation: { method: flags.method || 'captain', by: flags.actor || 'mem-cli', ref: flags.validation || flags.evidence }, reason: flags.reason });
+      const result = await appendRegistryEvent(dir, { event: 'revalidated', memId, actor: actor(flags), evidence: evidence(flags), validation: validation(flags), reason: flags.reason });
       print({ memId, eventId: result.event.eventId }, flags.json);
     } else if (verb === 'update') {
       const memId = flags._[1];
