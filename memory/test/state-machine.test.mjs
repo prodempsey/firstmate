@@ -82,6 +82,98 @@ test('finding-2: a guard-linked candidate cannot self-activate but captain autho
   assert.equal(foldRegistry(dir).records.get('MEM-0001').status, 'active');
 });
 
+// ---- Finding 3: canonical top-level supersedes validation + lineage mutation ----
+
+test('finding-3: top-level supersedes runs the canonical validator before any mutation', async () => {
+  const dir = tmpRegistry();
+  await propose(dir, 'MEM-0001'); await activate(dir, 'MEM-0001');
+  await propose(dir, 'MEM-0002'); await activate(dir, 'MEM-0002');
+
+  // Dangling target -> refused, no mutation.
+  await assertRejectsNoChange(dir, {
+    event: 'updated', memId: 'MEM-0002', actor: firstmate,
+    evidence: [{ type: 'test', ref: 'dangling' }], supersedes: ['MEM-9999']
+  }, /supersession target not found: MEM-9999/);
+
+  // Self-reference -> refused, no mutation.
+  await assertRejectsNoChange(dir, {
+    event: 'updated', memId: 'MEM-0002', actor: firstmate,
+    evidence: [{ type: 'test', ref: 'self' }], supersedes: ['MEM-0002']
+  }, /cannot supersede itself/);
+
+  // Valid top-level supersession consistently updates both sides.
+  await appendRegistryEvent(dir, {
+    event: 'updated', memId: 'MEM-0002', actor: firstmate,
+    evidence: [{ type: 'test', ref: 'valid' }], supersedes: ['MEM-0001']
+  });
+  const fold = foldRegistry(dir);
+  assert.equal(fold.records.get('MEM-0001').status, 'superseded');
+  assert.equal(fold.records.get('MEM-0001').supersededBy, 'MEM-0002');
+  assert.ok(fold.records.get('MEM-0002').supersedes.includes('MEM-0001'));
+});
+
+test('finding-3: top-level supersedes enforces target-state and active-successor rules', async () => {
+  const dir = tmpRegistry();
+  await propose(dir, 'MEM-0001'); await activate(dir, 'MEM-0001');
+  await propose(dir, 'MEM-0002'); await activate(dir, 'MEM-0002');
+  await appendRegistryEvent(dir, { event: 'retired', memId: 'MEM-0002', actor: firstmate });
+  // Terminal (retired) target cannot be superseded.
+  await assertRejectsNoChange(dir, {
+    event: 'updated', memId: 'MEM-0001', actor: firstmate,
+    evidence: [{ type: 'test', ref: 'terminal-target' }], supersedes: ['MEM-0002']
+  }, /supersession target must be active or candidate/);
+
+  // The successor (event.memId) must itself be active.
+  await propose(dir, 'MEM-0003'); await activate(dir, 'MEM-0003');
+  await propose(dir, 'MEM-0004'); await activate(dir, 'MEM-0004');
+  await appendRegistryEvent(dir, { event: 'quarantined', memId: 'MEM-0003', actor: firstmate });
+  await assertRejectsNoChange(dir, {
+    event: 'updated', memId: 'MEM-0003', actor: firstmate,
+    evidence: [{ type: 'test', ref: 'inactive-successor' }], supersedes: ['MEM-0004']
+  }, /supersession successor must be active/);
+});
+
+test('finding-3: top-level supersedes refuses self and reverse (A->B then B->A) lineage without mutation', async () => {
+  const dir = tmpRegistry();
+  await propose(dir, 'MEM-0001'); await activate(dir, 'MEM-0001');
+  await propose(dir, 'MEM-0002'); await activate(dir, 'MEM-0002');
+  // MEM-0002 supersedes MEM-0001.
+  await appendRegistryEvent(dir, { event: 'updated', memId: 'MEM-0002', actor: firstmate, evidence: [{ type: 'test', ref: 'fwd' }], supersedes: ['MEM-0001'] });
+  const before = foldRegistry(dir).watermark.seq;
+  // MEM-0001 is now superseded (terminal); it cannot turn around and supersede
+  // MEM-0002. The terminal-state transition guard refuses the reverse event
+  // before supersession logic, so the lineage can never cycle back.
+  await assertRejectsNoChange(dir, {
+    event: 'updated', memId: 'MEM-0001', actor: firstmate,
+    evidence: [{ type: 'test', ref: 'rev' }], supersedes: ['MEM-0002']
+  }, /illegal transition: superseded --updated-->/);
+  const fold = foldRegistry(dir);
+  assert.equal(fold.watermark.seq, before);
+  assert.equal(fold.records.get('MEM-0002').status, 'active');
+  assert.deepEqual(fold.records.get('MEM-0002').supersedes, ['MEM-0001']);
+});
+
+test('finding-3: top-level supersedes and the superseded event yield identical canonical lineage', async () => {
+  const build = async (useTopLevel) => {
+    const dir = tmpRegistry();
+    await propose(dir, 'MEM-0001'); await activate(dir, 'MEM-0001');
+    await propose(dir, 'MEM-0002'); await activate(dir, 'MEM-0002');
+    if (useTopLevel) {
+      await appendRegistryEvent(dir, { event: 'updated', memId: 'MEM-0002', actor: firstmate, evidence: [{ type: 'test', ref: 't' }], supersedes: ['MEM-0001'] });
+    } else {
+      await appendRegistryEvent(dir, { event: 'superseded', memId: 'MEM-0001', successor: 'MEM-0002', actor: firstmate });
+    }
+    const f = foldRegistry(dir);
+    return { status: f.records.get('MEM-0001').status, by: f.records.get('MEM-0001').supersededBy, sup: f.records.get('MEM-0002').supersedes };
+  };
+  const viaTopLevel = await build(true);
+  const viaEvent = await build(false);
+  assert.equal(viaTopLevel.status, 'superseded');
+  assert.equal(viaTopLevel.by, 'MEM-0002');
+  assert.deepEqual(viaTopLevel.sup, ['MEM-0001']);
+  assert.deepEqual(viaTopLevel, viaEvent, 'both supersession representations must produce identical lineage');
+});
+
 test('m7-17 independent high-impact activation requires concrete independent actor IDs', async () => {
   const dir = tmpRegistry();
   await appendRegistryEvent(dir, { event: 'proposed', memId: 'MEM-0001', actor: { kind: 'agent', id: 'same-agent' }, fields: { summary: 'dispatch guidance', taskKinds: ['dispatch'] } });

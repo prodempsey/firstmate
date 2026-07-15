@@ -160,6 +160,48 @@ function assertTransition(record, event) {
   }
 }
 
+// Single canonical supersession validator, shared by BOTH representations: the
+// `superseded` event (target = event.memId, successor = event.successor) and a
+// top-level `event.supersedes` list (successor = event.memId, each entry a
+// target). A target must exist and be in a supersedable state; the successor
+// must exist and be active; self-reference and direct/multi-hop lineage cycles
+// are refused. Throwing here aborts the whole fold event before any byte is
+// appended, so a rejected supersession leaves canonical state unchanged.
+function assertSupersessionAllowed(records, targetId, successorId) {
+  if (!targetId) throw new Error('supersession target is required');
+  if (!successorId) throw new Error(`supersession successor is required for ${targetId}`);
+  if (targetId === successorId) throw new Error(`memory record cannot supersede itself: ${targetId}`);
+  const target = records.get(targetId);
+  if (!target) throw new Error(`supersession target not found: ${targetId}`);
+  if (!TRANSITIONS.superseded.includes(target.status)) {
+    throw new Error(`supersession target must be active or candidate: ${targetId}`);
+  }
+  const successor = records.get(successorId);
+  if (!successor) throw new Error(`supersession successor not found: ${successorId} for ${targetId}`);
+  if (successor.status !== 'active') throw new Error(`supersession successor must be active: ${successorId}`);
+  let cursor = successorId;
+  const seen = new Set();
+  while (cursor) {
+    if (cursor === targetId) throw new Error(`supersession lineage cycle detected: ${targetId} -> ${successorId}`);
+    if (seen.has(cursor)) throw new Error(`supersession lineage cycle detected at ${cursor}`);
+    seen.add(cursor);
+    cursor = records.get(cursor)?.supersededBy ?? null;
+  }
+}
+
+// Apply a validated supersession, updating BOTH sides consistently: the target
+// becomes superseded (with validTo and supersededBy set) and the successor
+// records the target in its supersedes lineage.
+function applySupersession(records, targetId, successorId, event) {
+  assertSupersessionAllowed(records, targetId, successorId);
+  const target = records.get(targetId);
+  const successor = records.get(successorId);
+  target.status = 'superseded';
+  target.validTo = event.ts;
+  target.supersededBy = successorId;
+  successor.supersedes = [...new Set([...(successor.supersedes || []), targetId])];
+}
+
 function applyEvent(records, event) {
   let record = records.get(event.memId);
   if (event.event === 'proposed') {
@@ -176,8 +218,14 @@ function applyEvent(records, event) {
     record.status = 'candidate';
     record.proposedBy = { kind: event.actor?.kind, id: actorId(event.actor) };
     record.evidence = mergeEvidence(record.evidence, event.evidence || []);
-    record.eventIds.push(event.eventId);
     records.set(event.memId, record);
+    // Route any top-level supersedes through the same canonical validator. A
+    // brand-new candidate is not active, so this fails closed rather than
+    // silently recording an unvalidated lineage.
+    if (event.supersedes?.length) {
+      for (const targetId of event.supersedes) applySupersession(records, targetId, event.memId, event);
+    }
+    record.eventIds.push(event.eventId);
     return;
   }
   if (!record) throw new Error(`unknown memory record: ${event.memId}`);
@@ -219,24 +267,7 @@ function applyEvent(records, event) {
   } else if (event.event === 'updated') {
     record.evidence = mergeEvidence(record.evidence, event.evidence || []);
   } else if (event.event === 'superseded') {
-    const successorId = event.successor;
-    if (successorId === event.memId) throw new Error(`memory record cannot supersede itself: ${event.memId}`);
-    const successor = records.get(successorId);
-    if (!successor) throw new Error(`supersession successor not found: ${successorId} for ${event.memId}`);
-    if (successor.status !== 'active') throw new Error(`supersession successor must be active: ${successorId}`);
-    let cursor = successorId;
-    const seen = new Set();
-    while (cursor) {
-      if (cursor === event.memId) throw new Error(`supersession lineage cycle detected: ${event.memId} -> ${successorId}`);
-      if (seen.has(cursor)) throw new Error(`supersession lineage cycle detected at ${cursor}`);
-      seen.add(cursor);
-      cursor = records.get(cursor)?.supersededBy ?? null;
-    }
-    // Update both sides of the lineage atomically within this one fold event.
-    record.status = 'superseded';
-    record.validTo = event.ts;
-    record.supersededBy = successorId;
-    successor.supersedes = [...new Set([...(successor.supersedes || []), event.memId])];
+    applySupersession(records, event.memId, event.successor, event);
   } else if (event.event === 'retired') {
     record.status = 'retired';
     record.validTo = event.ts;
@@ -247,7 +278,12 @@ function applyEvent(records, event) {
     record.validTo = event.ts;
   }
 
-  if (event.supersedes?.length) record.supersedes = [...new Set([...(record.supersedes || []), ...event.supersedes])];
+  // Top-level supersedes: this record (event.memId) is the successor for each
+  // listed target. Route every entry through the same canonical validator/apply
+  // so it can never bypass target/state/cycle checks or the target status flip.
+  if (event.supersedes?.length) {
+    for (const targetId of event.supersedes) applySupersession(records, targetId, event.memId, event);
+  }
   record.eventIds.push(event.eventId);
 }
 
