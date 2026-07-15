@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pinned canonical mem shim.
+# Executable code resolves ONLY to the canonical FirstMate Runtime checkout under
+# $HOME, or, for tests, to an explicit MEM_CLI override. FM_HOME selects operational
+# state for FirstMate but must NEVER redirect executable code to another checkout,
+# so it is deliberately not consulted here. No alternate-checkout path search of
+# any kind is performed.
+
+if [[ -n "${MEM_CLI:-}" ]]; then
+  exec node "$MEM_CLI" "$@"
+fi
+
+CLI="$HOME/fleet/firstmate-runtime/memory/bin/mem.mjs"
+
+if [[ ! -f "$CLI" ]]; then
+  echo "mem: canonical CLI not found at $CLI; fix: cd \"$HOME/fleet/firstmate-runtime/memory\" && npm ci" >&2
+  exit 127
+fi
+
+exec node "$CLI" "$@"
