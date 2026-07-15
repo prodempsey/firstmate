@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import test from 'node:test';
 import { appendRegistryEvent, buildActiveIndex, foldRegistry } from '../lib/registry.mjs';
+import { registryPaths } from '../lib/paths.mjs';
 import { tmpRegistry } from './helpers.mjs';
 
 const firstmate = { kind: 'firstmate', id: 'fm' };
@@ -12,6 +14,73 @@ async function propose(dir, memId, fields = {}, extra = {}) {
 async function activate(dir, memId, actor = captain, extra = {}) {
   return appendRegistryEvent(dir, { event: 'activated', memId, actor, evidence: [{ type: 'test', ref: memId }], validation: { method: 'test', by: actor.id || 'validator', ref: `auth-${memId}` }, ...extra });
 }
+
+// Reject an event AND prove the canonical registry bytes did not change.
+async function assertRejectsNoChange(dir, partial, pattern) {
+  const reg = registryPaths(dir).registry;
+  const before = fs.existsSync(reg) ? fs.readFileSync(reg) : Buffer.alloc(0);
+  await assert.rejects(appendRegistryEvent(dir, partial), pattern);
+  const after = fs.existsSync(reg) ? fs.readFileSync(reg) : Buffer.alloc(0);
+  assert.equal(after.equals(before), true, 'rejected mutation must leave canonical registry bytes unchanged');
+}
+
+// ---- Finding 2: guard_linked canonical normalization + conflict rejection ----
+
+test('finding-2: top-level guard_linked is normalized before activation governance and cannot bypass it', async () => {
+  const dir = tmpRegistry();
+  await appendRegistryEvent(dir, { event: 'proposed', memId: 'MEM-0001', actor: { kind: 'agent', id: 'same-agent' }, fields: { summary: 'ordinary until activation guard' } });
+  await assertRejectsNoChange(dir, {
+    event: 'activated', memId: 'MEM-0001', actor: { kind: 'agent', id: 'same-agent' },
+    guard_linked: true,
+    evidence: [{ type: 'test', ref: 'top-level-guard' }],
+    validation: { method: 'qa', by: 'same-agent', ref: 'qa-ref' }
+  }, /high-impact activation requires an independent activator or captain authority/);
+  const rec = foldRegistry(dir).records.get('MEM-0001');
+  assert.equal(rec.status, 'candidate');
+  assert.equal(rec.guardLinked, false);
+});
+
+test('finding-2: top-level and nested guard_linked have the same activation outcome', async () => {
+  for (const [label, guard] of [['top-level', { guard_linked: true }], ['nested', { fields: { summary: 'nested guard', guard_linked: true } }]]) {
+    const dir = tmpRegistry();
+    await appendRegistryEvent(dir, { event: 'proposed', memId: 'MEM-0001', actor: { kind: 'agent', id: 'same-agent' }, fields: { summary: `${label} guard candidate` } });
+    await assertRejectsNoChange(dir, {
+      event: 'activated', memId: 'MEM-0001', actor: { kind: 'agent', id: 'same-agent' }, ...guard,
+      evidence: [{ type: 'test', ref: label }], validation: { method: 'qa', by: 'same-agent', ref: 'qa-ref' }
+    }, /high-impact activation requires an independent activator or captain authority/);
+  }
+});
+
+test('finding-2: conflicting top-level vs nested guard_linked fails closed before append', async () => {
+  const dir = tmpRegistry();
+  await appendRegistryEvent(dir, { event: 'proposed', memId: 'MEM-0001', actor: { kind: 'agent', id: 'a' }, fields: { summary: 'conflict candidate' } });
+  await assertRejectsNoChange(dir, {
+    event: 'activated', memId: 'MEM-0001', actor: captain,
+    guard_linked: true, fields: { guard_linked: false },
+    evidence: [{ type: 'test', ref: 'conflict' }], validation: { method: 'qa', by: 'captain', ref: 'auth' }
+  }, /conflicting guard_linked representations/);
+});
+
+test('finding-2: proposal guard linkage survives a sparse update that omits it', async () => {
+  const dir = tmpRegistry();
+  await appendRegistryEvent(dir, { event: 'proposed', memId: 'MEM-0001', actor: { kind: 'agent', id: 'proposer' }, guard_linked: true, fields: { summary: 'guarded memory' } });
+  assert.equal(foldRegistry(dir).records.get('MEM-0001').guardLinked, true);
+  await appendRegistryEvent(dir, { event: 'updated', memId: 'MEM-0001', actor: firstmate, fields: { summary: 'guarded memory (edited)' } });
+  const rec = foldRegistry(dir).records.get('MEM-0001');
+  assert.equal(rec.guardLinked, true, 'sparse update must preserve guard linkage');
+  assert.equal(rec.summary, 'guarded memory (edited)');
+});
+
+test('finding-2: a guard-linked candidate cannot self-activate but captain authority succeeds', async () => {
+  const dir = tmpRegistry();
+  await appendRegistryEvent(dir, { event: 'proposed', memId: 'MEM-0001', actor: { kind: 'agent', id: 'same-agent' }, guard_linked: true, fields: { summary: 'guarded self-activation' } });
+  await assertRejectsNoChange(dir, {
+    event: 'activated', memId: 'MEM-0001', actor: { kind: 'agent', id: 'same-agent' },
+    evidence: [{ type: 'test', ref: 'self' }], validation: { method: 'qa', by: 'same-agent', ref: 'qa-ref' }
+  }, /independent activator or captain authority/);
+  await appendRegistryEvent(dir, { event: 'activated', memId: 'MEM-0001', actor: captain, evidence: [{ type: 'test', ref: 'ok' }], validation: { method: 'qa', by: 'captain', ref: 'auth-cap' } });
+  assert.equal(foldRegistry(dir).records.get('MEM-0001').status, 'active');
+});
 
 test('m7-17 independent high-impact activation requires concrete independent actor IDs', async () => {
   const dir = tmpRegistry();

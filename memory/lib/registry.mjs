@@ -40,6 +40,17 @@ function validationRef(event) {
   return typeof event.validation?.ref === 'string' && event.validation.ref.length > 0 ? event.validation.ref : null;
 }
 
+// Canonical guard-linkage for an event: one boolean derived from either the
+// top-level `guard_linked` or the nested `fields.guard_linked` (top-level takes
+// precedence). The schema rejects conflicting top-level/nested values before a
+// row can fold, so when both are present they agree. Returns undefined when the
+// event asserts no guard linkage, so sparse updates preserve the record value.
+function eventGuardLinked(event) {
+  if (event.guard_linked !== undefined) return Boolean(event.guard_linked);
+  if (event.fields?.guard_linked !== undefined) return Boolean(event.fields.guard_linked);
+  return undefined;
+}
+
 export function emptyFold(paths = registryPaths()) {
   return {
     health: 'ok',
@@ -134,10 +145,9 @@ const MUTABLE_FIELD_KEYS = new Set([
 function applyFields(record, fields = {}) {
   for (const [key, value] of Object.entries(fields)) {
     if (value === undefined) continue;
-    if (key === 'guard_linked') {
-      record.guardLinked = Boolean(value);
-      continue;
-    }
+    // guard_linked is governance state, not a passthrough content field: it is
+    // normalized (top-level + nested) and applied by applyEvent, never here.
+    if (key === 'guard_linked') continue;
     if (!MUTABLE_FIELD_KEYS.has(key)) continue;
     record[key] = value;
   }
@@ -155,13 +165,16 @@ function applyEvent(records, event) {
   if (event.event === 'proposed') {
     if (record) throw new Error(`record already exists: ${event.memId}`);
     record = defaultRecord(event.memId, event);
+    // Normalize guard linkage BEFORE the high-impact check so a top-level
+    // guard_linked can never slip a high-impact proposal past governance.
+    const guardLinked = eventGuardLinked(event);
+    if (guardLinked !== undefined) record.guardLinked = guardLinked;
     applyFields(record, event.fields || {});
     if (isHighImpact(record) && !actorId(event.actor)) {
       throw new Error(`high-impact proposal requires actor.id: ${event.memId}`);
     }
     record.status = 'candidate';
     record.proposedBy = { kind: event.actor?.kind, id: actorId(event.actor) };
-    if (event.guard_linked !== undefined) record.guardLinked = Boolean(event.guard_linked);
     record.evidence = mergeEvidence(record.evidence, event.evidence || []);
     record.eventIds.push(event.eventId);
     records.set(event.memId, record);
@@ -169,10 +182,16 @@ function applyEvent(records, event) {
   }
   if (!record) throw new Error(`unknown memory record: ${event.memId}`);
   assertTransition(record, event);
+  const eventGuard = eventGuardLinked(event);
   const activationGovernanceRecord = event.event === 'activated'
     ? { ...record, taskKinds: [...(record.taskKinds || [])] }
     : null;
+  // Guard linkage asserted on the activation event itself is governance-relevant:
+  // fold it into the pre-mutation snapshot so a top-level guard_linked cannot
+  // bypass the high-impact activation requirements below.
+  if (activationGovernanceRecord && eventGuard === true) activationGovernanceRecord.guardLinked = true;
   applyFields(record, event.fields || {});
+  if (eventGuard !== undefined) record.guardLinked = eventGuard;
 
   if (event.event === 'activated' || event.event === 'revalidated') {
     if ((event.evidence || []).length === 0 || !event.validation?.method) {
@@ -228,7 +247,6 @@ function applyEvent(records, event) {
     record.validTo = event.ts;
   }
 
-  if (event.guard_linked !== undefined) record.guardLinked = Boolean(event.guard_linked);
   if (event.supersedes?.length) record.supersedes = [...new Set([...(record.supersedes || []), ...event.supersedes])];
   record.eventIds.push(event.eventId);
 }

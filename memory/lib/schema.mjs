@@ -80,6 +80,12 @@ export const registryEventSchema = z.object({
     const hasEvidence = (event.evidence?.length ?? 0) > 0;
     require(Boolean(hasFields || hasEvidence), ['fields'], 'updated event requires at least one field or evidence entry to change');
   }
+  // Guard linkage has one canonical value. If both the top-level and nested
+  // representations are present they must agree; a conflict fails closed before
+  // the row can fold into canonical state.
+  if (event.guard_linked !== undefined && event.fields?.guard_linked !== undefined && event.guard_linked !== event.fields.guard_linked) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['guard_linked'], message: 'conflicting guard_linked representations' });
+  }
 });
 
 export const activityEventSchema = z.object({
