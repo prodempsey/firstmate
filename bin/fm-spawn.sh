@@ -751,6 +751,43 @@ validate_spawn_worktree() {  # <source> <inspect-target> [require_pool 0|1] [pre
   esac
 }
 
+# --- governance dispatch gate (Memory PR-1 incident prevention) -------------
+# A governed ship/scout task carries a declaration at data/<id>/governance.decl
+# (mode=/scope=/milestone=), written by firstmate's intake classifier when
+# fm-govern.sh classify reports the task governed. When that declaration exists,
+# this gate runs BEFORE any backend window, worktree lease, or agent launch is
+# created, and it is fail-closed: a delivery-mode contradiction (the exact PR-1
+# failure - a local-only task whose brief also says push/update a PR) or an active
+# durable hold aborts the spawn here, so no crew is ever launched into a governed
+# contradiction. A task with no declaration is ungoverned and this gate is a no-op,
+# leaving the ordinary dispatch path byte-identical.
+GOV_DECL="${FM_GOV_DECL_FILE:-$DATA/$ID/governance.decl}"
+if { [ "$KIND" = ship ] || [ "$KIND" = scout ]; } && [ -f "$GOV_DECL" ]; then
+  gov_decl_val() { grep -m1 "^$1=" "$GOV_DECL" 2>/dev/null | cut -d= -f2- || true; }
+  GOV_MODE=$(gov_decl_val mode)
+  GOV_MILESTONE=$(gov_decl_val milestone)
+  if [ -z "$GOV_MODE" ]; then
+    # No explicit governance mode: derive from the project's delivery mode.
+    PROJ_NAME_G=$(basename "$PROJ_ABS")
+    read -r PMODE _ <<EOF2
+$("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME_G")
+EOF2
+    case "$PMODE" in
+      local-only) GOV_MODE=local-only ;;
+      *) GOV_MODE=upstream-pr ;;
+    esac
+  fi
+  if ! "$FM_ROOT/bin/fm-govern.sh" delivery-check --mode "$GOV_MODE" --text-file "$BRIEF" >/dev/null; then
+    echo "error: governance gate REFUSED spawn of $ID - the declared delivery mode ($GOV_MODE) contradicts the brief. No crew launched. Reconcile the delivery mode and the brief, then re-dispatch." >&2
+    "$FM_ROOT/bin/fm-govern.sh" delivery-check --mode "$GOV_MODE" --text-file "$BRIEF" >/dev/null || true
+    exit 1
+  fi
+  if ! "$FM_ROOT/bin/fm-hold.sh" check --task "$ID" --project "$(basename "$PROJ_ABS")" ${GOV_MILESTONE:+--milestone "$GOV_MILESTONE"}; then
+    echo "error: governance gate REFUSED spawn of $ID - a durable hold blocks this work (see HELD lines above). No crew launched." >&2
+    exit 1
+  fi
+fi
+
 W="fm-$ID"
 case "$BACKEND" in
   tmux)
@@ -1171,6 +1208,16 @@ META_WINDOW=$T
   fi
 } > "$STATE/$ID.meta"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
+
+# Governed tasks get a durable exact-SHA governance record seeded at dispatch, so
+# the freeze/attestation/pre-QA gates have state to enforce against. Best-effort:
+# a missing jq never blocks a launch, but the launch gate above already ran.
+if { [ "$KIND" = ship ] || [ "$KIND" = scout ]; } && [ -f "$GOV_DECL" ] && command -v jq >/dev/null 2>&1; then
+  GOV_SCOPE=$(grep -m1 '^scope=' "$GOV_DECL" 2>/dev/null | cut -d= -f2- || true)
+  GOV_IDENT=$(git -C "$WT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || printf '%s' "$PROJ_ABS")
+  GOV_HEAD=$(git -C "$WT" rev-parse HEAD 2>/dev/null || true)
+  "$FM_ROOT/bin/fm-govern.sh" record init "$ID" "$GOV_MODE" "$PROJ_ABS" "$GOV_IDENT" "fm/$ID" "$GOV_HEAD" "$GOV_HEAD" "$GOV_SCOPE" 1 >/dev/null 2>&1 || true
+fi
 
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")
