@@ -185,7 +185,13 @@ run_hook() {
 run_hook_codex() {
   local dir=$1 stop_active=$2 home
   home=$(cd "$dir" && pwd)
-  printf '{"stop_hook_active":%s}' "$stop_active" | FM_CODEX_SYSTEMD_FAKE_DIR="$dir/fake-systemd" FM_SUPERVISION_HARNESS=codex FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" 2>&1
+  printf '{"stop_hook_active":%s}' "$stop_active" | FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$dir/fake-systemd" FM_SUPERVISION_HARNESS=codex FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" 2>&1
+}
+
+run_hook_codex_production_identity_override() {
+  local dir=$1 stop_active=$2 identity=$3 home
+  home=$(cd "$dir" && pwd)
+  printf '{"stop_hook_active":%s}' "$stop_active" | FM_CODEX_SYSTEMD_FAKE_DIR="$dir/fake-systemd" FM_CODEX_PRIMARY_IDENTITY="$identity" FM_SUPERVISION_HARNESS=codex FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" 2>&1
 }
 
 nonexistent_pid() {
@@ -283,17 +289,27 @@ write_codex_schedule() {  # <dir> <start-offset> <cadence> <lateness> [result] [
   now=$(date +%s)
   start=$((now + start_offset))
   end=$((start + 1))
-  FM_CODEX_SYSTEMD_FAKE_DIR="$fake" bash -c '. "$1/bin/fm-supervision-lib.sh"; fm_supervision_persist_primary_harness "$2/state" "$2" codex' \
+  FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$fake" bash -c '. "$1/bin/fm-supervision-lib.sh"; fm_supervision_persist_primary_harness "$2/state" "$2" codex' \
     _ "$dir" "$home" || fail "could not persist Codex harness for $dir"
   if [ -n "$owner_override" ]; then
-    FM_CODEX_SYSTEMD_FAKE_DIR="$fake" FM_CODEX_PRIMARY_IDENTITY="$owner_override" bash -c '. "$1/bin/fm-supervision-lib.sh"; fm_codex_checkpoint_prepare "$2/state" "$2" "$3" "$6" || exit 1; fm_codex_checkpoint_finish "$2/state" "$2" "$3" "$4" "$5" "$6" "$7" "$FM_CODEX_CHECKPOINT_GENERATION"' \
+    FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$fake" FM_CODEX_PRIMARY_IDENTITY="$owner_override" bash -c '. "$1/bin/fm-supervision-lib.sh"; fm_codex_checkpoint_prepare "$2/state" "$2" "$3" "$6" || exit 1; fm_codex_checkpoint_finish "$2/state" "$2" "$3" "$4" "$5" "$6" "$7" "$FM_CODEX_CHECKPOINT_GENERATION"' \
       _ "$dir" "$home" "$start" "$end" "$result" "$cadence" "$lateness" \
       || fail "could not write Codex schedule for $dir"
   else
-    FM_CODEX_SYSTEMD_FAKE_DIR="$fake" bash -c '. "$1/bin/fm-supervision-lib.sh"; fm_codex_checkpoint_prepare "$2/state" "$2" "$3" "$6" || exit 1; fm_codex_checkpoint_finish "$2/state" "$2" "$3" "$4" "$5" "$6" "$7" "$FM_CODEX_CHECKPOINT_GENERATION"' \
+    FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$fake" bash -c '. "$1/bin/fm-supervision-lib.sh"; fm_codex_checkpoint_prepare "$2/state" "$2" "$3" "$6" || exit 1; fm_codex_checkpoint_finish "$2/state" "$2" "$3" "$4" "$5" "$6" "$7" "$FM_CODEX_CHECKPOINT_GENERATION"' \
       _ "$dir" "$home" "$start" "$end" "$result" "$cadence" "$lateness" \
       || fail "could not write Codex schedule for $dir"
   fi
+}
+
+rewrite_codex_schedule() {  # <dir> <jq-filter>
+  local dir=$1 filter=$2 file payload hash
+  file="$dir/state/.codex-watch-checkpoint.next.json"
+  payload=$(jq -cS "del(.integrity) | $filter" "$file") || fail "could not rewrite schedule payload with $filter"
+  hash=$(printf '%s\n' "$payload" | sha256sum | awk '{print $1}')
+  printf '%s\n' "$payload" | jq -cS --arg integrity "sha256:$hash" '. + {integrity:$integrity}' > "$file.tmp" \
+    || fail "could not rebuild schedule integrity"
+  mv -f "$file.tmp" "$file"
 }
 
 stop_watcher() {  # <pid>
@@ -928,6 +944,58 @@ test_hook_codex_rejects_duplicate_checkpoint_schedules() {
   [ "$(printf '%s' "$log" | jq -r '.supervision_health')" = unhealthy-duplicate-owner ] \
     || fail "Codex duplicate schedule did not log unhealthy-duplicate-owner: $log"
   pass "fm-turnend-guard: Codex rejects duplicate active checkpoint schedules"
+}
+
+test_hook_codex_rejects_disabled_scheduler() {
+  local dir out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-disabled-scheduler")
+  : > "$dir/state/task1.meta"
+  write_codex_schedule "$dir" -1 60 60 quiet
+  FM_CODEX_SYSTEMD_FAKE_DIR="$dir/fake-systemd" "$dir/bin/fm-codex-systemd-scheduler.sh" disable --home "$dir" --state "$dir/state" \
+    || fail "fake scheduler disable failed"
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 2 "$status" "Codex hook must block when scheduler registration is disabled"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.supervision_health')" = unhealthy-no-supervision ] \
+    || fail "Codex disabled scheduler did not log unhealthy-no-supervision: $log"
+  assert_contains "$(printf '%s' "$log" | jq -r '.supervision_reason')" "timer-not-registered" \
+    "Codex disabled scheduler reason was not logged"
+  pass "fm-turnend-guard: Codex rejects a disabled managed scheduler"
+}
+
+test_hook_codex_rejects_bad_generation_and_excessive_lateness() {
+  local dir out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-bad-fields")
+  : > "$dir/state/task1.meta"
+  write_codex_schedule "$dir" -1 60 60 quiet
+  rewrite_codex_schedule "$dir" '.generation = 0'
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 2 "$status" "Codex hook must block on zero schedule generation"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.supervision_reason')" = bad-generation ] \
+    || fail "Codex bad generation reason was not logged: $log"
+  rm -f "$dir/state/.codex-watch-checkpoint.next.json" "$dir"/fake-systemd/timers/*.json
+  write_codex_schedule "$dir" -1 60 60 quiet
+  rewrite_codex_schedule "$dir" '.max_lateness_seconds = 999999'
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 2 "$status" "Codex hook must block on excessive self-declared lateness"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.supervision_reason')" = bad-lateness ] \
+    || fail "Codex bad lateness reason was not logged: $log"
+  pass "fm-turnend-guard: Codex rejects bad schedule generation and excessive lateness"
+}
+
+test_hook_codex_production_identity_override_cannot_make_wrong_owner_healthy() {
+  local dir out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-prod-identity-override")
+  : > "$dir/state/task1.meta"
+  write_codex_schedule "$dir" -1 60 60 quiet forged-primary
+  out=$(run_hook_codex_production_identity_override "$dir" false forged-primary); status=$?
+  expect_code 2 "$status" "production Codex health must ignore FM_CODEX_PRIMARY_IDENTITY override"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.supervision_health')" = unhealthy-owner-mismatch ] \
+    || fail "Codex production identity override did not fail as owner mismatch: $log"
+  pass "fm-turnend-guard: production Codex health does not accept ambient primary identity override"
 }
 
 test_hook_codex_failed_checkpoint_is_not_green() {
@@ -1898,6 +1966,9 @@ test_hook_codex_rejects_overdue_checkpoint_schedule
 test_hook_codex_rejects_malformed_checkpoint_schedule
 test_hook_codex_rejects_owner_mismatch_schedule
 test_hook_codex_rejects_duplicate_checkpoint_schedules
+test_hook_codex_rejects_disabled_scheduler
+test_hook_codex_rejects_bad_generation_and_excessive_lateness
+test_hook_codex_production_identity_override_cannot_make_wrong_owner_healthy
 test_hook_codex_failed_checkpoint_is_not_green
 test_hook_codex_normal_bounded_exit_is_not_a_crash
 test_hook_codex_rejects_schedule_without_scheduler_registration

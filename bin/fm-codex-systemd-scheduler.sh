@@ -37,9 +37,14 @@ Usage: fm-codex-systemd-scheduler.sh <command> [--home PATH] [--state PATH] [--r
 
 Commands:
   unit-metadata  Print the deterministic unit names and expected unit paths.
+  install        Register and start the user timer described by --record.
+  register       Register and start the user timer described by --record.
+  arm            Register and start the user timer described by --record.
   schedule       Register and start the user timer described by --record.
-  validate       Verify --record agrees with the registered scheduler.
   status         Print scheduler status as JSON.
+  query          Print scheduler status as JSON.
+  validate       Verify --record agrees with the registered scheduler.
+  disable        Disable the deterministic timer but leave unit files inspectable.
   remove         Disable and remove the deterministic timer/service.
   doctor         Report whether a systemd --user manager is available.
 EOF
@@ -139,7 +144,7 @@ status_json_fake() {
   file=$(fake_registration)
   meta=$(metadata_json) || return 1
   if [ -f "$file" ]; then
-    jq -cS --argjson meta "$meta" '. + {mode:"fake",registered:true,metadata:$meta}' "$file"
+    jq -cS --argjson meta "$meta" '. + {mode:"fake",registered:(.registered == true),metadata:$meta}' "$file"
   else
     jq -cnS --argjson meta "$meta" '{mode:"fake",registered:false,metadata:$meta,reason:"not-registered"}'
   fi
@@ -241,6 +246,21 @@ schedule_fake() {
   mv -f "$file.tmp.$$" "$file"
 }
 
+disable_scheduler() {
+  local meta timer file
+  if [ "${FM_CODEX_SYSTEMD_FAKE_DIR:-}" ]; then
+    file=$(fake_registration)
+    [ -f "$file" ] || return 0
+    jq -cS '.registered=false | .disabled=true' "$file" > "$file.tmp.$$" || return 1
+    mv -f "$file.tmp.$$" "$file"
+    return 0
+  fi
+  meta=$(metadata_json) || return 1
+  timer=$(printf '%s' "$meta" | jq -r '.timer_name')
+  "$SYSTEMCTL" --user disable --now "$timer" >/dev/null 2>&1 || true
+  "$SYSTEMCTL" --user daemon-reload >/dev/null 2>&1 || true
+}
+
 schedule_real() {
   local meta dir service_path timer_path exec_path canon_home canon_state lease generation cadence due calendar
   meta=$(metadata_json) || return 1
@@ -302,15 +322,18 @@ case "$cmd" in
   unit-metadata)
     metadata_json
     ;;
-  status)
+  status|query)
     if [ "${FM_CODEX_SYSTEMD_FAKE_DIR:-}" ]; then status_json_fake; else status_json_real; fi
     ;;
   validate)
     validate_record
     ;;
-  schedule)
+  install|register|arm|schedule|controlled-replacement)
     [ -n "$record" ] && [ -f "$record" ] || { echo "error: --record FILE is required" >&2; exit 2; }
     if [ "${FM_CODEX_SYSTEMD_FAKE_DIR:-}" ]; then schedule_fake; else schedule_real; fi
+    ;;
+  disable)
+    disable_scheduler
     ;;
   remove)
     remove_scheduler

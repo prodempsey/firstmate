@@ -21,7 +21,7 @@ test_quiet_checkpoint_exits_124_cleanly() {
   out="$home/out.txt"
   err="$home/err.txt"
   status=0
-  FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
   expect_code 124 "$status" "quiet checkpoint exit"
   assert_contains "$(cat "$out")" "checkpoint: no actionable wake within 1s" "quiet checkpoint line missing"
   assert_absent "$home/state/.watch.lock/pid" "watch lock pid survived quiet checkpoint timeout"
@@ -32,6 +32,10 @@ test_quiet_checkpoint_exits_124_cleanly() {
     || fail "quiet checkpoint schedule did not carry integrity"
   [ "$(jq -r '.scheduler.adapter' "$home/state/.codex-watch-checkpoint.next.json")" = systemd-user-timer ] \
     || fail "quiet checkpoint schedule did not carry managed scheduler metadata"
+  [ "$(stat -c '%a' "$home/state/.codex-watch-checkpoint.next.json" 2>/dev/null || stat -f '%Lp' "$home/state/.codex-watch-checkpoint.next.json")" = 600 ] \
+    || fail "quiet checkpoint schedule was not written with restrictive 0600 mode"
+  [ "$(stat -c '%a' "$home/state/.primary-harness.json" 2>/dev/null || stat -f '%Lp' "$home/state/.primary-harness.json")" = 600 ] \
+    || fail "primary harness record was not written with restrictive 0600 mode"
   [ -n "$(find "$home/fake-systemd/timers" -name '*.json' -print -quit 2>/dev/null)" ] \
     || fail "quiet checkpoint did not register the managed fake timer"
   pass "quiet checkpoint exits 124 with a clean checkpoint line and no live lock"
@@ -47,7 +51,7 @@ test_signal_passes_through_and_exits_zero() {
     printf 'done: synthetic wake\n' > "$home/state/demo.status"
   ) &
   status=0
-  FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds 8 >"$out" 2>"$err" || status=$?
+  FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds 8 >"$out" 2>"$err" || status=$?
   expect_code 0 "$status" "signal checkpoint exit"
   assert_contains "$(cat "$out")" "signal:" "signal wake was not passed through"
   [ "$(jq -r '.previous_result' "$home/state/.codex-watch-checkpoint.next.json")" = wake ] \
@@ -68,7 +72,7 @@ printf 'env check fired with FM_CHECK_INTERVAL=%s\n' "${FM_CHECK_INTERVAL:-missi
 SH
   chmod +x "$home/state/env-check.check.sh"
   status=0
-  FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=1 "$CHECKPOINT" --seconds 5 >"$out" 2>"$err" || status=$?
+  FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=1 "$CHECKPOINT" --seconds 5 >"$out" 2>"$err" || status=$?
   expect_code 0 "$status" "check checkpoint exit"
   assert_contains "$(cat "$out")" "check:" "check wake was not passed through"
   assert_contains "$(cat "$out")" "FM_CHECK_INTERVAL=1" "watcher environment was not preserved"
@@ -83,7 +87,7 @@ test_existing_singleton_watcher_is_not_success() {
   mkdir "$home/state/.watch.lock"
   printf '%s\n' "$$" > "$home/state/.watch.lock/pid"
   status=0
-  FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" FM_GUARD_GRACE=300 "$CHECKPOINT" --seconds 5 >"$out" 2>"$err" || status=$?
+  FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" FM_GUARD_GRACE=300 "$CHECKPOINT" --seconds 5 >"$out" 2>"$err" || status=$?
   expect_code 1 "$status" "singleton checkpoint exit"
   assert_contains "$(cat "$out")" "watcher: already running" "singleton watcher output was not passed through"
   assert_contains "$(cat "$err")" "outside this foreground checkpoint" "singleton watcher failure was not explained"
@@ -100,7 +104,7 @@ test_duplicate_running_checkpoint_is_refused() {
   err="$home/err.txt"
   sleep 60 >/dev/null 2>&1 &
   pid=$!
-  identity=$(FM_HOME="$home" bash -c '. "$1/bin/fm-supervision-lib.sh"; fm_codex_primary_identity "$2/state" "$2"' _ "$ROOT" "$home")
+  identity=$(FM_SUPERVISION_TEST_MODE=1 FM_HOME="$home" bash -c '. "$1/bin/fm-supervision-lib.sh"; fm_codex_primary_identity "$2/state" "$2"' _ "$ROOT" "$home")
   jq -cnS --arg owner "codex:$identity" --arg primary_identity "$identity" --arg home "$home" \
     --arg state "$home/state" --argjson pid "$pid" \
     '{version:1,harness:"codex",owner:$owner,primary_identity:$primary_identity,
@@ -108,7 +112,7 @@ test_duplicate_running_checkpoint_is_refused() {
       cadence_seconds:1,mechanism:"codex-bounded-checkpoint"}' \
     > "$home/state/.codex-watch-checkpoint.running.json"
   status=0
-  FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   expect_code 1 "$status" "duplicate running checkpoint exit"
@@ -122,9 +126,9 @@ test_checkpoint_advances_generation_from_existing_schedule() {
   home=$(make_home generation)
   out="$home/out.txt"
   err="$home/err.txt"
-  FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || true
+  FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || true
   gen1=$(jq -r '.generation' "$home/state/.codex-watch-checkpoint.next.json")
-  FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
   status=${status:-124}
   expect_code 124 "$status" "second quiet checkpoint exit"
   gen2=$(jq -r '.generation' "$home/state/.codex-watch-checkpoint.next.json")

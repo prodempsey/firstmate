@@ -93,17 +93,51 @@ fm_supervision_primary_harness_path() {
 }
 
 fm_supervision_persist_primary_harness() {
-  local state=$1 home=$2 harness=$3 path canon_home payload
+  local state=$1 home=$2 harness=$3 path canon_home primary_identity payload
   mkdir -p "$state" || return 1
   path=$(fm_supervision_primary_harness_path "$state")
   canon_home=$(cd "$home" 2>/dev/null && pwd -P) || canon_home=$home
+  primary_identity=$(fm_supervision_detect_primary_identity "$state" "$home" "$harness") || return 1
   payload=$(jq -cnS \
     --arg harness "$harness" \
+    --arg primary_identity "$primary_identity" \
     --arg fm_home "$canon_home" \
     --argjson uid "$(id -u)" \
     --arg recorded_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{version:1,harness:$harness,fm_home:$fm_home,uid:$uid,recorded_at:$recorded_at}' 2>/dev/null) || return 1
+    '{version:1,harness:$harness,primary_identity:$primary_identity,
+      fm_home:$fm_home,uid:$uid,recorded_at:$recorded_at}' 2>/dev/null) || return 1
   fm_codex_write_json_atomic "$path" "$payload"
+}
+
+fm_supervision_detect_primary_identity() {
+  local state=$1 home=$2 harness=${3:-} lock pid ident
+  if [ "${FM_SUPERVISION_TEST_MODE:-}" = 1 ] && [ -n "${FM_CODEX_PRIMARY_IDENTITY:-}" ]; then
+    printf '%s\n' "$FM_CODEX_PRIMARY_IDENTITY"
+    return 0
+  fi
+  lock="$state/.lock"
+  pid=$(cat "$lock" 2>/dev/null || true)
+  case "$pid" in
+    ''|*[!0-9]*) pid= ;;
+  esac
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    if command -v fm_pid_identity >/dev/null 2>&1 || fm_sup_load_wake_lib; then
+      ident=$(fm_pid_identity "$pid" 2>/dev/null || true)
+    else
+      ident=
+    fi
+    if [ -n "$ident" ]; then
+      printf 'pid:%s:%s\n' "$pid" "$ident"
+    else
+      printf 'pid:%s\n' "$pid"
+    fi
+    return 0
+  fi
+  if [ "${FM_SUPERVISION_TEST_MODE:-}" = 1 ]; then
+    printf 'test:%s:%s\n' "${harness:-unknown}" "$(cd "$home" 2>/dev/null && pwd -P || printf '%s' "$home")"
+    return 0
+  fi
+  return 1
 }
 
 fm_supervision_primary_harness() {
@@ -124,6 +158,18 @@ fm_supervision_primary_harness() {
     return 0
   fi
   printf '%s\n' "${ambient:-unknown}"
+}
+
+fm_supervision_primary_identity_recorded() {
+  local state=$1 home=$2 path canon_home file_home uid identity
+  path=$(fm_supervision_primary_harness_path "$state")
+  [ -f "$path" ] && command -v jq >/dev/null 2>&1 || return 1
+  identity=$(jq -r '.primary_identity // empty' "$path" 2>/dev/null)
+  file_home=$(jq -r '.fm_home // empty' "$path" 2>/dev/null)
+  uid=$(jq -r '.uid // empty' "$path" 2>/dev/null)
+  canon_home=$(cd "$home" 2>/dev/null && pwd -P) || canon_home=$home
+  [ -n "$identity" ] && [ "$file_home" = "$canon_home" ] && [ "$uid" = "$(id -u)" ] || return 1
+  printf '%s\n' "$identity"
 }
 
 fm_sup_load_wake_lib() {
@@ -202,31 +248,12 @@ fm_codex_schedule_count() {
 }
 
 fm_codex_primary_identity() {
-  local state=$1 home=$2 lock pid ident canon_home
-  if [ -n "${FM_CODEX_PRIMARY_IDENTITY:-}" ]; then
-    printf '%s\n' "$FM_CODEX_PRIMARY_IDENTITY"
+  local state=$1 home=$2 identity
+  identity=$(fm_supervision_detect_primary_identity "$state" "$home" codex 2>/dev/null) && {
+    printf '%s\n' "$identity"
     return 0
-  fi
-  lock="$state/.lock"
-  pid=$(cat "$lock" 2>/dev/null || true)
-  case "$pid" in
-    ''|*[!0-9]*) pid= ;;
-  esac
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    if command -v fm_pid_identity >/dev/null 2>&1 || fm_sup_load_wake_lib; then
-      ident=$(fm_pid_identity "$pid" 2>/dev/null || true)
-    else
-      ident=
-    fi
-    if [ -n "$ident" ]; then
-      printf 'pid:%s:%s\n' "$pid" "$ident"
-    else
-      printf 'pid:%s\n' "$pid"
-    fi
-    return 0
-  fi
-  canon_home=$(cd "$home" 2>/dev/null && pwd -P) || canon_home=$home
-  printf 'home:%s\n' "$canon_home"
+  }
+  fm_supervision_primary_identity_recorded "$state" "$home"
 }
 
 fm_codex_schedule_integrity_payload() {
@@ -241,6 +268,7 @@ fm_codex_write_json_atomic() {
   local dest=$1 payload=$2 tmp
   tmp="${dest}.tmp.$$"
   printf '%s\n' "$payload" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$dest" || { rm -f "$tmp"; return 1; }
 }
 
@@ -249,7 +277,7 @@ fm_codex_build_schedule_payload() {
   local canon_home canon_state owner payload hash scheduler
   canon_home=$(cd "$home" 2>/dev/null && pwd -P) || canon_home=$home
   canon_state=$(cd "$state" 2>/dev/null && pwd -P) || canon_state=$state
-  owner=$(fm_codex_primary_identity "$state" "$home")
+  owner=$(fm_codex_primary_identity "$state" "$home") || return 1
   scheduler=$(fm_codex_scheduler_metadata "$state" "$home") || return 1
   payload=$(jq -cnS \
     --argjson scheduler "$scheduler" \
@@ -282,7 +310,7 @@ fm_codex_build_schedule_payload() {
 
 fm_codex_schedule_validate() {
   local state=$1 home=$2 now file
-  local count integrity expected version harness mechanism scheduling owner primary current file_home file_state canon_home canon_state durable_harness scheduler_adapter
+  local count integrity expected version harness mechanism scheduling owner primary current file_home file_state canon_home canon_state durable_harness scheduler_adapter expected_late unit_name timer_name service_name
   local start end due cadence late result generation lease
   now=${3:-$(date +%s)}
   file=${4:-$(fm_codex_schedule_path "$state")}
@@ -319,14 +347,18 @@ fm_codex_schedule_validate() {
   generation=$(jq -r '.generation // empty' "$file" 2>/dev/null)
   lease=$(jq -r '.lease_id // empty' "$file" 2>/dev/null)
   scheduler_adapter=$(jq -r '.scheduler.adapter // empty' "$file" 2>/dev/null)
+  unit_name=$(jq -r '.scheduler.unit_name // empty' "$file" 2>/dev/null)
+  timer_name=$(jq -r '.scheduler.timer_name // empty' "$file" 2>/dev/null)
+  service_name=$(jq -r '.scheduler.service_name // empty' "$file" 2>/dev/null)
   [ "$version" = 1 ] || { FM_CODEX_SCHEDULE_REASON=unsupported-version; return 1; }
   [ "$harness" = codex ] || { FM_CODEX_SCHEDULE_REASON='harness-mismatch'; return 1; }
   [ "$mechanism" = "$FM_CODEX_CHECKPOINT_MECHANISM" ] || { FM_CODEX_SCHEDULE_REASON='mechanism-mismatch'; return 1; }
   [ "$scheduling" = "$FM_CODEX_SCHEDULING_MECHANISM" ] || { FM_CODEX_SCHEDULE_REASON='scheduler-mismatch'; return 1; }
   [ "$scheduler_adapter" = "$FM_CODEX_SCHEDULING_MECHANISM" ] || { FM_CODEX_SCHEDULE_REASON='scheduler-mismatch'; return 1; }
+  [ -n "$unit_name" ] && [ -n "$timer_name" ] && [ -n "$service_name" ] || { FM_CODEX_SCHEDULE_REASON='scheduler-mismatch'; return 1; }
   durable_harness=$(fm_supervision_primary_harness "$state" "$home" "")
   [ "$durable_harness" = codex ] || { FM_CODEX_SCHEDULE_REASON='harness-mismatch'; return 1; }
-  current=$(fm_codex_primary_identity "$state" "$home")
+  current=$(fm_codex_primary_identity "$state" "$home") || { FM_CODEX_SCHEDULE_REASON='owner-mismatch'; return 1; }
   [ "$primary" = "$current" ] && [ "$owner" = "codex:$current" ] || { FM_CODEX_SCHEDULE_REASON='owner-mismatch'; return 1; }
   canon_home=$(cd "$home" 2>/dev/null && pwd -P) || canon_home=$home
   canon_state=$(cd "$state" 2>/dev/null && pwd -P) || canon_state=$state
@@ -343,6 +375,10 @@ fm_codex_schedule_validate() {
   [ "$end" -ge "$start" ] || { FM_CODEX_SCHEDULE_REASON=bad-time-order; return 1; }
   [ "$due" -ge "$end" ] || { FM_CODEX_SCHEDULE_REASON=bad-due-time; return 1; }
   [ "$cadence" -gt 0 ] || { FM_CODEX_SCHEDULE_REASON=bad-cadence; return 1; }
+  [ "$generation" -gt 0 ] || { FM_CODEX_SCHEDULE_REASON=bad-generation; return 1; }
+  expected_late=${FM_CODEX_WATCH_CHECKPOINT_MAX_LATENESS:-60}
+  case "$expected_late" in ''|*[!0-9]*) expected_late=60 ;; esac
+  [ "$late" -le "$expected_late" ] || { FM_CODEX_SCHEDULE_REASON=bad-lateness; return 1; }
   if [ "$now" -gt "$((due + late))" ]; then
     FM_CODEX_SCHEDULE_REASON=checkpoint-overdue
     FM_CODEX_SCHEDULE_DUE=$due
@@ -364,7 +400,7 @@ fm_codex_last_checkpoint_failed() {
 fm_codex_checkpoint_start_record() {
   local state=$1 home=$2 start_epoch=$3 cadence=$4 generation=$5 lease=$6 running owner canon_home canon_state payload
   running=$(fm_codex_running_path "$state")
-  owner=$(fm_codex_primary_identity "$state" "$home")
+  owner=$(fm_codex_primary_identity "$state" "$home") || return 1
   canon_home=$(cd "$home" 2>/dev/null && pwd -P) || canon_home=$home
   canon_state=$(cd "$state" 2>/dev/null && pwd -P) || canon_state=$state
   payload=$(jq -cnS \
