@@ -35,6 +35,9 @@ shift 2
 
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+# shellcheck source=bin/fm-role-context-lib.sh
+. "$SCRIPT_DIR/fm-role-context-lib.sh"
+fm_require_primary "fm-pr-merge.sh (merge)" || exit 2
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 META="$STATE/$ID.meta"
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META; refusing to merge without recording pr=" >&2; exit 1; }

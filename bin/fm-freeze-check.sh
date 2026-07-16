@@ -29,6 +29,8 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # shellcheck source=bin/fm-governance-lib.sh
 . "$SCRIPT_DIR/fm-governance-lib.sh"
+# shellcheck source=bin/fm-role-context-lib.sh
+. "$SCRIPT_DIR/fm-role-context-lib.sh"
 
 ID=${1:-}
 [ -n "$ID" ] || { echo "usage: fm-freeze-check.sh <task-id> [--json] [--stop]" >&2; exit 2; }
@@ -41,6 +43,10 @@ while [ $# -gt 0 ]; do
     *) shift ;;
   esac
 done
+
+# Freeze INSPECTION (default / --json) is read-only and stays available to crewmates.
+# Only --stop mutates (it SIGTERM/SIGKILLs coding-agent PIDs), so it is primary-only.
+[ "$STOP" = 1 ] && { fm_require_primary "fm-freeze-check.sh --stop" || exit 2; }
 
 META="$STATE/$ID.meta"
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 2; }

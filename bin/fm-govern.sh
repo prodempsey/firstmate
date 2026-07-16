@@ -20,6 +20,12 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-governance-lib.sh
 . "$SCRIPT_DIR/fm-governance-lib.sh"
+# shellcheck source=bin/fm-role-context-lib.sh
+. "$SCRIPT_DIR/fm-role-context-lib.sh"
+# Operation-level role enforcement: read-only subcommands (classify, delivery-check,
+# status/doctor, auth-valid, sync-head, preqa-gate, local-gate, record get) stay
+# available to crewmates; the mutating record subverbs (init/freeze/attest/observe)
+# are primary-only.
 
 cmd=${1:-}
 [ -n "$cmd" ] || { echo "usage: fm-govern.sh <classify|delivery-check|record|auth-valid|status|sync-head|preqa-gate|local-gate> ..." >&2; exit 2; }
@@ -46,6 +52,10 @@ case "$cmd" in
 
   record)
     sub=${1:-}; shift || true
+    case "$sub" in
+      init|freeze|attest|observe)
+        fm_require_primary "fm-govern.sh record $sub" || exit 2 ;;
+    esac
     case "$sub" in
       init)    fm_gov_record_init "$@" && echo "record: initialized $1" ;;
       freeze)  fm_gov_record_freeze "$@" && echo "record: frozen $1 at $2" ;;

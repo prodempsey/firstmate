@@ -110,9 +110,18 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+# shellcheck source=bin/fm-role-context-lib.sh
+. "$SCRIPT_DIR/fm-role-context-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
+# Dispatch is a primary-only authority operation. Role determination runs here, BEFORE
+# any backend/window/worktree/launch side effect and before the governance gate below,
+# so a crewmate (proven by durable worktree/task evidence, not just FM_CREWMATE) cannot
+# launch another governed crew. A secondmate is the primary of its own home and resolves
+# to `primary` there, so its own spawns are unaffected. This layer is complementary to
+# fm_refuse_if_gate_agent (gate-agent) - not a duplicate.
+fm_require_primary "fm-spawn.sh (dispatch)" || exit 2
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
@@ -1240,11 +1249,31 @@ LAUNCH=${LAUNCH//__CODEXHOME__/$sq_codexhome}
 if [ "$KIND" = secondmate ]; then
   sq_home=$(shell_quote "$PROJ_ABS")
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_HOME=$sq_home $LAUNCH"
+elif [ "$KIND" = ship ] || [ "$KIND" = scout ]; then
+  # Attach DURABLE crewmate role evidence to the launched crew: a marker in the worktree
+  # root that bin/fm-role-context-lib.sh reads as the AUTHORITATIVE role signal - it
+  # survives a crew that unsets FM_CREWMATE. A secondmate is NOT a crewmate, so this runs
+  # only for ship/scout. The corroborating env vars are exported into the pane below (with
+  # GOTMPDIR), NOT prepended to LAUNCH, so the launch command stays byte-identical.
+  {
+    printf 'task_id=%s\n' "$ID"
+    printf 'primary_home=%s\n' "$FM_HOME"
+    printf 'project=%s\n' "$PROJ_ABS"
+    printf 'kind=%s\n' "$KIND"
+    printf 'spawned_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
+  } > "$WT/.fm-crew-role" 2>/dev/null || true
+  exclude_path '.fm-crew-role'
 fi
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
+# Corroborating crewmate role env (ship/scout only). The durable .fm-crew-role marker
+# written above is the authoritative signal; these exports are supporting context.
+# Sent as a pane export (not in LAUNCH) so the launch command stays byte-identical.
+if [ "$KIND" = ship ] || [ "$KIND" = scout ]; then
+  spawn_send_text_line "$T" "export FM_CREWMATE=1 FM_TASK_ID=$(shell_quote "$ID") FM_PRIMARY_HOME=$(shell_quote "$FM_HOME") FM_PROJECT=$(shell_quote "$PROJ_ABS") FM_WORKTREE=$(shell_quote "$WT")"
+fi
 sleep 0.3
 spawn_send_literal "$T" "$LAUNCH"
 sleep 0.3

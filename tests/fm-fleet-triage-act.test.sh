@@ -23,7 +23,8 @@ new_world() {
   mkdir -p "$root/bin" "$home/state" "$home/data"
   cp "$ACT" "$ROOT/bin/fm-fleet-triage.sh" "$ROOT/bin/fm-fleet-triage-lib.sh" \
     "$ROOT/bin/fm-supervision-lib.sh" \
-    "$ROOT/bin/fm-fleet-triage-record.sh" "$ROOT/bin/fm-tasks-axi-lib.sh" "$root/bin/"
+    "$ROOT/bin/fm-fleet-triage-record.sh" "$ROOT/bin/fm-tasks-axi-lib.sh" \
+    "$ROOT/bin/fm-role-context-lib.sh" "$root/bin/"
   chmod +x "$root/bin/fm-fleet-triage-act.sh" "$root/bin/fm-fleet-triage.sh" \
     "$root/bin/fm-fleet-triage-record.sh"
   cat > "$root/bin/fm-fleet-snapshot.sh" <<'SH'

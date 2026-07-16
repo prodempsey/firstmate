@@ -32,6 +32,8 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 HOLDS="$STATE/holds"
 AUDIT="$HOLDS/audit.log"
+# shellcheck source=bin/fm-role-context-lib.sh
+. "$SCRIPT_DIR/fm-role-context-lib.sh"
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq not found; holds cannot be read or written" >&2; exit 2; }
 
@@ -60,6 +62,12 @@ valid_kind() { case "$1" in project|milestone|task|branch) return 0 ;; *) return
 cmd=${1:-}
 [ -n "$cmd" ] || { echo "usage: fm-hold.sh <add|list|check|release> ..." >&2; exit 2; }
 shift || true
+
+# add/release mutate durable holds and are primary-only; list/check are read-only and
+# stay available to crewmates (a crewmate may inspect whether it is under a hold).
+case "$cmd" in
+  add|release) fm_require_primary "fm-hold.sh $cmd" || exit 2 ;;
+esac
 
 case "$cmd" in
   add)

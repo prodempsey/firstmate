@@ -21,7 +21,7 @@ new_world() {
   home="$world/home"
   mkdir -p "$root/bin" "$home/state" "$home/data"
   cp "$TRIAGE" "$ROOT/bin/fm-fleet-triage-lib.sh" "$ROOT/bin/fm-supervision-lib.sh" \
-    "$ROOT/bin/fm-fleet-triage-record.sh" "$root/bin/"
+    "$ROOT/bin/fm-fleet-triage-record.sh" "$ROOT/bin/fm-role-context-lib.sh" "$root/bin/"
   chmod +x "$root/bin/fm-fleet-triage.sh" "$root/bin/fm-fleet-triage-record.sh"
   printf '%s|%s\n' "$root" "$home"
 }

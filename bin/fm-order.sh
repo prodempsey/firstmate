@@ -64,6 +64,8 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+# shellcheck source=bin/fm-role-context-lib.sh
+. "$SCRIPT_DIR/fm-role-context-lib.sh"
 
 # shellcheck disable=SC1091 # Dynamic sibling path is resolved from BASH_SOURCE.
 . "$SCRIPT_DIR/fm-order-lib.sh"
@@ -349,6 +351,13 @@ VERB=${1:-}
 case "$VERB" in
   -h|--help|'') usage; exit 0 ;;
   *) shift ;;
+esac
+
+# Reading the captain order inbox stays available to every role; every WRITE verb is a
+# primary-only mutation. (bin/fm-role-context-lib.sh is sourced near the top.)
+case "$VERB" in
+  path|list|show|digest|metrics|pending|health) ;;
+  *) fm_require_primary "fm-order.sh $VERB" || exit 2 ;;
 esac
 
 case "$VERB" in
