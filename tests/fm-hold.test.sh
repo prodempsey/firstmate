@@ -85,8 +85,19 @@ test_release_with_authorization_audits() {
   pass "an authorized release clears the hold and appends an audit record"
 }
 
+# Independent-review regression: two values that slug identically must not collide
+# onto one file and make a hold silently disappear.
+test_slug_collision_keeps_both_holds() {
+  "$HOLD" add --kind branch --value "fm/collide-x" --reason "slash form" >/dev/null
+  "$HOLD" add --kind branch --value "fm-collide-x" --reason "dash form" >/dev/null
+  "$HOLD" check --branch "fm/collide-x" >/dev/null 2>&1; expect_code 3 "$?" "the slash-form hold must survive"
+  "$HOLD" check --branch "fm-collide-x" >/dev/null 2>&1; expect_code 3 "$?" "the dash-form hold must survive"
+  pass "distinct values that slug identically do not collide (no disappearing hold)"
+}
+
 test_hold_survives_restart
 test_held_pr2_task_blocked
+test_slug_collision_keeps_both_holds
 test_unrelated_task_not_blocked
 test_recovery_work_allowed
 test_scoped_by_project_task_branch

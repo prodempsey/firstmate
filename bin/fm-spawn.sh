@@ -777,12 +777,14 @@ EOF2
       *) GOV_MODE=upstream-pr ;;
     esac
   fi
-  if ! "$FM_ROOT/bin/fm-govern.sh" delivery-check --mode "$GOV_MODE" --text-file "$BRIEF" >/dev/null; then
+  if ! gov_conflicts=$("$FM_ROOT/bin/fm-govern.sh" delivery-check --mode "$GOV_MODE" --text-file "$BRIEF" 2>&1); then
+    printf '%s\n' "$gov_conflicts" >&2
     echo "error: governance gate REFUSED spawn of $ID - the declared delivery mode ($GOV_MODE) contradicts the brief. No crew launched. Reconcile the delivery mode and the brief, then re-dispatch." >&2
-    "$FM_ROOT/bin/fm-govern.sh" delivery-check --mode "$GOV_MODE" --text-file "$BRIEF" >/dev/null || true
     exit 1
   fi
-  if ! "$FM_ROOT/bin/fm-hold.sh" check --task "$ID" --project "$(basename "$PROJ_ABS")" ${GOV_MILESTONE:+--milestone "$GOV_MILESTONE"}; then
+  gov_hold_args=(check --task "$ID" --project "$(basename "$PROJ_ABS")")
+  [ -n "$GOV_MILESTONE" ] && gov_hold_args+=(--milestone "$GOV_MILESTONE")
+  if ! "$FM_ROOT/bin/fm-hold.sh" "${gov_hold_args[@]}"; then
     echo "error: governance gate REFUSED spawn of $ID - a durable hold blocks this work (see HELD lines above). No crew launched." >&2
     exit 1
   fi

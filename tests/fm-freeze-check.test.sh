@@ -88,8 +88,20 @@ test_stop_reports_nothing_when_no_agent() {
   pass "the safe scoped stop path does nothing when there is no in-worktree coding agent"
 }
 
+# Independent-review regression: a pi agent launched by absolute path must still
+# count as a coding agent (not misclassified as unrelated -> false frozen-safe).
+test_pi_by_absolute_path_blocks_freeze() {
+  local id=fz-pi src status
+  setup_task "$id"
+  src=$(procsrc pipath "700 1 $WT /usr/local/bin/pi run the task")
+  FM_FREEZE_PROC_SOURCE="$src" "$FREEZE" "$id" >/dev/null 2>&1; status=$?
+  expect_code 3 "$status" "a pi agent launched by absolute path must block freeze"
+  pass "a pi coding agent launched by absolute path is not misclassified as unrelated"
+}
+
 test_live_coding_agent_blocks_freeze
 test_inert_login_shell_is_safe
+test_pi_by_absolute_path_blocks_freeze
 test_dead_and_unrelated_classification
 test_stop_reports_nothing_when_no_agent
 

@@ -134,9 +134,21 @@ fm_gov_delivery_mode_valid() {  # <mode>
 # 0 if the given instruction/brief text requests a REMOTE delivery action - a push,
 # a PR creation/update, or an upstream landing. This is the predicate that catches a
 # local-only task whose brief nonetheless says "push/update PR #592".
+#
+# Two failure modes the independent review flagged are handled here:
+#   * Negation blindness: a responsible local-only brief that says "do not push / never
+#     open a PR" must NOT be read as a remote request. Negated clauses (from a negation
+#     token to the next sentence boundary) are stripped before matching.
+#   * Porous phrasings: "push to origin", "push the branch", "raise/open/submit a pull
+#     request", and "land it upstream" are all matched, not only the exact incident
+#     string. `push` is required to sit near a git-ish target so "push forward on the
+#     plan" is not a false positive.
 fm_gov_text_requests_remote() {  # <text>
   local t=$1
-  printf '%s' "$t" | grep -qiE 'git[ _-]?push|\bpush(es|ed|ing)?\b (to|the|this|your|its|a )?(remote|branch|fork|origin|upstream|pr)|open(ing|s)? (a |the )?pr\b|creat(e|es|ing) (a |the )?pull request|creat(e|es|ing) (a |the )?pr\b|updat(e|es|ing) (the |a )?pr\b|pr #?[0-9]+|pull request #?[0-9]+|gh-axi pr|gh pr (create|merge|edit)|upstream (land|merge|contribution|pr)'
+  # Drop negated clauses so "do not open a PR or push to any remote" is not flagged.
+  t=$(printf '%s' "$t" | sed -E 's/([Dd]o not|[Dd]on.t|[Nn]ever|[Ww]ithout|[Nn]o need to)[^.;]*/ /g')
+  printf '%s' "$t" | grep -qiE \
+'git[ _-]?push|\bpush(es|ed|ing)?\b[^.;]{0,25}(remote|branch|origin|upstream|fork|\bpr\b|commit|change)|open(ing|s)?[[:space:]]+(a[[:space:]]+|the[[:space:]]+)?(pr\b|pull request)|creat(e|es|ing)[[:space:]]+(a[[:space:]]+|the[[:space:]]+)?(pull request|pr\b)|submit(s|ting|ted)?[[:space:]]+(a[[:space:]]+|the[[:space:]]+)?(pull request|pr\b)|rais(e|es|ing)[[:space:]]+(a[[:space:]]+|the[[:space:]]+)?(pull request|pr\b)|updat(e|es|ing)[[:space:]]+(the[[:space:]]+|a[[:space:]]+)?(pr\b|pull request)|\bpr[[:space:]]+#?[0-9]+|\bpr#[0-9]+|\bpull request[[:space:]]+#?[0-9]+|\bpull request#[0-9]+|gh-axi pr|gh pr (create|merge|edit)|upstream[[:space:]]+(land|merge|contribution|pr|pull request)|land[[:space:]]+(it[[:space:]]+|this[[:space:]]+|the[[:space:]]+changes?[[:space:]]+)?upstream'
 }
 
 # Validate a declared delivery mode against a structured task declaration. All
@@ -429,6 +441,26 @@ fm_gov_auth_valid() {  # <task> <current-head>
     && [ "$(jq -r '.qa.sha // ""' "$path")" = "$head" ] && [ "$(jq -r '.review.sha // ""' "$path")" = "$head" ]
 }
 
+# Re-derive the branch's CURRENT head from the recorded repository and re-observe it,
+# so status/doctor reflect reality even when no external caller ran `record observe`
+# after the branch head moved. This closes the gap the independent review flagged:
+# the exact-SHA invalidation is only as good as the head the record last saw, so the
+# doctor view syncs the live head itself rather than trusting a possibly-stale stored
+# value. Best-effort: an unreadable repository or branch leaves the record untouched
+# (a live worktree the record cannot resolve is reported, never silently trusted).
+fm_gov_sync_head() {  # <task>
+  fm_gov_require_jq || return 2
+  local path; path=$(fm_gov_record_path "$1")
+  [ -f "$path" ] || return 1
+  local repo branch live
+  repo=$(jq -r '.repository.path // ""' "$path")
+  branch=$(jq -r '.branch // ""' "$path")
+  { [ -n "$repo" ] && [ -n "$branch" ]; } || return 0
+  live=$(git -C "$repo" rev-parse --verify --quiet "refs/heads/$branch" 2>/dev/null) || return 0
+  [ -n "$live" ] || return 0
+  fm_gov_record_observe "$1" --head "$live" >/dev/null 2>&1 || true
+}
+
 # --- pre-QA gate ordering (Scope D) ----------------------------------------
 
 # 0 iff every pre-QA field is satisfied so FINAL independent QA may dispatch.
@@ -480,7 +512,9 @@ fm_gov_classify_process() {  # <command-string>
   local cmd=$1
   [ -n "$cmd" ] || { printf 'dead'; return; }
   case "$cmd" in
-    *claude*|*codex*|*opencode*|*' pi '*|pi\ *|*grok*|*gemini*|*mem.mjs*|*'no-mistakes'*|*'axi run'*)
+    *claude*|*codex*|*opencode*|*grok*|*gemini*|*mem.mjs*|*'no-mistakes'*|*'axi run'*)
+      printf 'coding-agent'; return ;;
+    pi|pi\ *|*/pi|*/pi\ *|*' pi '*)  # pi harness, including an absolute-path launch
       printf 'coding-agent'; return ;;
   esac
   # A bare interactive/login shell with no agent is inert.

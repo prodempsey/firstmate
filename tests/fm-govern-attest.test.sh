@@ -126,7 +126,27 @@ test_status_doctor_reports_fields() {
   pass "status/doctor reports head, attested SHA, authorized SHA, validity, and reason"
 }
 
+# Independent-review regression: status/doctor must re-derive the LIVE branch head
+# and invalidate, WITHOUT any external caller having run `record observe`.
+test_status_syncs_live_head_and_invalidates() {
+  local task=att-sync shaA shaB out
+  # Real branch so status can resolve the live head from repository.path + branch.
+  git -C "$REPO" checkout -q -b "fm/$task"
+  shaA=$(commit_change "sync-A")
+  "$GOVERN" record init "$task" local-only "$REPO" ident "fm/$task" "$shaA" "$shaA" "work.txt" 1 >/dev/null
+  authorize_at "$task" "$shaA"
+  # The agent makes another commit but nobody calls observe.
+  shaB=$(commit_change "sync-B, no observe called")
+  out=$("$GOVERN" status "$task")
+  assert_contains "$out" "currentHead:       $shaB" "status must re-derive the live branch head"
+  assert_contains "$out" "authorizationValid:no" "a moved head must not read as authorized in status"
+  case "$out" in *"invalidationReason:"*"$shaB"*) : ;; *) fail "status must record the head-move invalidation: $out" ;; esac
+  git -C "$REPO" checkout -q master 2>/dev/null || git -C "$REPO" checkout -q main 2>/dev/null || true
+  pass "status/doctor re-derives the live head and invalidates without an external observe"
+}
+
 test_head_move_invalidates_everything
+test_status_syncs_live_head_and_invalidates
 test_matching_tree_new_commit_not_authorized
 test_descendant_not_authorized
 test_squash_replay_not_authorized

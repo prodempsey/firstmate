@@ -37,11 +37,17 @@ command -v jq >/dev/null 2>&1 || { echo "error: jq not found; holds cannot be re
 
 now() { printf '%s' "${FM_GOV_NOW:-$(date -u '+%Y-%m-%dT%H:%M:%SZ')}"; }
 
-# Deterministic filename for a (kind,value) hold: safe slug of both.
+# Deterministic filename for a (kind,value) hold: a readable slug plus a short hash
+# of the EXACT kind+value, so distinct values that slug identically (e.g. branch
+# fm/x vs fm-x) never collide onto one file and silently overwrite each other.
+# check/release resolve the same (kind,value) through this function, so it stays
+# deterministic; check additionally reads .value from every file, so enforcement
+# never depends on the filename.
 hold_file() {  # <kind> <value>
-  local slug
+  local slug hash
   slug=$(printf '%s-%s' "$1" "$2" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\{2,\}/-/g;s/^-//;s/-$//')
-  printf '%s/%s.json' "$HOLDS" "$slug"
+  hash=$(printf '%s\0%s' "$1" "$2" | sha256sum | cut -c1-8)
+  printf '%s/%s-%s.json' "$HOLDS" "$slug" "$hash"
 }
 
 audit() {  # <event> <detail>

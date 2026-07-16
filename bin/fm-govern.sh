@@ -22,7 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/fm-governance-lib.sh"
 
 cmd=${1:-}
-[ -n "$cmd" ] || { echo "usage: fm-govern.sh <classify|delivery-check|record|auth-valid|status|preqa-gate|local-gate> ..." >&2; exit 2; }
+[ -n "$cmd" ] || { echo "usage: fm-govern.sh <classify|delivery-check|record|auth-valid|status|sync-head|preqa-gate|local-gate> ..." >&2; exit 2; }
 shift || true
 
 case "$cmd" in
@@ -67,11 +67,20 @@ case "$cmd" in
     fi
     ;;
 
+  sync-head)
+    task=${1:?task}
+    fm_gov_sync_head "$task" && echo "sync-head: $task now at $(fm_gov_record_get "$task" headSha)"
+    ;;
+
   status|doctor)
     task=${1:?task}
     fm_gov_require_jq || exit 2
     path=$(fm_gov_record_path "$task")
     [ -f "$path" ] || { echo "error: no governance record for $task" >&2; exit 1; }
+    # Re-derive the live branch head first so the doctor view never reports a moved
+    # head as still authorized (independent-review finding: invalidation must not
+    # depend on an external caller having run `observe`).
+    fm_gov_sync_head "$task" || true
     head=$(jq -r '.headSha // "<none>"' "$path")
     frozen=$(jq -r '.frozen.sha // "<none>"' "$path")
     review=$(jq -r '.review.sha // "<none>"' "$path")
