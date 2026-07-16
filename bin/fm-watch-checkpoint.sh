@@ -55,7 +55,12 @@ esac
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
 
 START_EPOCH=$(date +%s)
+fm_supervision_persist_primary_harness "$STATE" "$FM_HOME" codex || {
+  printf 'checkpoint: failed to persist Codex primary harness identity\n' >&2
+  exit 1
+}
 FM_CODEX_CHECKPOINT_GENERATION=0
+FM_CODEX_CHECKPOINT_LEASE=
 FM_CODEX_CHECKPOINT_PREPARE_REASON=
 if ! fm_codex_checkpoint_prepare "$STATE" "$FM_HOME" "$START_EPOCH" "$SECONDS_ARG"; then
   printf 'checkpoint: refused to start Codex checkpoint supervision: %s\n' "$FM_CODEX_CHECKPOINT_PREPARE_REASON" >&2

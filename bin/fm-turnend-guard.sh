@@ -90,6 +90,7 @@ BLOCK_IDS_FILE="$STATE/.turnend-guard-block-ids"
 
 # shellcheck source=bin/fm-supervision-lib.sh
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
+HARNESS=$(fm_supervision_primary_harness "$STATE" "$FM_HOME" "$HARNESS")
 
 # Read the whole turn-end hook payload once; never block on unreadable/absent
 # stdin.

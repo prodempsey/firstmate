@@ -91,6 +91,7 @@ install_guard_scripts() {
   cp "$ROOT/bin/fm-supervision-instructions.sh" "$dir/bin/fm-supervision-instructions.sh"
   cp "$ROOT/bin/fm-harness.sh" "$dir/bin/fm-harness.sh"
   cp "$ROOT/bin/fm-supervision-lib.sh" "$dir/bin/fm-supervision-lib.sh"
+  cp "$ROOT/bin/fm-codex-systemd-scheduler.sh" "$dir/bin/fm-codex-systemd-scheduler.sh"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/fm-wake-lib.sh"
   # The live needs_firstmate read: the attention lib and everything it sources, plus the
   # ack command the paper-disposition cases exercise.
@@ -104,7 +105,7 @@ install_guard_scripts() {
   chmod +x "$dir/bin/fm-nf-ack.sh" "$dir/bin/fm-turnend-metrics.sh"
   mkdir -p "$dir/docs"
   cp -R "$ROOT/docs/supervision-protocols" "$dir/docs/supervision-protocols"
-  chmod +x "$dir/bin/fm-turnend-guard.sh" "$dir/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-supervision-instructions.sh" "$dir/bin/fm-harness.sh"
+  chmod +x "$dir/bin/fm-turnend-guard.sh" "$dir/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-supervision-instructions.sh" "$dir/bin/fm-harness.sh" "$dir/bin/fm-codex-systemd-scheduler.sh"
 }
 
 mark_codex_hook_root() {
@@ -184,7 +185,7 @@ run_hook() {
 run_hook_codex() {
   local dir=$1 stop_active=$2 home
   home=$(cd "$dir" && pwd)
-  printf '{"stop_hook_active":%s}' "$stop_active" | FM_SUPERVISION_HARNESS=codex FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" 2>&1
+  printf '{"stop_hook_active":%s}' "$stop_active" | FM_CODEX_SYSTEMD_FAKE_DIR="$dir/fake-systemd" FM_SUPERVISION_HARNESS=codex FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" 2>&1
 }
 
 nonexistent_pid() {
@@ -276,17 +277,20 @@ start_healthy_watcher() {  # <dir>
 
 write_codex_schedule() {  # <dir> <start-offset> <cadence> <lateness> [result] [owner-override]
   local dir=$1 start_offset=$2 cadence=$3 lateness=$4 result=${5:-quiet} owner_override=${6:-}
-  local now start end home
+  local now start end home fake
   home=$(cd "$dir" && pwd)
+  fake="$dir/fake-systemd"
   now=$(date +%s)
   start=$((now + start_offset))
   end=$((start + 1))
+  FM_CODEX_SYSTEMD_FAKE_DIR="$fake" bash -c '. "$1/bin/fm-supervision-lib.sh"; fm_supervision_persist_primary_harness "$2/state" "$2" codex' \
+    _ "$dir" "$home" || fail "could not persist Codex harness for $dir"
   if [ -n "$owner_override" ]; then
-    FM_CODEX_PRIMARY_IDENTITY="$owner_override" bash -c '. "$1/bin/fm-supervision-lib.sh"; fm_codex_checkpoint_finish "$2/state" "$2" "$3" "$4" "$5" "$6" "$7" 0' \
+    FM_CODEX_SYSTEMD_FAKE_DIR="$fake" FM_CODEX_PRIMARY_IDENTITY="$owner_override" bash -c '. "$1/bin/fm-supervision-lib.sh"; fm_codex_checkpoint_prepare "$2/state" "$2" "$3" "$6" || exit 1; fm_codex_checkpoint_finish "$2/state" "$2" "$3" "$4" "$5" "$6" "$7" "$FM_CODEX_CHECKPOINT_GENERATION"' \
       _ "$dir" "$home" "$start" "$end" "$result" "$cadence" "$lateness" \
       || fail "could not write Codex schedule for $dir"
   else
-    bash -c '. "$1/bin/fm-supervision-lib.sh"; fm_codex_checkpoint_finish "$2/state" "$2" "$3" "$4" "$5" "$6" "$7" 0' \
+    FM_CODEX_SYSTEMD_FAKE_DIR="$fake" bash -c '. "$1/bin/fm-supervision-lib.sh"; fm_codex_checkpoint_prepare "$2/state" "$2" "$3" "$6" || exit 1; fm_codex_checkpoint_finish "$2/state" "$2" "$3" "$4" "$5" "$6" "$7" "$FM_CODEX_CHECKPOINT_GENERATION"' \
       _ "$dir" "$home" "$start" "$end" "$result" "$cadence" "$lateness" \
       || fail "could not write Codex schedule for $dir"
   fi
@@ -949,6 +953,23 @@ test_hook_codex_normal_bounded_exit_is_not_a_crash() {
   expect_code 0 "$status" "Codex hook must treat normal bounded checkpoint exit as healthy when schedule is valid"
   [ -z "$out" ] || fail "normal bounded checkpoint exit was reported as a crash: $out"
   pass "fm-turnend-guard: normal bounded Codex checkpoint exit is healthy by schedule, not a watcher crash"
+}
+
+test_hook_codex_rejects_schedule_without_scheduler_registration() {
+  local dir out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-no-systemd")
+  : > "$dir/state/task1.meta"
+  write_codex_schedule "$dir" -1 60 60 quiet
+  rm -f "$dir"/fake-systemd/timers/*.json
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 2 "$status" "Codex hook must block when the durable record has no scheduler registration"
+  assert_contains "$out" "TURN WOULD END BLIND" "missing scheduler registration must report supervision continuity failure"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.supervision_health')" = unhealthy-no-supervision ] \
+    || fail "Codex missing scheduler registration did not log unhealthy-no-supervision: $log"
+  assert_contains "$(printf '%s' "$log" | jq -r '.supervision_reason')" "timer-not-registered" \
+    "Codex missing scheduler registration reason was not logged"
+  pass "fm-turnend-guard: Codex rejects timestamp-only schedule continuity without managed scheduler registration"
 }
 
 test_hook_codex_unattended_gate_still_blocks_with_healthy_schedule() {
@@ -1879,6 +1900,7 @@ test_hook_codex_rejects_owner_mismatch_schedule
 test_hook_codex_rejects_duplicate_checkpoint_schedules
 test_hook_codex_failed_checkpoint_is_not_green
 test_hook_codex_normal_bounded_exit_is_not_a_crash
+test_hook_codex_rejects_schedule_without_scheduler_registration
 test_hook_codex_unattended_gate_still_blocks_with_healthy_schedule
 test_hook_blocks_when_unhealthy_in_primary
 test_hook_blocks_from_fm_home_state

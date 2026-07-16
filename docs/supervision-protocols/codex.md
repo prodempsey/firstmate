@@ -6,7 +6,8 @@ When this session owns supervision and away mode is not active:
 3. Run one foreground watcher checkpoint with `bin/fm-watch-checkpoint.sh --seconds "${FM_CODEX_WATCH_CHECKPOINT:-180}"`.
 4. If the command prints `signal:`, `stale:`, `check:`, or `heartbeat`, drain queued wakes, handle that wake, then start the next checkpoint.
 5. If the command prints `checkpoint:` or exits 124 with no wake, drain queued wakes anyway, process any queued user message now visible to Codex, then start the next checkpoint.
-6. A normal checkpoint completion writes `state/.codex-watch-checkpoint.next.json` before returning, and that durable record is what proves continuity while no foreground watcher process is running.
+6. A normal checkpoint completion registers the managed next-checkpoint timer and writes `state/.codex-watch-checkpoint.next.json` before returning.
+   The durable record proves continuity only when it agrees with the FirstMate-owned systemd user timer adapter documented in `docs/codex-systemd-scheduler.md`.
 7. A failed checkpoint writes `state/.codex-watch-checkpoint.last.json` with `previous_result=failed` and does not leave a healthy next-checkpoint schedule.
 8. Never use shell `&` or Codex background tasks for firstmate watcher supervision.
 9. Do not run `bin/fm-watch-arm.sh` as Codex's normal supervision command.
@@ -14,5 +15,5 @@ When this session owns supervision and away mode is not active:
 
 Codex cannot reason while a foreground tool call is running.
 The bounded checkpoint returns control regularly so user messages and queued wakes can be handled without relying on background-task wake semantics.
-The schedule record carries the checkpoint owner, primary identity, home, prior start and end, result, next due time, cadence, maximum lateness, generation, lease id, mechanism, version, and integrity hash.
+The schedule record carries the checkpoint owner, primary identity, home, prior start and end, result, next due time, cadence, maximum lateness, generation, lease id, checkpoint mechanism, scheduling mechanism, scheduler unit metadata, version, and integrity hash.
 `FM_CODEX_WATCH_CHECKPOINT_MAX_LATENESS` controls the lateness window and defaults to 60 seconds.

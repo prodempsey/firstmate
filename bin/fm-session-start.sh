@@ -93,6 +93,9 @@ PRIMARY_HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 # shellcheck source=bin/fm-backend.sh
 # shellcheck disable=SC1091 # Dynamic sibling path is resolved from SCRIPT_DIR.
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-supervision-lib.sh
+# shellcheck disable=SC1091 # Dynamic sibling path is resolved from SCRIPT_DIR.
+. "$SCRIPT_DIR/fm-supervision-lib.sh"
 
 STATUS_TAIL=${FM_SESSION_START_STATUS_TAIL:-5}
 case "$STATUS_TAIL" in ''|*[!0-9]*) STATUS_TAIL=5 ;; esac
@@ -174,6 +177,10 @@ if [ "$LOCK_RC" -ne 0 ]; then
     printf '●  otherwise mutate fleet state from this session.\n'
     printf '%s\n' "$BAR"
   }
+else
+  if ! fm_supervision_persist_primary_harness "$STATE" "$FM_HOME" "$PRIMARY_HARNESS"; then
+    printf 'PRIMARY_HARNESS: failed to persist durable primary harness identity for supervision health\n'
+  fi
 fi
 
 # --- 2. bootstrap --------------------------------------------------------

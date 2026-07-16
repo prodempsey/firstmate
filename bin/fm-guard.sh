@@ -44,6 +44,7 @@ US=$'\x1f'
 . "$SCRIPT_DIR/fm-tangle-lib.sh"
 # shellcheck source=bin/fm-supervision-lib.sh
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
+HARNESS=$(fm_supervision_primary_harness "$STATE" "$FM_HOME" "$HARNESS")
 
 # Worktree-tangle alarm, checked FIRST and independent of in-flight tasks: the
 # firstmate PRIMARY checkout (FM_ROOT) must stay on its default branch. If a
