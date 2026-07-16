@@ -15,5 +15,5 @@ When this session owns supervision and away mode is not active:
 
 Codex cannot reason while a foreground tool call is running.
 The bounded checkpoint returns control regularly so user messages and queued wakes can be handled without relying on background-task wake semantics.
-The schedule record carries the checkpoint owner, primary identity, home, prior start and end, result, next due time, cadence, maximum lateness, generation, lease id, checkpoint mechanism, scheduling mechanism, scheduler unit metadata, version, and integrity hash.
+The schedule record carries the checkpoint owner, primary identity, home, prior start and end, result, next due time, cadence, maximum lateness, generation, lease id, checkpoint mechanism, scheduling mechanism, scheduler unit metadata, version, and a sha256 corruption checksum (`integrity` - not an authenticity control; ownership is proven by the live verified primary identity, per `docs/turnend-guard.md`).
 `FM_CODEX_WATCH_CHECKPOINT_MAX_LATENESS` controls the lateness window and defaults to 60 seconds.

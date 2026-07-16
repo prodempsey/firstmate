@@ -25,9 +25,6 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 GRACE=${FM_GUARD_GRACE:-300}
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 HARNESS=${FM_SUPERVISION_HARNESS:-}
-if [ -z "$HARNESS" ]; then
-  HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
-fi
 queue_pending=false
 READ_ONLY=${FM_GUARD_READ_ONLY:-0}
 case "$READ_ONLY" in 1|true|TRUE|yes|YES) READ_ONLY=1 ;; *) READ_ONLY=0 ;; esac
@@ -45,6 +42,11 @@ US=$'\x1f'
 # shellcheck source=bin/fm-supervision-lib.sh
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
 HARNESS=$(fm_supervision_primary_harness "$STATE" "$FM_HOME" "$HARNESS")
+# The fm-harness.sh subprocess runs only when neither the durable record nor
+# the ambient environment answers - never unconditionally on this hot path.
+case "$HARNESS" in
+  ''|unknown) HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown) ;;
+esac
 
 # Worktree-tangle alarm, checked FIRST and independent of in-flight tasks: the
 # firstmate PRIMARY checkout (FM_ROOT) must stay on its default branch. If a

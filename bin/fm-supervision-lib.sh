@@ -8,7 +8,13 @@
 # legacy grace-based warning predicate directly in older call paths. New guards use
 # fm_supervision_health, which keeps persistent harnesses on live watcher identity checks
 # and lets Codex prove continuity with a durable next-checkpoint schedule after a normal
-# bounded checkpoint exits.
+# bounded checkpoint exits. Scheduled Codex health is never file-content alone: it
+# requires a LIVE verified primary (session-lock pid plus process identity, home, and
+# UID) that matches the schedule owner, a durable codex harness record for this home,
+# and the scheduler adapter's read-back of the loaded timer/service contract. The
+# schedule's sha256 `integrity` field is a corruption checksum only, never an
+# authenticity control - the state dir is same-account-writable by design, so the Unix
+# account boundary is the outermost trust boundary here.
 
 FM_CODEX_CHECKPOINT_SCHEDULE_NAME=.codex-watch-checkpoint.next.json
 FM_CODEX_CHECKPOINT_LAST_NAME=.codex-watch-checkpoint.last.json
@@ -109,6 +115,14 @@ fm_supervision_persist_primary_harness() {
   fm_codex_write_json_atomic "$path" "$payload"
 }
 
+# fm_supervision_detect_primary_identity <state> <home> [harness]
+# Prints a LIVE, VERIFIED primary identity or fails (review finding F-2):
+# outside test mode the only source is the per-home session lock's live holder
+# pid bound to its full process identity (fm_pid_identity: start time plus
+# command line). A pid whose identity cannot be read is not a verified primary.
+# There is deliberately no fallback to recorded state-file content: everything
+# in the state dir is same-account-writable, so a recorded identity can assert
+# ownership but never prove it.
 fm_supervision_detect_primary_identity() {
   local state=$1 home=$2 harness=${3:-} lock pid ident
   if [ "${FM_SUPERVISION_TEST_MODE:-}" = 1 ] && [ -n "${FM_CODEX_PRIMARY_IDENTITY:-}" ]; then
@@ -128,10 +142,8 @@ fm_supervision_detect_primary_identity() {
     fi
     if [ -n "$ident" ]; then
       printf 'pid:%s:%s\n' "$pid" "$ident"
-    else
-      printf 'pid:%s\n' "$pid"
+      return 0
     fi
-    return 0
   fi
   if [ "${FM_SUPERVISION_TEST_MODE:-}" = 1 ]; then
     printf 'test:%s:%s\n' "${harness:-unknown}" "$(cd "$home" 2>/dev/null && pwd -P || printf '%s' "$home")"
@@ -158,18 +170,6 @@ fm_supervision_primary_harness() {
     return 0
   fi
   printf '%s\n' "${ambient:-unknown}"
-}
-
-fm_supervision_primary_identity_recorded() {
-  local state=$1 home=$2 path canon_home file_home uid identity
-  path=$(fm_supervision_primary_harness_path "$state")
-  [ -f "$path" ] && command -v jq >/dev/null 2>&1 || return 1
-  identity=$(jq -r '.primary_identity // empty' "$path" 2>/dev/null)
-  file_home=$(jq -r '.fm_home // empty' "$path" 2>/dev/null)
-  uid=$(jq -r '.uid // empty' "$path" 2>/dev/null)
-  canon_home=$(cd "$home" 2>/dev/null && pwd -P) || canon_home=$home
-  [ -n "$identity" ] && [ "$file_home" = "$canon_home" ] && [ "$uid" = "$(id -u)" ] || return 1
-  printf '%s\n' "$identity"
 }
 
 fm_sup_load_wake_lib() {
@@ -247,19 +247,23 @@ fm_codex_schedule_count() {
   fm_codex_schedule_files "$1" | grep -c . 2>/dev/null || true
 }
 
+# fm_codex_primary_identity <state> <home>
+# The current primary's identity, live-verified only (review finding F-2). The
+# former fallback to the recorded .primary-harness.json identity is deliberately
+# gone: a schedule whose owner cannot be matched against a live verified primary
+# must never be treated as healthy-checkpoint-scheduled.
 fm_codex_primary_identity() {
-  local state=$1 home=$2 identity
-  identity=$(fm_supervision_detect_primary_identity "$state" "$home" codex 2>/dev/null) && {
-    printf '%s\n' "$identity"
-    return 0
-  }
-  fm_supervision_primary_identity_recorded "$state" "$home"
+  fm_supervision_detect_primary_identity "$1" "$2" codex 2>/dev/null
 }
 
 fm_codex_schedule_integrity_payload() {
   jq -cS 'del(.integrity)' "$1" 2>/dev/null
 }
 
+# The `integrity` field is a plain sha256 CORRUPTION CHECKSUM, not an
+# authenticity control: any same-account writer can recompute it, so it detects
+# truncation and accidental edits, never forgery. Ownership is proven by the
+# live-verified primary identity above, not by this hash.
 fm_codex_schedule_integrity() {
   fm_codex_schedule_integrity_payload "$1" | fm_sup_hash_stdin
 }
@@ -270,6 +274,26 @@ fm_codex_write_json_atomic() {
   printf '%s\n' "$payload" > "$tmp" || { rm -f "$tmp"; return 1; }
   chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$dest" || { rm -f "$tmp"; return 1; }
+}
+
+# fm_codex_write_json_exclusive <dest> <payload>
+# Atomic CREATE (noclobber): fails when <dest> already exists, so exactly one
+# concurrent writer wins. This is the running-checkpoint lease acquisition
+# (review finding F-6); the old bare `[ -f ]` probe was a TOCTOU window, not a
+# lock.
+fm_codex_write_json_exclusive() {
+  local dest=$1 payload=$2
+  ( umask 077; set -o noclobber; printf '%s\n' "$payload" > "$dest" ) 2>/dev/null
+}
+
+# fm_codex_checkpoint_release_own <running-path>
+# Releases the running-checkpoint lease only when this process owns it; a
+# loser or a bystander can never delete the winner's lease. Always returns 0.
+fm_codex_checkpoint_release_own() {
+  local running=$1 pid
+  pid=$(jq -r '.runner_pid // empty' "$running" 2>/dev/null || true)
+  [ "$pid" = "$$" ] && rm -f "$running" 2>/dev/null
+  return 0
 }
 
 fm_codex_build_schedule_payload() {
@@ -308,9 +332,19 @@ fm_codex_build_schedule_payload() {
   printf '%s\n' "$payload" | jq -cS --arg integrity "sha256:$hash" '. + {integrity:$integrity}' 2>/dev/null
 }
 
+# fm_codex_field_numeric <value>: one field, one check (review finding F-8).
+# The old concatenated `start:end:due:...` case pattern had a trailing-empty-
+# field hole; every numeric field is validated individually instead.
+fm_codex_field_numeric() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+
 fm_codex_schedule_validate() {
   local state=$1 home=$2 now file
-  local count integrity expected version harness mechanism scheduling owner primary current file_home file_state canon_home canon_state durable_harness scheduler_adapter expected_late unit_name timer_name service_name
+  local count integrity expected version harness mechanism scheduling owner primary current file_home file_state canon_home canon_state durable_harness scheduler_adapter expected_late unit_name timer_name service_name rec_uid
   local start end due cadence late result generation lease
   now=${3:-$(date +%s)}
   file=${4:-$(fm_codex_schedule_path "$state")}
@@ -350,6 +384,7 @@ fm_codex_schedule_validate() {
   unit_name=$(jq -r '.scheduler.unit_name // empty' "$file" 2>/dev/null)
   timer_name=$(jq -r '.scheduler.timer_name // empty' "$file" 2>/dev/null)
   service_name=$(jq -r '.scheduler.service_name // empty' "$file" 2>/dev/null)
+  rec_uid=$(jq -r '.scheduler.uid // empty' "$file" 2>/dev/null)
   [ "$version" = 1 ] || { FM_CODEX_SCHEDULE_REASON=unsupported-version; return 1; }
   [ "$harness" = codex ] || { FM_CODEX_SCHEDULE_REASON='harness-mismatch'; return 1; }
   [ "$mechanism" = "$FM_CODEX_CHECKPOINT_MECHANISM" ] || { FM_CODEX_SCHEDULE_REASON='mechanism-mismatch'; return 1; }
@@ -368,10 +403,17 @@ fm_codex_schedule_validate() {
     failed) FM_CODEX_SCHEDULE_REASON='last-checkpoint-failed'; return 1 ;;
     *) FM_CODEX_SCHEDULE_REASON=bad-result; return 1 ;;
   esac
-  case "$start:$end:$due:$cadence:$late:$generation" in
-    *[!0-9:]*|:*|*::*) FM_CODEX_SCHEDULE_REASON=bad-time; return 1 ;;
-  esac
+  [ "$rec_uid" = "$(id -u)" ] || { FM_CODEX_SCHEDULE_REASON=uid-mismatch; return 1; }
+  fm_codex_field_numeric "$start" || { FM_CODEX_SCHEDULE_REASON=bad-time; return 1; }
+  fm_codex_field_numeric "$end" || { FM_CODEX_SCHEDULE_REASON=bad-time; return 1; }
+  fm_codex_field_numeric "$due" || { FM_CODEX_SCHEDULE_REASON=bad-time; return 1; }
+  fm_codex_field_numeric "$cadence" || { FM_CODEX_SCHEDULE_REASON=bad-cadence; return 1; }
+  fm_codex_field_numeric "$late" || { FM_CODEX_SCHEDULE_REASON=bad-lateness; return 1; }
+  fm_codex_field_numeric "$generation" || { FM_CODEX_SCHEDULE_REASON=bad-generation; return 1; }
   [ -n "$lease" ] || { FM_CODEX_SCHEDULE_REASON=missing-lease; return 1; }
+  case "$lease" in
+    *[!A-Za-z0-9._-]*) FM_CODEX_SCHEDULE_REASON=bad-lease; return 1 ;;
+  esac
   [ "$end" -ge "$start" ] || { FM_CODEX_SCHEDULE_REASON=bad-time-order; return 1; }
   [ "$due" -ge "$end" ] || { FM_CODEX_SCHEDULE_REASON=bad-due-time; return 1; }
   [ "$cadence" -gt 0 ] || { FM_CODEX_SCHEDULE_REASON=bad-cadence; return 1; }
@@ -423,19 +465,60 @@ fm_codex_checkpoint_start_record() {
   fm_codex_write_json_atomic "$running" "$payload"
 }
 
+# fm_codex_checkpoint_prepare <state> <home> <start-epoch> <cadence>
+# Order matters (review finding F-6): resolve the live identity first (nothing
+# consumed on an identity blip), acquire the running-checkpoint lease
+# atomically, and only then - holding exclusive ownership - validate and
+# consume the prior schedule and its armed timer. A losing or failing prepare
+# releases only its own lease and leaves the winner and any prior-valid
+# schedule untouched.
 fm_codex_checkpoint_prepare() {
-  local state=$1 home=$2 start_epoch=$3 cadence=$4 running pid count schedule generation lease
+  local state=$1 home=$2 start_epoch=$3 cadence=$4 running pid count schedule generation lease owner canon_home canon_state payload
+  FM_CODEX_CHECKPOINT_PREPARE_REASON=
   mkdir -p "$state" || return 1
   running=$(fm_codex_running_path "$state")
+  owner=$(fm_codex_primary_identity "$state" "$home") || {
+    FM_CODEX_CHECKPOINT_PREPARE_REASON=identity-unresolvable
+    return 1
+  }
   if [ -f "$running" ]; then
     pid=$(jq -r '.runner_pid // empty' "$running" 2>/dev/null || true)
     case "$pid" in
-      ''|*[!0-9]*) ;;
-      *) kill -0 "$pid" 2>/dev/null && { FM_CODEX_CHECKPOINT_PREPARE_REASON=duplicate-running-checkpoint; return 1; } ;;
+      ''|*[!0-9]*) rm -f "$running" 2>/dev/null || true ;;
+      *)
+        if kill -0 "$pid" 2>/dev/null; then
+          FM_CODEX_CHECKPOINT_PREPARE_REASON=duplicate-running-checkpoint
+          return 1
+        fi
+        rm -f "$running" 2>/dev/null || true
+        ;;
     esac
+  fi
+  lease="${start_epoch}-$$-${RANDOM:-0}"
+  canon_home=$(cd "$home" 2>/dev/null && pwd -P) || canon_home=$home
+  canon_state=$(cd "$state" 2>/dev/null && pwd -P) || canon_state=$state
+  payload=$(jq -cnS \
+    --arg owner "codex:$owner" \
+    --arg primary_identity "$owner" \
+    --arg fm_home "$canon_home" \
+    --arg state_dir "$canon_state" \
+    --arg mechanism "$FM_CODEX_CHECKPOINT_MECHANISM" \
+    --arg lease_id "$lease" \
+    --argjson version 1 \
+    --argjson runner_pid "$$" \
+    --argjson checkpoint_start "$start_epoch" \
+    --argjson cadence_seconds "$cadence" \
+    '{version:$version,harness:"codex",owner:$owner,primary_identity:$primary_identity,
+      fm_home:$fm_home,state_dir:$state_dir,runner_pid:$runner_pid,
+      checkpoint_start:$checkpoint_start,cadence_seconds:$cadence_seconds,
+      generation:0,lease_id:$lease_id,mechanism:$mechanism}' 2>/dev/null) || return 1
+  if ! fm_codex_write_json_exclusive "$running" "$payload"; then
+    FM_CODEX_CHECKPOINT_PREPARE_REASON=duplicate-running-checkpoint
+    return 1
   fi
   count=$(fm_codex_schedule_count "$state")
   if [ "$count" -gt 1 ]; then
+    fm_codex_checkpoint_release_own "$running"
     FM_CODEX_CHECKPOINT_PREPARE_REASON=duplicate-schedule
     return 1
   fi
@@ -444,19 +527,24 @@ fm_codex_checkpoint_prepare() {
   if [ -f "$schedule" ]; then
     if ! fm_codex_schedule_validate "$state" "$home" "$(date +%s)" "$schedule"; then
       if [ "$FM_CODEX_SCHEDULE_REASON" != checkpoint-overdue ]; then
+        fm_codex_checkpoint_release_own "$running"
         FM_CODEX_CHECKPOINT_PREPARE_REASON=$FM_CODEX_SCHEDULE_REASON
         return 1
       fi
     fi
     generation=$(jq -r '.generation // 0' "$schedule" 2>/dev/null)
     fm_codex_scheduler_remove "$state" "$home"
-    rm -f "$schedule" || { FM_CODEX_CHECKPOINT_PREPARE_REASON=consume-schedule-failed; return 1; }
+    if ! rm -f "$schedule"; then
+      fm_codex_checkpoint_release_own "$running"
+      FM_CODEX_CHECKPOINT_PREPARE_REASON=consume-schedule-failed
+      return 1
+    fi
   fi
-  lease="${start_epoch}-$$-${RANDOM:-0}"
-  fm_codex_checkpoint_start_record "$state" "$home" "$start_epoch" "$cadence" "$generation" "$lease" || {
+  if ! fm_codex_checkpoint_start_record "$state" "$home" "$start_epoch" "$cadence" "$generation" "$lease"; then
+    fm_codex_checkpoint_release_own "$running"
     FM_CODEX_CHECKPOINT_PREPARE_REASON=write-running-record-failed
     return 1
-  }
+  fi
   # shellcheck disable=SC2034 # Read by callers after fm_codex_checkpoint_prepare returns.
   FM_CODEX_CHECKPOINT_GENERATION=$generation
   # shellcheck disable=SC2034 # Read by callers after fm_codex_checkpoint_prepare returns.
@@ -558,11 +646,11 @@ fm_supervision_health() {
   case "$reason" in
     checkpoint-overdue)
       FM_SUP_HEALTH_STATE=unhealthy-checkpoint-overdue ;;
-    owner-mismatch|home-mismatch|harness-mismatch|mechanism-mismatch)
+    owner-mismatch|home-mismatch|harness-mismatch|mechanism-mismatch|uid-mismatch*)
       FM_SUP_HEALTH_STATE=unhealthy-owner-mismatch ;;
-    scheduler-mismatch|scheduler-missing|scheduler-invalid|timer-not-registered*|timer-not-active*|service-not-loaded*)
+    scheduler-mismatch|scheduler-missing|scheduler-invalid|timer-not-registered*|timer-not-active*|timer-not-enabled*|service-not-loaded*)
       FM_SUP_HEALTH_STATE=unhealthy-no-supervision ;;
-    duplicate-schedule)
+    duplicate-schedule|duplicate-unit*)
       FM_SUP_HEALTH_STATE=unhealthy-duplicate-owner ;;
     last-checkpoint-failed)
       FM_SUP_HEALTH_STATE=unhealthy-last-checkpoint-failed ;;

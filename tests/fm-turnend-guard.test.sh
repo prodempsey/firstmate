@@ -951,7 +951,7 @@ test_hook_codex_rejects_disabled_scheduler() {
   dir=$(make_primary_dir "$TMP_ROOT/hook-codex-disabled-scheduler")
   : > "$dir/state/task1.meta"
   write_codex_schedule "$dir" -1 60 60 quiet
-  FM_CODEX_SYSTEMD_FAKE_DIR="$dir/fake-systemd" "$dir/bin/fm-codex-systemd-scheduler.sh" disable --home "$dir" --state "$dir/state" \
+  FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$dir/fake-systemd" "$dir/bin/fm-codex-systemd-scheduler.sh" disable --home "$dir" --state "$dir/state" \
     || fail "fake scheduler disable failed"
   out=$(run_hook_codex "$dir" false); status=$?
   expect_code 2 "$status" "Codex hook must block when scheduler registration is disabled"
@@ -996,6 +996,108 @@ test_hook_codex_production_identity_override_cannot_make_wrong_owner_healthy() {
   [ "$(printf '%s' "$log" | jq -r '.supervision_health')" = unhealthy-owner-mismatch ] \
     || fail "Codex production identity override did not fail as owner mismatch: $log"
   pass "fm-turnend-guard: production Codex health does not accept ambient primary identity override"
+}
+
+# forge_codex_supervision_files <dir> <identity>: the review-r2 attack fixture -
+# a hand-written durable harness record, schedule (checksum recomputed), and fake
+# scheduler registration, with NO process backing the claimed identity. Metadata
+# is computed via a gated test-mode call; the attack itself runs in production.
+forge_codex_supervision_files() {
+  local dir=$1 identity=$2 home meta payload hash now uid
+  home=$(cd "$dir" && pwd)
+  now=$(date +%s)
+  uid=$(id -u)
+  meta=$(FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$dir/fake-systemd" \
+    "$dir/bin/fm-codex-systemd-scheduler.sh" unit-metadata --home "$home" --state "$home/state") \
+    || fail "could not compute unit metadata for forged fixture"
+  jq -cnS --arg identity "$identity" --arg home "$home" --argjson uid "$uid" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{version:1,harness:"codex",primary_identity:$identity,fm_home:$home,uid:$uid,recorded_at:$ts}' \
+    > "$dir/state/.primary-harness.json" || fail "could not forge primary harness record"
+  payload=$(jq -cnS --argjson scheduler "$meta" --arg identity "$identity" \
+    --arg home "$home" --arg state "$home/state" --argjson now "$now" \
+    '{version:1,harness:"codex",owner:("codex:" + $identity),primary_identity:$identity,
+      fm_home:$home,state_dir:$state,previous_checkpoint_start:($now - 2),
+      previous_checkpoint_end:($now - 1),previous_result:"quiet",
+      next_checkpoint_due:($now + 60),cadence_seconds:60,max_lateness_seconds:60,
+      generation:1,lease_id:"forged-lease",mechanism:"codex-bounded-checkpoint",
+      scheduling_mechanism:"systemd-user-timer",scheduler:$scheduler}') || fail "could not forge schedule payload"
+  hash=$(printf '%s\n' "$payload" | sha256sum | awk '{print $1}')
+  printf '%s\n' "$payload" | jq -cS --arg integrity "sha256:$hash" '. + {integrity:$integrity}' \
+    > "$dir/state/.codex-watch-checkpoint.next.json" || fail "could not forge schedule record"
+  mkdir -p "$dir/fake-systemd/timers"
+  jq -cnS --argjson scheduler "$meta" --arg home "$home" --arg state "$home/state" --argjson now "$now" \
+    '{registered:true,lease_id:"forged-lease",generation:1,cadence_seconds:60,
+      next_checkpoint_due:($now + 60),previous_result:"quiet",fm_home:$home,
+      state_dir:$state,harness:"codex",metadata:$scheduler}' \
+    > "$dir/fake-systemd/timers/$(printf '%s' "$meta" | jq -r '.unit_name').json" \
+    || fail "could not forge fake registration"
+}
+
+# The review-r2 F-2 reproduction as a permanent regression: three hand-written
+# files, zero processes, no lock, no test mode - the forged owner must never
+# make scheduled Codex supervision healthy.
+test_hook_codex_forged_state_files_cannot_own_schedule() {
+  local dir home out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-forged-files")
+  home=$(cd "$dir" && pwd)
+  : > "$dir/state/task1.meta"
+  forge_codex_supervision_files "$dir" 'pid:999999:totally-made-up'
+  out=$(printf '{"stop_hook_active":false}' | FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" 2>&1); status=$?
+  expect_code 2 "$status" "forged durable identity files must not make Codex scheduled supervision healthy"
+  assert_contains "$out" "TURN WOULD END BLIND" "forged schedule must be reported as missing supervision continuity"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.supervision_health')" = unhealthy-owner-mismatch ] \
+    || fail "forged owner did not fail as owner mismatch: $log"
+  [ "$(printf '%s' "$log" | jq -r '.supervision_harness')" = codex ] \
+    || fail "forged fixture should still resolve the codex branch to prove the block: $log"
+  pass "fm-turnend-guard: hand-written state files with no live primary never prove Codex scheduled health"
+}
+
+# The review-r2 F-1 reproduction as a permanent regression: a LIVE primary with a
+# genuinely owned schedule, evaluated in production with the ambient fake-dir
+# override exported. The adapter must fail closed instead of reading the fake
+# registration, so the turn is blocked even though every durable file agrees.
+test_hook_codex_production_ambient_fake_dir_cannot_fake_health() {
+  local dir home out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-ambient-fake-dir")
+  home=$(cd "$dir" && pwd)
+  : > "$dir/state/task1.meta"
+  printf '%s\n' "$$" > "$dir/state/.lock"
+  write_codex_schedule "$dir" -1 60 60 quiet
+  out=$(printf '{"stop_hook_active":false}' | FM_CODEX_SYSTEMD_FAKE_DIR="$dir/fake-systemd" FM_HOME="$home" \
+    bash "$dir/bin/fm-turnend-guard.sh" 2>&1); status=$?
+  expect_code 2 "$status" "ambient FM_CODEX_SYSTEMD_FAKE_DIR must not substitute a file for the real scheduler query"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.supervision_health')" != healthy-checkpoint-scheduled ] \
+    || fail "ambient fake dir produced healthy scheduled supervision: $log"
+  assert_contains "$(printf '%s' "$log" | jq -r '.supervision_reason')" "test-override-without-test-mode" \
+    "the block must name the ungated test override"
+  pass "fm-turnend-guard: production Codex health fails closed on an ambient fake-scheduler override"
+}
+
+# Scheduled Codex health is bound to the LIVE primary: the same schedule is
+# healthy while the session lock holder that owns it is alive, and unhealthy the
+# moment the lock names a dead or different session.
+test_hook_codex_schedule_bound_to_live_primary() {
+  local dir out status log dead
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-live-binding")
+  : > "$dir/state/task1.meta"
+  printf '%s\n' "$$" > "$dir/state/.lock"
+  write_codex_schedule "$dir" -1 60 60 quiet
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 0 "$status" "a schedule owned by the live locked primary must be healthy"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.watcher')" = healthy-checkpoint-scheduled ] \
+    || fail "live-owner schedule did not log healthy-checkpoint-scheduled: $log"
+  dead=$(nonexistent_pid)
+  printf '%s\n' "$dead" > "$dir/state/.lock"
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 2 "$status" "the same schedule must turn unhealthy once its owning session is gone"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.supervision_health')" = unhealthy-owner-mismatch ] \
+    || fail "dead-session schedule did not fail as owner mismatch: $log"
+  pass "fm-turnend-guard: Codex scheduled health is bound to the live verified primary, not to file content"
 }
 
 test_hook_codex_failed_checkpoint_is_not_green() {
@@ -1969,6 +2071,9 @@ test_hook_codex_rejects_duplicate_checkpoint_schedules
 test_hook_codex_rejects_disabled_scheduler
 test_hook_codex_rejects_bad_generation_and_excessive_lateness
 test_hook_codex_production_identity_override_cannot_make_wrong_owner_healthy
+test_hook_codex_forged_state_files_cannot_own_schedule
+test_hook_codex_production_ambient_fake_dir_cannot_fake_health
+test_hook_codex_schedule_bound_to_live_primary
 test_hook_codex_failed_checkpoint_is_not_green
 test_hook_codex_normal_bounded_exit_is_not_a_crash
 test_hook_codex_rejects_schedule_without_scheduler_registration

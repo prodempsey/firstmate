@@ -136,9 +136,100 @@ test_checkpoint_advances_generation_from_existing_schedule() {
   pass "checkpoint consumes and advances an existing durable next-checkpoint schedule"
 }
 
+# arm_valid_schedule <home>: run one quiet checkpoint so the home holds a valid
+# durable schedule plus a live fake scheduler registration.
+arm_valid_schedule() {
+  local home=$1
+  FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds 1 >/dev/null 2>&1 || true
+  [ -f "$home/state/.codex-watch-checkpoint.next.json" ] || fail "could not arm a valid schedule for $home"
+  [ -n "$(find "$home/fake-systemd/timers" -name '*.json' -print -quit 2>/dev/null)" ] \
+    || fail "could not arm a fake scheduler registration for $home"
+}
+
+# Review finding F-6: a prepare that fails (here: no live identity, production
+# mode) must fail BEFORE consuming the armed timer and durable schedule, leaving
+# the prior-valid supervision fully intact.
+test_prepare_failure_preserves_prior_supervision() {
+  local home out
+  home=$(make_home preserve-prior)
+  arm_valid_schedule "$home"
+  out=$(env -u FM_SUPERVISION_TEST_MODE -u FM_CODEX_PRIMARY_IDENTITY -u FM_CODEX_SYSTEMD_FAKE_DIR \
+    bash -c '. "$1/bin/fm-supervision-lib.sh"
+      fm_codex_checkpoint_prepare "$2/state" "$2" "$(date +%s)" 60
+      printf "prepare_rc=%s reason=%s\n" "$?" "$FM_CODEX_CHECKPOINT_PREPARE_REASON"' _ "$ROOT" "$home")
+  assert_contains "$out" "prepare_rc=1" "prepare without a live verified primary must fail"
+  assert_contains "$out" "reason=identity-unresolvable" "prepare must name the identity failure"
+  [ -f "$home/state/.codex-watch-checkpoint.next.json" ] \
+    || fail "failed prepare consumed the durable schedule"
+  [ -n "$(find "$home/fake-systemd/timers" -name '*.json' -print -quit 2>/dev/null)" ] \
+    || fail "failed prepare destroyed the armed scheduler registration"
+  assert_absent "$home/state/.codex-watch-checkpoint.running.json" "failed prepare left a running-checkpoint lease behind"
+  pass "checkpoint prepare failure preserves the prior schedule and armed timer"
+}
+
+# Review finding F-6: ownership acquisition is atomic. Two prepares released
+# against one barrier admit exactly one winner; the loser touches nothing.
+test_concurrent_prepare_admits_exactly_one_winner() {
+  local home barrier i ok_count fail_count winner_result loser_result deadline
+  home=$(make_home concurrent-prepare)
+  arm_valid_schedule "$home"
+  barrier="$home/barrier"
+  for i in 1 2; do
+    FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" \
+      bash -c '. "$1/bin/fm-supervision-lib.sh"
+        until [ -f "$2" ]; do sleep 0.02; done
+        if fm_codex_checkpoint_prepare "$3/state" "$3" "$(date +%s)" 60; then
+          printf "ok gen=%s\n" "$FM_CODEX_CHECKPOINT_GENERATION" > "$4"
+        else
+          printf "fail %s\n" "$FM_CODEX_CHECKPOINT_PREPARE_REASON" > "$4"
+        fi
+        until [ -f "$5" ]; do sleep 0.05; done' \
+      _ "$ROOT" "$barrier" "$home" "$home/result-$i" "$home/release" >/dev/null 2>&1 &
+  done
+  : > "$barrier"
+  deadline=$((SECONDS + 20))
+  while [ ! -s "$home/result-1" ] || [ ! -s "$home/result-2" ]; do
+    [ "$SECONDS" -lt "$deadline" ] || { : > "$home/release"; fail "concurrent prepares did not both report" ; }
+    sleep 0.05
+  done
+  ok_count=$(cat "$home/result-1" "$home/result-2" | grep -c '^ok' || true)
+  fail_count=$(cat "$home/result-1" "$home/result-2" | grep -c '^fail duplicate-running-checkpoint' || true)
+  winner_result=$(cat "$home/result-1" "$home/result-2" | grep '^ok' || true)
+  loser_result=$(cat "$home/result-1" "$home/result-2" | grep '^fail' || true)
+  [ "$ok_count" = 1 ] || { : > "$home/release"; fail "expected exactly one prepare winner, got $ok_count ($winner_result / $loser_result)"; }
+  [ "$fail_count" = 1 ] || { : > "$home/release"; fail "loser did not fail as duplicate-running-checkpoint: $loser_result"; }
+  assert_contains "$winner_result" "gen=1" "winner did not consume the armed schedule generation"
+  assert_absent "$home/state/.codex-watch-checkpoint.next.json" "the schedule was not consumed exactly once"
+  [ -f "$home/state/.codex-watch-checkpoint.running.json" ] \
+    || { : > "$home/release"; fail "the winner's running-checkpoint lease is missing"; }
+  : > "$home/release"
+  wait
+  pass "checkpoint prepare admits exactly one concurrent owner and the loser preserves state"
+}
+
+test_stale_running_record_is_reclaimed() {
+  local home out err status dead
+  home=$(make_home stale-running)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  dead=999999
+  while kill -0 "$dead" 2>/dev/null; do dead=$((dead + 1)); done
+  jq -cnS --argjson pid "$dead" '{version:1,harness:"codex",runner_pid:$pid,lease_id:"stale",generation:0}' \
+    > "$home/state/.codex-watch-checkpoint.running.json"
+  status=0
+  FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  expect_code 124 "$status" "checkpoint exit with a stale running record present"
+  [ -f "$home/state/.codex-watch-checkpoint.next.json" ] \
+    || fail "checkpoint did not recover from a dead runner's stale running record"
+  pass "checkpoint reclaims a dead runner's stale running-checkpoint record"
+}
+
 test_quiet_checkpoint_exits_124_cleanly
 test_signal_passes_through_and_exits_zero
 test_check_uses_preserved_watcher_environment
 test_existing_singleton_watcher_is_not_success
 test_duplicate_running_checkpoint_is_refused
 test_checkpoint_advances_generation_from_existing_schedule
+test_prepare_failure_preserves_prior_supervision
+test_concurrent_prepare_admits_exactly_one_winner
+test_stale_running_record_is_reclaimed

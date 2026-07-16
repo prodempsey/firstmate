@@ -6,9 +6,22 @@
 # It never backgrounds a shell process.
 # Production mode writes one deterministic user service/timer pair for the
 # canonical FM_HOME and controls it through systemctl --user.
-# Test mode is selected by FM_CODEX_SYSTEMD_FAKE_DIR and writes the same
-# registration contract into isolated fixture files instead of touching the user
-# manager.
+#
+# Test seams are FAIL-CLOSED (review finding F-1): FM_CODEX_SYSTEMD_FAKE_DIR,
+# FM_CODEX_SYSTEMD_SYSTEMCTL, and FM_CODEX_SYSTEMD_UNIT_DIR are honored only
+# under FM_SUPERVISION_TEST_MODE=1, and only when the evaluated home, state
+# dir, and overridden directories are provably test-owned: each must sit under
+# a root carrying the .fm-test-owner marker written by tests/lib.sh (the same
+# marker bin/fm-test-tmp-sweep.sh reclaims by), and never inside the real user
+# unit directory. Any override set without that full gate is an error, never a
+# fallback to fake or real mode, so no ambient environment variable can
+# substitute a file for a real `systemctl --user` query in production.
+#
+# Every record field that reaches a unit file is validated first (review
+# finding F-4): leases against a safe charset, numbers as bounded digits, paths
+# against control characters. The service command is constructed only from this
+# adapter's own computed metadata plus the validated numeric cadence, never
+# from free-form record text.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,10 +56,14 @@ Commands:
   schedule       Register and start the user timer described by --record.
   status         Print scheduler status as JSON.
   query          Print scheduler status as JSON.
-  validate       Verify --record agrees with the registered scheduler.
+  validate       Verify --record agrees with the loaded scheduler contract.
   disable        Disable the deterministic timer but leave unit files inspectable.
   remove         Disable and remove the deterministic timer/service.
   doctor         Report whether a systemd --user manager is available.
+
+Test seams (FM_CODEX_SYSTEMD_FAKE_DIR, FM_CODEX_SYSTEMD_SYSTEMCTL,
+FM_CODEX_SYSTEMD_UNIT_DIR) require FM_SUPERVISION_TEST_MODE=1 and test-owned
+directories; any of them set without that gate fails closed with exit 2.
 EOF
       exit 0
       ;;
@@ -73,6 +90,83 @@ canon_path() {
   cd "$p" 2>/dev/null && pwd -P
 }
 
+# refuse <reason>: fail closed with a machine-readable reason. Under --json the
+# reason lands on stdout as the same {ok:false,reason} shape validate emits, so
+# callers surface it instead of a generic failure.
+refuse() {
+  local reason=$1
+  [ "$json" -eq 1 ] && printf '{"ok":false,"reason":"%s"}\n' "$reason"
+  echo "error: $reason" >&2
+  exit 2
+}
+
+real_default_unit_dir() {
+  if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    printf '%s/systemd/user\n' "$XDG_CONFIG_HOME"
+  else
+    printf '%s/.config/systemd/user\n' "$HOME"
+  fi
+}
+
+path_inside() {  # <path> <root> - true when <path> is <root> or inside it
+  case "$1" in
+    "$2"|"$2"/*) return 0 ;;
+  esac
+  return 1
+}
+
+# path_test_owned <path>: true when <path> sits under a root that carries the
+# .fm-test-owner marker written by tests/lib.sh - the repo's one durable proof
+# that a directory belongs to a test fixture, the same marker
+# bin/fm-test-tmp-sweep.sh reclaims by. The walk uses the path string, so a
+# not-yet-created fixture subdirectory still proves ownership through its
+# existing marker-carrying ancestor.
+path_test_owned() {
+  local p=$1
+  case "$p" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  while [ -n "$p" ] && [ "$p" != / ]; do
+    [ -f "$p/.fm-test-owner" ] && return 0
+    p=$(dirname "$p")
+  done
+  return 1
+}
+
+# --- fail-closed test-seam gate (F-1) ----------------------------------------
+# Runs before any command dispatch. Production (no FM_SUPERVISION_TEST_MODE=1)
+# refuses every test override outright; test mode additionally requires the
+# evaluated home, state dir, and overridden directories to be provably
+# test-owned and outside the real user unit directory.
+test_seam_gate() {
+  local overrides= real_units
+  [ -n "${FM_CODEX_SYSTEMD_FAKE_DIR:-}" ] && overrides="$overrides FM_CODEX_SYSTEMD_FAKE_DIR"
+  [ -n "${FM_CODEX_SYSTEMD_SYSTEMCTL:-}" ] && overrides="$overrides FM_CODEX_SYSTEMD_SYSTEMCTL"
+  [ -n "${FM_CODEX_SYSTEMD_UNIT_DIR:-}" ] && overrides="$overrides FM_CODEX_SYSTEMD_UNIT_DIR"
+  [ -n "$overrides" ] || return 0
+  if [ "${FM_SUPERVISION_TEST_MODE:-}" != 1 ]; then
+    refuse "test-override-without-test-mode:${overrides# }"
+  fi
+  real_units=$(real_default_unit_dir)
+  path_test_owned "$FM_HOME" || refuse 'test-override-home-not-test-owned'
+  path_test_owned "$STATE" || refuse 'test-override-state-not-test-owned'
+  if [ -n "${FM_CODEX_SYSTEMD_FAKE_DIR:-}" ]; then
+    path_test_owned "$FM_CODEX_SYSTEMD_FAKE_DIR" || refuse 'fake-dir-not-test-owned'
+    path_inside "$FM_CODEX_SYSTEMD_FAKE_DIR" "$real_units" && refuse 'fake-dir-inside-real-unit-dir'
+  fi
+  if [ -n "${FM_CODEX_SYSTEMD_SYSTEMCTL:-}" ] && [ -z "${FM_CODEX_SYSTEMD_UNIT_DIR:-}" ]; then
+    # A stubbed systemctl with the real unit dir would write test units into the
+    # real user manager's directory.
+    refuse 'stub-systemctl-without-test-unit-dir'
+  fi
+  if [ -n "${FM_CODEX_SYSTEMD_UNIT_DIR:-}" ]; then
+    path_test_owned "$FM_CODEX_SYSTEMD_UNIT_DIR" || refuse 'unit-dir-not-test-owned'
+    path_inside "$FM_CODEX_SYSTEMD_UNIT_DIR" "$real_units" && refuse 'unit-dir-inside-real-unit-dir'
+  fi
+  return 0
+}
+
 unit_base() {
   local canon uid hash
   canon=$(canon_path "$FM_HOME") || canon=$FM_HOME
@@ -84,10 +178,11 @@ unit_base() {
 unit_dir() {
   if [ -n "${FM_CODEX_SYSTEMD_UNIT_DIR:-}" ]; then
     printf '%s\n' "$FM_CODEX_SYSTEMD_UNIT_DIR"
-  elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
-    printf '%s/systemd/user\n' "$XDG_CONFIG_HOME"
+  elif [ -n "${FM_CODEX_SYSTEMD_FAKE_DIR:-}" ]; then
+    # Fake mode never touches the real user unit dir, not even in metadata.
+    printf '%s/units\n' "$FM_CODEX_SYSTEMD_FAKE_DIR"
   else
-    printf '%s/.config/systemd/user\n' "$HOME"
+    real_default_unit_dir
   fi
 }
 
@@ -116,8 +211,65 @@ metadata_json() {
       fm_home:$fm_home,state_dir:$state_dir,uid:$uid}'
 }
 
-systemd_quote() {
+# --- record-field validation (F-4) --------------------------------------------
+# Every value below can end up inside a systemd unit file, which is
+# line-oriented: an embedded newline terminates the current directive and
+# starts an attacker-chosen one (ExecStart injection). Validation is therefore
+# charset-allowlisting per field, never quoting alone.
+
+valid_lease() {
   local s=$1
+  [ -n "$s" ] || return 1
+  [ "${#s}" -le 128 ] || return 1
+  case "$s" in
+    *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  return 0
+}
+
+valid_number() {
+  local s=$1
+  [ -n "$s" ] || return 1
+  [ "${#s}" -le 12 ] || return 1
+  case "$s" in
+    *[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Absolute path with no control characters and none of the characters that are
+# unsafe inside a quoted systemd value. Spaces are allowed (paths may carry
+# them and every path lands quoted); quotes, backslashes, percent specifiers,
+# and all non-printables are not.
+valid_unit_path() {
+  local s=$1 LC_ALL=C
+  [ -n "$s" ] || return 1
+  case "$s" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$s" in
+    *[![:print:]]*|*'"'*|*\\*|*%*) return 1 ;;
+  esac
+  return 0
+}
+
+# The exec path additionally forbids whitespace so the ExecStart line can be
+# compared back byte-for-byte against the loaded unit.
+valid_exec_path() {
+  local s=$1
+  valid_unit_path "$s" || return 1
+  case "$s" in
+    *[[:space:]]*) return 1 ;;
+  esac
+  return 0
+}
+
+systemd_quote() {
+  local s=$1 LC_ALL=C
+  case "$s" in
+    *[![:print:]]*) return 1 ;;
+  esac
   s=${s//\\/\\\\}
   s=${s//\"/\\\"}
   s=${s//%/%%}
@@ -126,6 +278,31 @@ systemd_quote() {
 
 record_field() {
   jq -r "$1 // empty" "$record" 2>/dev/null
+}
+
+# validate_record_fields: shared pre-flight for schedule and validate. Sets
+# FIELD_REASON on failure. Reads lease/generation/cadence/due plus the paths
+# the record claims, and refuses anything outside the allowlists above.
+FIELD_REASON=
+validate_record_fields() {
+  local lease generation cadence due home state exec_rec
+  FIELD_REASON=
+  lease=$(record_field '.lease_id')
+  generation=$(record_field '.generation')
+  cadence=$(record_field '.cadence_seconds')
+  due=$(record_field '.next_checkpoint_due')
+  home=$(record_field '.fm_home')
+  state=$(record_field '.state_dir')
+  exec_rec=$(record_field '.scheduler.exec_path')
+  valid_lease "$lease" || { FIELD_REASON=bad-lease; return 1; }
+  valid_number "$generation" || { FIELD_REASON=bad-generation; return 1; }
+  valid_number "$cadence" || { FIELD_REASON=bad-cadence; return 1; }
+  [ "$cadence" -gt 0 ] || { FIELD_REASON=bad-cadence; return 1; }
+  valid_number "$due" || { FIELD_REASON=bad-due; return 1; }
+  valid_unit_path "$home" || { FIELD_REASON=bad-home-path; return 1; }
+  valid_unit_path "$state" || { FIELD_REASON=bad-state-path; return 1; }
+  valid_exec_path "$exec_rec" || { FIELD_REASON=bad-exec-path; return 1; }
+  return 0
 }
 
 fake_root() {
@@ -150,8 +327,20 @@ status_json_fake() {
   fi
 }
 
+# unit_property <show-output> <name>
+unit_property() {
+  printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1
+}
+
+# loaded_unit_value <cat-output> <directive>: the value of one directive in the
+# LOADED unit content (systemctl cat), first occurrence.
+loaded_unit_value() {
+  printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1
+}
+
 status_json_real() {
-  local meta timer service timer_show service_show timer_load timer_active service_load service_active next realtime
+  local meta timer service timer_show service_show timer_load timer_active timer_unit_file triggers
+  local service_load service_active service_cat timer_cat exec_start on_calendar next realtime exec_count
   meta=$(metadata_json) || return 1
   timer=$(printf '%s' "$meta" | jq -r '.timer_name')
   service=$(printf '%s' "$meta" | jq -r '.service_name')
@@ -159,11 +348,20 @@ status_json_real() {
     -p LoadState -p ActiveState -p UnitFileState -p FragmentPath -p Triggers -p NextElapseUSecRealtime 2>/dev/null || true)
   service_show=$("$SYSTEMCTL" --user show "$service" \
     -p LoadState -p ActiveState -p UnitFileState -p FragmentPath 2>/dev/null || true)
-  timer_load=$(printf '%s\n' "$timer_show" | sed -n 's/^LoadState=//p')
-  timer_active=$(printf '%s\n' "$timer_show" | sed -n 's/^ActiveState=//p')
-  service_load=$(printf '%s\n' "$service_show" | sed -n 's/^LoadState=//p')
-  service_active=$(printf '%s\n' "$service_show" | sed -n 's/^ActiveState=//p')
-  realtime=$(printf '%s\n' "$timer_show" | sed -n 's/^NextElapseUSecRealtime=//p')
+  timer_load=$(unit_property "$timer_show" LoadState)
+  timer_active=$(unit_property "$timer_show" ActiveState)
+  timer_unit_file=$(unit_property "$timer_show" UnitFileState)
+  triggers=$(unit_property "$timer_show" Triggers)
+  service_load=$(unit_property "$service_show" LoadState)
+  service_active=$(unit_property "$service_show" ActiveState)
+  realtime=$(unit_property "$timer_show" NextElapseUSecRealtime)
+  # The LOADED contract, read back from systemd itself - never only from the
+  # file this adapter wrote (F-3).
+  service_cat=$("$SYSTEMCTL" --user cat "$service" 2>/dev/null || true)
+  timer_cat=$("$SYSTEMCTL" --user cat "$timer" 2>/dev/null || true)
+  exec_start=$(loaded_unit_value "$service_cat" ExecStart)
+  exec_count=$(printf '%s\n' "$service_cat" | grep -c '^ExecStart=' 2>/dev/null || true)
+  on_calendar=$(loaded_unit_value "$timer_cat" OnCalendar)
   next=
   if [ -n "$realtime" ] && command -v date >/dev/null 2>&1; then
     next=$(date -d "$realtime" +%s 2>/dev/null || true)
@@ -172,19 +370,32 @@ status_json_real() {
     --argjson meta "$meta" \
     --arg timer_load "${timer_load:-not-found}" \
     --arg timer_active "${timer_active:-inactive}" \
+    --arg timer_unit_file "${timer_unit_file:-unknown}" \
+    --arg triggers "${triggers:-}" \
     --arg service_load "${service_load:-not-found}" \
     --arg service_active "${service_active:-inactive}" \
+    --arg exec_start "${exec_start:-}" \
+    --argjson exec_count "${exec_count:-0}" \
+    --arg on_calendar "${on_calendar:-}" \
     --arg next_raw "$realtime" \
     --arg next_epoch "$next" \
     '{mode:"systemd",registered:($timer_load == "loaded"),metadata:$meta,
-      timer:{load:$timer_load,active:$timer_active,next_raw:$next_raw,next_epoch:$next_epoch},
-      service:{load:$service_load,active:$service_active}}'
+      timer:{load:$timer_load,active:$timer_active,unit_file:$timer_unit_file,
+             triggers:$triggers,on_calendar:$on_calendar,next_raw:$next_raw,next_epoch:$next_epoch},
+      service:{load:$service_load,active:$service_active,exec_start:$exec_start,exec_count:$exec_count}}'
 }
 
 validate_record() {
-  local status meta adapter timer_active service_load uid expected_uid lease generation cadence due exec home state reasons
+  local status meta adapter uid expected_uid lease generation cadence due exec_rec home state reasons
+  local timer_active timer_load timer_unit_file service_load triggers exec_start exec_count on_calendar next_epoch
+  local expected_service expected_exec_line expected_calendar service_cat tolerance diff f canon_home service_path
   [ -n "$record" ] && [ -f "$record" ] || { printf 'missing-record\n'; return 1; }
   jq -e 'type == "object"' "$record" >/dev/null 2>&1 || { printf 'malformed-record\n'; return 1; }
+  if ! validate_record_fields; then
+    [ "$json" -eq 1 ] && printf '{"ok":false,"reason":"%s"}\n' "$FIELD_REASON"
+    [ "$json" -eq 1 ] || printf '%s\n' "$FIELD_REASON"
+    return 1
+  fi
   status=$("$SCRIPT_SELF" status --home "$FM_HOME" --state "$STATE" --json) || { printf 'scheduler-status-failed\n'; return 1; }
   meta=$(metadata_json) || { printf 'metadata-failed\n'; return 1; }
   adapter=$(record_field '.scheduler.adapter')
@@ -194,13 +405,13 @@ validate_record() {
   generation=$(record_field '.generation')
   cadence=$(record_field '.cadence_seconds')
   due=$(record_field '.next_checkpoint_due')
-  exec=$(record_field '.scheduler.exec_path')
+  exec_rec=$(record_field '.scheduler.exec_path')
   home=$(record_field '.fm_home')
   state=$(record_field '.state_dir')
   reasons=
   [ "$adapter" = systemd-user-timer ] || reasons="${reasons} adapter-mismatch"
   [ "$uid" = "$expected_uid" ] || reasons="${reasons} uid-mismatch"
-  [ "$exec" = "$(printf '%s' "$meta" | jq -r '.exec_path')" ] || reasons="${reasons} exec-mismatch"
+  [ "$exec_rec" = "$(printf '%s' "$meta" | jq -r '.exec_path')" ] || reasons="${reasons} exec-mismatch"
   [ "$home" = "$(printf '%s' "$meta" | jq -r '.fm_home')" ] || reasons="${reasons} home-mismatch"
   [ "$state" = "$(printf '%s' "$meta" | jq -r '.state_dir')" ] || reasons="${reasons} state-mismatch"
   if [ "${FM_CODEX_SYSTEMD_FAKE_DIR:-}" ]; then
@@ -212,19 +423,57 @@ validate_record() {
     [ "$(printf '%s' "$status" | jq -r '.cadence_seconds // empty')" = "$cadence" ] || reasons="${reasons} cadence-mismatch"
     [ "$(printf '%s' "$status" | jq -r '.next_checkpoint_due // empty')" = "$due" ] || reasons="${reasons} due-mismatch"
   else
+    timer_load=$(printf '%s' "$status" | jq -r '.timer.load // empty')
     timer_active=$(printf '%s' "$status" | jq -r '.timer.active // empty')
+    timer_unit_file=$(printf '%s' "$status" | jq -r '.timer.unit_file // empty')
+    triggers=$(printf '%s' "$status" | jq -r '.timer.triggers // empty')
+    on_calendar=$(printf '%s' "$status" | jq -r '.timer.on_calendar // empty')
+    next_epoch=$(printf '%s' "$status" | jq -r '.timer.next_epoch // empty')
     service_load=$(printf '%s' "$status" | jq -r '.service.load // empty')
-    [ "$(printf '%s' "$status" | jq -r '.registered')" = true ] || reasons="${reasons} timer-not-registered"
+    exec_start=$(printf '%s' "$status" | jq -r '.service.exec_start // empty')
+    exec_count=$(printf '%s' "$status" | jq -r '.service.exec_count // 0')
+    expected_service=$(printf '%s' "$meta" | jq -r '.service_name')
+    service_path=$(printf '%s' "$meta" | jq -r '.service_path')
+    canon_home=$(printf '%s' "$meta" | jq -r '.fm_home')
+    [ "$timer_load" = loaded ] || reasons="${reasons} timer-not-registered"
     [ "$timer_active" = active ] || reasons="${reasons} timer-not-active"
+    [ "$timer_unit_file" = enabled ] || reasons="${reasons} timer-not-enabled"
     [ "$service_load" = loaded ] || reasons="${reasons} service-not-loaded"
-    grep -F "FM_CODEX_SYSTEMD_LEASE=$lease" "$(printf '%s' "$meta" | jq -r '.service_path')" >/dev/null 2>&1 || reasons="${reasons} lease-mismatch"
-    grep -F "FM_CODEX_SYSTEMD_GENERATION=$generation" "$(printf '%s' "$meta" | jq -r '.service_path')" >/dev/null 2>&1 || reasons="${reasons} generation-mismatch"
-    grep -F "FM_CODEX_WATCH_CHECKPOINT=$cadence" "$(printf '%s' "$meta" | jq -r '.service_path')" >/dev/null 2>&1 || reasons="${reasons} cadence-mismatch"
-    grep -F "OnCalendar=" "$(printf '%s' "$meta" | jq -r '.timer_path')" >/dev/null 2>&1 || reasons="${reasons} next-trigger-missing"
+    [ "$triggers" = "$expected_service" ] || reasons="${reasons} trigger-mismatch"
+    # The service command systemd will actually run, compared byte-for-byte
+    # against the one this adapter constructs from its own metadata (F-3).
+    expected_exec_line="$(printf '%s' "$meta" | jq -r '.exec_path') --seconds $cadence"
+    [ "$exec_start" = "$expected_exec_line" ] || reasons="${reasons} exec-start-mismatch"
+    [ "$exec_count" = 1 ] || reasons="${reasons} exec-start-duplicated"
+    # The loaded environment contract, matched as exact whole lines.
+    service_cat=$("$SYSTEMCTL" --user cat "$expected_service" 2>/dev/null || true)
+    printf '%s\n' "$service_cat" | grep -Fx "Environment=$(systemd_quote "FM_CODEX_SYSTEMD_LEASE=$lease")" >/dev/null 2>&1 || reasons="${reasons} lease-mismatch"
+    printf '%s\n' "$service_cat" | grep -Fx "Environment=$(systemd_quote "FM_CODEX_SYSTEMD_GENERATION=$generation")" >/dev/null 2>&1 || reasons="${reasons} generation-mismatch"
+    printf '%s\n' "$service_cat" | grep -Fx "Environment=$(systemd_quote "FM_CODEX_WATCH_CHECKPOINT=$cadence")" >/dev/null 2>&1 || reasons="${reasons} cadence-mismatch"
+    printf '%s\n' "$service_cat" | grep -Fx "Environment=$(systemd_quote "FM_HOME=$canon_home")" >/dev/null 2>&1 || reasons="${reasons} home-env-mismatch"
+    printf '%s\n' "$service_cat" | grep -Fx "Environment=$(systemd_quote "FM_STATE_OVERRIDE=$(printf '%s' "$meta" | jq -r '.state_dir')")" >/dev/null 2>&1 || reasons="${reasons} state-env-mismatch"
+    # The timer's real next trigger, compared against the record's due time.
+    expected_calendar=$(date -u -d "@$due" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || true)
+    [ -n "$expected_calendar" ] && [ "$on_calendar" = "$expected_calendar" ] || reasons="${reasons} calendar-mismatch"
+    if [ -n "$next_epoch" ]; then
+      tolerance=60
+      diff=$((next_epoch - due))
+      [ "$diff" -lt 0 ] && diff=$((-diff))
+      [ "$diff" -le "$tolerance" ] || reasons="${reasons} next-elapse-mismatch"
+    fi
+    # Exactly one unit pair may claim this home (duplicate detection).
+    for f in "$(printf '%s' "$meta" | jq -r '.unit_dir')"/fm-codex-checkpoint-*.service; do
+      [ -e "$f" ] || continue
+      [ "$f" = "$service_path" ] && continue
+      if grep -Fx "Environment=$(systemd_quote "FM_HOME=$canon_home")" "$f" >/dev/null 2>&1; then
+        reasons="${reasons} duplicate-unit"
+        break
+      fi
+    done
   fi
   if [ -n "$reasons" ]; then
     reasons=${reasons# }
-    [ "$json" -eq 1 ] && jq -cnS --arg ok false --arg reason "$reasons" --argjson status "$status" '{ok:false,reason:$reason,status:$status}'
+    [ "$json" -eq 1 ] && jq -cnS --arg reason "$reasons" --argjson status "$status" '{ok:false,reason:$reason,status:$status}'
     [ "$json" -eq 1 ] || printf '%s\n' "$reasons"
     return 1
   fi
@@ -238,11 +487,14 @@ schedule_fake() {
   root=$(fake_root)
   file=$(fake_registration)
   meta=$(metadata_json) || return 1
+  validate_record_fields || { echo "error: $FIELD_REASON" >&2; return 1; }
   mkdir -p "$root/timers" || return 1
-  jq -cS --argjson meta "$meta" \
-    '{registered:true,lease_id:.lease_id,generation:.generation,cadence_seconds:.cadence_seconds,
-      next_checkpoint_due:.next_checkpoint_due,previous_result:.previous_result,
-      fm_home:.fm_home,state_dir:.state_dir,harness:.harness,metadata:$meta}' "$record" > "$file.tmp.$$" || return 1
+  ( umask 077
+    jq -cS --argjson meta "$meta" \
+      '{registered:true,lease_id:.lease_id,generation:.generation,cadence_seconds:.cadence_seconds,
+        next_checkpoint_due:.next_checkpoint_due,previous_result:.previous_result,
+        fm_home:.fm_home,state_dir:.state_dir,harness:.harness,metadata:$meta}' "$record" > "$file.tmp.$$"
+  ) || { rm -f "$file.tmp.$$"; return 1; }
   mv -f "$file.tmp.$$" "$file"
 }
 
@@ -264,6 +516,7 @@ disable_scheduler() {
 schedule_real() {
   local meta dir service_path timer_path exec_path canon_home canon_state lease generation cadence due calendar
   meta=$(metadata_json) || return 1
+  validate_record_fields || { echo "error: $FIELD_REASON" >&2; return 1; }
   dir=$(printf '%s' "$meta" | jq -r '.unit_dir')
   service_path=$(printf '%s' "$meta" | jq -r '.service_path')
   timer_path=$(printf '%s' "$meta" | jq -r '.timer_path')
@@ -274,25 +527,46 @@ schedule_real() {
   generation=$(record_field '.generation')
   cadence=$(record_field '.cadence_seconds')
   due=$(record_field '.next_checkpoint_due')
+  # The command line is constructed only from this adapter's own computed
+  # metadata plus the numeric cadence validated above; record text never
+  # reaches ExecStart unvalidated (F-4).
+  valid_exec_path "$exec_path" || { echo "error: computed exec path is not unit-safe: $exec_path" >&2; return 1; }
+  valid_unit_path "$canon_home" || { echo "error: computed home path is not unit-safe" >&2; return 1; }
+  valid_unit_path "$canon_state" || { echo "error: computed state path is not unit-safe" >&2; return 1; }
+  # The record must describe THIS home's contract, not another home's.
+  [ "$(record_field '.fm_home')" = "$canon_home" ] || { echo "error: record home does not match this home" >&2; return 1; }
+  [ "$(record_field '.state_dir')" = "$canon_state" ] || { echo "error: record state dir does not match this home" >&2; return 1; }
+  [ "$(record_field '.scheduler.exec_path')" = "$exec_path" ] || { echo "error: record exec path does not match this adapter" >&2; return 1; }
   calendar=$(date -u -d "@$due" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null) || return 1
   mkdir -p "$dir" || return 1
-  {
-    printf '[Unit]\nDescription=FirstMate Codex checkpoint for %s\n\n' "$canon_home"
-    printf '[Service]\nType=oneshot\nWorkingDirectory=%s\n' "$(systemd_quote "$canon_home")"
-    printf 'Environment=%s\n' "$(systemd_quote "FM_HOME=$canon_home")"
-    printf 'Environment=%s\n' "$(systemd_quote "FM_STATE_OVERRIDE=$canon_state")"
-    printf 'Environment=%s\n' "$(systemd_quote 'FM_SUPERVISION_HARNESS=codex')"
-    printf 'Environment=%s\n' "$(systemd_quote "FM_CODEX_SYSTEMD_LEASE=$lease")"
-    printf 'Environment=%s\n' "$(systemd_quote "FM_CODEX_SYSTEMD_GENERATION=$generation")"
-    printf 'Environment=%s\n' "$(systemd_quote "FM_CODEX_WATCH_CHECKPOINT=$cadence")"
-    printf 'ExecStart=%s --seconds %s\n' "$exec_path" "$cadence"
-  } > "$service_path.tmp.$$" || return 1
+  ( umask 077
+    {
+      printf '[Unit]\nDescription=FirstMate Codex checkpoint for %s\n\n' "$canon_home"
+      # WorkingDirectory is a PATH directive: systemd takes the raw value after
+      # '=' and does no quote-unescaping, so quoting it makes the unit fatally
+      # invalid ("path is not absolute"). The path is charset-validated above;
+      # write it raw. (Found by the disposable real-systemd proof - the quoted
+      # form armed nothing, ever.)
+      printf '[Service]\nType=oneshot\nWorkingDirectory=%s\n' "$canon_home"
+      printf 'Environment=%s\n' "$(systemd_quote "FM_HOME=$canon_home")"
+      printf 'Environment=%s\n' "$(systemd_quote "FM_STATE_OVERRIDE=$canon_state")"
+      printf 'Environment=%s\n' "$(systemd_quote 'FM_SUPERVISION_HARNESS=codex')"
+      printf 'Environment=%s\n' "$(systemd_quote "FM_CODEX_SYSTEMD_LEASE=$lease")"
+      printf 'Environment=%s\n' "$(systemd_quote "FM_CODEX_SYSTEMD_GENERATION=$generation")"
+      printf 'Environment=%s\n' "$(systemd_quote "FM_CODEX_WATCH_CHECKPOINT=$cadence")"
+      printf 'ExecStart=%s --seconds %s\n' "$exec_path" "$cadence"
+    } > "$service_path.tmp.$$"
+  ) || { rm -f "$service_path.tmp.$$"; return 1; }
+  chmod 600 "$service_path.tmp.$$" 2>/dev/null || { rm -f "$service_path.tmp.$$"; return 1; }
   mv -f "$service_path.tmp.$$" "$service_path" || return 1
-  {
-    printf '[Unit]\nDescription=FirstMate Codex next checkpoint timer for %s\n\n' "$canon_home"
-    printf '[Timer]\nOnCalendar=%s\nAccuracySec=1s\nPersistent=true\nUnit=%s\n\n' "$calendar" "$(printf '%s' "$meta" | jq -r '.service_name')"
-    printf '[Install]\nWantedBy=timers.target\n'
-  } > "$timer_path.tmp.$$" || return 1
+  ( umask 077
+    {
+      printf '[Unit]\nDescription=FirstMate Codex next checkpoint timer for %s\n\n' "$canon_home"
+      printf '[Timer]\nOnCalendar=%s\nAccuracySec=1s\nPersistent=true\nUnit=%s\n\n' "$calendar" "$(printf '%s' "$meta" | jq -r '.service_name')"
+      printf '[Install]\nWantedBy=timers.target\n'
+    } > "$timer_path.tmp.$$"
+  ) || { rm -f "$timer_path.tmp.$$"; return 1; }
+  chmod 600 "$timer_path.tmp.$$" 2>/dev/null || { rm -f "$timer_path.tmp.$$"; return 1; }
   mv -f "$timer_path.tmp.$$" "$timer_path" || return 1
   "$SYSTEMCTL" --user daemon-reload >/dev/null || return 1
   "$SYSTEMCTL" --user enable --now "$(printf '%s' "$meta" | jq -r '.timer_name')" >/dev/null || return 1
@@ -317,6 +591,7 @@ remove_scheduler() {
 }
 
 need_jq
+test_seam_gate
 
 case "$cmd" in
   unit-metadata)

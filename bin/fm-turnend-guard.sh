@@ -76,9 +76,6 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 GRACE=${FM_GUARD_GRACE:-300}
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 HARNESS=${FM_SUPERVISION_HARNESS:-}
-if [ -z "$HARNESS" ]; then
-  HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
-fi
 # The decision log: one JSON line per primary turn-end evaluation, permitted ones included.
 LOG="${FM_TURNEND_LOG:-$STATE/.turnend-guard.log}"
 LOG_MAX=${FM_TURNEND_LOG_MAX:-2000}
@@ -91,6 +88,11 @@ BLOCK_IDS_FILE="$STATE/.turnend-guard-block-ids"
 # shellcheck source=bin/fm-supervision-lib.sh
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
 HARNESS=$(fm_supervision_primary_harness "$STATE" "$FM_HOME" "$HARNESS")
+# The fm-harness.sh subprocess runs only when neither the durable record nor
+# the ambient environment answers - never unconditionally on this hot path.
+case "$HARNESS" in
+  ''|unknown) HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown) ;;
+esac
 
 # Read the whole turn-end hook payload once; never block on unreadable/absent
 # stdin.
