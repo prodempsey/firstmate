@@ -338,6 +338,237 @@ loaded_unit_value() {
   printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1
 }
 
+# --- effective loaded-contract validation (review-r4 F-1) ----------------------
+# Expected-line presence alone is never validation authority: a unit can carry
+# every expected line and still be overridden by a later directive, a drop-in,
+# EnvironmentFile=, or UnsetEnvironment= (systemd.exec(5): a later Environment=
+# wins, EnvironmentFile= overrides Environment=, UnsetEnvironment= is a final
+# removal). Health therefore requires TWO views to match the contract exactly:
+# systemd's merged effective view (systemctl show) catches loaded state that
+# diverged from the visible file, and the loaded source (systemctl cat) catches
+# duplicate assignments the effective view collapses to a single last value.
+# Empirical show formats are recorded in docs/codex-systemd-scheduler.md.
+
+SHOW_PROPS_OUT=
+SHOW_PROPS_REASON=
+# show_required_props <unit> <prop>...: one systemctl show query whose output
+# may contain only requested `Prop=` lines, each at most once. A failed query,
+# an unexpected line, or a duplicated property fails closed; a missing line is
+# judged per property by the caller (systemd omits some properties when empty).
+show_required_props() {
+  local unit=$1 out line name p ok seen
+  shift
+  local args=()
+  for p in "$@"; do args+=(-p "$p"); done
+  SHOW_PROPS_OUT=
+  SHOW_PROPS_REASON=
+  out=$("$SYSTEMCTL" --user show "$unit" "${args[@]}" 2>/dev/null) || {
+    SHOW_PROPS_REASON='property-query-failed'
+    return 1
+  }
+  seen=' '
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name=${line%%=*}
+    [ "$name" != "$line" ] || { SHOW_PROPS_REASON='property-output-unexpected'; return 1; }
+    ok=0
+    for p in "$@"; do
+      [ "$p" = "$name" ] && { ok=1; break; }
+    done
+    [ "$ok" -eq 1 ] || { SHOW_PROPS_REASON='property-output-unexpected'; return 1; }
+    case "$seen" in
+      *" $name "*) SHOW_PROPS_REASON="property-duplicate:$name"; return 1 ;;
+    esac
+    seen="$seen$name "
+  done <<<"$out"
+  SHOW_PROPS_OUT=$out
+  return 0
+}
+
+shown_prop_present() {
+  printf '%s\n' "$SHOW_PROPS_OUT" | grep -q "^$1="
+}
+
+shown_prop() {
+  printf '%s\n' "$SHOW_PROPS_OUT" | sed -n "s/^$1=//p" | head -n 1
+}
+
+# parse_env_entries <raw>: split systemd's merged Environment property into one
+# NAME=VALUE line per entry. systemd joins entries with single spaces and wraps
+# an entry containing spaces in double quotes ("NAME=value with space").
+# Expected values are charset-validated to exclude quotes and backslashes, so
+# any escape, unterminated quote, empty token, or token without a NAME= shape
+# is parser ambiguity and fails closed. Record text never reaches this parser's
+# syntax: it splits only systemd's own reported value against a fixed grammar.
+parse_env_entries() {
+  local rest=$1 entry
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      \"*)
+        rest=${rest#\"}
+        entry=${rest%%\"*}
+        [ "$entry" != "$rest" ] || return 1
+        rest=${rest#"$entry"\"}
+        case "$rest" in
+          '') ;;
+          ' '*) rest=${rest#' '} ;;
+          *) return 1 ;;
+        esac
+        ;;
+      *)
+        entry=${rest%% *}
+        if [ "$entry" = "$rest" ]; then rest=; else rest=${rest#"$entry" }; fi
+        ;;
+    esac
+    case "$entry" in
+      *\\*|*\"*) return 1 ;;
+      *=*) ;;
+      *) return 1 ;;
+    esac
+    case "${entry%%=*}" in
+      ''|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;;
+    esac
+    printf '%s\n' "$entry"
+  done
+  return 0
+}
+
+# The exact controlled environment the generated service carries - the single
+# reviewed source both validation views compare against.
+expected_env_entries() {  # <home> <state> <lease> <generation> <cadence>
+  printf 'FM_HOME=%s\n' "$1"
+  printf 'FM_STATE_OVERRIDE=%s\n' "$2"
+  printf 'FM_SUPERVISION_HARNESS=codex\n'
+  printf 'FM_CODEX_SYSTEMD_LEASE=%s\n' "$3"
+  printf 'FM_CODEX_SYSTEMD_GENERATION=%s\n' "$4"
+  printf 'FM_CODEX_WATCH_CHECKPOINT=%s\n' "$5"
+}
+
+env_mismatch_reason() {
+  case "$1" in
+    FM_HOME) printf 'home-env-mismatch' ;;
+    FM_STATE_OVERRIDE) printf 'state-env-mismatch' ;;
+    FM_SUPERVISION_HARNESS) printf 'harness-env-mismatch' ;;
+    FM_CODEX_SYSTEMD_LEASE) printf 'lease-mismatch' ;;
+    FM_CODEX_SYSTEMD_GENERATION) printf 'generation-mismatch' ;;
+    FM_CODEX_WATCH_CHECKPOINT) printf 'cadence-mismatch' ;;
+    *) printf 'env-value-mismatch:%s' "$1" ;;
+  esac
+}
+
+CONTRACT_REASONS=
+# validate_effective_service <service> <service-path> <home> <state> <lease>
+# <generation> <cadence> <exec-path>: the merged contract systemd will actually
+# execute, appended to CONTRACT_REASONS (each reason carries a leading space).
+validate_effective_service() {
+  local service=$1 service_path=$2 canon_home=$3 canon_state=$4 lease=$5 generation=$6 cadence=$7 exec_path=$8
+  local p entries entry name exp_line seen expected env_raw exec_show argv_count
+  CONTRACT_REASONS=
+  if ! show_required_props "$service" FragmentPath DropInPaths WorkingDirectory Environment EnvironmentFiles UnsetEnvironment PassEnvironment ExecStart; then
+    CONTRACT_REASONS=" service-$SHOW_PROPS_REASON"
+    return 1
+  fi
+  # systemd prints these even when empty, so a missing line means the query did
+  # not answer this property and fails closed. EnvironmentFiles and ExecStart
+  # are omitted when empty, so absence there means none are loaded.
+  for p in FragmentPath DropInPaths WorkingDirectory Environment UnsetEnvironment PassEnvironment; do
+    if ! shown_prop_present "$p"; then
+      CONTRACT_REASONS=" service-property-missing:$p"
+      return 1
+    fi
+  done
+  [ "$(shown_prop FragmentPath)" = "$service_path" ] || CONTRACT_REASONS="$CONTRACT_REASONS service-fragment-mismatch"
+  [ -z "$(shown_prop DropInPaths)" ] || CONTRACT_REASONS="$CONTRACT_REASONS service-drop-in"
+  [ "$(shown_prop WorkingDirectory)" = "$canon_home" ] || CONTRACT_REASONS="$CONTRACT_REASONS workdir-mismatch"
+  [ -z "$(shown_prop EnvironmentFiles)" ] || CONTRACT_REASONS="$CONTRACT_REASONS environment-file-present"
+  [ -z "$(shown_prop UnsetEnvironment)" ] || CONTRACT_REASONS="$CONTRACT_REASONS unset-environment-present"
+  [ -z "$(shown_prop PassEnvironment)" ] || CONTRACT_REASONS="$CONTRACT_REASONS pass-environment-present"
+  exec_show=$(shown_prop ExecStart)
+  case "$exec_show" in
+    "{ path=$exec_path ; argv[]=$exec_path --seconds $cadence ; ignore_errors="*) ;;
+    *) CONTRACT_REASONS="$CONTRACT_REASONS exec-effective-mismatch" ;;
+  esac
+  argv_count=$(printf '%s\n' "$exec_show" | grep -o 'argv\[\]=' | wc -l)
+  [ "$argv_count" -eq 1 ] || CONTRACT_REASONS="$CONTRACT_REASONS exec-effective-count"
+  env_raw=$(shown_prop Environment)
+  if ! entries=$(parse_env_entries "$env_raw"); then
+    CONTRACT_REASONS="$CONTRACT_REASONS environment-parse-ambiguous"
+    return 1
+  fi
+  expected=$(expected_env_entries "$canon_home" "$canon_state" "$lease" "$generation" "$cadence")
+  seen=' '
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    name=${entry%%=*}
+    case "$seen" in
+      *" $name "*) CONTRACT_REASONS="$CONTRACT_REASONS env-duplicate:$name"; continue ;;
+    esac
+    seen="$seen$name "
+    if ! exp_line=$(printf '%s\n' "$expected" | grep -m 1 "^$name="); then
+      CONTRACT_REASONS="$CONTRACT_REASONS env-unexpected:$name"
+      continue
+    fi
+    [ "$entry" = "$exp_line" ] || CONTRACT_REASONS="$CONTRACT_REASONS $(env_mismatch_reason "$name")"
+  done <<<"$entries"
+  while IFS= read -r exp_line; do
+    name=${exp_line%%=*}
+    case "$seen" in
+      *" $name "*) ;;
+      *) CONTRACT_REASONS="$CONTRACT_REASONS env-missing:$name" ;;
+    esac
+  done <<<"$expected"
+  [ -z "$CONTRACT_REASONS" ]
+}
+
+# validate_effective_timer <timer> <timer-path>
+validate_effective_timer() {
+  local timer=$1 timer_path=$2 p
+  CONTRACT_REASONS=
+  if ! show_required_props "$timer" FragmentPath DropInPaths; then
+    CONTRACT_REASONS=" timer-$SHOW_PROPS_REASON"
+    return 1
+  fi
+  for p in FragmentPath DropInPaths; do
+    if ! shown_prop_present "$p"; then
+      CONTRACT_REASONS=" timer-property-missing:$p"
+      return 1
+    fi
+  done
+  [ "$(shown_prop FragmentPath)" = "$timer_path" ] || CONTRACT_REASONS="$CONTRACT_REASONS timer-fragment-mismatch"
+  [ -z "$(shown_prop DropInPaths)" ] || CONTRACT_REASONS="$CONTRACT_REASONS timer-drop-in"
+  [ -z "$CONTRACT_REASONS" ]
+}
+
+# validate_source_contract <service-cat> <home> <state> <lease> <generation>
+# <cadence>: the loaded on-disk source as an exact allowlist. The effective
+# view above collapses a repeated assignment to its last value, so same-value
+# and conflicting duplicates are caught here by per-variable assignment counts.
+validate_source_contract() {
+  local cat_out=$1 canon_home=$2 canon_state=$3 lease=$4 generation=$5 cadence=$6
+  local total name value exp_line prefix_count exact_count wd_count
+  CONTRACT_REASONS=
+  printf '%s\n' "$cat_out" | grep -q '^EnvironmentFile=' && CONTRACT_REASONS="$CONTRACT_REASONS source-environment-file"
+  printf '%s\n' "$cat_out" | grep -q '^UnsetEnvironment=' && CONTRACT_REASONS="$CONTRACT_REASONS source-unset-environment"
+  printf '%s\n' "$cat_out" | grep -q '^PassEnvironment=' && CONTRACT_REASONS="$CONTRACT_REASONS source-pass-environment"
+  total=$(printf '%s\n' "$cat_out" | grep -c '^Environment=')
+  [ "$total" -eq 6 ] || CONTRACT_REASONS="$CONTRACT_REASONS env-line-count-mismatch"
+  while IFS= read -r exp_line; do
+    name=${exp_line%%=*}
+    value=${exp_line#*=}
+    prefix_count=$(printf '%s\n' "$cat_out" | grep -cE "^Environment=\"?$name=")
+    exact_count=$(printf '%s\n' "$cat_out" | grep -cFx "Environment=$(systemd_quote "$name=$value")")
+    if [ "$prefix_count" -gt 1 ]; then
+      CONTRACT_REASONS="$CONTRACT_REASONS env-duplicate:$name"
+    elif [ "$exact_count" -ne 1 ]; then
+      CONTRACT_REASONS="$CONTRACT_REASONS $(env_mismatch_reason "$name")"
+    fi
+  done <<<"$(expected_env_entries "$canon_home" "$canon_state" "$lease" "$generation" "$cadence")"
+  wd_count=$(printf '%s\n' "$cat_out" | grep -c '^WorkingDirectory=')
+  [ "$wd_count" -eq 1 ] || CONTRACT_REASONS="$CONTRACT_REASONS workdir-line-count-mismatch"
+  printf '%s\n' "$cat_out" | grep -qFx "WorkingDirectory=$canon_home" || CONTRACT_REASONS="$CONTRACT_REASONS workdir-source-mismatch"
+  [ -z "$CONTRACT_REASONS" ]
+}
+
 status_json_real() {
   local meta timer service timer_show service_show timer_load timer_active timer_unit_file triggers
   local service_load service_active service_cat timer_cat exec_start on_calendar next realtime exec_count
@@ -388,7 +619,8 @@ status_json_real() {
 validate_record() {
   local status meta adapter uid expected_uid lease generation cadence due exec_rec home state reasons
   local timer_active timer_load timer_unit_file service_load triggers exec_start exec_count on_calendar next_epoch
-  local expected_service expected_exec_line expected_calendar service_cat tolerance diff f canon_home service_path
+  local expected_service expected_timer expected_exec_line expected_calendar service_cat timer_cat tolerance diff f
+  local canon_home canon_state service_path timer_path_meta exec_path_meta
   [ -n "$record" ] && [ -f "$record" ] || { printf 'missing-record\n'; return 1; }
   jq -e 'type == "object"' "$record" >/dev/null 2>&1 || { printf 'malformed-record\n'; return 1; }
   if ! validate_record_fields; then
@@ -433,8 +665,12 @@ validate_record() {
     exec_start=$(printf '%s' "$status" | jq -r '.service.exec_start // empty')
     exec_count=$(printf '%s' "$status" | jq -r '.service.exec_count // 0')
     expected_service=$(printf '%s' "$meta" | jq -r '.service_name')
+    expected_timer=$(printf '%s' "$meta" | jq -r '.timer_name')
     service_path=$(printf '%s' "$meta" | jq -r '.service_path')
+    timer_path_meta=$(printf '%s' "$meta" | jq -r '.timer_path')
+    exec_path_meta=$(printf '%s' "$meta" | jq -r '.exec_path')
     canon_home=$(printf '%s' "$meta" | jq -r '.fm_home')
+    canon_state=$(printf '%s' "$meta" | jq -r '.state_dir')
     [ "$timer_load" = loaded ] || reasons="${reasons} timer-not-registered"
     [ "$timer_active" = active ] || reasons="${reasons} timer-not-active"
     [ "$timer_unit_file" = enabled ] || reasons="${reasons} timer-not-enabled"
@@ -442,16 +678,31 @@ validate_record() {
     [ "$triggers" = "$expected_service" ] || reasons="${reasons} trigger-mismatch"
     # The service command systemd will actually run, compared byte-for-byte
     # against the one this adapter constructs from its own metadata (F-3).
-    expected_exec_line="$(printf '%s' "$meta" | jq -r '.exec_path') --seconds $cadence"
+    expected_exec_line="$exec_path_meta --seconds $cadence"
     [ "$exec_start" = "$expected_exec_line" ] || reasons="${reasons} exec-start-mismatch"
     [ "$exec_count" = 1 ] || reasons="${reasons} exec-start-duplicated"
-    # The loaded environment contract, matched as exact whole lines.
-    service_cat=$("$SYSTEMCTL" --user cat "$expected_service" 2>/dev/null || true)
-    printf '%s\n' "$service_cat" | grep -Fx "Environment=$(systemd_quote "FM_CODEX_SYSTEMD_LEASE=$lease")" >/dev/null 2>&1 || reasons="${reasons} lease-mismatch"
-    printf '%s\n' "$service_cat" | grep -Fx "Environment=$(systemd_quote "FM_CODEX_SYSTEMD_GENERATION=$generation")" >/dev/null 2>&1 || reasons="${reasons} generation-mismatch"
-    printf '%s\n' "$service_cat" | grep -Fx "Environment=$(systemd_quote "FM_CODEX_WATCH_CHECKPOINT=$cadence")" >/dev/null 2>&1 || reasons="${reasons} cadence-mismatch"
-    printf '%s\n' "$service_cat" | grep -Fx "Environment=$(systemd_quote "FM_HOME=$canon_home")" >/dev/null 2>&1 || reasons="${reasons} home-env-mismatch"
-    printf '%s\n' "$service_cat" | grep -Fx "Environment=$(systemd_quote "FM_STATE_OVERRIDE=$(printf '%s' "$meta" | jq -r '.state_dir')")" >/dev/null 2>&1 || reasons="${reasons} state-env-mismatch"
+    # The full loaded contract (review-r4 F-1): systemd's merged effective view
+    # plus the loaded source, both matched exactly. A unit that is not even
+    # loaded is already red above, so the contract checks run on loaded units.
+    if [ "$service_load" = loaded ]; then
+      validate_effective_service "$expected_service" "$service_path" "$canon_home" "$canon_state" "$lease" "$generation" "$cadence" "$exec_path_meta" || true
+      reasons="${reasons}${CONTRACT_REASONS}"
+      if service_cat=$("$SYSTEMCTL" --user cat "$expected_service" 2>/dev/null); then
+        validate_source_contract "$service_cat" "$canon_home" "$canon_state" "$lease" "$generation" "$cadence" || true
+        reasons="${reasons}${CONTRACT_REASONS}"
+      else
+        reasons="${reasons} service-source-unreadable"
+      fi
+    fi
+    if [ "$timer_load" = loaded ]; then
+      validate_effective_timer "$expected_timer" "$timer_path_meta" || true
+      reasons="${reasons}${CONTRACT_REASONS}"
+      if timer_cat=$("$SYSTEMCTL" --user cat "$expected_timer" 2>/dev/null); then
+        [ "$(printf '%s\n' "$timer_cat" | grep -c '^OnCalendar=')" -eq 1 ] || reasons="${reasons} calendar-line-count-mismatch"
+      else
+        reasons="${reasons} timer-source-unreadable"
+      fi
+    fi
     # The timer's real next trigger, compared against the record's due time.
     expected_calendar=$(date -u -d "@$due" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || true)
     [ -n "$expected_calendar" ] && [ "$on_calendar" = "$expected_calendar" ] || reasons="${reasons} calendar-mismatch"

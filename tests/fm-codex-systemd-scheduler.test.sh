@@ -26,7 +26,17 @@ fake_env() {
 
 # write_stub_systemctl <home>: install a deterministic systemctl stub that
 # serves unit state from <home>/units and marker files from <home>/stub-state.
-# Property overrides for attack cases live at stub-state/override-<unit>-<prop>.
+# It emulates systemd's EFFECTIVE property semantics the shipping validation
+# depends on: `show -p Environment` reports the merged environment (a repeated
+# assignment keeps only its last value, entries with spaces are whole-entry
+# quoted), EnvironmentFiles/ExecStart lines are omitted when empty, drop-ins
+# under <unit>.d/ are listed in DropInPaths and appended to `cat` output, and
+# ExecStart uses the `{ path=... ; argv[]=... ; ignore_errors=... }` block.
+# Attack seams: stub-state/override-<unit>-<prop> replaces one effective
+# property (loaded state diverging from the visible source),
+# stub-state/omit-<unit>-<prop> drops the property line (unsupported query),
+# stub-state/fail-show-<unit> makes every show query for the unit fail, and
+# stub-state/fail-show-contract-<unit> fails only the deep contract query.
 write_stub_systemctl() {
   local home=$1 stub="$1/systemctl-stub"
   mkdir -p "$home/units" "$home/stub-state"
@@ -39,6 +49,84 @@ MARKS=${STUB_MARKS:?}
 cmd=${1:-}
 shift || true
 unit_file() { printf '%s/%s' "$UNITS" "$1"; }
+unit_sources() {  # fragment then drop-ins, systemd load order
+  local f=$1 d
+  [ -f "$f" ] && printf '%s\n' "$f"
+  for d in "$f.d"/*.conf; do
+    [ -f "$d" ] && printf '%s\n' "$d"
+  done
+  return 0
+}
+directive_values() {  # <unit-file> <directive>: every value across sources
+  local f=$1 directive=$2 src
+  while IFS= read -r src; do
+    [ -n "$src" ] || continue
+    sed -n "s/^$directive=//p" "$src"
+  done < <(unit_sources "$f")
+}
+strip_entry_quotes() {
+  local v=$1
+  case "$v" in
+    \"*\") v=${v#\"}; v=${v%\"} ;;
+  esac
+  printf '%s' "$v"
+}
+merged_env() {  # last assignment wins, first-seen order, systemd-style quoting
+  local f=$1 raw entry name out='' n
+  declare -A env=()
+  local order=()
+  while IFS= read -r raw; do
+    [ -n "$raw" ] || continue
+    entry=$(strip_entry_quotes "$raw")
+    name=${entry%%=*}
+    [ -n "${env[$name]+x}" ] || order+=("$name")
+    env[$name]=${entry#*=}
+  done < <(directive_values "$f" Environment)
+  [ "${#order[@]}" -gt 0 ] || { printf ''; return 0; }
+  for n in "${order[@]}"; do
+    entry="$n=${env[$n]}"
+    case "$entry" in
+      *' '*) entry="\"$entry\"" ;;
+    esac
+    out="$out$entry "
+  done
+  printf '%s' "${out% }"
+}
+env_files() {
+  local f=$1 raw out=''
+  while IFS= read -r raw; do
+    [ -n "$raw" ] || continue
+    case "$raw" in
+      -*) out="$out${raw#-} (ignore_errors=yes) " ;;
+      *) out="$out$raw (ignore_errors=no) " ;;
+    esac
+  done < <(directive_values "$f" EnvironmentFile)
+  printf '%s' "${out% }"
+}
+list_values() {  # <unit-file> <directive>: space-joined merged list
+  local f=$1 directive=$2 raw out=''
+  while IFS= read -r raw; do
+    [ -n "$raw" ] || continue
+    out="$out$raw "
+  done < <(directive_values "$f" "$directive")
+  printf '%s' "${out% }"
+}
+exec_blocks() {
+  local f=$1 cmdline first out=''
+  while IFS= read -r cmdline; do
+    [ -n "$cmdline" ] || continue
+    first=${cmdline%% *}
+    out="$out{ path=$first ; argv[]=$cmdline ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 } "
+  done < <(directive_values "$f" ExecStart)
+  printf '%s' "${out% }"
+}
+drop_in_paths() {
+  local f=$1 d out=''
+  for d in "$f.d"/*.conf; do
+    [ -f "$d" ] && out="$out$d "
+  done
+  printf '%s' "${out% }"
+}
 prop_value() {
   local unit=$1 prop=$2 f override
   override="$MARKS/override-$unit-$prop"
@@ -49,8 +137,15 @@ prop_value() {
     ActiveState) if [ -f "$MARKS/active-$unit" ]; then printf 'active'; else printf 'inactive'; fi ;;
     UnitFileState) if [ -f "$MARKS/enabled-$unit" ]; then printf 'enabled'; else printf 'disabled'; fi ;;
     FragmentPath) printf '%s' "$f" ;;
+    DropInPaths) drop_in_paths "$f" ;;
     Triggers) sed -n 's/^Unit=//p' "$f" 2>/dev/null | head -n 1 | tr -d '\n' ;;
     NextElapseUSecRealtime) sed -n 's/^OnCalendar=//p' "$f" 2>/dev/null | head -n 1 | tr -d '\n' ;;
+    WorkingDirectory) directive_values "$f" WorkingDirectory | tail -n 1 | tr -d '\n' ;;
+    Environment) merged_env "$f" ;;
+    EnvironmentFiles) env_files "$f" ;;
+    UnsetEnvironment) list_values "$f" UnsetEnvironment ;;
+    PassEnvironment) list_values "$f" PassEnvironment ;;
+    ExecStart) exec_blocks "$f" ;;
     *) : ;;
   esac
 }
@@ -58,10 +153,27 @@ case "$cmd" in
   show)
     unit=${1:-}
     shift || true
+    [ -f "$MARKS/fail-show-$unit" ] && exit 1
+    if [ -f "$MARKS/fail-show-contract-$unit" ]; then
+      # Fail only the deep contract query (it alone asks for WorkingDirectory
+      # or DropInPaths), so the basic status query still answers and the
+      # contract-query failure path is what gets exercised.
+      for a in "$@"; do
+        case "$a" in
+          WorkingDirectory|DropInPaths) exit 1 ;;
+        esac
+      done
+    fi
     while [ "$#" -gt 0 ]; do
       case "$1" in
         -p)
-          printf '%s=%s\n' "$2" "$(prop_value "$unit" "$2")"
+          if [ ! -f "$MARKS/omit-$unit-$2" ]; then
+            v=$(prop_value "$unit" "$2")
+            case "$2" in
+              EnvironmentFiles|ExecStart) [ -z "$v" ] || printf '%s=%s\n' "$2" "$v" ;;
+              *) printf '%s=%s\n' "$2" "$v" ;;
+            esac
+          fi
           shift 2
           ;;
         *) shift ;;
@@ -74,6 +186,11 @@ case "$cmd" in
     [ -f "$f" ] || exit 1
     printf '# %s\n' "$f"
     cat "$f"
+    for d in "$f.d"/*.conf; do
+      [ -f "$d" ] || continue
+      printf '# %s\n' "$d"
+      cat "$d"
+    done
     ;;
   enable)
     for a in "$@"; do
@@ -379,6 +496,171 @@ test_real_mode_rejects_duplicate_unit_for_home() {
   pass "fm-codex-systemd-scheduler: real mode refuses duplicate unit ownership of one home"
 }
 
+# --- loaded-service-contract exactness (review-r4 F-1) -------------------------
+# Expected-line presence is never authority: every case below keeps all the
+# expected lines present and proves the added or diverged directive still
+# fails validation with a deterministic reason.
+
+test_real_mode_rejects_duplicate_controlled_env() {
+  local home service_path pristine line name reason
+  home=$(real_home_with_schedule real-dup-env)
+  service_path=$(real_meta "$home" | jq -r '.service_path')
+  pristine="$home/pristine.service"
+  cp "$service_path" "$pristine"
+  # A same-value duplicate collapses in systemd's merged effective view, so
+  # only the per-variable source assignment count can catch it.
+  line=$(grep '^Environment="FM_HOME=' "$pristine")
+  printf '%s\n' "$line" >> "$service_path"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "env-duplicate:FM_HOME" "a same-value duplicate FM_HOME assignment must fail validation"
+  # A conflicting duplicate wins at exec time (later assignment overrides), so
+  # the effective merged value must also be reported wrong.
+  cp "$pristine" "$service_path"
+  printf 'Environment="FM_HOME=%s"\n' "$home/evil" >> "$service_path"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "env-duplicate:FM_HOME" "a conflicting duplicate FM_HOME assignment must fail validation"
+  assert_contains "$reason" "home-env-mismatch" "the effective merged FM_HOME must be compared, not line presence"
+  for name in FM_STATE_OVERRIDE FM_SUPERVISION_HARNESS FM_CODEX_SYSTEMD_LEASE FM_CODEX_SYSTEMD_GENERATION FM_CODEX_WATCH_CHECKPOINT; do
+    cp "$pristine" "$service_path"
+    printf 'Environment="%s=evil-conflict"\n' "$name" >> "$service_path"
+    reason=$(real_validate_reason "$home")
+    assert_contains "$reason" "env-duplicate:$name" "a conflicting duplicate $name assignment must fail validation"
+  done
+  pass "fm-codex-systemd-scheduler: same-value and conflicting duplicate controlled assignments fail validation"
+}
+
+test_real_mode_rejects_environment_indirection() {
+  local home service_path pristine reason
+  home=$(real_home_with_schedule real-env-indirection)
+  service_path=$(real_meta "$home" | jq -r '.service_path')
+  pristine="$home/pristine.service"
+  cp "$service_path" "$pristine"
+  printf 'EnvironmentFile=%s\n' "$home/evil.env" >> "$service_path"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "environment-file-present" "a loaded EnvironmentFile must fail effective validation"
+  assert_contains "$reason" "source-environment-file" "a loaded EnvironmentFile must fail source validation"
+  cp "$pristine" "$service_path"
+  printf 'EnvironmentFile=-%s\n' "$home/optional.env" >> "$service_path"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "environment-file-present" "an optional EnvironmentFile must fail validation too"
+  cp "$pristine" "$service_path"
+  printf 'UnsetEnvironment=FM_HOME FM_STATE_OVERRIDE FM_CODEX_WATCH_CHECKPOINT\n' >> "$service_path"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "unset-environment-present" "UnsetEnvironment must fail effective validation"
+  assert_contains "$reason" "source-unset-environment" "UnsetEnvironment must fail source validation"
+  cp "$pristine" "$service_path"
+  printf 'PassEnvironment=FM_HOME\n' >> "$service_path"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "pass-environment-present" "PassEnvironment must fail effective validation"
+  assert_contains "$reason" "source-pass-environment" "PassEnvironment must fail source validation"
+  pass "fm-codex-systemd-scheduler: environment indirection and removal directives fail validation"
+}
+
+test_real_mode_rejects_wrong_working_directory() {
+  local home service_path reason
+  home=$(real_home_with_schedule real-workdir)
+  service_path=$(real_meta "$home" | jq -r '.service_path')
+  sed -i "s|^WorkingDirectory=.*|WorkingDirectory=$home/evil|" "$service_path"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "workdir-mismatch" "a tampered WorkingDirectory must fail effective validation"
+  assert_contains "$reason" "workdir-source-mismatch" "a tampered WorkingDirectory must fail source validation"
+  pass "fm-codex-systemd-scheduler: a WorkingDirectory that is not the canonical home fails validation"
+}
+
+test_real_mode_rejects_drop_ins() {
+  local home meta service_path timer_path reason
+  home=$(real_home_with_schedule real-drop-ins)
+  meta=$(real_meta "$home")
+  service_path=$(printf '%s' "$meta" | jq -r '.service_path')
+  timer_path=$(printf '%s' "$meta" | jq -r '.timer_path')
+  mkdir -p "$service_path.d"
+  printf '[Service]\nEnvironment="FM_HOME=%s"\n' "$home/evil" > "$service_path.d/override.conf"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "service-drop-in" "a service drop-in must fail validation"
+  rm -rf "$service_path.d"
+  mkdir -p "$timer_path.d"
+  printf '[Timer]\nOnCalendar=2036-01-01 00:00:00 UTC\n' > "$timer_path.d/override.conf"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "timer-drop-in" "a timer drop-in must fail validation"
+  pass "fm-codex-systemd-scheduler: drop-ins on the service or timer fail validation"
+}
+
+test_real_mode_rejects_unexpected_env_vars() {
+  local home service_path pristine reason
+  home=$(real_home_with_schedule real-unexpected-env)
+  service_path=$(real_meta "$home" | jq -r '.service_path')
+  pristine="$home/pristine.service"
+  cp "$service_path" "$pristine"
+  printf 'Environment="FM_CODEX_EXTRA=1"\n' >> "$service_path"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "env-unexpected:FM_CODEX_EXTRA" "an unexpected FM_CODEX_* variable must fail validation"
+  assert_contains "$reason" "env-line-count-mismatch" "the source assignment count must be exact"
+  cp "$pristine" "$service_path"
+  printf 'Environment="LD_PRELOAD=%s"\n' "$home/evil.so" >> "$service_path"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "env-unexpected:LD_PRELOAD" "any unexpected variable must fail validation"
+  pass "fm-codex-systemd-scheduler: unexpected environment variables fail validation"
+}
+
+test_real_mode_rejects_each_missing_required_variable() {
+  local home service_path pristine name reason
+  home=$(real_home_with_schedule real-missing-env)
+  service_path=$(real_meta "$home" | jq -r '.service_path')
+  pristine="$home/pristine.service"
+  cp "$service_path" "$pristine"
+  for name in FM_HOME FM_STATE_OVERRIDE FM_SUPERVISION_HARNESS FM_CODEX_SYSTEMD_LEASE FM_CODEX_SYSTEMD_GENERATION FM_CODEX_WATCH_CHECKPOINT; do
+    grep -v "^Environment=\"$name=" "$pristine" > "$service_path"
+    reason=$(real_validate_reason "$home")
+    assert_contains "$reason" "env-missing:$name" "a missing $name assignment must fail validation"
+  done
+  pass "fm-codex-systemd-scheduler: each missing required environment variable fails validation"
+}
+
+test_real_mode_rejects_effective_source_divergence() {
+  local home meta service reason canon_state
+  home=$(real_home_with_schedule real-divergence)
+  meta=$(real_meta "$home")
+  service=$(printf '%s' "$meta" | jq -r '.service_name')
+  canon_state=$(printf '%s' "$meta" | jq -r '.state_dir')
+  # The visible unit file stays byte-for-byte pristine; only systemd's loaded
+  # state diverges. Line-presence validation would stay green here.
+  printf 'FM_HOME=%s FM_STATE_OVERRIDE=%s FM_SUPERVISION_HARNESS=codex FM_CODEX_SYSTEMD_LEASE=lease-one FM_CODEX_SYSTEMD_GENERATION=1 FM_CODEX_WATCH_CHECKPOINT=60' \
+    "$home/evil" "$canon_state" > "$home/stub-state/override-$service-Environment"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "home-env-mismatch" "a loaded environment diverging from the visible source must fail validation"
+  rm -f "$home/stub-state/override-$service-Environment"
+  printf '%s' "$home/evil" > "$home/stub-state/override-$service-WorkingDirectory"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "workdir-mismatch" "a loaded WorkingDirectory diverging from the visible source must fail validation"
+  rm -f "$home/stub-state/override-$service-WorkingDirectory"
+  reason=$(real_validate_reason "$home")
+  [ -z "$reason" ] || [ "$reason" = valid ] || fail "pristine contract no longer validates after divergence probes: $reason"
+  pass "fm-codex-systemd-scheduler: effective state diverging from the visible source fails validation"
+}
+
+test_real_mode_fails_closed_on_property_query_problems() {
+  local home service reason
+  home=$(real_home_with_schedule real-query-problems)
+  service=$(real_meta "$home" | jq -r '.service_name')
+  : > "$home/stub-state/fail-show-contract-$service"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "service-property-query-failed" "a failed contract property query must fail closed"
+  rm -f "$home/stub-state/fail-show-contract-$service"
+  : > "$home/stub-state/omit-$service-WorkingDirectory"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "service-property-missing:WorkingDirectory" "an unanswered required property must fail closed"
+  rm -f "$home/stub-state/omit-$service-WorkingDirectory"
+  printf 'FM_HOME="unterminated' > "$home/stub-state/override-$service-Environment"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "environment-parse-ambiguous" "an unparseable effective environment must fail closed"
+  rm -f "$home/stub-state/override-$service-Environment"
+  : > "$home/stub-state/override-$service-Environment"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "env-missing:FM_HOME" "an empty effective environment must fail closed"
+  rm -f "$home/stub-state/override-$service-Environment"
+  pass "fm-codex-systemd-scheduler: failed, unanswered, malformed, or empty property queries fail closed"
+}
+
 # --- unit-file injection (review finding F-4) ----------------------------------
 
 test_real_mode_rejects_directive_injection_in_lease() {
@@ -438,6 +720,14 @@ test_real_mode_rejects_missing_timer
 test_real_mode_rejects_next_elapse_disagreement
 test_real_mode_rejects_trigger_mismatch
 test_real_mode_rejects_duplicate_unit_for_home
+test_real_mode_rejects_duplicate_controlled_env
+test_real_mode_rejects_environment_indirection
+test_real_mode_rejects_wrong_working_directory
+test_real_mode_rejects_drop_ins
+test_real_mode_rejects_unexpected_env_vars
+test_real_mode_rejects_each_missing_required_variable
+test_real_mode_rejects_effective_source_divergence
+test_real_mode_fails_closed_on_property_query_problems
 test_real_mode_rejects_directive_injection_in_lease
 test_real_mode_rejects_non_numeric_cadence
 test_fake_mode_rejects_invalid_record_fields
