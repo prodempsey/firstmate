@@ -1,13 +1,19 @@
 # shellcheck shell=bash
-# Shared "supervision missing" predicate.
+# Shared supervision health predicates.
 # Usage: . bin/fm-supervision-lib.sh
 #
-# True exactly when a firstmate home has in-flight work (a state/<id>.meta
+# fm_supervision_unhealthy is true exactly when a firstmate home has in-flight work (a state/<id>.meta
 # exists) but no watcher has a fresh liveness beacon (state/.last-watcher-beat,
 # touched every poll cycle, within the grace window). bin/fm-guard.sh uses this
-# grace-based warning predicate directly; bin/fm-turnend-guard.sh uses the status
-# fields here for its banner but performs its end-of-turn block decision with the
-# live watcher lock check in bin/fm-wake-lib.sh.
+# legacy grace-based warning predicate directly in older call paths. New guards use
+# fm_supervision_health, which keeps persistent harnesses on live watcher identity checks
+# and lets Codex prove continuity with a durable next-checkpoint schedule after a normal
+# bounded checkpoint exits.
+
+FM_CODEX_CHECKPOINT_SCHEDULE_NAME=.codex-watch-checkpoint.next.json
+FM_CODEX_CHECKPOINT_LAST_NAME=.codex-watch-checkpoint.last.json
+FM_CODEX_CHECKPOINT_RUNNING_NAME=.codex-watch-checkpoint.running.json
+FM_CODEX_CHECKPOINT_MECHANISM=codex-bounded-checkpoint
 
 # fm_session_lock_owner <state-dir>
 # Reads the per-home session lock (state/.lock, whose sole writer is bin/fm-lock.sh:
@@ -56,6 +62,366 @@ fm_sup_stat_mtime() {
   else
     stat -c %Y "$1" 2>/dev/null
   fi
+}
+
+fm_sup_repo_bin_dir() {
+  cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd
+}
+
+fm_sup_abs_path() {
+  local path=$1 dir base
+  dir=$(dirname "$path")
+  base=$(basename "$path")
+  dir=$(cd "$dir" 2>/dev/null && pwd -P) || return 1
+  printf '%s/%s\n' "$dir" "$base"
+}
+
+fm_sup_hash_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
+fm_sup_load_wake_lib() {
+  command -v fm_watcher_healthy >/dev/null 2>&1 && return 0
+  local bin_dir
+  bin_dir=$(fm_sup_repo_bin_dir) || return 1
+  # shellcheck source=bin/fm-wake-lib.sh
+  . "$bin_dir/fm-wake-lib.sh"
+}
+
+fm_codex_schedule_path() {
+  printf '%s/%s\n' "$1" "$FM_CODEX_CHECKPOINT_SCHEDULE_NAME"
+}
+
+fm_codex_last_path() {
+  printf '%s/%s\n' "$1" "$FM_CODEX_CHECKPOINT_LAST_NAME"
+}
+
+fm_codex_running_path() {
+  printf '%s/%s\n' "$1" "$FM_CODEX_CHECKPOINT_RUNNING_NAME"
+}
+
+fm_codex_schedule_files() {
+  local state=$1 f
+  for f in "$state"/.codex-watch-checkpoint.next*.json; do
+    [ -e "$f" ] || continue
+    printf '%s\n' "$f"
+  done
+}
+
+fm_codex_schedule_count() {
+  fm_codex_schedule_files "$1" | grep -c . 2>/dev/null || true
+}
+
+fm_codex_primary_identity() {
+  local state=$1 home=$2 lock pid ident canon_home
+  if [ -n "${FM_CODEX_PRIMARY_IDENTITY:-}" ]; then
+    printf '%s\n' "$FM_CODEX_PRIMARY_IDENTITY"
+    return 0
+  fi
+  lock="$state/.lock"
+  pid=$(cat "$lock" 2>/dev/null || true)
+  case "$pid" in
+    ''|*[!0-9]*) pid= ;;
+  esac
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    if command -v fm_pid_identity >/dev/null 2>&1 || fm_sup_load_wake_lib; then
+      ident=$(fm_pid_identity "$pid" 2>/dev/null || true)
+    else
+      ident=
+    fi
+    if [ -n "$ident" ]; then
+      printf 'pid:%s:%s\n' "$pid" "$ident"
+    else
+      printf 'pid:%s\n' "$pid"
+    fi
+    return 0
+  fi
+  canon_home=$(cd "$home" 2>/dev/null && pwd -P) || canon_home=$home
+  printf 'home:%s\n' "$canon_home"
+}
+
+fm_codex_schedule_integrity_payload() {
+  jq -cS 'del(.integrity)' "$1" 2>/dev/null
+}
+
+fm_codex_schedule_integrity() {
+  fm_codex_schedule_integrity_payload "$1" | fm_sup_hash_stdin
+}
+
+fm_codex_write_json_atomic() {
+  local dest=$1 payload=$2 tmp
+  tmp="${dest}.tmp.$$"
+  printf '%s\n' "$payload" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$dest" || { rm -f "$tmp"; return 1; }
+}
+
+fm_codex_build_schedule_payload() {
+  local state=$1 home=$2 start_epoch=$3 end_epoch=$4 result=$5 cadence=$6 max_lateness=$7 generation=$8 lease_id=$9
+  local canon_home canon_state owner payload hash
+  canon_home=$(cd "$home" 2>/dev/null && pwd -P) || canon_home=$home
+  canon_state=$(cd "$state" 2>/dev/null && pwd -P) || canon_state=$state
+  owner=$(fm_codex_primary_identity "$state" "$home")
+  payload=$(jq -cnS \
+    --arg harness codex \
+    --arg owner "codex:$owner" \
+    --arg primary_identity "$owner" \
+    --arg fm_home "$canon_home" \
+    --arg state_dir "$canon_state" \
+    --arg previous_result "$result" \
+    --arg mechanism "$FM_CODEX_CHECKPOINT_MECHANISM" \
+    --arg lease_id "$lease_id" \
+    --argjson version 1 \
+    --argjson checkpoint_start "$start_epoch" \
+    --argjson checkpoint_end "$end_epoch" \
+    --argjson next_due "$((end_epoch + cadence))" \
+    --argjson cadence_seconds "$cadence" \
+    --argjson max_lateness_seconds "$max_lateness" \
+    --argjson generation "$generation" \
+    '{version:$version,harness:$harness,owner:$owner,primary_identity:$primary_identity,
+      fm_home:$fm_home,state_dir:$state_dir,previous_checkpoint_start:$checkpoint_start,
+      previous_checkpoint_end:$checkpoint_end,previous_result:$previous_result,
+      next_checkpoint_due:$next_due,cadence_seconds:$cadence_seconds,
+      max_lateness_seconds:$max_lateness_seconds,generation:$generation,
+      lease_id:$lease_id,mechanism:$mechanism}' 2>/dev/null) || return 1
+  hash=$(printf '%s\n' "$payload" | fm_sup_hash_stdin) || return 1
+  printf '%s\n' "$payload" | jq -cS --arg integrity "sha256:$hash" '. + {integrity:$integrity}' 2>/dev/null
+}
+
+fm_codex_schedule_validate() {
+  local state=$1 home=$2 now file
+  local count integrity expected version harness mechanism owner primary current file_home file_state canon_home canon_state
+  local start end due cadence late result generation lease
+  now=${3:-$(date +%s)}
+  file=${4:-$(fm_codex_schedule_path "$state")}
+  FM_CODEX_SCHEDULE_REASON=
+  FM_CODEX_SCHEDULE_DUE=
+  count=$(fm_codex_schedule_count "$state")
+  if [ "$count" -gt 1 ]; then
+    FM_CODEX_SCHEDULE_REASON=duplicate-schedule
+    return 1
+  fi
+  [ -f "$file" ] || { FM_CODEX_SCHEDULE_REASON=missing-schedule; return 1; }
+  command -v jq >/dev/null 2>&1 || { FM_CODEX_SCHEDULE_REASON=jq-missing; return 1; }
+  jq -e 'type == "object"' "$file" >/dev/null 2>&1 || { FM_CODEX_SCHEDULE_REASON=malformed-schedule; return 1; }
+  integrity=$(jq -r '.integrity // empty' "$file" 2>/dev/null)
+  expected=$(fm_codex_schedule_integrity "$file" 2>/dev/null || true)
+  if [ -z "$integrity" ] || [ -z "$expected" ] || [ "$integrity" != "sha256:$expected" ]; then
+    FM_CODEX_SCHEDULE_REASON=bad-integrity
+    return 1
+  fi
+  version=$(jq -r '.version // empty' "$file" 2>/dev/null)
+  harness=$(jq -r '.harness // empty' "$file" 2>/dev/null)
+  mechanism=$(jq -r '.mechanism // empty' "$file" 2>/dev/null)
+  owner=$(jq -r '.owner // empty' "$file" 2>/dev/null)
+  primary=$(jq -r '.primary_identity // empty' "$file" 2>/dev/null)
+  file_home=$(jq -r '.fm_home // empty' "$file" 2>/dev/null)
+  file_state=$(jq -r '.state_dir // empty' "$file" 2>/dev/null)
+  result=$(jq -r '.previous_result // empty' "$file" 2>/dev/null)
+  start=$(jq -r '.previous_checkpoint_start // empty' "$file" 2>/dev/null)
+  end=$(jq -r '.previous_checkpoint_end // empty' "$file" 2>/dev/null)
+  due=$(jq -r '.next_checkpoint_due // empty' "$file" 2>/dev/null)
+  cadence=$(jq -r '.cadence_seconds // empty' "$file" 2>/dev/null)
+  late=$(jq -r '.max_lateness_seconds // empty' "$file" 2>/dev/null)
+  generation=$(jq -r '.generation // empty' "$file" 2>/dev/null)
+  lease=$(jq -r '.lease_id // empty' "$file" 2>/dev/null)
+  [ "$version" = 1 ] || { FM_CODEX_SCHEDULE_REASON=unsupported-version; return 1; }
+  [ "$harness" = codex ] || { FM_CODEX_SCHEDULE_REASON='harness-mismatch'; return 1; }
+  [ "$mechanism" = "$FM_CODEX_CHECKPOINT_MECHANISM" ] || { FM_CODEX_SCHEDULE_REASON='mechanism-mismatch'; return 1; }
+  current=$(fm_codex_primary_identity "$state" "$home")
+  [ "$primary" = "$current" ] && [ "$owner" = "codex:$current" ] || { FM_CODEX_SCHEDULE_REASON='owner-mismatch'; return 1; }
+  canon_home=$(cd "$home" 2>/dev/null && pwd -P) || canon_home=$home
+  canon_state=$(cd "$state" 2>/dev/null && pwd -P) || canon_state=$state
+  [ "$file_home" = "$canon_home" ] && [ "$file_state" = "$canon_state" ] || { FM_CODEX_SCHEDULE_REASON='home-mismatch'; return 1; }
+  case "$result" in
+    quiet|wake) ;;
+    failed) FM_CODEX_SCHEDULE_REASON='last-checkpoint-failed'; return 1 ;;
+    *) FM_CODEX_SCHEDULE_REASON=bad-result; return 1 ;;
+  esac
+  case "$start:$end:$due:$cadence:$late:$generation" in
+    *[!0-9:]*|:*|*::*) FM_CODEX_SCHEDULE_REASON=bad-time; return 1 ;;
+  esac
+  [ -n "$lease" ] || { FM_CODEX_SCHEDULE_REASON=missing-lease; return 1; }
+  [ "$end" -ge "$start" ] || { FM_CODEX_SCHEDULE_REASON=bad-time-order; return 1; }
+  [ "$due" -ge "$end" ] || { FM_CODEX_SCHEDULE_REASON=bad-due-time; return 1; }
+  [ "$cadence" -gt 0 ] || { FM_CODEX_SCHEDULE_REASON=bad-cadence; return 1; }
+  if [ "$now" -gt "$((due + late))" ]; then
+    FM_CODEX_SCHEDULE_REASON=checkpoint-overdue
+    FM_CODEX_SCHEDULE_DUE=$due
+    return 1
+  fi
+  FM_CODEX_SCHEDULE_REASON=valid
+  FM_CODEX_SCHEDULE_DUE=$due
+  return 0
+}
+
+fm_codex_last_checkpoint_failed() {
+  local state=$1 last
+  last=$(fm_codex_last_path "$state")
+  [ -f "$last" ] || return 1
+  [ "$(jq -r '.previous_result // .result // empty' "$last" 2>/dev/null)" = failed ]
+}
+
+fm_codex_checkpoint_start_record() {
+  local state=$1 home=$2 start_epoch=$3 cadence=$4 running owner canon_home canon_state payload
+  running=$(fm_codex_running_path "$state")
+  owner=$(fm_codex_primary_identity "$state" "$home")
+  canon_home=$(cd "$home" 2>/dev/null && pwd -P) || canon_home=$home
+  canon_state=$(cd "$state" 2>/dev/null && pwd -P) || canon_state=$state
+  payload=$(jq -cnS \
+    --arg owner "codex:$owner" \
+    --arg primary_identity "$owner" \
+    --arg fm_home "$canon_home" \
+    --arg state_dir "$canon_state" \
+    --arg mechanism "$FM_CODEX_CHECKPOINT_MECHANISM" \
+    --argjson version 1 \
+    --argjson runner_pid "${BASHPID:-$$}" \
+    --argjson checkpoint_start "$start_epoch" \
+    --argjson cadence_seconds "$cadence" \
+    '{version:$version,harness:"codex",owner:$owner,primary_identity:$primary_identity,
+      fm_home:$fm_home,state_dir:$state_dir,runner_pid:$runner_pid,
+      checkpoint_start:$checkpoint_start,cadence_seconds:$cadence_seconds,
+      mechanism:$mechanism}' 2>/dev/null) || return 1
+  fm_codex_write_json_atomic "$running" "$payload"
+}
+
+fm_codex_checkpoint_prepare() {
+  local state=$1 home=$2 start_epoch=$3 cadence=$4 running pid count schedule generation
+  mkdir -p "$state" || return 1
+  running=$(fm_codex_running_path "$state")
+  if [ -f "$running" ]; then
+    pid=$(jq -r '.runner_pid // empty' "$running" 2>/dev/null || true)
+    case "$pid" in
+      ''|*[!0-9]*) ;;
+      *) kill -0 "$pid" 2>/dev/null && { FM_CODEX_CHECKPOINT_PREPARE_REASON=duplicate-running-checkpoint; return 1; } ;;
+    esac
+  fi
+  count=$(fm_codex_schedule_count "$state")
+  if [ "$count" -gt 1 ]; then
+    FM_CODEX_CHECKPOINT_PREPARE_REASON=duplicate-schedule
+    return 1
+  fi
+  schedule=$(fm_codex_schedule_path "$state")
+  generation=0
+  if [ -f "$schedule" ]; then
+    if ! fm_codex_schedule_validate "$state" "$home" "$(date +%s)" "$schedule"; then
+      if [ "$FM_CODEX_SCHEDULE_REASON" != checkpoint-overdue ]; then
+        FM_CODEX_CHECKPOINT_PREPARE_REASON=$FM_CODEX_SCHEDULE_REASON
+        return 1
+      fi
+    fi
+    generation=$(jq -r '.generation // 0' "$schedule" 2>/dev/null)
+    rm -f "$schedule" || { FM_CODEX_CHECKPOINT_PREPARE_REASON=consume-schedule-failed; return 1; }
+  fi
+  fm_codex_checkpoint_start_record "$state" "$home" "$start_epoch" "$cadence" || {
+    FM_CODEX_CHECKPOINT_PREPARE_REASON=write-running-record-failed
+    return 1
+  }
+  # shellcheck disable=SC2034 # Read by callers after fm_codex_checkpoint_prepare returns.
+  FM_CODEX_CHECKPOINT_GENERATION=$generation
+  # shellcheck disable=SC2034 # Read by callers after fm_codex_checkpoint_prepare returns.
+  FM_CODEX_CHECKPOINT_PREPARE_REASON=ok
+  return 0
+}
+
+fm_codex_checkpoint_finish() {
+  local state=$1 home=$2 start_epoch=$3 end_epoch=$4 result=$5 cadence=$6 max_lateness=$7 generation=$8
+  local lease payload schedule last
+  schedule=$(fm_codex_schedule_path "$state")
+  last=$(fm_codex_last_path "$state")
+  lease="${end_epoch}-${BASHPID:-$$}-${RANDOM:-0}"
+  payload=$(fm_codex_build_schedule_payload "$state" "$home" "$start_epoch" "$end_epoch" "$result" "$cadence" "$max_lateness" "$((generation + 1))" "$lease") || return 1
+  fm_codex_write_json_atomic "$last" "$payload" || return 1
+  if [ "$result" = failed ]; then
+    rm -f "$schedule" "$(fm_codex_running_path "$state")" 2>/dev/null || true
+    return 0
+  fi
+  fm_codex_write_json_atomic "$schedule" "$payload" || return 1
+  rm -f "$(fm_codex_running_path "$state")" 2>/dev/null || true
+  return 0
+}
+
+fm_supervision_health() {
+  local state=$1 watch_path=$2 grace=${3:-${FM_GUARD_GRACE:-300}} home=${4:-$FM_HOME} harness=${5:-unknown}
+  local running=false count reason
+  FM_SUP_HEALTH_STATE=healthy-persistent
+  FM_SUP_HEALTHY=true
+  FM_SUP_HEALTH_REASON=none
+  FM_SUP_SCHEDULE_DUE=
+  fm_supervision_status "$state" "$grace"
+  [ "$FM_SUP_IN_FLIGHT" -gt 0 ] || return 0
+  fm_sup_load_wake_lib || {
+    FM_SUP_HEALTH_STATE=unhealthy-no-supervision
+    FM_SUP_HEALTHY=false
+    FM_SUP_HEALTH_REASON=wake-lib-unavailable
+    return 0
+  }
+  if fm_watcher_healthy "$state" "$watch_path" "$grace" "$home"; then
+    running=true
+  fi
+  if [ "$harness" != codex ]; then
+    if [ "$running" = true ]; then
+      FM_SUP_HEALTH_STATE=healthy-persistent
+      FM_SUP_HEALTHY=true
+      FM_SUP_HEALTH_REASON=watcher-running
+    else
+      FM_SUP_HEALTH_STATE=unhealthy-no-supervision
+      FM_SUP_HEALTHY=false
+      FM_SUP_HEALTH_REASON=${FM_WATCHER_DIAG_FAIL:-watcher-down}
+    fi
+    return 0
+  fi
+  count=$(fm_codex_schedule_count "$state")
+  if [ "$running" = true ]; then
+    if [ "$count" -gt 0 ]; then
+      FM_SUP_HEALTH_STATE=unhealthy-duplicate-owner
+      FM_SUP_HEALTHY=false
+      FM_SUP_HEALTH_REASON=live-plus-scheduled
+    else
+      FM_SUP_HEALTH_STATE=healthy-checkpoint-running
+      FM_SUP_HEALTHY=true
+      FM_SUP_HEALTH_REASON=checkpoint-running
+    fi
+    return 0
+  fi
+  if fm_codex_schedule_validate "$state" "$home" "$(date +%s)"; then
+    FM_SUP_HEALTH_STATE=healthy-checkpoint-scheduled
+    FM_SUP_HEALTHY=true
+    FM_SUP_HEALTH_REASON=checkpoint-scheduled
+    # shellcheck disable=SC2034 # Read by callers after fm_supervision_health returns.
+    FM_SUP_SCHEDULE_DUE=$FM_CODEX_SCHEDULE_DUE
+    return 0
+  fi
+  reason=$FM_CODEX_SCHEDULE_REASON
+  case "$reason" in
+    checkpoint-overdue)
+      FM_SUP_HEALTH_STATE=unhealthy-checkpoint-overdue ;;
+    owner-mismatch|home-mismatch|harness-mismatch|mechanism-mismatch)
+      FM_SUP_HEALTH_STATE=unhealthy-owner-mismatch ;;
+    duplicate-schedule)
+      FM_SUP_HEALTH_STATE=unhealthy-duplicate-owner ;;
+    last-checkpoint-failed)
+      FM_SUP_HEALTH_STATE=unhealthy-last-checkpoint-failed ;;
+    *)
+      if fm_codex_last_checkpoint_failed "$state"; then
+        FM_SUP_HEALTH_STATE=unhealthy-last-checkpoint-failed
+        reason='last-checkpoint-failed'
+      else
+        # shellcheck disable=SC2034 # Read by callers after fm_supervision_health returns.
+        FM_SUP_HEALTH_STATE=unhealthy-no-supervision
+      fi
+      ;;
+  esac
+  # shellcheck disable=SC2034 # Read by callers after fm_supervision_health returns.
+  FM_SUP_HEALTHY=false
+  # shellcheck disable=SC2034 # Read by callers after fm_supervision_health returns.
+  FM_SUP_HEALTH_REASON=$reason
+  return 0
 }
 
 # fm_supervision_status <state-dir> [grace-seconds]

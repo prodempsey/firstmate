@@ -181,6 +181,12 @@ run_hook() {
   printf '{"stop_hook_active":%s}' "$stop_active" | CLAUDECODE=1 FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" 2>&1
 }
 
+run_hook_codex() {
+  local dir=$1 stop_active=$2 home
+  home=$(cd "$dir" && pwd)
+  printf '{"stop_hook_active":%s}' "$stop_active" | FM_SUPERVISION_HARNESS=codex FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" 2>&1
+}
+
 nonexistent_pid() {
   local pid=999999
   while kill -0 "$pid" 2>/dev/null; do
@@ -266,6 +272,24 @@ start_healthy_watcher() {  # <dir>
   record_watcher_lock "$dir" "$pid" "$identity"
   touch "$dir/state/.last-watcher-beat"
   printf '%s\n' "$pid"
+}
+
+write_codex_schedule() {  # <dir> <start-offset> <cadence> <lateness> [result] [owner-override]
+  local dir=$1 start_offset=$2 cadence=$3 lateness=$4 result=${5:-quiet} owner_override=${6:-}
+  local now start end home
+  home=$(cd "$dir" && pwd)
+  now=$(date +%s)
+  start=$((now + start_offset))
+  end=$((start + 1))
+  if [ -n "$owner_override" ]; then
+    FM_CODEX_PRIMARY_IDENTITY="$owner_override" bash -c '. "$1/bin/fm-supervision-lib.sh"; fm_codex_checkpoint_finish "$2/state" "$2" "$3" "$4" "$5" "$6" "$7" 0' \
+      _ "$dir" "$home" "$start" "$end" "$result" "$cadence" "$lateness" \
+      || fail "could not write Codex schedule for $dir"
+  else
+    bash -c '. "$1/bin/fm-supervision-lib.sh"; fm_codex_checkpoint_finish "$2/state" "$2" "$3" "$4" "$5" "$6" "$7" 0' \
+      _ "$dir" "$home" "$start" "$end" "$result" "$cadence" "$lateness" \
+      || fail "could not write Codex schedule for $dir"
+  fi
 }
 
 stop_watcher() {  # <pid>
@@ -412,6 +436,7 @@ SH
   expect_code 2 "$status" "a narrative acknowledgment (no state change) must not discharge the gate"
 
   # A triage surface: first-sight stamping re-opens items; it never closes one.
+  mkdir -p "$dir/data"
   jq -nc '{item_id: "needs_firstmate:open-p1", event: "surface",
            first_seen_at: "2026-07-13T00:00:00Z"}' >> "$dir/data/fleet-triage.jsonl"
   out=$(run_hook "$dir" false); status=$?
@@ -816,6 +841,130 @@ test_hook_blocks_with_live_lock_and_stale_beacon() {
   expect_code 2 "$status" "hook must block when a live watcher lock has an ancient beacon"
   assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
   pass "fm-turnend-guard: blocks on a live watcher lock with an ancient beacon"
+}
+
+test_hook_codex_accepts_valid_checkpoint_schedule() {
+  local dir out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-scheduled")
+  : > "$dir/state/task1.meta"
+  write_codex_schedule "$dir" -1 60 60 quiet
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 0 "$status" "Codex hook must accept a valid future next-checkpoint schedule"
+  [ -z "$out" ] || fail "Codex hook produced output with valid scheduled supervision: $out"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.watcher')" = healthy-checkpoint-scheduled ] \
+    || fail "Codex scheduled permit did not log healthy-checkpoint-scheduled: $log"
+  [ "$(printf '%s' "$log" | jq -r '.supervision_harness')" = codex ] \
+    || fail "Codex scheduled permit did not log the codex harness: $log"
+  pass "fm-turnend-guard: Codex accepts a durable future next-checkpoint schedule"
+}
+
+test_hook_codex_rejects_no_watcher_and_no_schedule() {
+  local dir out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-noschedule")
+  : > "$dir/state/task1.meta"
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 2 "$status" "Codex hook must block with no watcher and no durable schedule"
+  assert_contains "$out" "TURN WOULD END BLIND" "Codex no-schedule block must report supervision continuity"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.supervision_health')" = unhealthy-no-supervision ] \
+    || fail "Codex no-schedule block did not log unhealthy-no-supervision: $log"
+  pass "fm-turnend-guard: Codex rejects no watcher and no durable schedule"
+}
+
+test_hook_codex_rejects_overdue_checkpoint_schedule() {
+  local dir out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-overdue")
+  : > "$dir/state/task1.meta"
+  write_codex_schedule "$dir" -120 1 0 quiet
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 2 "$status" "Codex hook must block on an overdue next-checkpoint schedule"
+  assert_contains "$out" "unhealthy-checkpoint-overdue" "Codex overdue block must name the overdue health state"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.supervision_health')" = unhealthy-checkpoint-overdue ] \
+    || fail "Codex overdue block did not log unhealthy-checkpoint-overdue: $log"
+  pass "fm-turnend-guard: Codex rejects overdue next-checkpoint schedules"
+}
+
+test_hook_codex_rejects_malformed_checkpoint_schedule() {
+  local dir out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-malformed")
+  : > "$dir/state/task1.meta"
+  printf '{not-json\n' > "$dir/state/.codex-watch-checkpoint.next.json"
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 2 "$status" "Codex hook must block on a malformed next-checkpoint schedule"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.supervision_reason')" = malformed-schedule ] \
+    || fail "Codex malformed schedule reason was not logged: $log"
+  pass "fm-turnend-guard: Codex rejects malformed next-checkpoint schedules"
+}
+
+test_hook_codex_rejects_owner_mismatch_schedule() {
+  local dir out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-owner-mismatch")
+  : > "$dir/state/task1.meta"
+  write_codex_schedule "$dir" -1 60 60 quiet other-primary
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 2 "$status" "Codex hook must block when the schedule owner does not match this primary"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.supervision_health')" = unhealthy-owner-mismatch ] \
+    || fail "Codex owner mismatch did not log unhealthy-owner-mismatch: $log"
+  pass "fm-turnend-guard: Codex rejects schedule ownership mismatches"
+}
+
+test_hook_codex_rejects_duplicate_checkpoint_schedules() {
+  local dir out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-duplicate-schedule")
+  : > "$dir/state/task1.meta"
+  write_codex_schedule "$dir" -1 60 60 quiet
+  cp "$dir/state/.codex-watch-checkpoint.next.json" "$dir/state/.codex-watch-checkpoint.next.extra.json"
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 2 "$status" "Codex hook must block on duplicate active schedule ownership"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.supervision_health')" = unhealthy-duplicate-owner ] \
+    || fail "Codex duplicate schedule did not log unhealthy-duplicate-owner: $log"
+  pass "fm-turnend-guard: Codex rejects duplicate active checkpoint schedules"
+}
+
+test_hook_codex_failed_checkpoint_is_not_green() {
+  local dir out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-failed")
+  : > "$dir/state/task1.meta"
+  write_codex_schedule "$dir" -1 60 60 failed
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 2 "$status" "Codex hook must block after a failed checkpoint with no recovery schedule"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.supervision_health')" = unhealthy-last-checkpoint-failed ] \
+    || fail "Codex failed checkpoint did not log unhealthy-last-checkpoint-failed: $log"
+  pass "fm-turnend-guard: failed Codex checkpoint does not leave supervision falsely green"
+}
+
+test_hook_codex_normal_bounded_exit_is_not_a_crash() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-normal-exit")
+  : > "$dir/state/task1.meta"
+  touch "$dir/state/.last-watcher-beat"
+  write_codex_schedule "$dir" -1 60 60 quiet
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 0 "$status" "Codex hook must treat normal bounded checkpoint exit as healthy when schedule is valid"
+  [ -z "$out" ] || fail "normal bounded checkpoint exit was reported as a crash: $out"
+  pass "fm-turnend-guard: normal bounded Codex checkpoint exit is healthy by schedule, not a watcher crash"
+}
+
+test_hook_codex_unattended_gate_still_blocks_with_healthy_schedule() {
+  local dir out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-codex-nf-with-schedule")
+  : > "$dir/state/task1.meta"
+  write_codex_schedule "$dir" -1 60 60 quiet
+  write_nf_signal "$dir" codex-done-a1 'done: ready in branch fm/codex-done-a1'
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 2 "$status" "unattended finished work must still block even when Codex schedule continuity is healthy"
+  assert_contains "$out" "TURN WOULD END WITH FINISHED WORK UNATTENDED" "unattended-work gate did not fire"
+  assert_not_contains "$out" "TURN WOULD END BLIND" "healthy Codex schedule must not be reported as supervision blind"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.reason')" = unattended-needs-firstmate ] \
+    || fail "Codex unattended block should name only unattended work: $log"
+  pass "fm-turnend-guard: unattended terminal work gate remains independent of scheduled Codex supervision"
 }
 
 test_hook_blocks_when_unhealthy_in_primary() {
@@ -1722,6 +1871,15 @@ test_hook_blocks_when_fresh_beacon_has_no_live_lock
 test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
 test_hook_blocks_with_live_lock_and_stale_beacon
+test_hook_codex_accepts_valid_checkpoint_schedule
+test_hook_codex_rejects_no_watcher_and_no_schedule
+test_hook_codex_rejects_overdue_checkpoint_schedule
+test_hook_codex_rejects_malformed_checkpoint_schedule
+test_hook_codex_rejects_owner_mismatch_schedule
+test_hook_codex_rejects_duplicate_checkpoint_schedules
+test_hook_codex_failed_checkpoint_is_not_green
+test_hook_codex_normal_bounded_exit_is_not_a_crash
+test_hook_codex_unattended_gate_still_blocks_with_healthy_schedule
 test_hook_blocks_when_unhealthy_in_primary
 test_hook_blocks_from_fm_home_state
 test_hook_x_mode_reason_sources_cadence

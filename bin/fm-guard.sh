@@ -23,6 +23,11 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 GRACE=${FM_GUARD_GRACE:-300}
+WATCH="$SCRIPT_DIR/fm-watch.sh"
+HARNESS=${FM_SUPERVISION_HARNESS:-}
+if [ -z "$HARNESS" ]; then
+  HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
+fi
 queue_pending=false
 READ_ONLY=${FM_GUARD_READ_ONLY:-0}
 case "$READ_ONLY" in 1|true|TRUE|yes|YES) READ_ONLY=1 ;; *) READ_ONLY=0 ;; esac
@@ -260,9 +265,9 @@ fi
 # grace-based predicate (bin/fm-supervision-lib.sh). Only act with tasks in
 # flight; count them so the banner can say how much is riding on an absent
 # watcher.
-fm_supervision_status "$STATE" "$GRACE"
+fm_supervision_health "$STATE" "$WATCH" "$GRACE" "$FM_HOME" "$HARNESS"
 in_flight=$FM_SUP_IN_FLIGHT
-watcher_fresh=$FM_SUP_WATCHER_FRESH
+supervision_healthy=$FM_SUP_HEALTHY
 beacon_desc=$FM_SUP_BEACON_DESC
 [ "$in_flight" -eq 0 ] && exit 0
 
@@ -270,7 +275,7 @@ beacon_desc=$FM_SUP_BEACON_DESC
 
 # No fresh watcher with tasks in flight is the dangerous state: emit a prominent,
 # bordered banner FIRST so it reads as an alarm, not a buried stderr line.
-if [ "$watcher_fresh" = false ]; then
+if [ "$supervision_healthy" = false ]; then
   afk=0
   [ -e "$STATE/.afk" ] && afk=1
   queue_arg=0
@@ -278,6 +283,7 @@ if [ "$watcher_fresh" = false ]; then
   x_mode=0
   [ -f "$CONFIG/x-mode.env" ] && x_mode=1
   fix=$("$SCRIPT_DIR/fm-supervision-instructions.sh" \
+    --harness "$HARNESS" \
     --read-only "$READ_ONLY" \
     --afk "$afk" \
     --x-mode "$x_mode" \
@@ -287,7 +293,8 @@ if [ "$watcher_fresh" = false ]; then
   {
     printf '●%s\n' "$rule"
     printf '●  WATCHER DOWN - SUPERVISION IS OFF\n'
-    printf '●  %s task(s) in flight, but no watcher has a fresh beacon (last beat: %s, grace %ss).\n' "$in_flight" "$beacon_desc" "$GRACE"
+    printf '●  %s task(s) in flight, but supervision continuity is unhealthy (%s: %s; last beat: %s, grace %ss).\n' \
+      "$in_flight" "$FM_SUP_HEALTH_STATE" "$FM_SUP_HEALTH_REASON" "$beacon_desc" "$GRACE"
     if [ "$READ_ONLY" -eq 1 ]; then
       printf '●  This read-only session should report the lapse, not repair it.\n'
     else

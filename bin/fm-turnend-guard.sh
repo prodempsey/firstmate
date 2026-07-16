@@ -75,6 +75,10 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 GRACE=${FM_GUARD_GRACE:-300}
 WATCH="$SCRIPT_DIR/fm-watch.sh"
+HARNESS=${FM_SUPERVISION_HARNESS:-}
+if [ -z "$HARNESS" ]; then
+  HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
+fi
 # The decision log: one JSON line per primary turn-end evaluation, permitted ones included.
 LOG="${FM_TURNEND_LOG:-$STATE/.turnend-guard.log}"
 LOG_MAX=${FM_TURNEND_LOG_MAX:-2000}
@@ -283,11 +287,9 @@ fi
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
-fm_supervision_status "$STATE" "$GRACE"
-
+fm_supervision_health "$STATE" "$WATCH" "$GRACE" "$FM_HOME" "$HARNESS"
 blind=0
-if [ "$FM_SUP_IN_FLIGHT" -gt 0 ] \
-  && ! fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
+if [ "$FM_SUP_IN_FLIGHT" -gt 0 ] && [ "$FM_SUP_HEALTHY" = false ]; then
   blind=1
 fi
 
@@ -354,9 +356,8 @@ if [ "$nf" -gt 0 ]; then
   [ "$nf" -gt "$LOG_IDS" ] && nf_digest="$nf_digest,+$((nf - LOG_IDS)) more"
 fi
 
-watcher_desc=healthy
+watcher_desc=$FM_SUP_HEALTH_STATE
 [ "$FM_SUP_IN_FLIGHT" -eq 0 ] && watcher_desc=no-tasks-in-flight
-[ "$blind" -eq 1 ] && watcher_desc=down
 
 # --- decision log ------------------------------------------------------------
 # Every primary turn-end evaluation is recorded, one JSON line each - timestamp, watcher
@@ -419,13 +420,17 @@ log_decision() {  # <decision> <reason>
     --arg home_match "${FM_WATCHER_DIAG_HOME_MATCH:-unknown}" \
     --arg path_match "${FM_WATCHER_DIAG_PATH_MATCH:-unknown}" \
     --arg watcher_fail "${FM_WATCHER_DIAG_FAIL:-unknown}" \
+    --arg supervision_health "${FM_SUP_HEALTH_STATE:-unknown}" \
+    --arg supervision_reason "${FM_SUP_HEALTH_REASON:-unknown}" \
+    --arg supervision_harness "$HARNESS" \
     --argjson loop_protection "$([ "$STOP_HOOK_ACTIVE" = true ] && echo true || echo false)" \
     '{ts: $ts, watcher: $watcher, in_flight: $in_flight, needs_firstmate: $nf,
       nf_items: $nf_items, nf_gate: $nf_gate, nf_error: $nf_error,
       decision: $decision, reason: $reason, loop_protection: $loop_protection,
       beacon_age: $beacon_age, lock_pid: $lock_pid, lock_pid_alive: $lock_pid_alive,
       identity_match: $identity_match, home_match: $home_match, path_match: $path_match,
-      watcher_fail: $watcher_fail}' 2>/dev/null) \
+      watcher_fail: $watcher_fail, supervision_health: $supervision_health,
+      supervision_reason: $supervision_reason, supervision_harness: $supervision_harness}' 2>/dev/null) \
     || return 0
   printf '%s\n' "$line" >> "$LOG" 2>/dev/null || return 0
   # Bounded: this is an operational trail, not an archive.
@@ -572,12 +577,13 @@ block_reason=''
 
 if [ "$blind" -eq 1 ]; then
   block_reason='watcher-down'
-  REASON=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_mode" --repair-line 2>/dev/null \
+  REASON=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --harness "$HARNESS" --afk "$afk" --x-mode "$x_mode" --repair-line 2>/dev/null \
     || printf '%s\n' 'tasks in flight, no live watcher - resume supervision according to the session-start operating block before ending the turn')
   {
     printf '●%s\n' "$rule"
     printf '●  TURN WOULD END BLIND - SUPERVISION IS OFF\n'
-    printf '●  %s task(s) in flight, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_IN_FLIGHT" "$FM_SUP_BEACON_DESC"
+    printf '●  %s task(s) in flight, but supervision continuity is not healthy (%s: %s; last beat: %s).\n' \
+      "$FM_SUP_IN_FLIGHT" "$FM_SUP_HEALTH_STATE" "$FM_SUP_HEALTH_REASON" "$FM_SUP_BEACON_DESC"
     # Those two lines look self-contradictory on their own: the beacon outlives the
     # watcher that touched it, so a fresh beacon with an ABSENT lock is real. Say what
     # was actually observed, and which check decided it.

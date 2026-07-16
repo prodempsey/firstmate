@@ -4,7 +4,11 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 SECONDS_ARG=${FM_CODEX_WATCH_CHECKPOINT:-180}
+MAX_LATENESS=${FM_CODEX_WATCH_CHECKPOINT_MAX_LATENESS:-60}
 
 usage() {
   cat <<'EOF'
@@ -43,6 +47,30 @@ case "$SECONDS_ARG" in
   ''|*[!0-9]*) echo "error: --seconds must be a positive integer" >&2; exit 2 ;;
   0) echo "error: --seconds must be greater than zero" >&2; exit 2 ;;
 esac
+case "$MAX_LATENESS" in
+  ''|*[!0-9]*) echo "error: FM_CODEX_WATCH_CHECKPOINT_MAX_LATENESS must be a non-negative integer" >&2; exit 2 ;;
+esac
+
+# shellcheck source=bin/fm-supervision-lib.sh
+. "$SCRIPT_DIR/fm-supervision-lib.sh"
+
+START_EPOCH=$(date +%s)
+FM_CODEX_CHECKPOINT_GENERATION=0
+FM_CODEX_CHECKPOINT_PREPARE_REASON=
+if ! fm_codex_checkpoint_prepare "$STATE" "$FM_HOME" "$START_EPOCH" "$SECONDS_ARG"; then
+  printf 'checkpoint: refused to start Codex checkpoint supervision: %s\n' "$FM_CODEX_CHECKPOINT_PREPARE_REASON" >&2
+  exit 1
+fi
+
+finish_checkpoint() {
+  local result=$1 end_epoch
+  end_epoch=$(date +%s)
+  if ! fm_codex_checkpoint_finish "$STATE" "$FM_HOME" "$START_EPOCH" "$end_epoch" "$result" "$SECONDS_ARG" "$MAX_LATENESS" "$FM_CODEX_CHECKPOINT_GENERATION"; then
+    printf 'checkpoint: failed to record Codex checkpoint outcome\n' >&2
+    return 1
+  fi
+  return 0
+}
 
 OUT=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.out.XXXXXX") || exit 1
 ERR=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.err.XXXXXX") || {
@@ -89,6 +117,7 @@ set -e
 if grep -E '^(signal:|stale:|check:|heartbeat($|:))' "$OUT" >/dev/null 2>&1; then
   cat "$OUT"
   [ ! -s "$ERR" ] || cat "$ERR" >&2
+  finish_checkpoint wake || exit 1
   exit 0
 fi
 
@@ -96,14 +125,17 @@ if grep -E '^watcher: already running' "$OUT" "$ERR" >/dev/null 2>&1; then
   [ ! -s "$OUT" ] || cat "$OUT"
   [ ! -s "$ERR" ] || cat "$ERR" >&2
   echo "checkpoint: watcher is already running outside this foreground checkpoint" >&2
+  finish_checkpoint failed || exit 1
   exit 1
 fi
 
 if [ "$RC" -eq 124 ]; then
   printf 'checkpoint: no actionable wake within %ss\n' "$SECONDS_ARG"
+  finish_checkpoint quiet || exit 1
   exit 124
 fi
 
 [ ! -s "$OUT" ] || cat "$OUT"
 [ ! -s "$ERR" ] || cat "$ERR" >&2
+finish_checkpoint failed || exit 1
 exit "$RC"

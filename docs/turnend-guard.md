@@ -50,12 +50,17 @@ The same fail-armed rule governs the lock: only a provably foreign live holder s
 For an in-scope primary home it evaluates two independent conditions, and blocks when either holds.
 It exits silently when neither does, so the healthy path stays completely quiet.
 
-**Supervision is off.**
+**Supervision continuity is off.**
 It counts in-flight work from `state/*.meta`.
-If work is in flight, it requires `fm_watcher_healthy <state-dir> <watch-path> [grace-seconds] [home]` from `bin/fm-wake-lib.sh`.
-That is the same identity-matched live lock and fresh beacon check used by `bin/fm-watch-arm.sh`.
-A stale beacon blocks even if a watcher pid is still live.
-A fresh leftover beacon blocks if the watcher lock is missing, dead, or identity-mismatched.
+If work is in flight, it asks `fm_supervision_health <state-dir> <watch-path> [grace-seconds] [home] [harness]` from `bin/fm-supervision-lib.sh`.
+For persistent-watcher harnesses, healthy supervision still requires `fm_watcher_healthy <state-dir> <watch-path> [grace-seconds] [home]` from `bin/fm-wake-lib.sh`.
+That is the same identity-matched live lock and fresh beacon check used by `bin/fm-watch-arm.sh`, so a stale beacon blocks even if a watcher pid is still live and a fresh leftover beacon blocks if the watcher lock is missing, dead, or identity-mismatched.
+For Codex, healthy supervision is either a currently running bounded checkpoint watcher with that same valid lock and fresh heartbeat, or a valid durable next-checkpoint schedule in `state/.codex-watch-checkpoint.next.json`.
+The Codex schedule is valid only when its integrity hash verifies and it matches this primary's owner identity, `FM_HOME`, state directory, harness `codex`, mechanism `codex-bounded-checkpoint`, prior checkpoint start and end, prior result, next due time, cadence, maximum lateness, generation, lease id, and version.
+The schedule is unhealthy when it is missing, malformed, overdue, owned by another primary, tied to another home or stale session, duplicated by another active schedule, paired with a live watcher ownership record, or preceded by a failed checkpoint without recovery.
+The normalized health states are `healthy-persistent`, `healthy-checkpoint-running`, `healthy-checkpoint-scheduled`, `unhealthy-no-supervision`, `unhealthy-checkpoint-overdue`, `unhealthy-owner-mismatch`, `unhealthy-duplicate-owner`, and `unhealthy-last-checkpoint-failed`.
+`bin/fm-watch-checkpoint.sh` writes `state/.codex-watch-checkpoint.running.json` when a foreground checkpoint starts, consumes any valid active schedule, and atomically advances `state/.codex-watch-checkpoint.next.json` only after a normal `quiet` or `wake` result.
+Failed checkpoints write `state/.codex-watch-checkpoint.last.json` with `previous_result=failed` and deliberately leave no healthy schedule.
 
 **Finished work is unattended.**
 It reads the `needs_firstmate` lane LIVE, at the moment of the turn-end evaluation, through `fm_nf_unattended_ids <state-dir> <data-dir>` from `bin/fm-nf-attention-lib.sh`, computed from `state/<id>.meta`, `state/<id>.status`, and the triage ledger.
@@ -85,7 +90,7 @@ Both stand-downs are logged as their own decisions, never as compliant permits.
 
 ## Decision Log
 
-Every primary turn-end evaluation - permitted or blocked - appends one JSON line to `state/.turnend-guard.log`: timestamp, watcher status, in-flight count, `needs_firstmate` count, a bounded item-id digest, the `nf_gate` state, the read-error component (`nf_error`), the decision, the reason, and whether loop protection was active.
+Every primary turn-end evaluation - permitted or blocked - appends one JSON line to `state/.turnend-guard.log`: timestamp, watcher status, normalized supervision health and reason, supervision harness, in-flight count, `needs_firstmate` count, a bounded item-id digest, the `nf_gate` state, the read-error component (`nf_error`), the decision, the reason, and whether loop protection was active.
 The log carries ids, counts, and decisions only - never transcript content.
 It is best-effort (a log that cannot be written never changes the decision or wedges the turn) and size-capped (`FM_TURNEND_LOG_MAX`, default 2000 lines, trimmed to half when exceeded).
 `FM_TURNEND_LOG` overrides the path.

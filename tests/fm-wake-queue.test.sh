@@ -359,20 +359,31 @@ test_drain_dedupes_obvious_duplicates() {
 # when work is in flight with no live watcher, and stay silent right after a
 # normal fire (a fresh beacon within grace), so it never false-alarms every wake.
 test_drain_asserts_watcher_liveness() {
-  local dir state err
+  local dir state err pid identity
   dir=$(make_case drain-liveness)
   state="$dir/state"
   err="$dir/drain.err"
   printf 'window=test:fm-x\nkind=ship\n' > "$state/x.meta"
-  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || fail "drain failed while asserting liveness"
+  FM_ROOT_OVERRIDE="$dir" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || fail "drain failed while asserting liveness"
   grep -F 'WATCHER DOWN' "$err" >/dev/null || fail "drain did not surface the watcher-down banner with work in flight and no live watcher"
   : > "$err"
+  sleep 60 >/dev/null 2>&1 &
+  pid=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$ROOT/bin/fm-wake-lib.sh" "$pid") \
+    || fail "could not read watcher identity for drain liveness fixture"
+  mkdir -p "$state/.watch.lock"
+  printf '%s\n' "$pid" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
   touch "$state/.last-watcher-beat"
-  FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$DRAIN" >/dev/null 2> "$err" || fail "drain failed with a fresh beacon"
+  FM_ROOT_OVERRIDE="$dir" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$DRAIN" >/dev/null 2> "$err" || fail "drain failed with a fresh beacon"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
   if grep -F 'WATCHER DOWN' "$err" >/dev/null; then
-    fail "drain false-alarmed right after a normal fire (fresh beacon within grace)"
+    fail "drain false-alarmed with a live watcher lock and fresh beacon"
   fi
-  pass "drain asserts watcher liveness: warns on a lapse, stays silent right after a fire"
+  pass "drain asserts watcher liveness: warns on a lapse, stays silent with live lock and fresh beacon"
 }
 
 test_concurrent_append_and_drain
