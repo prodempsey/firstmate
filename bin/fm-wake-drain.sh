@@ -6,6 +6,10 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-role-context-lib.sh
+. "$SCRIPT_DIR/fm-role-context-lib.sh"
+# Draining the primary's durable wake queue is a primary-only mutation.
+fm_require_primary "fm-wake-drain.sh" || exit 2
 
 DRAIN_TMP=
 DRAIN_LOCK_HELD=false

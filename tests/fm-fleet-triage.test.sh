@@ -160,9 +160,10 @@ run_triage() {
 run_record() {
   local root=$1 home=$2
   shift 2
-  FM_ROOT_OVERRIDE="$root" FM_HOME="$home" \
+  # Run as the primary (from $home) so the role-context guard resolves `primary`.
+  ( cd "$home" && FM_ROOT_OVERRIDE="$root" FM_HOME="$home" \
     FM_FLEET_TRIAGE_BUG_CLI="${FM_FLEET_TRIAGE_BUG_CLI:-off}" \
-    "$root/bin/fm-fleet-triage-record.sh" "$@"
+    "$root/bin/fm-fleet-triage-record.sh" "$@" )
 }
 
 ledger_of() {  # <home>

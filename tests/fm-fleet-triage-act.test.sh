@@ -79,30 +79,32 @@ unblocked_snapshot() {
 EOF
 }
 
+# These helpers run as the PRIMARY firstmate (that is what exercises the ledger). Run
+# from $home so the role-context guard on fm-fleet-triage-record resolves `primary`.
 run_act() {  # <root> <home> <fakebin> [args...]
   local root=$1 home=$2 fakebin=$3
   shift 3
-  FM_ROOT_OVERRIDE="$root" FM_HOME="$home" \
+  ( cd "$home" && FM_ROOT_OVERRIDE="$root" FM_HOME="$home" \
     FM_FLEET_TRIAGE_BUG_CLI=off \
     FM_TEST_AXI_LOG="$home/axi.log" \
     PATH="$fakebin:$PATH" \
-    "$root/bin/fm-fleet-triage-act.sh" "$@"
+    "$root/bin/fm-fleet-triage-act.sh" "$@" )
 }
 
 run_triage() {  # <root> <home> [args...]
   local root=$1 home=$2
   shift 2
-  FM_ROOT_OVERRIDE="$root" FM_HOME="$home" \
+  ( cd "$home" && FM_ROOT_OVERRIDE="$root" FM_HOME="$home" \
     FM_FLEET_TRIAGE_BUG_CLI=off \
-    "$root/bin/fm-fleet-triage.sh" "$@"
+    "$root/bin/fm-fleet-triage.sh" "$@" )
 }
 
 run_record() {  # <root> <home> [args...]
   local root=$1 home=$2
   shift 2
-  FM_ROOT_OVERRIDE="$root" FM_HOME="$home" \
+  ( cd "$home" && FM_ROOT_OVERRIDE="$root" FM_HOME="$home" \
     FM_FLEET_TRIAGE_BUG_CLI=off \
-    "$root/bin/fm-fleet-triage-record.sh" "$@"
+    "$root/bin/fm-fleet-triage-record.sh" "$@" )
 }
 
 ledger_of() {  # <home>

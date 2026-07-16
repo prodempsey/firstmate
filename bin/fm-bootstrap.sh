@@ -643,6 +643,11 @@ crew_dispatch_validate() {
 }
 
 if [ "${1:-}" = "install" ]; then
+  # Installing shared tools mutates the environment - primary-only. Detection (the
+  # default, no-arg path) is read-only and stays available to any role.
+  # shellcheck source=bin/fm-role-context-lib.sh
+  . "$SCRIPT_DIR/fm-role-context-lib.sh"
+  fm_require_primary "fm-bootstrap.sh install" || exit 2
   shift
   [ $# -gt 0 ] || { echo "usage: fm-bootstrap.sh install <tool>..." >&2; exit 1; }
   for t in "$@"; do

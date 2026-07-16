@@ -88,6 +88,10 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+# shellcheck source=bin/fm-role-context-lib.sh
+. "$SCRIPT_DIR/fm-role-context-lib.sh"
+# The triage duty fires the banner and writes the volatile result cache - primary-only.
+fm_require_primary "fm-triage-duty.sh" || exit 2
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 LAST_RESULT="$STATE/.triage-duty-last.json"
 MAX_ITEMS=${FM_FLEET_TRIAGE_DIGEST_MAX_ITEMS:-8}

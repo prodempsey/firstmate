@@ -1255,13 +1255,18 @@ elif [ "$KIND" = ship ] || [ "$KIND" = scout ]; then
   # survives a crew that unsets FM_CREWMATE. A secondmate is NOT a crewmate, so this runs
   # only for ship/scout. The corroborating env vars are exported into the pane below (with
   # GOTMPDIR), NOT prepended to LAUNCH, so the launch command stays byte-identical.
-  {
+  # Fail CLOSED: an unmarked crew would lose its authoritative role evidence, so a marker
+  # write failure aborts the launch rather than silently launching an unguarded crew.
+  if ! {
     printf 'task_id=%s\n' "$ID"
     printf 'primary_home=%s\n' "$FM_HOME"
     printf 'project=%s\n' "$PROJ_ABS"
     printf 'kind=%s\n' "$KIND"
     printf 'spawned_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
-  } > "$WT/.fm-crew-role" 2>/dev/null || true
+  } > "$WT/.fm-crew-role" 2>/dev/null; then
+    echo "error: could not write crewmate role marker $WT/.fm-crew-role; refusing to launch an unmarked crew" >&2
+    exit 1
+  fi
   exclude_path '.fm-crew-role'
 fi
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
