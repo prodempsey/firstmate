@@ -153,6 +153,7 @@ test_prepare_failure_preserves_prior_supervision() {
   local home out
   home=$(make_home preserve-prior)
   arm_valid_schedule "$home"
+  # shellcheck disable=SC2016  # $1/$2 expand in the inner bash -c process, not here.
   out=$(env -u FM_SUPERVISION_TEST_MODE -u FM_CODEX_PRIMARY_IDENTITY -u FM_CODEX_SYSTEMD_FAKE_DIR \
     bash -c '. "$1/bin/fm-supervision-lib.sh"
       fm_codex_checkpoint_prepare "$2/state" "$2" "$(date +%s)" 60

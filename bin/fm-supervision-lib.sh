@@ -403,7 +403,7 @@ fm_codex_schedule_validate() {
     failed) FM_CODEX_SCHEDULE_REASON='last-checkpoint-failed'; return 1 ;;
     *) FM_CODEX_SCHEDULE_REASON=bad-result; return 1 ;;
   esac
-  [ "$rec_uid" = "$(id -u)" ] || { FM_CODEX_SCHEDULE_REASON=uid-mismatch; return 1; }
+  [ "$rec_uid" = "$(id -u)" ] || { FM_CODEX_SCHEDULE_REASON='uid-mismatch'; return 1; }
   fm_codex_field_numeric "$start" || { FM_CODEX_SCHEDULE_REASON=bad-time; return 1; }
   fm_codex_field_numeric "$end" || { FM_CODEX_SCHEDULE_REASON=bad-time; return 1; }
   fm_codex_field_numeric "$due" || { FM_CODEX_SCHEDULE_REASON=bad-time; return 1; }

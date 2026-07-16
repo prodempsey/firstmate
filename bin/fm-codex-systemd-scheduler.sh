@@ -140,7 +140,7 @@ path_test_owned() {
 # evaluated home, state dir, and overridden directories to be provably
 # test-owned and outside the real user unit directory.
 test_seam_gate() {
-  local overrides= real_units
+  local overrides='' real_units
   [ -n "${FM_CODEX_SYSTEMD_FAKE_DIR:-}" ] && overrides="$overrides FM_CODEX_SYSTEMD_FAKE_DIR"
   [ -n "${FM_CODEX_SYSTEMD_SYSTEMCTL:-}" ] && overrides="$overrides FM_CODEX_SYSTEMD_SYSTEMCTL"
   [ -n "${FM_CODEX_SYSTEMD_UNIT_DIR:-}" ] && overrides="$overrides FM_CODEX_SYSTEMD_UNIT_DIR"
