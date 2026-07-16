@@ -435,10 +435,15 @@ parse_env_entries() {
 
 # The exact controlled environment the generated service carries - the single
 # reviewed source both validation views compare against.
+# FM_CODEX_SYSTEMD_SERVICE=1 (review-r5 F-1) marks the managed service run so
+# bin/fm-watch-checkpoint.sh establishes its deterministic clean process
+# environment before reading any configuration; a user service inherits the
+# user manager's environment, which no unit-file validation can bound.
 expected_env_entries() {  # <home> <state> <lease> <generation> <cadence>
   printf 'FM_HOME=%s\n' "$1"
   printf 'FM_STATE_OVERRIDE=%s\n' "$2"
   printf 'FM_SUPERVISION_HARNESS=codex\n'
+  printf 'FM_CODEX_SYSTEMD_SERVICE=1\n'
   printf 'FM_CODEX_SYSTEMD_LEASE=%s\n' "$3"
   printf 'FM_CODEX_SYSTEMD_GENERATION=%s\n' "$4"
   printf 'FM_CODEX_WATCH_CHECKPOINT=%s\n' "$5"
@@ -449,6 +454,7 @@ env_mismatch_reason() {
     FM_HOME) printf 'home-env-mismatch' ;;
     FM_STATE_OVERRIDE) printf 'state-env-mismatch' ;;
     FM_SUPERVISION_HARNESS) printf 'harness-env-mismatch' ;;
+    FM_CODEX_SYSTEMD_SERVICE) printf 'service-marker-mismatch' ;;
     FM_CODEX_SYSTEMD_LEASE) printf 'lease-mismatch' ;;
     FM_CODEX_SYSTEMD_GENERATION) printf 'generation-mismatch' ;;
     FM_CODEX_WATCH_CHECKPOINT) printf 'cadence-mismatch' ;;
@@ -551,7 +557,7 @@ validate_source_contract() {
   printf '%s\n' "$cat_out" | grep -q '^UnsetEnvironment=' && CONTRACT_REASONS="$CONTRACT_REASONS source-unset-environment"
   printf '%s\n' "$cat_out" | grep -q '^PassEnvironment=' && CONTRACT_REASONS="$CONTRACT_REASONS source-pass-environment"
   total=$(printf '%s\n' "$cat_out" | grep -c '^Environment=')
-  [ "$total" -eq 6 ] || CONTRACT_REASONS="$CONTRACT_REASONS env-line-count-mismatch"
+  [ "$total" -eq 7 ] || CONTRACT_REASONS="$CONTRACT_REASONS env-line-count-mismatch"
   while IFS= read -r exp_line; do
     name=${exp_line%%=*}
     value=${exp_line#*=}
@@ -802,6 +808,7 @@ schedule_real() {
       printf 'Environment=%s\n' "$(systemd_quote "FM_HOME=$canon_home")"
       printf 'Environment=%s\n' "$(systemd_quote "FM_STATE_OVERRIDE=$canon_state")"
       printf 'Environment=%s\n' "$(systemd_quote 'FM_SUPERVISION_HARNESS=codex')"
+      printf 'Environment=%s\n' "$(systemd_quote 'FM_CODEX_SYSTEMD_SERVICE=1')"
       printf 'Environment=%s\n' "$(systemd_quote "FM_CODEX_SYSTEMD_LEASE=$lease")"
       printf 'Environment=%s\n' "$(systemd_quote "FM_CODEX_SYSTEMD_GENERATION=$generation")"
       printf 'Environment=%s\n' "$(systemd_quote "FM_CODEX_WATCH_CHECKPOINT=$cadence")"

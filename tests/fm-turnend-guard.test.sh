@@ -77,6 +77,46 @@ test_predicate_queue_pending_flag() {
   pass "fm_supervision_status: FM_SUP_QUEUE_PENDING tracks state/.wake-queue"
 }
 
+# Review-r5 F-1: FM_SUPERVISION_TEST_MODE is fail-closed at the shared
+# supervision-library boundary. Outside a provably test-owned home it must
+# never mint a synthetic identity - and it must not silently degrade to the
+# production lock path either, so the anomaly surfaces as red supervision.
+test_predicate_ambient_test_mode_requires_test_owned_home() {
+  local home owned out
+  home=$(mktemp -d) || fail "mktemp failed"
+  FM_TEST_CLEANUP_DIRS+=("$home")
+  mkdir -p "$home/state"
+  # shellcheck disable=SC2016  # $1/$2 expand in the inner bash -c process, not here.
+  out=$(FM_SUPERVISION_TEST_MODE=1 bash -c '. "$1/bin/fm-supervision-lib.sh"
+    if ident=$(fm_supervision_detect_primary_identity "$2/state" "$2" codex); then
+      printf "detected=%s\n" "$ident"
+    else
+      printf "refused\n"
+    fi' _ "$ROOT" "$home")
+  assert_contains "$out" "refused" "ambient test mode outside a test-owned home minted an identity"
+  printf '%s\n' "$$" > "$home/state/.lock"
+  # shellcheck disable=SC2016  # $1/$2 expand in the inner bash -c process, not here.
+  out=$(FM_SUPERVISION_TEST_MODE=1 bash -c '. "$1/bin/fm-supervision-lib.sh"
+    if ident=$(fm_supervision_detect_primary_identity "$2/state" "$2" codex); then
+      printf "detected=%s\n" "$ident"
+    else
+      printf "refused\n"
+    fi' _ "$ROOT" "$home")
+  assert_contains "$out" "refused" "ambient test mode with a live lock must fail closed, not silently degrade"
+  owned="$TMP_ROOT/pred-testmode-owned"
+  mkdir -p "$owned/state"
+  # shellcheck disable=SC2016  # $1/$2 expand in the inner bash -c process, not here.
+  out=$(FM_SUPERVISION_TEST_MODE=1 bash -c '. "$1/bin/fm-supervision-lib.sh"
+    if ident=$(fm_supervision_detect_primary_identity "$2/state" "$2" codex); then
+      printf "detected=%s\n" "$ident"
+    else
+      printf "refused\n"
+    fi' _ "$ROOT" "$owned")
+  assert_contains "$out" "detected=test:codex:" "a proven test-owned fixture identity stopped resolving"
+  rm -rf "$home"
+  pass "fm_supervision_detect_primary_identity: FM_SUPERVISION_TEST_MODE fails closed outside test-owned homes"
+}
+
 # --- HOOK: bin/fm-turnend-guard.sh ------------------------------------------
 #
 # Each scenario gets its own directory carrying a copy of the two guard scripts
@@ -1076,6 +1116,54 @@ test_hook_codex_production_ambient_fake_dir_cannot_fake_health() {
   pass "fm-turnend-guard: production Codex health fails closed on an ambient fake-scheduler override"
 }
 
+# The review-r5 F-1 reproduction as a permanent regression: a NON-test-owned
+# home (no .fm-test-owner ancestor, like any production home), hand-forged
+# durable records claiming a synthetic test identity, no session lock, and
+# ambient FM_SUPERVISION_TEST_MODE=1 plus a fake-scheduler override - exactly
+# the hermetic probe the r5 review used to turn health green. The shared
+# supervision boundary must fail the identity resolution closed, so the guard
+# blocks. Metadata is forged by hand because the adapter itself refuses its
+# test seams for a non-test-owned home.
+test_hook_codex_ambient_test_mode_outside_test_owned_home_is_never_green() {
+  local dir home out status log meta payload hash uid now
+  dir=$(mktemp -d) || fail "mktemp failed"
+  FM_TEST_CLEANUP_DIRS+=("$dir")
+  make_primary_dir "$dir" >/dev/null
+  home=$(cd "$dir" && pwd)
+  : > "$dir/state/task1.meta"
+  uid=$(id -u)
+  now=$(date +%s)
+  jq -cnS --arg home "$home" --argjson uid "$uid" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{version:1,harness:"codex",primary_identity:("test:codex:" + $home),fm_home:$home,uid:$uid,recorded_at:$ts}' \
+    > "$dir/state/.primary-harness.json" || fail "could not write forged harness record"
+  meta=$(jq -cnS --arg home "$home" --arg state "$home/state" --argjson uid "$uid" \
+    '{adapter:"systemd-user-timer",unit_name:"fm-codex-checkpoint-feedfacefeedface",
+      service_name:"fm-codex-checkpoint-feedfacefeedface.service",
+      timer_name:"fm-codex-checkpoint-feedfacefeedface.timer",
+      unit_dir:($home + "/fake-systemd/units"),
+      service_path:($home + "/fake-systemd/units/fm-codex-checkpoint-feedfacefeedface.service"),
+      timer_path:($home + "/fake-systemd/units/fm-codex-checkpoint-feedfacefeedface.timer"),
+      exec_path:($home + "/bin/fm-watch-checkpoint.sh"),fm_home:$home,state_dir:$state,uid:$uid}') \
+    || fail "could not forge scheduler metadata"
+  payload=$(jq -cnS --argjson scheduler "$meta" --arg home "$home" --arg state "$home/state" --argjson now "$now" \
+    '{version:1,harness:"codex",owner:("codex:test:codex:" + $home),primary_identity:("test:codex:" + $home),
+      fm_home:$home,state_dir:$state,previous_checkpoint_start:($now - 2),previous_checkpoint_end:($now - 1),
+      previous_result:"quiet",next_checkpoint_due:($now + 60),cadence_seconds:60,max_lateness_seconds:60,
+      generation:1,lease_id:"ambient-lease",mechanism:"codex-bounded-checkpoint",
+      scheduling_mechanism:"systemd-user-timer",scheduler:$scheduler}') || fail "could not forge schedule payload"
+  hash=$(printf '%s\n' "$payload" | sha256sum | awk '{print $1}')
+  printf '%s\n' "$payload" | jq -cS --arg integrity "sha256:$hash" '. + {integrity:$integrity}' \
+    > "$dir/state/.codex-watch-checkpoint.next.json" || fail "could not write forged schedule"
+  out=$(run_hook_codex "$dir" false); status=$?
+  expect_code 2 "$status" "ambient test mode outside a test-owned home must never prove Codex scheduled health"
+  assert_contains "$out" "TURN WOULD END BLIND" "the ambient test-mode attack must be reported as missing supervision continuity"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.supervision_health')" = unhealthy-owner-mismatch ] \
+    || fail "ambient test-mode attack did not fail as owner mismatch: $log"
+  rm -rf "$dir"
+  pass "fm-turnend-guard: R5 ambient FM_SUPERVISION_TEST_MODE with no live primary is never green"
+}
+
 # Scheduled Codex health is bound to the LIVE primary: the same schedule is
 # healthy while the session lock holder that owns it is alive, and unhealthy the
 # moment the lock names a dead or different session.
@@ -2042,6 +2130,7 @@ test_predicate_unhealthy_no_beacon
 test_predicate_unhealthy_stale_beacon
 test_predicate_healthy_fresh_beacon
 test_predicate_queue_pending_flag
+test_predicate_ambient_test_mode_requires_test_owned_home
 test_hook_silent_when_no_work_in_flight
 test_hook_blocks_on_unattended_finished_work
 test_hook_reads_live_state_not_the_duty_cache
@@ -2073,6 +2162,7 @@ test_hook_codex_rejects_bad_generation_and_excessive_lateness
 test_hook_codex_production_identity_override_cannot_make_wrong_owner_healthy
 test_hook_codex_forged_state_files_cannot_own_schedule
 test_hook_codex_production_ambient_fake_dir_cannot_fake_health
+test_hook_codex_ambient_test_mode_outside_test_owned_home_is_never_green
 test_hook_codex_schedule_bound_to_live_primary
 test_hook_codex_failed_checkpoint_is_not_green
 test_hook_codex_normal_bounded_exit_is_not_a_crash

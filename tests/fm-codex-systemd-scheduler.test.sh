@@ -408,6 +408,7 @@ test_real_mode_schedule_generates_exact_unit_contract() {
   [ "$(file_mode "$timer_path")" = 600 ] || fail "timer unit was not written with restrictive 0600 mode"
   assert_grep "ExecStart=$exec_path --seconds 60" "$service_path" "service ExecStart is not the adapter-constructed command"
   [ "$(grep -c '^ExecStart=' "$service_path")" = 1 ] || fail "service unit carries more than one ExecStart"
+  assert_grep 'Environment="FM_CODEX_SYSTEMD_SERVICE=1"' "$service_path" "service unit lost the clean-environment service marker line"
   assert_grep 'Environment="FM_CODEX_SYSTEMD_LEASE=lease-one"' "$service_path" "service unit lost the lease environment line"
   assert_grep 'Environment="FM_CODEX_SYSTEMD_GENERATION=1"' "$service_path" "service unit lost the generation environment line"
   assert_grep 'Environment="FM_CODEX_WATCH_CHECKPOINT=60"' "$service_path" "service unit lost the cadence environment line"
@@ -520,7 +521,7 @@ test_real_mode_rejects_duplicate_controlled_env() {
   reason=$(real_validate_reason "$home")
   assert_contains "$reason" "env-duplicate:FM_HOME" "a conflicting duplicate FM_HOME assignment must fail validation"
   assert_contains "$reason" "home-env-mismatch" "the effective merged FM_HOME must be compared, not line presence"
-  for name in FM_STATE_OVERRIDE FM_SUPERVISION_HARNESS FM_CODEX_SYSTEMD_LEASE FM_CODEX_SYSTEMD_GENERATION FM_CODEX_WATCH_CHECKPOINT; do
+  for name in FM_STATE_OVERRIDE FM_SUPERVISION_HARNESS FM_CODEX_SYSTEMD_SERVICE FM_CODEX_SYSTEMD_LEASE FM_CODEX_SYSTEMD_GENERATION FM_CODEX_WATCH_CHECKPOINT; do
     cp "$pristine" "$service_path"
     printf 'Environment="%s=evil-conflict"\n' "$name" >> "$service_path"
     reason=$(real_validate_reason "$home")
@@ -608,7 +609,7 @@ test_real_mode_rejects_each_missing_required_variable() {
   service_path=$(real_meta "$home" | jq -r '.service_path')
   pristine="$home/pristine.service"
   cp "$service_path" "$pristine"
-  for name in FM_HOME FM_STATE_OVERRIDE FM_SUPERVISION_HARNESS FM_CODEX_SYSTEMD_LEASE FM_CODEX_SYSTEMD_GENERATION FM_CODEX_WATCH_CHECKPOINT; do
+  for name in FM_HOME FM_STATE_OVERRIDE FM_SUPERVISION_HARNESS FM_CODEX_SYSTEMD_SERVICE FM_CODEX_SYSTEMD_LEASE FM_CODEX_SYSTEMD_GENERATION FM_CODEX_WATCH_CHECKPOINT; do
     grep -v "^Environment=\"$name=" "$pristine" > "$service_path"
     reason=$(real_validate_reason "$home")
     assert_contains "$reason" "env-missing:$name" "a missing $name assignment must fail validation"
@@ -624,7 +625,7 @@ test_real_mode_rejects_effective_source_divergence() {
   canon_state=$(printf '%s' "$meta" | jq -r '.state_dir')
   # The visible unit file stays byte-for-byte pristine; only systemd's loaded
   # state diverges. Line-presence validation would stay green here.
-  printf 'FM_HOME=%s FM_STATE_OVERRIDE=%s FM_SUPERVISION_HARNESS=codex FM_CODEX_SYSTEMD_LEASE=lease-one FM_CODEX_SYSTEMD_GENERATION=1 FM_CODEX_WATCH_CHECKPOINT=60' \
+  printf 'FM_HOME=%s FM_STATE_OVERRIDE=%s FM_SUPERVISION_HARNESS=codex FM_CODEX_SYSTEMD_SERVICE=1 FM_CODEX_SYSTEMD_LEASE=lease-one FM_CODEX_SYSTEMD_GENERATION=1 FM_CODEX_WATCH_CHECKPOINT=60' \
     "$home/evil" "$canon_state" > "$home/stub-state/override-$service-Environment"
   reason=$(real_validate_reason "$home")
   assert_contains "$reason" "home-env-mismatch" "a loaded environment diverging from the visible source must fail validation"

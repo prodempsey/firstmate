@@ -14,7 +14,10 @@
 # and the scheduler adapter's read-back of the loaded timer/service contract. The
 # schedule's sha256 `integrity` field is a corruption checksum only, never an
 # authenticity control - the state dir is same-account-writable by design, so the Unix
-# account boundary is the outermost trust boundary here.
+# account boundary is the outermost trust boundary here. FM_SUPERVISION_TEST_MODE=1
+# is itself fail-closed at this boundary (review-r5 F-1): it is honored only for a
+# provably test-owned home and state, and outside that proof the whole identity
+# resolution errors instead of minting a synthetic identity or silently degrading.
 
 FM_CODEX_CHECKPOINT_SCHEDULE_NAME=.codex-watch-checkpoint.next.json
 FM_CODEX_CHECKPOINT_LAST_NAME=.codex-watch-checkpoint.last.json
@@ -94,6 +97,44 @@ fm_sup_hash_stdin() {
   fi
 }
 
+# --- fail-closed test-mode identity gate (review-r5 F-1) ----------------------
+# FM_SUPERVISION_TEST_MODE=1 lets fixtures mint a synthetic primary identity,
+# so an ambient or inherited copy of it (for example from the systemd user
+# manager's environment) would replace the live-primary binding with an
+# unbacked test identity. Test mode is therefore honored only when the
+# evaluated home AND state dir are provably test-owned: each under a root
+# carrying the .fm-test-owner marker written by tests/lib.sh, the same gate
+# bin/fm-codex-systemd-scheduler.sh applies to its test seams. Test mode set
+# without that proof is an ERROR for the whole identity resolution, never a
+# fallback to production behavior, so the anomaly surfaces as red supervision
+# instead of silently changing meaning.
+
+fm_sup_path_test_owned() {
+  local p=$1
+  case "$p" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  while [ -n "$p" ] && [ "$p" != / ]; do
+    [ -f "$p/.fm-test-owner" ] && return 0
+    p=$(dirname "$p")
+  done
+  return 1
+}
+
+# fm_sup_test_mode_proven <state> <home>: true only when FM_SUPERVISION_TEST_MODE=1
+# may be honored here. A caller that sees test mode set and a false return must
+# fail its whole resolution closed.
+fm_sup_test_mode_proven() {
+  local state=$1 home=$2 canon
+  [ "${FM_SUPERVISION_TEST_MODE:-}" = 1 ] || return 1
+  canon=$(cd "$home" 2>/dev/null && pwd -P) || canon=$home
+  fm_sup_path_test_owned "$canon" || return 1
+  canon=$(cd "$state" 2>/dev/null && pwd -P) || canon=$state
+  fm_sup_path_test_owned "$canon" || return 1
+  return 0
+}
+
 fm_supervision_primary_harness_path() {
   printf '%s/%s\n' "$1" "$FM_PRIMARY_HARNESS_NAME"
 }
@@ -125,9 +166,15 @@ fm_supervision_persist_primary_harness() {
 # ownership but never prove it.
 fm_supervision_detect_primary_identity() {
   local state=$1 home=$2 harness=${3:-} lock pid ident
-  if [ "${FM_SUPERVISION_TEST_MODE:-}" = 1 ] && [ -n "${FM_CODEX_PRIMARY_IDENTITY:-}" ]; then
-    printf '%s\n' "$FM_CODEX_PRIMARY_IDENTITY"
-    return 0
+  if [ "${FM_SUPERVISION_TEST_MODE:-}" = 1 ]; then
+    # Review-r5 F-1: ambient test mode outside a provably test-owned fixture
+    # must never mint a synthetic identity, and must not silently degrade to
+    # production behavior either - the whole resolution fails closed.
+    fm_sup_test_mode_proven "$state" "$home" || return 1
+    if [ -n "${FM_CODEX_PRIMARY_IDENTITY:-}" ]; then
+      printf '%s\n' "$FM_CODEX_PRIMARY_IDENTITY"
+      return 0
+    fi
   fi
   lock="$state/.lock"
   pid=$(cat "$lock" 2>/dev/null || true)
@@ -165,10 +212,9 @@ fm_supervision_primary_harness() {
       return 0
     fi
   fi
-  if [ "${FM_SUPERVISION_TEST_MODE:-}" = 1 ] && [ -n "$ambient" ]; then
-    printf '%s\n' "$ambient"
-    return 0
-  fi
+  # No test-mode branch here (review-r5 F-1): the old ambient short-circuit was
+  # behaviorally identical to the fallback below and kept an ungated
+  # FM_SUPERVISION_TEST_MODE reference alive for no reason.
   printf '%s\n' "${ambient:-unknown}"
 }
 

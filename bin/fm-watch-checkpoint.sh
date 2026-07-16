@@ -4,6 +4,43 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=bin/fm-supervision-lib.sh
+. "$SCRIPT_DIR/fm-supervision-lib.sh"
+
+# --- deterministic clean service environment (review-r5 F-1) ------------------
+# A systemd user service inherits the user manager's environment underneath its
+# unit-declared Environment= lines (systemd.exec(5)), so the validated unit
+# contract alone cannot bound the actual process environment. When this script
+# starts as the managed checkpoint service - marked by the unit-declared
+# reviewed constant FM_CODEX_SYSTEMD_SERVICE=1 - every inherited FM_* variable
+# outside the reviewed unit set is removed BEFORE any configuration is read,
+# so inherited manager values (FM_ROOT_OVERRIDE,
+# FM_CODEX_WATCH_CHECKPOINT_MAX_LATENESS, FM_SUPERVISION_TEST_MODE,
+# FM_CODEX_PRIMARY_IDENTITY, ...) can never alter checkpoint behavior. The
+# gated scheduler test seams survive the scrub only when the unit-declared
+# home and state are provably test-owned, the same .fm-test-owner gate
+# bin/fm-supervision-lib.sh and the scheduler adapter enforce; a production
+# home never carries that marker. Names are unset from a fixed reviewed case
+# list - nothing here evaluates record or environment content.
+if [ "${FM_CODEX_SYSTEMD_SERVICE:-}" = 1 ]; then
+  [ -n "${FM_HOME:-}" ] || { echo 'error: checkpoint service started without FM_HOME' >&2; exit 2; }
+  [ "${FM_SUPERVISION_HARNESS:-}" = codex ] || { echo 'error: checkpoint service started without FM_SUPERVISION_HARNESS=codex' >&2; exit 2; }
+  keep_test_seams=0
+  if fm_sup_test_mode_proven "${FM_STATE_OVERRIDE:-$FM_HOME/state}" "$FM_HOME"; then
+    keep_test_seams=1
+  fi
+  while IFS= read -r scrub_name; do
+    case "$scrub_name" in
+      FM_HOME|FM_STATE_OVERRIDE|FM_SUPERVISION_HARNESS|FM_CODEX_SYSTEMD_LEASE|FM_CODEX_SYSTEMD_GENERATION|FM_CODEX_WATCH_CHECKPOINT|FM_CODEX_SYSTEMD_SERVICE) ;;
+      FM_SUPERVISION_TEST_MODE|FM_CODEX_SYSTEMD_FAKE_DIR|FM_CODEX_SYSTEMD_SYSTEMCTL|FM_CODEX_SYSTEMD_UNIT_DIR)
+        [ "$keep_test_seams" = 1 ] || unset "$scrub_name" ;;
+      FM_*) unset "$scrub_name" ;;
+    esac
+  done < <(compgen -e FM_ || true)
+  unset scrub_name keep_test_seams
+fi
+
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
@@ -50,9 +87,6 @@ esac
 case "$MAX_LATENESS" in
   ''|*[!0-9]*) echo "error: FM_CODEX_WATCH_CHECKPOINT_MAX_LATENESS must be a non-negative integer" >&2; exit 2 ;;
 esac
-
-# shellcheck source=bin/fm-supervision-lib.sh
-. "$SCRIPT_DIR/fm-supervision-lib.sh"
 
 START_EPOCH=$(date +%s)
 fm_supervision_persist_primary_harness "$STATE" "$FM_HOME" codex || {

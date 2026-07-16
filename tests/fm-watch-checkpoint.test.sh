@@ -225,6 +225,97 @@ test_stale_running_record_is_reclaimed() {
   pass "checkpoint reclaims a dead runner's stale running-checkpoint record"
 }
 
+# --- review-r5 F-1: the managed service's actual process environment ----------
+# A systemd user service inherits the user manager's environment underneath the
+# validated unit Environment= lines, so the checkpoint itself must establish a
+# deterministic clean environment when started as the managed service
+# (FM_CODEX_SYSTEMD_SERVICE=1). These cases run the service entry exactly as
+# the unit would, with hostile inherited manager variables layered on top.
+
+# run_service_checkpoint <home> [hostile NAME=VALUE assignments...] <cmd...>
+# Runs the checkpoint the way the generated unit does - the seven unit-declared
+# variables - with any hostile inherited manager variables layered on top by
+# the caller as extra env assignments before the command.
+run_service_checkpoint() {
+  local home=$1
+  shift
+  env \
+    FM_CODEX_SYSTEMD_SERVICE=1 \
+    FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" \
+    FM_SUPERVISION_HARNESS=codex \
+    FM_CODEX_SYSTEMD_LEASE=unit-lease \
+    FM_CODEX_SYSTEMD_GENERATION=1 \
+    FM_CODEX_WATCH_CHECKPOINT=1 \
+    "$@"
+}
+
+test_service_mode_scrubs_inherited_manager_environment() {
+  local home decoy out err status schedule owner canon_home
+  home=$(make_home service-scrub)
+  decoy="$TMP_ROOT/service-scrub-decoy"
+  mkdir -p "$decoy/state"
+  out="$home/out.txt"
+  err="$home/err.txt"
+  status=0
+  run_service_checkpoint "$home" \
+    FM_SUPERVISION_TEST_MODE=1 \
+    FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" \
+    FM_ROOT_OVERRIDE="$decoy" \
+    FM_CODEX_WATCH_CHECKPOINT_MAX_LATENESS=999999 \
+    FM_CODEX_PRIMARY_IDENTITY=forged-manager-identity \
+    FM_GUARD_GRACE=1 \
+    "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  expect_code 124 "$status" "service-mode quiet checkpoint exit under hostile inherited environment"
+  schedule="$home/state/.codex-watch-checkpoint.next.json"
+  [ -f "$schedule" ] || fail "service-mode checkpoint did not leave a durable schedule: $(cat "$err")"
+  [ "$(jq -r '.max_lateness_seconds' "$schedule")" = 60 ] \
+    || fail "inherited FM_CODEX_WATCH_CHECKPOINT_MAX_LATENESS altered the recorded lateness bound"
+  canon_home=$(cd "$home" && pwd -P)
+  owner=$(jq -r '.owner' "$schedule")
+  [ "$owner" = "codex:test:codex:$canon_home" ] \
+    || fail "inherited FM_CODEX_PRIMARY_IDENTITY reached service identity resolution: $owner"
+  [ -z "$(find "$decoy/state" -mindepth 1 -print -quit 2>/dev/null)" ] \
+    || fail "inherited FM_ROOT_OVERRIDE redirected service state writes into the decoy root"
+  pass "service mode scrubs inherited manager FM_* variables before reading any configuration"
+}
+
+test_service_mode_rejects_inherited_test_mode_outside_test_owned_home() {
+  local home out err status
+  home=$(mktemp -d) || fail "mktemp failed"
+  FM_TEST_CLEANUP_DIRS+=("$home")
+  mkdir -p "$home/state"
+  out="$home/out.txt"
+  err="$home/err.txt"
+  status=0
+  run_service_checkpoint "$home" \
+    FM_SUPERVISION_TEST_MODE=1 \
+    FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-systemd" \
+    "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  expect_code 1 "$status" "service-mode checkpoint with inherited test mode and no live primary must fail"
+  assert_contains "$(cat "$err")" "failed to persist Codex primary harness identity" \
+    "the failure must be the identity resolution, not a later stage"
+  assert_absent "$home/state/.codex-watch-checkpoint.next.json" \
+    "inherited test mode minted a healthy schedule with no live primary"
+  assert_absent "$home/fake-systemd" \
+    "inherited fake-scheduler seam was honored outside a test-owned home"
+  rm -rf "$home"
+  pass "service mode rejects inherited FM_SUPERVISION_TEST_MODE outside a test-owned home (no synthetic identity)"
+}
+
+test_service_mode_requires_codex_harness_binding() {
+  local home out err status
+  home=$(make_home service-binding)
+  out="$home/out.txt"
+  err="$home/err.txt"
+  status=0
+  env FM_CODEX_SYSTEMD_SERVICE=1 FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
+  expect_code 2 "$status" "service mode without the codex harness binding must fail closed"
+  assert_contains "$(cat "$err")" "without FM_SUPERVISION_HARNESS=codex" "the missing harness binding must be named"
+  pass "service mode requires the unit-declared codex harness binding"
+}
+
 test_quiet_checkpoint_exits_124_cleanly
 test_signal_passes_through_and_exits_zero
 test_check_uses_preserved_watcher_environment
@@ -234,3 +325,6 @@ test_checkpoint_advances_generation_from_existing_schedule
 test_prepare_failure_preserves_prior_supervision
 test_concurrent_prepare_admits_exactly_one_winner
 test_stale_running_record_is_reclaimed
+test_service_mode_scrubs_inherited_manager_environment
+test_service_mode_rejects_inherited_test_mode_outside_test_owned_home
+test_service_mode_requires_codex_harness_binding

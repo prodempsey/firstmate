@@ -7,7 +7,7 @@ The implementation lives in `bin/fm-codex-systemd-scheduler.sh`.
 
 Codex primary supervision may use one FirstMate-owned `systemd --user` timer for the canonical `FM_HOME`.
 The adapter derives one deterministic service name and one deterministic timer name from the canonical home path and Unix UID.
-The service runs `bin/fm-watch-checkpoint.sh --seconds <cadence>` with explicit `FM_HOME`, `FM_STATE_OVERRIDE`, `FM_SUPERVISION_HARNESS=codex`, generation, lease, and cadence environment.
+The service runs `bin/fm-watch-checkpoint.sh --seconds <cadence>` with explicit `FM_HOME`, `FM_STATE_OVERRIDE`, `FM_SUPERVISION_HARNESS=codex`, the `FM_CODEX_SYSTEMD_SERVICE=1` clean-environment marker, generation, lease, and cadence environment.
 The timer is registered through `systemctl --user`, not through shell backgrounding or a detached unmanaged process.
 Health is never proven by the JSON schedule record alone.
 `bin/fm-supervision-lib.sh` treats `healthy-checkpoint-scheduled` as valid only when the record's owner matches a live verified primary (the session lock's live holder pid bound to its process identity, home, UID, and durable codex harness record), every field validates individually, and the scheduler adapter's read-back of the LOADED timer/service contract agrees per the loaded-contract validation section below: exact fragment paths with no drop-ins, exact `ExecStart`, the exact controlled environment with no indirection, linked service, enabled plus active state, the timer's real next trigger against the record due time, and no duplicate unit claiming the home.
@@ -43,7 +43,7 @@ The exact requirements are:
 
 - exact service and timer `FragmentPath`, and empty `DropInPaths` on both units;
 - effective `WorkingDirectory` equal to the canonical home, plus exactly one matching source directive;
-- an effective environment of exactly the six controlled variables (`FM_HOME`, `FM_STATE_OVERRIDE`, `FM_SUPERVISION_HARNESS`, `FM_CODEX_SYSTEMD_LEASE`, `FM_CODEX_SYSTEMD_GENERATION`, `FM_CODEX_WATCH_CHECKPOINT`), each with its expected value, none missing, none unexpected;
+- an effective environment of exactly the seven controlled variables (`FM_HOME`, `FM_STATE_OVERRIDE`, `FM_SUPERVISION_HARNESS`, `FM_CODEX_SYSTEMD_SERVICE`, `FM_CODEX_SYSTEMD_LEASE`, `FM_CODEX_SYSTEMD_GENERATION`, `FM_CODEX_WATCH_CHECKPOINT`), each with its expected value, none missing, none unexpected;
 - exactly one source `Environment=` assignment per controlled variable, so same-value and conflicting duplicates both fail;
 - no environment indirection or removal in either view: `EnvironmentFile=` (optional or not), `UnsetEnvironment=`, and `PassEnvironment=` all fail validation;
 - exactly one `ExecStart`, matched byte-for-byte in the source and against the effective `{ path=... ; argv[]=... }` command;
@@ -53,6 +53,16 @@ Any property-query failure, missing always-printed property, duplicated property
 The effective-view parser splits only systemd's own reported values against a fixed grammar; record text never reaches parser syntax, and nothing is ever evaluated.
 
 Empirical `systemctl show` formats (systemd 259, 2026-07-16, verified by the disposable proof below): `Environment=` reports the merged environment with whole-entry quoting for values containing spaces; `EnvironmentFiles=` and `ExecStart=` lines are omitted when empty while the other queried properties print even when empty; `ExecStart` reports `{ path=<argv0> ; argv[]=<command> ; ignore_errors=... }`.
+
+## Service runtime environment (review-r5)
+
+The loaded unit contract above is exact for everything the unit declares, but it is still not the actual process environment of a user service: per `systemd.exec(5)`, processes started by the user service manager inherit the manager's own environment underneath the unit's `Environment=` assignments, and no unit-file validation can bound that inherited block.
+The runtime contract is therefore enforced inside the reviewed executable the exact `ExecStart` binding already pins: when `bin/fm-watch-checkpoint.sh` starts under the unit-declared `FM_CODEX_SYSTEMD_SERVICE=1` marker, it removes every inherited `FM_*` variable outside the seven reviewed unit variables from a fixed case list, before any configuration is read and without evaluating any environment or record content.
+Inherited manager values such as `FM_ROOT_OVERRIDE`, `FM_CODEX_WATCH_CHECKPOINT_MAX_LATENESS`, `FM_CODEX_PRIMARY_IDENTITY`, and `FM_SUPERVISION_TEST_MODE` therefore cannot alter checkpoint behavior or identity resolution.
+The gated test seams survive the scrub only when the unit-declared home and state are provably test-owned - the same `.fm-test-owner` gate as everywhere else - so a production home always gets the full scrub.
+Independently, `FM_SUPERVISION_TEST_MODE=1` itself fails closed at the shared supervision-library boundary (`bin/fm-supervision-lib.sh`): outside a test-owned home and state, identity resolution errors instead of minting a synthetic `test:` identity, so ambient test mode can never substitute for a live verified primary anywhere health is computed.
+`UnsetEnvironment=` remains rejected in the unit contract: the scrub lives in the reviewed executable, not in a unit directive another writer could extend, and the marker variable is validated exactly like every other controlled assignment (`service-marker-mismatch`).
+This stays within the same-account trust boundary stated above: the scrub defends against inherited and ambient environment pollution, not against a hostile same-account process replacing the executable itself.
 
 ## Disposable Timer Proof (adapter-generated units)
 
