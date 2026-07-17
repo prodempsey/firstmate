@@ -275,6 +275,19 @@ file_mode() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
 
+# expected_launcher_line <canon_home> <canon_state> <lease> <generation>
+# <cadence> <exec_path>: the reviewed clean-launcher ExecStart the adapter must
+# generate (review-r6-sol F-2), reconstructed independently here so a drifted
+# adapter cannot vouch for itself.
+LAUNCHER_SAFE_PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+expected_launcher_line() {
+  local uid home_dir
+  uid=$(id -u)
+  home_dir=$(getent passwd "$uid" | head -n 1 | cut -d: -f6)
+  printf '/usr/bin/env -i HOME=%s PATH=%s XDG_RUNTIME_DIR=/run/user/%s DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%s/bus FM_HOME=%s FM_STATE_OVERRIDE=%s FM_SUPERVISION_HARNESS=codex FM_CODEX_SYSTEMD_SERVICE=1 FM_CODEX_SYSTEMD_LEASE=%s FM_CODEX_SYSTEMD_GENERATION=%s FM_CODEX_WATCH_CHECKPOINT=%s /bin/bash %s --seconds %s\n' \
+    "$home_dir" "$LAUNCHER_SAFE_PATH" "$uid" "$uid" "$1" "$2" "$3" "$4" "$5" "$6" "$5"
+}
+
 # --- the fail-closed test-seam gate (review finding F-1) ---------------------
 
 test_fake_dir_without_test_mode_fails_closed() {
@@ -315,6 +328,131 @@ test_test_overrides_require_test_owned_home() {
   expect_code 2 "$status" "test overrides against a non-test-owned home must fail closed"
   assert_contains "$out" "test-override-home-not-test-owned" "gate refusal must name the non-test-owned home"
   pass "fm-codex-systemd-scheduler: test seams require a provably test-owned home"
+}
+
+# --- canonical gated-path aliases (review-r6-sol F-1) --------------------------
+# The gate must judge what a path actually addresses, not its spelling: symlink
+# and normalized-`..` aliases into non-test-owned space, ambiguous ancestry,
+# and aliases of the real user unit directory all fail closed.
+
+test_gate_rejects_home_and_state_aliases() {
+  local home prod status out raw
+  home=$(make_home alias-home)
+  prod=$(mktemp -d) || fail "mktemp failed"
+  FM_TEST_CLEANUP_DIRS+=("$prod")
+  mkdir -p "$prod/state"
+  ln -s "$prod" "$home/home-link"
+  status=0
+  out=$(fake_env "$home" "$SCHED" unit-metadata --home "$home/home-link" --state "$home/home-link/state" 2>&1) || status=$?
+  expect_code 2 "$status" "a symlink alias of a non-test-owned home must fail closed"
+  assert_contains "$out" "test-override-home-not-test-owned" "home symlink alias refusal must name the home gate"
+  mkdir -p "$home/sub"
+  raw="$home/sub/../../../$(basename "$prod")"
+  status=0
+  out=$(fake_env "$home" "$SCHED" unit-metadata --home "$raw" --state "$raw/state" 2>&1) || status=$?
+  expect_code 2 "$status" "a ..-traversal alias of a non-test-owned home must fail closed"
+  assert_contains "$out" "test-override-home-not-test-owned" "home traversal alias refusal must name the home gate"
+  ln -s "$prod/state" "$home/state-link"
+  status=0
+  out=$(fake_env "$home" "$SCHED" unit-metadata --home "$home" --state "$home/state-link" 2>&1) || status=$?
+  expect_code 2 "$status" "a symlink alias of a non-test-owned state dir must fail closed"
+  assert_contains "$out" "test-override-state-not-test-owned" "state symlink alias refusal must name the state gate"
+  pass "fm-codex-systemd-scheduler: home and state symlink or traversal aliases into non-test-owned space fail closed"
+}
+
+test_gate_rejects_fake_dir_aliases_and_ambiguous_ancestry() {
+  local home prod status out
+  home=$(make_home alias-fake)
+  prod=$(mktemp -d) || fail "mktemp failed"
+  FM_TEST_CLEANUP_DIRS+=("$prod")
+  mkdir -p "$prod/fake-systemd"
+  ln -s "$prod/fake-systemd" "$home/fake-link"
+  status=0
+  out=$(FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$home/fake-link" \
+    "$SCHED" unit-metadata --home "$home" --state "$home/state" 2>&1) || status=$?
+  expect_code 2 "$status" "a symlink alias of a non-test-owned fake dir must fail closed"
+  assert_contains "$out" "fake-dir-not-test-owned" "fake-dir symlink alias refusal must name the fake-dir gate"
+  ln -s "$home/nonexistent" "$home/dangle"
+  status=0
+  out=$(FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$home/dangle/fake-systemd" \
+    "$SCHED" unit-metadata --home "$home" --state "$home/state" 2>&1) || status=$?
+  expect_code 2 "$status" "dangling-symlink ancestry under a fake dir must fail closed"
+  assert_contains "$out" "fake-dir-unresolvable" "ambiguous fake-dir ancestry refusal must name the resolution failure"
+  status=0
+  out=$(FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$home/missing/../fake-systemd" \
+    "$SCHED" unit-metadata --home "$home" --state "$home/state" 2>&1) || status=$?
+  expect_code 2 "$status" "a ..-component in a not-yet-created fake-dir suffix must fail closed"
+  assert_contains "$out" "fake-dir-unresolvable" "unnormalizable fake-dir suffix refusal must name the resolution failure"
+  pass "fm-codex-systemd-scheduler: fake-dir aliases and ambiguous ancestry fail closed"
+}
+
+test_gate_rejects_unit_dir_alias_of_real_unit_dir() {
+  local home status out
+  home=$(make_home alias-unit)
+  write_stub_systemctl "$home"
+  mkdir -p "$home/xdg/systemd/user"
+  ln -s "$home/xdg/systemd/user" "$home/unit-link"
+  status=0
+  out=$(XDG_CONFIG_HOME="$home/xdg" FM_SUPERVISION_TEST_MODE=1 \
+    FM_CODEX_SYSTEMD_SYSTEMCTL="$home/systemctl-stub" FM_CODEX_SYSTEMD_UNIT_DIR="$home/unit-link" \
+    STUB_UNITS="$home/units" STUB_MARKS="$home/stub-state" \
+    "$SCHED" unit-metadata --home "$home" --state "$home/state" 2>&1) || status=$?
+  expect_code 2 "$status" "a symlink alias of the real unit dir must fail closed"
+  assert_contains "$out" "unit-dir-inside-real-unit-dir" "unit-dir symlink alias refusal must name the containment gate"
+  mkdir -p "$home/xdg/systemd/other"
+  status=0
+  out=$(XDG_CONFIG_HOME="$home/xdg" FM_SUPERVISION_TEST_MODE=1 \
+    FM_CODEX_SYSTEMD_SYSTEMCTL="$home/systemctl-stub" FM_CODEX_SYSTEMD_UNIT_DIR="$home/xdg/systemd/other/../user" \
+    STUB_UNITS="$home/units" STUB_MARKS="$home/stub-state" \
+    "$SCHED" unit-metadata --home "$home" --state "$home/state" 2>&1) || status=$?
+  expect_code 2 "$status" "a ..-traversal alias of the real unit dir must fail closed"
+  assert_contains "$out" "unit-dir-inside-real-unit-dir" "unit-dir traversal alias refusal must name the containment gate"
+  pass "fm-codex-systemd-scheduler: unit-dir aliases of the real user unit directory fail closed"
+}
+
+test_gate_rejects_untrusted_stub_systemctl() {
+  local home prod status out
+  home=$(make_home alias-stub)
+  mkdir -p "$home/units"
+  prod=$(mktemp -d) || fail "mktemp failed"
+  FM_TEST_CLEANUP_DIRS+=("$prod")
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$prod/rogue-systemctl"
+  chmod +x "$prod/rogue-systemctl"
+  status=0
+  out=$(FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_SYSTEMCTL="$prod/rogue-systemctl" \
+    FM_CODEX_SYSTEMD_UNIT_DIR="$home/units" \
+    "$SCHED" status --home "$home" --state "$home/state" --json 2>&1) || status=$?
+  expect_code 2 "$status" "a stub systemctl outside test ownership must fail closed"
+  assert_contains "$out" "stub-systemctl-not-test-owned" "untrusted stub refusal must name the stub gate"
+  write_stub_systemctl "$home"
+  ln -s "$home/systemctl-stub" "$home/stub-link"
+  status=0
+  out=$(FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_SYSTEMCTL="$home/stub-link" \
+    FM_CODEX_SYSTEMD_UNIT_DIR="$home/units" \
+    "$SCHED" status --home "$home" --state "$home/state" --json 2>&1) || status=$?
+  expect_code 2 "$status" "a symlink stub systemctl must fail closed"
+  assert_contains "$out" "stub-systemctl-unresolvable" "symlink stub refusal must name the resolution failure"
+  pass "fm-codex-systemd-scheduler: the stub systemctl must be a canonical test-owned regular file"
+}
+
+test_schedule_never_writes_through_unit_dir_alias() {
+  local home target record status out
+  home=$(make_home alias-write)
+  write_stub_systemctl "$home"
+  target=$(mktemp -d) || fail "mktemp failed"
+  FM_TEST_CLEANUP_DIRS+=("$target")
+  record=$(real_record "$home" 1 lease-one)
+  ln -s "$target" "$home/unit-alias"
+  status=0
+  out=$(FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_SYSTEMCTL="$home/systemctl-stub" \
+    FM_CODEX_SYSTEMD_UNIT_DIR="$home/unit-alias" \
+    STUB_UNITS="$home/units" STUB_MARKS="$home/stub-state" \
+    "$SCHED" schedule --home "$home" --state "$home/state" --record "$record" 2>&1) || status=$?
+  expect_code 2 "$status" "a mutating schedule through a unit-dir alias must fail closed"
+  assert_contains "$out" "unit-dir-not-test-owned" "aliased mutating schedule refusal must name the unit-dir gate"
+  [ -z "$(find "$target" -mindepth 1 -print -quit 2>/dev/null)" ] \
+    || fail "a refused aliased schedule still wrote through the alias target"
+  pass "fm-codex-systemd-scheduler: mutating operations never write through a rejected unit-dir alias"
 }
 
 # --- fake-mode lifecycle ------------------------------------------------------
@@ -396,17 +534,21 @@ real_validate_reason() {  # <home> - prints the (possibly empty) failure reason
 }
 
 test_real_mode_schedule_generates_exact_unit_contract() {
-  local home meta service_path timer_path exec_path due calendar validation
+  local home meta service_path timer_path exec_path due calendar validation canon_home canon_state expected_exec
   home=$(real_home_with_schedule real-lifecycle)
   meta=$(real_meta "$home")
   service_path=$(printf '%s' "$meta" | jq -r '.service_path')
   timer_path=$(printf '%s' "$meta" | jq -r '.timer_path')
   exec_path=$(printf '%s' "$meta" | jq -r '.exec_path')
+  canon_home=$(printf '%s' "$meta" | jq -r '.fm_home')
+  canon_state=$(printf '%s' "$meta" | jq -r '.state_dir')
   assert_present "$service_path" "real-mode schedule did not write the service unit"
   assert_present "$timer_path" "real-mode schedule did not write the timer unit"
   [ "$(file_mode "$service_path")" = 600 ] || fail "service unit was not written with restrictive 0600 mode"
   [ "$(file_mode "$timer_path")" = 600 ] || fail "timer unit was not written with restrictive 0600 mode"
-  assert_grep "ExecStart=$exec_path --seconds 60" "$service_path" "service ExecStart is not the adapter-constructed command"
+  expected_exec=$(expected_launcher_line "$canon_home" "$canon_state" lease-one 1 60 "$exec_path")
+  grep -qFx "ExecStart=$expected_exec" "$service_path" \
+    || fail "service ExecStart is not the exact clean-launcher command: $(sed -n 's/^ExecStart=//p' "$service_path")"
   [ "$(grep -c '^ExecStart=' "$service_path")" = 1 ] || fail "service unit carries more than one ExecStart"
   assert_grep 'Environment="FM_CODEX_SYSTEMD_SERVICE=1"' "$service_path" "service unit lost the clean-environment service marker line"
   assert_grep 'Environment="FM_CODEX_SYSTEMD_LEASE=lease-one"' "$service_path" "service unit lost the lease environment line"
@@ -662,6 +804,138 @@ test_real_mode_fails_closed_on_property_query_problems() {
   pass "fm-codex-systemd-scheduler: failed, unanswered, malformed, or empty property queries fail closed"
 }
 
+# --- clean-launcher ExecStart contract (review-r6-sol F-2) ---------------------
+# The launcher line is the environment boundary, so every mutation class the
+# review names must fail with its own deterministic reason: wrong environment
+# executable, missing clean flag, pass-through, unexpected/missing/duplicate
+# values, changed safe runtime values, and changed checkpoint arguments.
+
+test_real_mode_rejects_launcher_mutations() {
+  local home service_path pristine orig reason name
+  home=$(real_home_with_schedule real-launcher-mutations)
+  service_path=$(real_meta "$home" | jq -r '.service_path')
+  pristine="$home/pristine.service"
+  cp "$service_path" "$pristine"
+  orig=$(sed -n 's/^ExecStart=//p' "$pristine" | head -n 1)
+  set_exec() {  # <line>: replace the pristine ExecStart with <line>
+    grep -v '^ExecStart=' "$pristine" > "$service_path"
+    printf 'ExecStart=%s\n' "$1" >> "$service_path"
+  }
+  # Launcher tokens are whitespace-free by contract, so token-wise rewriting of
+  # $orig is exact.
+  replace_token() {  # <old> <new>
+    local old=$1 new=$2 out='' tok
+    for tok in $orig; do
+      [ "$tok" = "$old" ] && tok=$new
+      out="$out$tok "
+    done
+    printf '%s' "${out% }"
+  }
+  drop_token() {  # <exact-token-or-NAME=*-glob>
+    local drop=$1 out='' tok
+    for tok in $orig; do
+      # shellcheck disable=SC2254  # $drop is a deliberate NAME=* glob
+      case "$tok" in
+        $drop) continue ;;
+      esac
+      out="$out$tok "
+    done
+    printf '%s' "${out% }"
+  }
+  insert_after_flag() {  # <token>: insert right after the -i clean flag
+    local ins=$1 out='' tok
+    for tok in $orig; do
+      out="$out$tok "
+      [ "$tok" = -i ] && out="$out$ins "
+    done
+    printf '%s' "${out% }"
+  }
+  mutate_env_value() {  # <name> <newvalue>
+    local name=$1 val=$2 out='' tok
+    for tok in $orig; do
+      case "$tok" in
+        "$name="*) tok="$name=$val" ;;
+      esac
+      out="$out$tok "
+    done
+    printf '%s' "${out% }"
+  }
+  set_exec "$(replace_token /usr/bin/env /opt/rogue-env)"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "exec-launcher-mismatch" "a wrong environment executable must fail validation"
+  set_exec "$(drop_token -i)"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "exec-clean-flag-missing" "a missing ignore-environment flag must fail validation"
+  set_exec "$(insert_after_flag "LD_PRELOAD=$home/evil.so")"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "launcher-env-unexpected:LD_PRELOAD" "a passed-through extra variable must fail validation"
+  for name in PATH HOME XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS; do
+    set_exec "$(mutate_env_value "$name" "evil-value")"
+    reason=$(real_validate_reason "$home")
+    assert_contains "$reason" "launcher-env-mismatch:$name" "a changed safe runtime value $name must fail validation"
+  done
+  for name in FM_HOME FM_STATE_OVERRIDE FM_SUPERVISION_HARNESS FM_CODEX_SYSTEMD_SERVICE FM_CODEX_SYSTEMD_LEASE FM_CODEX_SYSTEMD_GENERATION FM_CODEX_WATCH_CHECKPOINT; do
+    set_exec "$(mutate_env_value "$name" "evil-value")"
+    reason=$(real_validate_reason "$home")
+    assert_contains "$reason" "launcher-env-mismatch:$name" "a changed supervision value $name must fail validation"
+  done
+  set_exec "$(drop_token 'HOME=*')"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "launcher-env-missing:HOME" "a missing safe HOME must fail validation"
+  set_exec "$(insert_after_flag "FM_HOME=$home/evil")"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "launcher-env-duplicate:FM_HOME" "a duplicate launcher assignment must fail validation"
+  set_exec "$(replace_token /bin/bash /bin/sh)"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "exec-command-mismatch" "a changed fixed interpreter must fail validation"
+  set_exec "$(replace_token 60 1)"
+  reason=$(real_validate_reason "$home")
+  assert_contains "$reason" "exec-command-mismatch" "a changed checkpoint argument must fail validation"
+  cp "$pristine" "$service_path"
+  reason=$(real_validate_reason "$home")
+  [ -z "$reason" ] || [ "$reason" = valid ] || fail "pristine launcher contract no longer validates: $reason"
+  pass "fm-codex-systemd-scheduler: every clean-launcher mutation class fails validation with its own reason"
+}
+
+# The adapter-generated polluted-parent execution proof: run the EXACT loaded
+# ExecStart command from a parent carrying hostile supervision, loader, and
+# PATH pollution, and prove the checkpoint's first observable environment
+# (/proc/self/environ at exec) is byte-identical to the reviewed allowlist.
+test_launcher_delivers_exact_clean_environment_from_polluted_parent() {
+  local home service_path execline decoy status tok
+  local -a argv
+  home=$(real_home_with_schedule real-clean-launch)
+  service_path=$(real_meta "$home" | jq -r '.service_path')
+  execline=$(sed -n 's/^ExecStart=//p' "$service_path" | head -n 1)
+  : > "$home/state/.codex-env-capture"
+  decoy="$TMP_ROOT/clean-launch-decoy"
+  mkdir -p "$decoy/state"
+  read -r -a argv <<<"$execline"
+  [ "${argv[0]}" = /usr/bin/env ] || fail "loaded ExecStart does not start with the fixed environment executable: $execline"
+  [ "${argv[1]}" = -i ] || fail "loaded ExecStart does not carry the ignore-environment flag: $execline"
+  status=0
+  env FM_ROOT_OVERRIDE="$decoy" FM_SUPERVISION_TEST_MODE=1 \
+    FM_CODEX_WATCH_CHECKPOINT_MAX_LATENESS=999999 FM_CODEX_PRIMARY_IDENTITY=forged-parent-identity \
+    FM_CODEX_SYSTEMD_FAKE_DIR="$decoy/fake-systemd" LD_PRELOAD="$decoy/evil.so" PATH="$decoy/evil-bin:$PATH" \
+    "${argv[@]}" >"$home/launch-out.txt" 2>"$home/launch-err.txt" || status=$?
+  [ -f "$home/state/.codex-env-capture.out" ] \
+    || fail "the launched checkpoint did not capture its first observable environment (exit $status): $(cat "$home/launch-err.txt")"
+  for ((i = 2; i < ${#argv[@]}; i++)); do
+    tok=${argv[i]}
+    case "$tok" in
+      [A-Za-z_]*=*) printf '%s\n' "$tok" ;;
+      *) break ;;
+    esac
+  done | LC_ALL=C sort > "$home/expected-env.txt"
+  diff -u "$home/expected-env.txt" "$home/state/.codex-env-capture.out" >"$home/env-diff.txt" 2>&1 \
+    || fail "checkpoint first observable environment is not exactly the reviewed allowlist: $(cat "$home/env-diff.txt")"
+  [ -z "$(find "$decoy/state" -mindepth 1 -print -quit 2>/dev/null)" ] \
+    || fail "polluted parent FM_ROOT_OVERRIDE leaked into the launched checkpoint"
+  [ -e "$decoy/fake-systemd" ] \
+    && fail "polluted parent fake-scheduler seam was honored by the launched checkpoint"
+  pass "fm-codex-systemd-scheduler: the loaded launcher delivers exactly the reviewed environment from a polluted parent"
+}
+
 # --- unit-file injection (review finding F-4) ----------------------------------
 
 test_real_mode_rejects_directive_injection_in_lease() {
@@ -711,6 +985,11 @@ test_fake_mode_rejects_invalid_record_fields() {
 test_fake_dir_without_test_mode_fails_closed
 test_stub_systemctl_without_test_unit_dir_fails_closed
 test_test_overrides_require_test_owned_home
+test_gate_rejects_home_and_state_aliases
+test_gate_rejects_fake_dir_aliases_and_ambiguous_ancestry
+test_gate_rejects_unit_dir_alias_of_real_unit_dir
+test_gate_rejects_untrusted_stub_systemctl
+test_schedule_never_writes_through_unit_dir_alias
 test_metadata_is_deterministic_and_home_scoped
 test_schedule_query_validate_disable_remove
 test_alias_verbs_replace_generation
@@ -729,6 +1008,8 @@ test_real_mode_rejects_unexpected_env_vars
 test_real_mode_rejects_each_missing_required_variable
 test_real_mode_rejects_effective_source_divergence
 test_real_mode_fails_closed_on_property_query_problems
+test_real_mode_rejects_launcher_mutations
+test_launcher_delivers_exact_clean_environment_from_polluted_parent
 test_real_mode_rejects_directive_injection_in_lease
 test_real_mode_rejects_non_numeric_cadence
 test_fake_mode_rejects_invalid_record_fields

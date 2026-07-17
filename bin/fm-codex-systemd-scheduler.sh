@@ -16,6 +16,12 @@
 # unit directory. Any override set without that full gate is an error, never a
 # fallback to fake or real mode, so no ambient environment variable can
 # substitute a file for a real `systemctl --user` query in production.
+# Every gated path is CANONICALIZED before ownership and containment are
+# judged and before any use (review-r6-sol F-1): symlink and `..` aliases
+# resolve to what they actually address, ambiguous ancestry (a dangling
+# symlink or an existing non-directory in a not-yet-created suffix) is
+# rejected outright, and the canonical form replaces the alias for the rest
+# of the run so mutating operations never write through an accepted alias.
 #
 # Every record field that reaches a unit file is validated first (review
 # finding F-4): leases against a safe charset, numbers as bounded digits, paths
@@ -115,6 +121,66 @@ path_inside() {  # <path> <root> - true when <path> is <root> or inside it
   return 1
 }
 
+# canon_gated_dir <path>: print the fully canonical form of a gated directory
+# path (review-r6-sol F-1). The deepest existing prefix is resolved with
+# cd/pwd -P, so symlink and normalized-`..` aliases become the path they
+# actually address before any ownership or containment judgment. A
+# not-yet-created suffix is allowed only as plain child components: never '.',
+# '..', or empty, and never an existing non-directory or dangling symlink,
+# which a later mkdir -p would follow somewhere else. Ambiguous ancestry fails
+# instead of falling back to the raw string.
+# bin/fm-supervision-lib.sh carries the same walk as fm_sup_canon_gated_path
+# for its own boundary; this adapter deliberately does not source that library.
+canon_gated_dir() {
+  local p=$1 rest='' c canon
+  case "$p" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$p" in
+    *[![:print:]]*) return 1 ;;
+  esac
+  while [ "$p" != / ] && [ ! -d "$p" ]; do
+    if [ -e "$p" ] || [ -L "$p" ]; then
+      return 1
+    fi
+    c=${p##*/}
+    case "$c" in
+      .|..|'') return 1 ;;
+    esac
+    rest="/$c$rest"
+    p=${p%/*}
+    [ -n "$p" ] || p=/
+  done
+  canon=$(cd "$p" 2>/dev/null && pwd -P) || return 1
+  [ "$canon" = / ] && canon=
+  if [ -z "$canon" ] && [ -z "$rest" ]; then
+    printf '/\n'
+  else
+    printf '%s%s\n' "$canon" "$rest"
+  fi
+}
+
+# canon_gated_file <path>: canonical form of a gated executable path. The file
+# must exist as a regular non-symlink file, and its parent directory is
+# canonicalized like any other gated path.
+canon_gated_file() {
+  local p=$1 dir base
+  case "$p" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  [ -L "$p" ] && return 1
+  [ -f "$p" ] || return 1
+  base=${p##*/}
+  case "$base" in
+    .|..|'') return 1 ;;
+  esac
+  dir=$(canon_gated_dir "${p%/*}") || return 1
+  [ "$dir" = / ] && dir=
+  printf '%s/%s\n' "$dir" "$base"
+}
+
 # path_test_owned <path>: true when <path> sits under a root that carries the
 # .fm-test-owner marker written by tests/lib.sh - the repo's one durable proof
 # that a directory belongs to a test fixture, the same marker
@@ -134,13 +200,17 @@ path_test_owned() {
   return 1
 }
 
-# --- fail-closed test-seam gate (F-1) ----------------------------------------
+# --- fail-closed test-seam gate (F-1, canonicalized per review-r6-sol F-1) -----
 # Runs before any command dispatch. Production (no FM_SUPERVISION_TEST_MODE=1)
 # refuses every test override outright; test mode additionally requires the
-# evaluated home, state dir, and overridden directories to be provably
-# test-owned and outside the real user unit directory.
+# evaluated home, state dir, and overridden paths to be provably test-owned
+# and outside the real user unit directory. Every judgment runs on the
+# CANONICAL path, and the canonical form replaces the supplied value for the
+# rest of the run, so a symlink or `..` alias that survives the gate cannot
+# later be written through: what was judged is what is used.
+GATE_ENGAGED=0
 test_seam_gate() {
-  local overrides='' real_units
+  local overrides='' real_units canon
   [ -n "${FM_CODEX_SYSTEMD_FAKE_DIR:-}" ] && overrides="$overrides FM_CODEX_SYSTEMD_FAKE_DIR"
   [ -n "${FM_CODEX_SYSTEMD_SYSTEMCTL:-}" ] && overrides="$overrides FM_CODEX_SYSTEMD_SYSTEMCTL"
   [ -n "${FM_CODEX_SYSTEMD_UNIT_DIR:-}" ] && overrides="$overrides FM_CODEX_SYSTEMD_UNIT_DIR"
@@ -148,22 +218,37 @@ test_seam_gate() {
   if [ "${FM_SUPERVISION_TEST_MODE:-}" != 1 ]; then
     refuse "test-override-without-test-mode:${overrides# }"
   fi
-  real_units=$(real_default_unit_dir)
+  real_units=$(canon_gated_dir "$(real_default_unit_dir)") || refuse 'real-unit-dir-unresolvable'
+  canon=$(canon_gated_dir "$FM_HOME") || refuse 'test-override-home-unresolvable'
+  FM_HOME=$canon
   path_test_owned "$FM_HOME" || refuse 'test-override-home-not-test-owned'
+  canon=$(canon_gated_dir "$STATE") || refuse 'test-override-state-unresolvable'
+  STATE=$canon
   path_test_owned "$STATE" || refuse 'test-override-state-not-test-owned'
   if [ -n "${FM_CODEX_SYSTEMD_FAKE_DIR:-}" ]; then
+    canon=$(canon_gated_dir "$FM_CODEX_SYSTEMD_FAKE_DIR") || refuse 'fake-dir-unresolvable'
+    FM_CODEX_SYSTEMD_FAKE_DIR=$canon
     path_test_owned "$FM_CODEX_SYSTEMD_FAKE_DIR" || refuse 'fake-dir-not-test-owned'
     path_inside "$FM_CODEX_SYSTEMD_FAKE_DIR" "$real_units" && refuse 'fake-dir-inside-real-unit-dir'
   fi
-  if [ -n "${FM_CODEX_SYSTEMD_SYSTEMCTL:-}" ] && [ -z "${FM_CODEX_SYSTEMD_UNIT_DIR:-}" ]; then
-    # A stubbed systemctl with the real unit dir would write test units into the
-    # real user manager's directory.
-    refuse 'stub-systemctl-without-test-unit-dir'
+  if [ -n "${FM_CODEX_SYSTEMD_SYSTEMCTL:-}" ]; then
+    canon=$(canon_gated_file "$FM_CODEX_SYSTEMD_SYSTEMCTL") || refuse 'stub-systemctl-unresolvable'
+    FM_CODEX_SYSTEMD_SYSTEMCTL=$canon
+    SYSTEMCTL=$canon
+    path_test_owned "$FM_CODEX_SYSTEMD_SYSTEMCTL" || refuse 'stub-systemctl-not-test-owned'
+    if [ -z "${FM_CODEX_SYSTEMD_UNIT_DIR:-}" ]; then
+      # A stubbed systemctl with the real unit dir would write test units into
+      # the real user manager's directory.
+      refuse 'stub-systemctl-without-test-unit-dir'
+    fi
   fi
   if [ -n "${FM_CODEX_SYSTEMD_UNIT_DIR:-}" ]; then
+    canon=$(canon_gated_dir "$FM_CODEX_SYSTEMD_UNIT_DIR") || refuse 'unit-dir-unresolvable'
+    FM_CODEX_SYSTEMD_UNIT_DIR=$canon
     path_test_owned "$FM_CODEX_SYSTEMD_UNIT_DIR" || refuse 'unit-dir-not-test-owned'
     path_inside "$FM_CODEX_SYSTEMD_UNIT_DIR" "$real_units" && refuse 'unit-dir-inside-real-unit-dir'
   fi
+  GATE_ENGAGED=1
   return 0
 }
 
@@ -462,14 +547,162 @@ env_mismatch_reason() {
   esac
 }
 
+# --- fixed clean checkpoint launcher (review-r6-sol F-2) -----------------------
+# A user service inherits the user manager's whole environment underneath its
+# unit Environment= lines (systemd.exec(5)), so the checkpoint's actual process
+# environment can only be bounded by the launch itself. The generated ExecStart
+# is therefore a CLEAN LAUNCH: a fixed trusted absolute environment executable
+# with ignore-environment semantics rebuilds the checkpoint's entire
+# environment from the reviewed allowlist below, before any behaviorally
+# relevant interpreter or program runs. Only reviewed constants and
+# adapter-validated fields appear in the argv. The in-script FM_* scrub in
+# bin/fm-watch-checkpoint.sh remains behind this boundary as defense in depth,
+# not as the boundary.
+LAUNCHER_ENV_EXEC=/usr/bin/env
+LAUNCHER_CLEAN_FLAG=-i
+LAUNCHER_INTERP=/bin/bash
+# The minimal safe runtime values the checkpoint needs to find standard tools
+# and reach the user manager: a fixed system PATH, the account database's home,
+# and the conventional /run/user/<uid> runtime dir and session bus address the
+# user manager serves (empirically confirmed against the real manager's own
+# environment block; docs/codex-systemd-scheduler.md).
+LAUNCHER_SAFE_PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+# account_home_dir: the account's home directory from the account database,
+# never ambient $HOME, validated launcher-argv safe (absolute, no whitespace,
+# no unit-unsafe characters).
+account_home_dir() {
+  local d
+  d=$(getent passwd "$(id -u)" 2>/dev/null | head -n 1 | cut -d: -f6)
+  valid_exec_path "$d" || return 1
+  printf '%s\n' "$d"
+}
+
+# expected_launcher_argv <home> <state> <lease> <generation> <cadence>
+# <exec-path> <home-dir> <uid>: one argv element per line - the single
+# reviewed source every launcher validation view compares against. Every value
+# is whitespace-free by validation, so the space-joined ExecStart line and the
+# argv are byte-equivalent representations.
+expected_launcher_argv() {
+  printf '%s\n' "$LAUNCHER_ENV_EXEC"
+  printf '%s\n' "$LAUNCHER_CLEAN_FLAG"
+  printf 'HOME=%s\n' "$7"
+  printf 'PATH=%s\n' "$LAUNCHER_SAFE_PATH"
+  printf 'XDG_RUNTIME_DIR=/run/user/%s\n' "$8"
+  printf 'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%s/bus\n' "$8"
+  expected_env_entries "$1" "$2" "$3" "$4" "$5"
+  printf '%s\n' "$LAUNCHER_INTERP"
+  printf '%s\n' "$6"
+  printf -- '--seconds\n'
+  printf '%s\n' "$5"
+}
+
+expected_execstart_line() {  # same arguments as expected_launcher_argv
+  local line='' tok
+  while IFS= read -r tok; do
+    line="$line$tok "
+  done < <(expected_launcher_argv "$@")
+  printf '%s\n' "${line% }"
+}
+
+is_env_assignment() {  # <token>: NAME=VALUE with a plain variable name
+  local tok=$1 name
+  case "$tok" in
+    *=*) ;;
+    *) return 1 ;;
+  esac
+  name=${tok%%=*}
+  case "$name" in
+    ''|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;;
+  esac
+  return 0
+}
+
+# classify_launcher_argv <actual-line> <expected-line>: name which part of the
+# clean-launcher command diverged, appended to CONTRACT_REASONS. Tokens are
+# whitespace-free by construction, so word splitting is exact. Reason names
+# only ever carry validated variable names, never raw token text.
+classify_launcher_argv() {
+  local actual=$1 expected=$2 i tok name exp_line seen in_cmd
+  local -a a e
+  local act_env='' exp_env='' act_cmd='' exp_cmd=''
+  read -r -a a <<<"$actual"
+  read -r -a e <<<"$expected"
+  [ "${a[0]:-}" = "${e[0]:-}" ] || CONTRACT_REASONS="$CONTRACT_REASONS exec-launcher-mismatch"
+  [ "${a[1]:-}" = "${e[1]:-}" ] || CONTRACT_REASONS="$CONTRACT_REASONS exec-clean-flag-missing"
+  in_cmd=0
+  for ((i = 2; i < ${#a[@]}; i++)); do
+    tok=${a[i]}
+    if [ "$in_cmd" -eq 0 ] && is_env_assignment "$tok"; then
+      act_env="$act_env$tok"$'\n'
+    else
+      in_cmd=1
+      act_cmd="$act_cmd$tok "
+    fi
+  done
+  in_cmd=0
+  for ((i = 2; i < ${#e[@]}; i++)); do
+    tok=${e[i]}
+    if [ "$in_cmd" -eq 0 ] && is_env_assignment "$tok"; then
+      exp_env="$exp_env$tok"$'\n'
+    else
+      in_cmd=1
+      exp_cmd="$exp_cmd$tok "
+    fi
+  done
+  seen=' '
+  while IFS= read -r tok; do
+    [ -n "$tok" ] || continue
+    name=${tok%%=*}
+    case "$seen" in
+      *" $name "*) CONTRACT_REASONS="$CONTRACT_REASONS launcher-env-duplicate:$name"; continue ;;
+    esac
+    seen="$seen$name "
+    if ! exp_line=$(printf '%s' "$exp_env" | grep -m 1 "^$name="); then
+      CONTRACT_REASONS="$CONTRACT_REASONS launcher-env-unexpected:$name"
+      continue
+    fi
+    [ "$tok" = "$exp_line" ] || CONTRACT_REASONS="$CONTRACT_REASONS launcher-env-mismatch:$name"
+  done <<<"$act_env"
+  while IFS= read -r exp_line; do
+    [ -n "$exp_line" ] || continue
+    name=${exp_line%%=*}
+    case "$seen" in
+      *" $name "*) ;;
+      *) CONTRACT_REASONS="$CONTRACT_REASONS launcher-env-missing:$name" ;;
+    esac
+  done <<<"$exp_env"
+  [ "$act_cmd" = "$exp_cmd" ] || CONTRACT_REASONS="$CONTRACT_REASONS exec-command-mismatch"
+}
+
+# classify_exec_effective <exec-show-block> <expected-line>: applied when the
+# effective ExecStart block did not match exactly; guarantees at least one
+# deterministic reason lands.
+classify_exec_effective() {
+  local shown=$1 expected_line=$2 argv_str before=$CONTRACT_REASONS
+  argv_str=${shown#*"argv[]="}
+  if [ "$argv_str" = "$shown" ]; then
+    CONTRACT_REASONS="$CONTRACT_REASONS exec-effective-mismatch"
+    return 0
+  fi
+  argv_str=${argv_str%% ; ignore_errors=*}
+  classify_launcher_argv "$argv_str" "$expected_line"
+  [ "$CONTRACT_REASONS" != "$before" ] || CONTRACT_REASONS="$CONTRACT_REASONS exec-effective-mismatch"
+}
+
 CONTRACT_REASONS=
 # validate_effective_service <service> <service-path> <home> <state> <lease>
 # <generation> <cadence> <exec-path>: the merged contract systemd will actually
 # execute, appended to CONTRACT_REASONS (each reason carries a leading space).
 validate_effective_service() {
   local service=$1 service_path=$2 canon_home=$3 canon_state=$4 lease=$5 generation=$6 cadence=$7 exec_path=$8
-  local p entries entry name exp_line seen expected env_raw exec_show argv_count
+  local p entries entry name exp_line seen expected env_raw exec_show argv_count home_dir expected_exec
   CONTRACT_REASONS=
+  home_dir=$(account_home_dir) || {
+    CONTRACT_REASONS=' launcher-home-dir-underivable'
+    return 1
+  }
+  expected_exec=$(expected_execstart_line "$canon_home" "$canon_state" "$lease" "$generation" "$cadence" "$exec_path" "$home_dir" "$(id -u)")
   if ! show_required_props "$service" FragmentPath DropInPaths WorkingDirectory Environment EnvironmentFiles UnsetEnvironment PassEnvironment ExecStart; then
     CONTRACT_REASONS=" service-$SHOW_PROPS_REASON"
     return 1
@@ -491,8 +724,8 @@ validate_effective_service() {
   [ -z "$(shown_prop PassEnvironment)" ] || CONTRACT_REASONS="$CONTRACT_REASONS pass-environment-present"
   exec_show=$(shown_prop ExecStart)
   case "$exec_show" in
-    "{ path=$exec_path ; argv[]=$exec_path --seconds $cadence ; ignore_errors="*) ;;
-    *) CONTRACT_REASONS="$CONTRACT_REASONS exec-effective-mismatch" ;;
+    "{ path=$LAUNCHER_ENV_EXEC ; argv[]=$expected_exec ; ignore_errors="*) ;;
+    *) classify_exec_effective "$exec_show" "$expected_exec" ;;
   esac
   argv_count=$(printf '%s\n' "$exec_show" | grep -o 'argv\[\]=' | wc -l)
   [ "$argv_count" -eq 1 ] || CONTRACT_REASONS="$CONTRACT_REASONS exec-effective-count"
@@ -626,7 +859,7 @@ validate_record() {
   local status meta adapter uid expected_uid lease generation cadence due exec_rec home state reasons
   local timer_active timer_load timer_unit_file service_load triggers exec_start exec_count on_calendar next_epoch
   local expected_service expected_timer expected_exec_line expected_calendar service_cat timer_cat tolerance diff f
-  local canon_home canon_state service_path timer_path_meta exec_path_meta
+  local canon_home canon_state service_path timer_path_meta exec_path_meta home_dir
   [ -n "$record" ] && [ -f "$record" ] || { printf 'missing-record\n'; return 1; }
   jq -e 'type == "object"' "$record" >/dev/null 2>&1 || { printf 'malformed-record\n'; return 1; }
   if ! validate_record_fields; then
@@ -683,9 +916,14 @@ validate_record() {
     [ "$service_load" = loaded ] || reasons="${reasons} service-not-loaded"
     [ "$triggers" = "$expected_service" ] || reasons="${reasons} trigger-mismatch"
     # The service command systemd will actually run, compared byte-for-byte
-    # against the one this adapter constructs from its own metadata (F-3).
-    expected_exec_line="$exec_path_meta --seconds $cadence"
-    [ "$exec_start" = "$expected_exec_line" ] || reasons="${reasons} exec-start-mismatch"
+    # against the clean-launcher line this adapter constructs from reviewed
+    # constants plus its own metadata (F-3, review-r6-sol F-2).
+    if home_dir=$(account_home_dir); then
+      expected_exec_line=$(expected_execstart_line "$canon_home" "$canon_state" "$lease" "$generation" "$cadence" "$exec_path_meta" "$home_dir" "$expected_uid")
+      [ "$exec_start" = "$expected_exec_line" ] || reasons="${reasons} exec-start-mismatch"
+    else
+      reasons="${reasons} launcher-home-dir-underivable"
+    fi
     [ "$exec_count" = 1 ] || reasons="${reasons} exec-start-duplicated"
     # The full loaded contract (review-r4 F-1): systemd's merged effective view
     # plus the loaded source, both matched exactly. A unit that is not even
@@ -740,12 +978,18 @@ validate_record() {
 }
 
 schedule_fake() {
-  local root file meta
+  local root file meta recheck
   root=$(fake_root)
   file=$(fake_registration)
   meta=$(metadata_json) || return 1
   validate_record_fields || { echo "error: $FIELD_REASON" >&2; return 1; }
   mkdir -p "$root/timers" || return 1
+  # Race-safe creation (review-r6-sol F-1): fake mode is always gated, so the
+  # created registration dir must still be the judged canonical test-owned path.
+  if ! recheck=$(canon_gated_dir "$root/timers") || [ "$recheck" != "$root/timers" ] || ! path_test_owned "$recheck"; then
+    echo "error: fake-dir-changed-after-create" >&2
+    return 1
+  fi
   ( umask 077
     jq -cS --argjson meta "$meta" \
       '{registered:true,lease_id:.lease_id,generation:.generation,cadence_seconds:.cadence_seconds,
@@ -772,6 +1016,7 @@ disable_scheduler() {
 
 schedule_real() {
   local meta dir service_path timer_path exec_path canon_home canon_state lease generation cadence due calendar
+  local home_dir exec_line recheck
   meta=$(metadata_json) || return 1
   validate_record_fields || { echo "error: $FIELD_REASON" >&2; return 1; }
   dir=$(printf '%s' "$meta" | jq -r '.unit_dir')
@@ -785,17 +1030,32 @@ schedule_real() {
   cadence=$(record_field '.cadence_seconds')
   due=$(record_field '.next_checkpoint_due')
   # The command line is constructed only from this adapter's own computed
-  # metadata plus the numeric cadence validated above; record text never
-  # reaches ExecStart unvalidated (F-4).
+  # metadata, the reviewed launcher constants, and the numeric cadence
+  # validated above; record text never reaches ExecStart unvalidated (F-4).
+  # Every ExecStart value must additionally be whitespace-free so the launcher
+  # argv and its space-joined line are byte-equivalent (review-r6-sol F-2).
   valid_exec_path "$exec_path" || { echo "error: computed exec path is not unit-safe: $exec_path" >&2; return 1; }
-  valid_unit_path "$canon_home" || { echo "error: computed home path is not unit-safe" >&2; return 1; }
-  valid_unit_path "$canon_state" || { echo "error: computed state path is not unit-safe" >&2; return 1; }
+  valid_exec_path "$canon_home" || { echo "error: computed home path is not launcher-safe" >&2; return 1; }
+  valid_exec_path "$canon_state" || { echo "error: computed state path is not launcher-safe" >&2; return 1; }
+  [ -x "$LAUNCHER_ENV_EXEC" ] || { echo "error: fixed environment executable missing: $LAUNCHER_ENV_EXEC" >&2; return 1; }
+  [ -x "$LAUNCHER_INTERP" ] || { echo "error: fixed interpreter missing: $LAUNCHER_INTERP" >&2; return 1; }
+  home_dir=$(account_home_dir) || { echo "error: account home directory is not launcher-safe" >&2; return 1; }
+  exec_line=$(expected_execstart_line "$canon_home" "$canon_state" "$lease" "$generation" "$cadence" "$exec_path" "$home_dir" "$(id -u)")
   # The record must describe THIS home's contract, not another home's.
   [ "$(record_field '.fm_home')" = "$canon_home" ] || { echo "error: record home does not match this home" >&2; return 1; }
   [ "$(record_field '.state_dir')" = "$canon_state" ] || { echo "error: record state dir does not match this home" >&2; return 1; }
   [ "$(record_field '.scheduler.exec_path')" = "$exec_path" ] || { echo "error: record exec path does not match this adapter" >&2; return 1; }
   calendar=$(date -u -d "@$due" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null) || return 1
   mkdir -p "$dir" || return 1
+  # Race-safe creation for a gated unit dir (review-r6-sol F-1): the gate
+  # judged the canonical path, so the created path must still BE that judged
+  # canonical path before anything is written through it.
+  if [ "$GATE_ENGAGED" -eq 1 ]; then
+    if ! recheck=$(canon_gated_dir "$dir") || [ "$recheck" != "$dir" ] || ! path_test_owned "$recheck"; then
+      echo "error: unit-dir-changed-after-create" >&2
+      return 1
+    fi
+  fi
   ( umask 077
     {
       printf '[Unit]\nDescription=FirstMate Codex checkpoint for %s\n\n' "$canon_home"
@@ -805,6 +1065,11 @@ schedule_real() {
       # write it raw. (Found by the disposable real-systemd proof - the quoted
       # form armed nothing, ever.)
       printf '[Service]\nType=oneshot\nWorkingDirectory=%s\n' "$canon_home"
+      # The Environment= lines remain the validated unit-level declaration of
+      # the supervision binding (review-r4); the clean-launcher ExecStart below
+      # is what actually bounds the checkpoint's process environment, because
+      # its ignore-environment launch discards everything inherited from the
+      # user manager, unit assignments included (review-r6-sol F-2).
       printf 'Environment=%s\n' "$(systemd_quote "FM_HOME=$canon_home")"
       printf 'Environment=%s\n' "$(systemd_quote "FM_STATE_OVERRIDE=$canon_state")"
       printf 'Environment=%s\n' "$(systemd_quote 'FM_SUPERVISION_HARNESS=codex')"
@@ -812,7 +1077,7 @@ schedule_real() {
       printf 'Environment=%s\n' "$(systemd_quote "FM_CODEX_SYSTEMD_LEASE=$lease")"
       printf 'Environment=%s\n' "$(systemd_quote "FM_CODEX_SYSTEMD_GENERATION=$generation")"
       printf 'Environment=%s\n' "$(systemd_quote "FM_CODEX_WATCH_CHECKPOINT=$cadence")"
-      printf 'ExecStart=%s --seconds %s\n' "$exec_path" "$cadence"
+      printf 'ExecStart=%s\n' "$exec_line"
     } > "$service_path.tmp.$$"
   ) || { rm -f "$service_path.tmp.$$"; return 1; }
   chmod 600 "$service_path.tmp.$$" 2>/dev/null || { rm -f "$service_path.tmp.$$"; return 1; }

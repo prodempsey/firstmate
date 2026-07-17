@@ -303,6 +303,48 @@ test_service_mode_rejects_inherited_test_mode_outside_test_owned_home() {
   pass "service mode rejects inherited FM_SUPERVISION_TEST_MODE outside a test-owned home (no synthetic identity)"
 }
 
+# Review-r6-sol F-2: the first-environment capture hook is a test-only proof
+# seam. Outside a provably test-owned state dir it must never fire, even when
+# the request marker is present.
+test_capture_hook_never_fires_outside_test_owned_state() {
+  local home
+  home=$(mktemp -d) || fail "mktemp failed"
+  FM_TEST_CLEANUP_DIRS+=("$home")
+  mkdir -p "$home/state"
+  : > "$home/state/.codex-env-capture"
+  run_service_checkpoint "$home" "$CHECKPOINT" --seconds 1 >/dev/null 2>&1 || true
+  assert_absent "$home/state/.codex-env-capture.out" \
+    "the first-environment capture fired outside a test-owned state dir"
+  rm -rf "$home"
+  pass "the first-environment capture hook never fires outside a test-owned state dir"
+}
+
+# Review-r6-sol F-1: the shared test-mode boundary judges canonical paths only.
+# A dangling-symlink or `..` alias must never prove test ownership.
+test_test_mode_rejects_aliased_or_ambiguous_paths() {
+  local home prod out
+  home=$(make_home alias-boundary)
+  prod=$(mktemp -d) || fail "mktemp failed"
+  FM_TEST_CLEANUP_DIRS+=("$prod")
+  mkdir -p "$prod/state"
+  ln -s "$home/nonexistent" "$home/state-dangle"
+  # shellcheck disable=SC2016  # $1/$2/$3 expand in the inner bash -c process, not here.
+  out=$(FM_SUPERVISION_TEST_MODE=1 bash -c '. "$1/bin/fm-supervision-lib.sh"
+    fm_sup_test_mode_proven "$2" "$3" && echo proven || echo refused' _ "$ROOT" "$home/state-dangle" "$home")
+  [ "$out" = refused ] || fail "a dangling-symlink state alias proved test mode: $out"
+  mkdir -p "$home/sub"
+  # shellcheck disable=SC2016
+  out=$(FM_SUPERVISION_TEST_MODE=1 bash -c '. "$1/bin/fm-supervision-lib.sh"
+    fm_sup_test_mode_proven "$2" "$3" && echo proven || echo refused' \
+    _ "$ROOT" "$prod/state" "$home/sub/../../../$(basename "$prod")")
+  [ "$out" = refused ] || fail "a ..-traversal home alias into non-test-owned space proved test mode: $out"
+  # shellcheck disable=SC2016
+  out=$(FM_SUPERVISION_TEST_MODE=1 bash -c '. "$1/bin/fm-supervision-lib.sh"
+    fm_sup_test_mode_proven "$2" "$3" && echo proven || echo refused' _ "$ROOT" "$home/state" "$home")
+  [ "$out" = proven ] || fail "a genuine test-owned fixture no longer proves test mode: $out"
+  pass "test-mode proof rejects aliased or ambiguous paths and still accepts genuine fixtures"
+}
+
 test_service_mode_requires_codex_harness_binding() {
   local home out err status
   home=$(make_home service-binding)
@@ -327,4 +369,6 @@ test_concurrent_prepare_admits_exactly_one_winner
 test_stale_running_record_is_reclaimed
 test_service_mode_scrubs_inherited_manager_environment
 test_service_mode_rejects_inherited_test_mode_outside_test_owned_home
+test_capture_hook_never_fires_outside_test_owned_state
+test_test_mode_rejects_aliased_or_ambiguous_paths
 test_service_mode_requires_codex_harness_binding

@@ -403,11 +403,11 @@ FM_CHECK_INTERVAL=300   # seconds between slow checks (merge polls or the X-mode
 FM_CHECK_TIMEOUT=30     # seconds allowed per slow check script
 FM_CODEX_WATCH_CHECKPOINT=180   # seconds per foreground watcher checkpoint in Codex primary supervision
 FM_CODEX_WATCH_CHECKPOINT_MAX_LATENESS=60   # seconds a managed Codex next-checkpoint timer may be late before health fails
-FM_SUPERVISION_TEST_MODE=       # TEST SEAM: enables synthetic supervision identity for fixtures; fail-closed at the shared library boundary outside test-owned home/state dirs (docs/codex-systemd-scheduler.md "Service runtime environment")
-FM_CODEX_SYSTEMD_FAKE_DIR=      # TEST SEAM: fake scheduler registration dir; fails closed outside FM_SUPERVISION_TEST_MODE=1 with test-owned dirs (docs/codex-systemd-scheduler.md "Test seams")
-FM_CODEX_SYSTEMD_SYSTEMCTL=     # TEST SEAM: stub systemctl for the real-mode branch; same fail-closed gate, requires FM_CODEX_SYSTEMD_UNIT_DIR
-FM_CODEX_SYSTEMD_UNIT_DIR=      # TEST SEAM: scratch unit directory; same fail-closed gate, never the real user unit dir
-FM_CODEX_SYSTEMD_SERVICE=       # unit-internal marker (never set by hand): tells fm-watch-checkpoint.sh it runs as the managed service and must scrub inherited FM_* manager environment first
+FM_SUPERVISION_TEST_MODE=       # TEST SEAM: enables synthetic supervision identity for fixtures; fail-closed at the shared library boundary outside canonically test-owned home/state dirs (docs/codex-systemd-scheduler.md "Clean launch boundary")
+FM_CODEX_SYSTEMD_FAKE_DIR=      # TEST SEAM: fake scheduler registration dir; fails closed outside FM_SUPERVISION_TEST_MODE=1 with canonically test-owned dirs (docs/codex-systemd-scheduler.md "Test seams")
+FM_CODEX_SYSTEMD_SYSTEMCTL=     # TEST SEAM: stub systemctl for the real-mode branch; same fail-closed gate, must be a canonical test-owned regular file and requires FM_CODEX_SYSTEMD_UNIT_DIR
+FM_CODEX_SYSTEMD_UNIT_DIR=      # TEST SEAM: scratch unit directory; same fail-closed gate, never the real user unit dir or any alias of it
+FM_CODEX_SYSTEMD_SERVICE=       # unit-internal marker (never set by hand): tells fm-watch-checkpoint.sh it runs as the managed service behind the unit's clean-launcher ExecStart; the in-script FM_* scrub stays as defense in depth
 FM_CREW_STATE_NM_TIMEOUT=10   # seconds allowed per no-mistakes query inside fm-crew-state.sh
 FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes runs rows scanned when cross-branch attribution falls back from axi status
 FM_CREW_STATE_BIN=bin/fm-crew-state.sh   # test override for the current-state reader used by working/paused watcher triage

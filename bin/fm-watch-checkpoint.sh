@@ -8,14 +8,36 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-supervision-lib.sh
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
 
-# --- deterministic clean service environment (review-r5 F-1) ------------------
-# A systemd user service inherits the user manager's environment underneath its
-# unit-declared Environment= lines (systemd.exec(5)), so the validated unit
-# contract alone cannot bound the actual process environment. When this script
-# starts as the managed checkpoint service - marked by the unit-declared
+# --- test-only first-environment capture (review-r6-sol F-2) -------------------
+# Proof hook for the clean-launcher contract: when the managed service entry
+# starts against a provably test-owned state dir carrying a .codex-env-capture
+# request marker, the exact exec-time environment (/proc/$$/environ, this
+# script process's immutable snapshot from exec - /proc/self would name the
+# pipeline subshell instead) is recorded before anything else runs, so tests
+# can prove the launcher delivered exactly the reviewed allowlist. The gate is
+# the same .fm-test-owner ancestry the supervision library enforces, judged on
+# the canonical state path only; a production state dir never carries the
+# marker, so this never fires in production.
+if [ "${FM_CODEX_SYSTEMD_SERVICE:-}" = 1 ] && [ -n "${FM_STATE_OVERRIDE:-}" ] \
+  && [ -f "$FM_STATE_OVERRIDE/.codex-env-capture" ] && [ -r "/proc/$$/environ" ]; then
+  if _fm_cap_state=$(cd "$FM_STATE_OVERRIDE" 2>/dev/null && pwd -P) \
+    && fm_sup_path_test_owned "$_fm_cap_state"; then
+    tr '\0' '\n' < "/proc/$$/environ" | LC_ALL=C sort > "$_fm_cap_state/.codex-env-capture.out"
+  fi
+  unset _fm_cap_state
+fi
+
+# --- deterministic clean service environment (review-r5 F-1, r6-sol F-2) ------
+# The PRIMARY environment boundary for the managed service is the generated
+# unit's clean-launcher ExecStart (bin/fm-codex-systemd-scheduler.sh): a fixed
+# /usr/bin/env -i launch rebuilds the whole process environment from the
+# reviewed allowlist, so nothing from the user manager's environment reaches
+# this script at all. The scrub below remains as DEFENSE IN DEPTH behind that
+# boundary - it also covers a service started outside the validated unit. When
+# this script starts as the managed checkpoint service - marked by the
 # reviewed constant FM_CODEX_SYSTEMD_SERVICE=1 - every inherited FM_* variable
 # outside the reviewed unit set is removed BEFORE any configuration is read,
-# so inherited manager values (FM_ROOT_OVERRIDE,
+# so inherited values (FM_ROOT_OVERRIDE,
 # FM_CODEX_WATCH_CHECKPOINT_MAX_LATENESS, FM_SUPERVISION_TEST_MODE,
 # FM_CODEX_PRIMARY_IDENTITY, ...) can never alter checkpoint behavior. The
 # gated scheduler test seams survive the scrub only when the unit-declared

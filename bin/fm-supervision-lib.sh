@@ -122,15 +122,55 @@ fm_sup_path_test_owned() {
   return 1
 }
 
+# fm_sup_canon_gated_path <path>: the fully canonical form of a gated path, or
+# failure when ancestry is ambiguous (review-r6-sol F-1). The deepest existing
+# prefix resolves via cd/pwd -P so symlink and `..` aliases become what they
+# actually address; a not-yet-created suffix is allowed only as plain child
+# components - never '.', '..', empty, an existing non-directory, or a
+# dangling symlink a later mkdir -p would follow elsewhere. The scheduler
+# adapter carries the same walk as canon_gated_dir; it deliberately does not
+# source this library.
+fm_sup_canon_gated_path() {
+  local p=$1 rest='' c canon
+  case "$p" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$p" in
+    *[![:print:]]*) return 1 ;;
+  esac
+  while [ "$p" != / ] && [ ! -d "$p" ]; do
+    if [ -e "$p" ] || [ -L "$p" ]; then
+      return 1
+    fi
+    c=${p##*/}
+    case "$c" in
+      .|..|'') return 1 ;;
+    esac
+    rest="/$c$rest"
+    p=${p%/*}
+    [ -n "$p" ] || p=/
+  done
+  canon=$(cd "$p" 2>/dev/null && pwd -P) || return 1
+  [ "$canon" = / ] && canon=
+  if [ -z "$canon" ] && [ -z "$rest" ]; then
+    printf '/\n'
+  else
+    printf '%s%s\n' "$canon" "$rest"
+  fi
+}
+
 # fm_sup_test_mode_proven <state> <home>: true only when FM_SUPERVISION_TEST_MODE=1
 # may be honored here. A caller that sees test mode set and a false return must
-# fail its whole resolution closed.
+# fail its whole resolution closed. Both paths are judged canonically and only
+# canonically: a path whose ancestry cannot be canonicalized unambiguously is
+# never proven (review-r6-sol F-1).
 fm_sup_test_mode_proven() {
   local state=$1 home=$2 canon
   [ "${FM_SUPERVISION_TEST_MODE:-}" = 1 ] || return 1
-  canon=$(cd "$home" 2>/dev/null && pwd -P) || canon=$home
+  canon=$(fm_sup_canon_gated_path "$home") || return 1
   fm_sup_path_test_owned "$canon" || return 1
-  canon=$(cd "$state" 2>/dev/null && pwd -P) || canon=$state
+  canon=$(fm_sup_canon_gated_path "$state") || return 1
   fm_sup_path_test_owned "$canon" || return 1
   return 0
 }
