@@ -10,6 +10,16 @@
 # All hermetic over temp dirs; no real agent session is invoked.
 set -u
 
+# Hermeticity: the guard and its libs resolve the home/state/data/root/config it
+# reads from these override vars (bin/fm-turnend-guard.sh:71-75), so a shell that
+# already exports any of them - e.g. a crewmate session pointing FM_ROOT_OVERRIDE
+# at the live runtime home - would leak that home into every test's resolution and
+# corrupt caller-identity assertions like `.fm_root == $home`. Each test sets its
+# own FM_HOME per case; clear the ambient overrides once here so nothing else
+# survives from the launching environment.
+unset FM_HOME FM_ROOT_OVERRIDE FM_STATE_OVERRIDE FM_DATA_OVERRIDE \
+  FM_CONFIG_OVERRIDE FM_PROJECTS_OVERRIDE 2>/dev/null || true
+
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -675,10 +685,11 @@ test_hook_blocks_on_both_reasons_at_once() {
 # and it raises one deduped durable bug signal, because a silently dead gate looks exactly
 # like a healthy one.
 test_hook_guard_error_fails_open_loudly() {
-  local dir home pid out status log
+  local dir home pid out status log coalesce
   # The attention lib is missing outright (a partial checkout).
   dir=$(make_primary_dir "$TMP_ROOT/hook-nf-nolib")
   home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
   mkdir -p "$dir/stubbin"
   printf '#!/usr/bin/env bash\necho "$@" >> "%s/bug-calls.log"\n' "$home" > "$dir/stubbin/bugstub"
   chmod +x "$dir/stubbin/bugstub"
@@ -686,6 +697,7 @@ test_hook_guard_error_fails_open_loudly() {
   write_nf_signal "$dir" hidden-h8
   rm "$dir/bin/fm-nf-attention-lib.sh"
   out=$(printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" \
     FM_FLEET_TRIAGE_BUG_CLI="$home/stubbin/bugstub" bash "$dir/bin/fm-turnend-guard.sh" 2>&1)
   status=$?
   expect_code 0 "$status" "a missing attention lib must fail open, not wedge the primary"
@@ -696,22 +708,205 @@ test_hook_guard_error_fails_open_loudly() {
   [ "$(printf '%s' "$log" | jq -r '.nf_error')" = 'fm-nf-attention-lib.sh missing' ] || fail "the log must record the failed component: $log"
   # The durable signal fires once, not once per turn end.
   printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" \
     FM_FLEET_TRIAGE_BUG_CLI="$home/stubbin/bugstub" bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
   [ "$(grep -c 'turn-end guard' "$home/bug-calls.log")" -eq 1 ] \
     || fail "the durable bug signal must be deduped per component, got: $(cat "$home/bug-calls.log")"
   stop_watcher "$pid"
-  # The attention lib is present but broken (a syntax error mid-upgrade).
+  # The attention lib is present but broken (a syntax error mid-upgrade). Bug filing disabled
+  # (FM_FLEET_TRIAGE_BUG_CLI=off) so the test never touches the live captain ledger - this
+  # path used to file a real bug through the host's `bug` on PATH.
   dir=$(make_primary_dir "$TMP_ROOT/hook-nf-brokenlib")
+  home=$(cd "$dir" && pwd)
   pid=$(start_healthy_watcher "$dir")
   write_nf_signal "$dir" hidden-i9
   printf 'if [\n' > "$dir/bin/fm-nf-attention-lib.sh"
-  out=$(run_hook "$dir" false); status=$?
+  out=$(printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_FLEET_TRIAGE_BUG_CLI=off bash "$dir/bin/fm-turnend-guard.sh" 2>&1)
+  status=$?
   stop_watcher "$pid"
   expect_code 0 "$status" "a broken attention lib must fail open, not wedge the primary"
   assert_contains "$out" "fm-nf-attention-lib.sh failed to source" "the broken component must be named"
   log=$(last_guard_log "$dir")
   [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_guard_error ] || fail "a broken lib must log guard_error: $log"
   pass "fm-turnend-guard: read failures fail open with a loud banner, a guard_error record, and one deduped bug signal"
+}
+
+# --- ORD-231: the original sourcing-failure mode, reproduced hermetically ------
+# The 61 open, still-firing duplicate guard-error bugs came from `fm-nf-attention-lib.sh
+# failed to source` (data/turnend-failopen-x6/report.md): a TRANSIENT source failure under
+# concurrent Stop-hook fan-in, per-$STATE dedup that could not stop cross-home duplicates,
+# and no caller identity to trace it. These cases pin the fix. All are sandboxed: a stub bug
+# CLI, a per-test coalesce dir, and a fixture attention lib - the live runtime is never
+# touched.
+
+# Install a stub attention lib whose source FAILS the first N times it is sourced and then
+# succeeds, using a persisted counter, to model the transient failure exactly.
+install_transient_nf_lib() {  # <dir> <fail-through-attempt-count>
+  local dir=$1 fail_upto=$2
+  cat > "$dir/bin/fm-nf-attention-lib.sh" <<EOF
+_gc="\${FM_TEST_SRCCOUNT:-/dev/null}"
+_gn=0; [ -f "\$_gc" ] && _gn=\$(cat "\$_gc" 2>/dev/null || echo 0)
+_gn=\$((_gn + 1)); echo "\$_gn" > "\$_gc" 2>/dev/null || true
+if [ "\$_gn" -le $fail_upto ]; then return 1; fi
+fm_nf_unattended_ids() { return 0; }
+EOF
+}
+
+install_always_failing_nf_lib() {  # <dir>
+  printf 'return 1\n' > "$1/bin/fm-nf-attention-lib.sh"
+}
+
+install_bug_stub() {  # <dir> <log-path>
+  local dir=$1 log=$2
+  mkdir -p "$dir/stubbin"
+  # shellcheck disable=SC2016  # $*, $$, $RANDOM are literal in the generated stub; they expand when it runs.
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\necho "bug-stub-id-$$-$RANDOM"\n' "$log" > "$dir/stubbin/bugstub"
+  chmod +x "$dir/stubbin/bugstub"
+  printf '%s\n' "$dir/stubbin/bugstub"
+}
+
+# A single transient source failure must be ABSORBED by the bounded retry, not reported as a
+# guard_error and not filed as a bug. This is the exact condition the incident was made of.
+test_hook_source_failure_is_absorbed_by_retry() {
+  local dir home pid out status log stub coalesce
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-transient")
+  home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
+  stub=$(install_bug_stub "$dir" "$home/bug-calls.log")
+  install_transient_nf_lib "$dir" 1
+  pid=$(start_healthy_watcher "$dir")
+  out=$(printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_TEST_SRCCOUNT="$dir/state/.srccount" FM_GUARD_ERROR_COALESCE_DIR="$coalesce" \
+    FM_FLEET_TRIAGE_BUG_CLI="$stub" bash "$dir/bin/fm-turnend-guard.sh" 2>&1)
+  status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "a transient source failure that clears on retry must permit the turn"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_needs_firstmate_empty ] \
+    || fail "the retry must absorb the transient failure, not declare guard_error: $log"
+  [ "$(printf '%s' "$log" | jq -r '.nf_error')" = '' ] || fail "an absorbed transient failure must leave nf_error empty: $log"
+  assert_not_contains "$out" "TURN-END GUARD ERROR" "an absorbed transient failure must not emit a guard-error banner"
+  [ ! -s "$home/bug-calls.log" ] || fail "an absorbed transient failure must not file a bug: $(cat "$home/bug-calls.log")"
+  [ "$(cat "$dir/state/.srccount" 2>/dev/null)" = 2 ] || fail "the source must have been retried exactly once (count=2), got $(cat "$dir/state/.srccount" 2>/dev/null)"
+  pass "fm-turnend-guard: a single transient source failure is absorbed by the bounded retry"
+}
+
+# A PERSISTENT source failure still fails open loudly as guard_error - the retry never mutes
+# a real outage - and the record now carries CALLER IDENTITY so it is traceable.
+test_hook_persistent_source_failure_reports_with_caller_identity() {
+  local dir home pid out status log stub coalesce bugtext
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-persistent")
+  home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
+  stub=$(install_bug_stub "$dir" "$home/bug-calls.log")
+  install_always_failing_nf_lib "$dir"
+  pid=$(start_healthy_watcher "$dir")
+  out=$(printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" \
+    FM_FLEET_TRIAGE_BUG_CLI="$stub" bash "$dir/bin/fm-turnend-guard.sh" 2>&1)
+  status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "a persistent source failure must still fail open, not wedge the primary"
+  assert_contains "$out" "TURN-END GUARD ERROR" "a persistent source failure must stay loud"
+  assert_contains "$out" "fm-nf-attention-lib.sh failed to source" "the failed component must be named"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_guard_error ] || fail "a persistent source failure must log guard_error: $log"
+  # Caller identity is now on the record - the traceability gap ORD-231 was about.
+  [ "$(printf '%s' "$log" | jq -r '.fm_root')" = "$home" ] || fail "the guard_error record must carry fm_root: $log"
+  [ "$(printf '%s' "$log" | jq -r '.state_dir')" = "$home/state" ] || fail "the guard_error record must carry the state dir: $log"
+  [ "$(printf '%s' "$log" | jq -r '.cwd')" != '' ] || fail "the guard_error record must carry cwd: $log"
+  [ "$(printf '%s' "$log" | jq -r '.hook_source')" != '' ] || fail "the guard_error record must carry the hook source: $log"
+  [ "$(printf '%s' "$log" | jq -r '.pid')" != '' ] || fail "the guard_error record must carry the pid: $log"
+  # The filed bug text carries the same identity so a ledger row is traceable on its own.
+  bugtext=$(cat "$home/bug-calls.log")
+  case "$bugtext" in
+    *"Caller: fm_root=$home"*) : ;;
+    *) fail "the filed bug must embed caller identity, got: $bugtext" ;;
+  esac
+  pass "fm-turnend-guard: a persistent source failure fails open as guard_error and carries caller identity"
+}
+
+# THE COALESCING FIX: two DIFFERENT homes hitting the identical failure must file exactly ONE
+# captain bug between them (fleet-wide dedup keyed on the failure fingerprint), where the old
+# per-$STATE marker filed one per home - the mechanism behind ~58 duplicate rows.
+test_hook_guard_error_bug_is_coalesced_fleet_wide() {
+  local base coalesce buglog stub1 stub2 h1 h2 pid1 pid2
+  base="$TMP_ROOT/hook-nf-coalesce"
+  mkdir -p "$base"
+  coalesce="$base/coalesce"
+  buglog="$base/bug-calls.log"
+  h1=$(make_primary_dir "$base/home1")
+  h2=$(make_primary_dir "$base/home2")
+  install_always_failing_nf_lib "$h1"
+  install_always_failing_nf_lib "$h2"
+  stub1=$(install_bug_stub "$h1" "$buglog")
+  stub2=$(install_bug_stub "$h2" "$buglog")
+  pid1=$(start_healthy_watcher "$h1")
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$(cd "$h1" && pwd)" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$stub1" \
+    bash "$h1/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  stop_watcher "$pid1"
+  pid2=$(start_healthy_watcher "$h2")
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$(cd "$h2" && pwd)" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$stub2" \
+    bash "$h2/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  stop_watcher "$pid2"
+  [ "$(grep -c 'turn-end guard' "$buglog" 2>/dev/null)" -eq 1 ] \
+    || fail "the same failure across two homes must file exactly one bug, got: $(cat "$buglog" 2>/dev/null)"
+  # The shared record counted both occurrences even though only one bug was filed.
+  [ "$(grep '^count=' "$coalesce"/*.record 2>/dev/null | head -1 | cut -d= -f2)" = 2 ] \
+    || fail "the shared coalescing record must count both occurrences: $(cat "$coalesce"/*.record 2>/dev/null)"
+  pass "fm-turnend-guard: identical guard errors across homes coalesce into one fleet-wide bug"
+}
+
+# The dedup must NOT be forever: once the window elapses, a genuinely-new recurrence surfaces
+# a fresh bug. With a zero-length window every occurrence re-files.
+test_hook_guard_error_bug_refiles_after_window() {
+  local dir home pid stub coalesce
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-window")
+  home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
+  stub=$(install_bug_stub "$dir" "$home/bug-calls.log")
+  install_always_failing_nf_lib "$dir"
+  pid=$(start_healthy_watcher "$dir")
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_GUARD_ERROR_COALESCE_WINDOW=0 \
+    FM_FLEET_TRIAGE_BUG_CLI="$stub" bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_GUARD_ERROR_COALESCE_WINDOW=0 \
+    FM_FLEET_TRIAGE_BUG_CLI="$stub" bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  stop_watcher "$pid"
+  [ "$(grep -c 'turn-end guard' "$home/bug-calls.log" 2>/dev/null)" -eq 2 ] \
+    || fail "a zero-length window must re-file on every occurrence, got: $(cat "$home/bug-calls.log" 2>/dev/null)"
+  pass "fm-turnend-guard: coalescing expires with the window so a real recurrence is never muted forever"
+}
+
+# FAIL-CLOSED linked-worktree exclusion: a crewmate/scout worktree must stay inert even when
+# `git` itself fails (the transient git failure that let crew worktrees run the primary sweep
+# and fail open - data/turnend-failopen-x6/report.md section 6.5). The .git-file signal is
+# git-binary-independent, so a broken git no longer opens the gate.
+test_hook_linked_worktree_excluded_when_git_is_broken() {
+  local base dir home pid out status gitfake
+  base="$TMP_ROOT/hook-failclosed-base"
+  dir="$TMP_ROOT/hook-failclosed-wt"
+  make_crewmate_worktree_dir "$base" "$dir" >/dev/null
+  home=$(cd "$dir" && pwd)
+  [ -f "$dir/.git" ] || fail "fixture precondition: a linked worktree's .git must be a regular file"
+  gitfake="$TMP_ROOT/hook-failclosed-gitfake"
+  mkdir -p "$gitfake"
+  printf '#!/bin/sh\nexit 1\n' > "$gitfake/git"
+  chmod +x "$gitfake/git"
+  pid=$(start_healthy_watcher "$dir")
+  write_nf_signal "$dir" ship-w1 'done: ready in branch fm/ship-w1'
+  out=$(printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    PATH="$gitfake:$PATH" bash "$dir/bin/fm-turnend-guard.sh" 2>&1)
+  status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "a linked worktree must stay inert even when git fails, never fail open into the primary path"
+  [ -z "$out" ] || fail "a linked worktree with a broken git produced output: $out"
+  [ ! -e "$dir/state/.turnend-guard.log" ] || fail "an excluded linked worktree must never write the decision log"
+  pass "fm-turnend-guard: the linked-worktree exclusion is fail-closed - a broken git no longer opens the gate"
 }
 
 # The other direction is NOT open: a corrupt ledger must not hide work. The fold skips
@@ -2142,6 +2337,11 @@ test_hook_no_progress_permit_queues_a_durable_wake
 test_metrics_report_counts_outcomes
 test_hook_blocks_on_both_reasons_at_once
 test_hook_guard_error_fails_open_loudly
+test_hook_source_failure_is_absorbed_by_retry
+test_hook_persistent_source_failure_reports_with_caller_identity
+test_hook_guard_error_bug_is_coalesced_fleet_wide
+test_hook_guard_error_bug_refiles_after_window
+test_hook_linked_worktree_excluded_when_git_is_broken
 test_hook_malformed_ledger_rows_do_not_hide_work
 test_hook_afk_stands_down_without_losing_work
 test_hook_duty_kill_switch_is_loud_and_logged

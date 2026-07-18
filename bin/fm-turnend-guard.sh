@@ -169,9 +169,24 @@ fi
 [ -d "$FM_ROOT/bin" ] || exit 0
 [ -d "$STATE" ] || exit 0
 
-# The linked-worktree exclusion, applied only where the concept exists and never to a
-# genuinely marked secondmate home (a treehouse-leased secondmate home IS a linked
-# worktree, but it runs its own primary session and must stay guarded). The toplevel
+# FAIL-CLOSED linked-worktree exclusion, git-binary-INDEPENDENT. A linked worktree's .git
+# is a regular FILE ("gitdir: ..."); a real checkout's .git is a DIRECTORY; a non-git
+# rebaselined runtime home has no .git at all. bin/fm-spawn.sh only ever hands a
+# crewmate/scout firstmate-on-itself task a genuine linked worktree, so this identifies one
+# WITHOUT invoking git. It closes the fail-OPEN gap the git-based check below carries: when
+# `git rev-parse` failed for any transient reason (contention under concurrent Stop-hook
+# fan-in), GIT_TOP came back empty, the whole exclusion block was skipped, and the crew
+# worktree ran the primary sweep and failed open - the mechanism behind ORD-231's ~58
+# duplicate guard-error bugs (data/turnend-failopen-x6/report.md section 6.5). A
+# genuinely-marked secondmate home is force-included above and must NOT be excluded here,
+# even though a treehouse-leased one IS a linked worktree.
+if [ "$SECONDMATE_PRIMARY" -eq 0 ] && [ -f "$FM_ROOT/.git" ]; then
+  exit 0
+fi
+
+# The git-based linked-worktree exclusion, kept as a secondary discriminator for the case a
+# checkout's .git is a directory but git-dir still differs from git-common-dir. Applied only
+# where the concept exists and never to a genuinely marked secondmate home. The toplevel
 # comparison keeps this precise: it fires on a task worktree (whose root IS the git
 # toplevel), not on a non-git home that merely happens to sit inside some unrelated
 # repo's tree.
@@ -203,25 +218,132 @@ rule='━━━━━━━━━━━━━━━━━━━━━━━━�
 # durable operational-health signal, because a gate that is silently dead looks exactly
 # like a gate with nothing to say.
 
+# Caller identity for every guard-error record and decision-log line, so a guard_error can
+# be traced to the process that produced it - the traceability gap that made ORD-231's
+# duplicate bugs impossible to attribute (data/turnend-failopen-x6/report.md sections 4 and
+# 6.1). Read from globals at call time; FM_ROOT, STATE, and HARNESS are all resolved before
+# any guard-error path runs. Pure-builtin cwd (pwd), so it works even on a degraded PATH.
+guard_caller_cwd() { pwd -P 2>/dev/null || pwd 2>/dev/null || printf '?'; }
+guard_caller_host() { uname -n 2>/dev/null || printf '?'; }
+guard_caller_line() {
+  printf 'fm_root=%s state=%s cwd=%s hook_source=%s host=%s pid=%s' \
+    "$FM_ROOT" "$STATE" "$(guard_caller_cwd)" "${HARNESS:-unknown}" "$(guard_caller_host)" "$$"
+}
+# Minimal JSON string escaping via bash parameter expansion (no external command), so the
+# jq-free guard-error record path stays valid even when jq itself is the failed component.
+json_escape() {  # <string>
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '%s' "$s"
+}
+
+# The fleet-wide coalescing store for the durable guard-error bug signal. It must be shared
+# across every firstmate home and worktree for the user, because the failure fires in many
+# of them at once (the shipped Stop hook runs the primary guard in every firstmate-repo
+# worktree). Default to a per-user cache path; FM_GUARD_ERROR_COALESCE_DIR overrides it
+# (tests point it at a temp dir), and a home with no HOME/cache falls back to its own state.
+guard_error_coalesce_dir() {
+  if [ -n "${FM_GUARD_ERROR_COALESCE_DIR:-}" ]; then
+    printf '%s' "$FM_GUARD_ERROR_COALESCE_DIR"
+  elif [ -n "${XDG_CACHE_HOME:-}" ]; then
+    printf '%s/firstmate/guard-error' "$XDG_CACHE_HOME"
+  elif [ -n "${HOME:-}" ]; then
+    printf '%s/.cache/firstmate/guard-error' "$HOME"
+  else
+    printf '%s/.guard-error-coalesce' "$STATE"
+  fi
+}
+
 # Raise the durable health signal through the sanctioned bug CLI (the same one the triage
 # enumerator's bugs lane reads; FM_FLEET_TRIAGE_BUG_CLI overrides it, `off` disables).
-# Deduped per failed component via a state marker so a persistent failure files one bug,
-# not one per turn end; the marker set is cleared by the next healthy evaluation so a
-# recurrence after repair files a fresh one. Best-effort in every direction.
+#
+# COALESCED, FLEET-WIDE, TIME-WINDOWED (ORD-231). The old per-$STATE marker could not stop a
+# DIFFERENT home or worktree from re-filing the identical text, and the next healthy
+# evaluation cleared it, so an INTERMITTENT failure filed a fresh captain bug on every
+# recurrence - ~58 identical open bugs in three days (data/turnend-failopen-x6/report.md
+# sections 5 and 6.4). This keys on the failure fingerprint (the component slug) in a
+# shared store: the FIRST occurrence in a window files ONE bug carrying caller identity;
+# every later occurrence with the same fingerprint only increments the shared record. After
+# the window elapses a genuinely-new recurrence surfaces a fresh bug, so a real regression
+# is never muted forever. Best-effort in every direction: a coalescing failure never changes
+# the fail-open decision.
 signal_guard_error_bug() {  # <component> <detail>
-  local cli slug marker
+  local cli slug dir rec lock window now caller waited k v
+  local count first last_bug bug_id new_id
   cli=${FM_FLEET_TRIAGE_BUG_CLI:-}
   [ "$cli" = off ] && return 0
   if [ -z "$cli" ]; then
     cli=$(command -v bug 2>/dev/null) || return 0
   fi
   [ -x "$cli" ] || return 0
+
   slug=$(printf '%s' "$1" | tr -c 'a-zA-Z0-9' '-')
-  marker="$STATE/.turnend-guard-error-reported-$slug"
-  [ -e "$marker" ] && return 0
-  "$cli" record "turn-end guard could not inspect fleet state ($1): $2. The unattended-work gate is failing open until this is repaired; see state/.turnend-guard.log for guard_error decisions." \
-    --quiet >/dev/null 2>&1 || return 0
-  : > "$marker" 2>/dev/null || true
+  dir=$(guard_error_coalesce_dir)
+  mkdir -p "$dir" 2>/dev/null || return 0
+  rec="$dir/$slug.record"
+  lock="$dir/$slug.lock"
+  window=${FM_GUARD_ERROR_COALESCE_WINDOW:-86400}
+  case "$window" in *[!0-9]*) window=86400 ;; '') window=86400 ;; esac
+  now=$(date -u +%s 2>/dev/null || printf 0)
+  caller=$(guard_caller_line)
+
+  # Serialize concurrent Stop hooks racing the same fingerprint. mkdir is atomic across
+  # processes; a brief bounded wait covers the near-simultaneous pair/triple the incident
+  # showed, and if the lock cannot be taken we treat this occurrence as coalesced rather
+  # than file a racing duplicate.
+  waited=0
+  until mkdir "$lock" 2>/dev/null; do
+    waited=$((waited + 1))
+    [ "$waited" -gt 50 ] && return 0
+    sleep 0.1 2>/dev/null || true
+  done
+
+  count=0
+  first=$now
+  last_bug=0
+  bug_id='-'
+  if [ -f "$rec" ]; then
+    while IFS='=' read -r k v; do
+      case "$k" in
+        count) count=$v ;;
+        first_seen) first=$v ;;
+        last_bug_epoch) last_bug=$v ;;
+        bug_id) bug_id=$v ;;
+      esac
+    done < "$rec"
+    case "$count" in *[!0-9]*) count=0 ;; '') count=0 ;; esac
+    case "$last_bug" in *[!0-9]*) last_bug=0 ;; '') last_bug=0 ;; esac
+    case "$first" in *[!0-9]*) first=$now ;; '') first=$now ;; esac
+  fi
+  count=$((count + 1))
+
+  if [ ! -f "$rec" ] || [ "$((now - last_bug))" -ge "$window" ]; then
+    # File exactly one captain bug for this fingerprint in this window, carrying caller
+    # identity and enough context that the ledger stays self-describing.
+    new_id=$("$cli" record "turn-end guard could not inspect fleet state ($1): $2. The unattended-work gate is failing open until this is repaired. Caller: $caller. Coalesced per failure fingerprint ($slug): repeat occurrences update a shared record ($rec) instead of filing new bugs; see state/.turnend-guard.log for guard_error decisions." \
+      --quiet 2>/dev/null) || new_id=''
+    [ -n "$new_id" ] && bug_id=$new_id
+    last_bug=$now
+  fi
+
+  # Persist the shared record (plain key=value; never sourced back, so no code-exec risk).
+  if {
+    printf 'fingerprint=%s\n' "$slug"
+    printf 'first_seen=%s\n' "$first"
+    printf 'last_bug_epoch=%s\n' "$last_bug"
+    printf 'last_seen=%s\n' "$now"
+    printf 'count=%s\n' "$count"
+    printf 'bug_id=%s\n' "$bug_id"
+    printf 'last_caller=%s\n' "$caller"
+  } > "$rec.tmp.$$" 2>/dev/null; then
+    mv -f "$rec.tmp.$$" "$rec" 2>/dev/null || rm -f "$rec.tmp.$$" 2>/dev/null
+  else
+    rm -f "$rec.tmp.$$" 2>/dev/null || true
+  fi
+
+  rmdir "$lock" 2>/dev/null || true
+  return 0
 }
 
 guard_error_banner() {  # <component> <detail>
@@ -238,10 +360,18 @@ guard_error_banner() {  # <component> <detail>
 }
 
 # Log a guard_error decision without jq (jq itself may be the failed component). Every
-# interpolated value here is guard-controlled text, never transcript content.
+# interpolated value here is guard-controlled text, never transcript content. Carries caller
+# identity so even a jq-less guard_error is traceable to its originating process (ORD-231).
 log_guard_error_raw() {  # <component>
-  printf '{"ts":"%s","watcher":"unknown","in_flight":-1,"needs_firstmate":-1,"nf_items":"","nf_gate":"on","nf_error":"%s","decision":"allowed_guard_error","reason":"%s","loop_protection":false}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$1" >> "$LOG" 2>/dev/null || true
+  local esc_comp esc_root esc_state esc_cwd esc_host esc_hook
+  esc_comp=$(json_escape "$1")
+  esc_root=$(json_escape "$FM_ROOT")
+  esc_state=$(json_escape "$STATE")
+  esc_cwd=$(json_escape "$(guard_caller_cwd)")
+  esc_host=$(json_escape "$(guard_caller_host)")
+  esc_hook=$(json_escape "${HARNESS:-unknown}")
+  printf '{"ts":"%s","watcher":"unknown","in_flight":-1,"needs_firstmate":-1,"nf_items":"","nf_gate":"on","nf_error":"%s","decision":"allowed_guard_error","reason":"%s","loop_protection":false,"fm_root":"%s","state_dir":"%s","cwd":"%s","hook_source":"%s","host":"%s","pid":%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$esc_comp" "$esc_comp" "$esc_root" "$esc_state" "$esc_cwd" "$esc_hook" "$esc_host" "$$" >> "$LOG" 2>/dev/null || true
 }
 
 # jq is the repo's established JSON dependency. Without it we cannot safely read the
@@ -330,9 +460,7 @@ NF_LIB="$SCRIPT_DIR/fm-nf-attention-lib.sh"
 NF_SWEEP='. "$1" 2>/dev/null || exit 3
 command -v fm_nf_unattended_ids >/dev/null 2>&1 || exit 4
 fm_nf_unattended_ids "$2" "$3"'
-if [ ! -f "$NF_LIB" ]; then
-  nf_error='fm-nf-attention-lib.sh missing'
-else
+run_nf_sweep() {  # sets nf_ids and sweep_rc
   if command -v timeout >/dev/null 2>&1; then
     nf_ids=$(timeout "${FM_TURNEND_SWEEP_TIMEOUT:-30}" bash -c "$NF_SWEEP" _ "$NF_LIB" "$STATE" "$DATA" 2>/dev/null)
     sweep_rc=$?
@@ -340,6 +468,29 @@ else
     nf_ids=$(bash -c "$NF_SWEEP" _ "$NF_LIB" "$STATE" "$DATA" 2>/dev/null)
     sweep_rc=$?
   fi
+}
+if [ ! -f "$NF_LIB" ]; then
+  nf_error='fm-nf-attention-lib.sh missing'
+else
+  # BOUNDED RETRY before declaring guard_error (ORD-231). The sweep failure that spammed
+  # ~58 duplicate captain bugs was TRANSIENT under concurrent Stop-hook fan-in, not a code
+  # defect: the lib is byte-identical across homes and sources cleanly in isolation
+  # (data/turnend-failopen-x6/report.md section 2). A small retry, well inside
+  # FM_TURNEND_SWEEP_TIMEOUT, absorbs the transient case; a persistently-broken environment
+  # still reports guard_error after the last attempt rather than hanging. A timeout (124) is
+  # never retried - it already consumed the hook's budget.
+  sweep_attempts=${FM_TURNEND_SWEEP_ATTEMPTS:-2}
+  case "$sweep_attempts" in *[!0-9]*) sweep_attempts=2 ;; '') sweep_attempts=2 ;; esac
+  [ "$sweep_attempts" -lt 1 ] && sweep_attempts=1
+  sweep_try=1
+  while :; do
+    run_nf_sweep
+    if [ "$sweep_rc" -eq 0 ] || [ "$sweep_rc" -eq 124 ] || [ "$sweep_try" -ge "$sweep_attempts" ]; then
+      break
+    fi
+    sweep_try=$((sweep_try + 1))
+    sleep "${FM_TURNEND_SWEEP_RETRY_DELAY:-0.2}" 2>/dev/null || true
+  done
   case "$sweep_rc" in
     0) : ;;
     3) nf_error='fm-nf-attention-lib.sh failed to source'; nf_ids='' ;;
@@ -426,6 +577,12 @@ log_decision() {  # <decision> <reason>
     --arg supervision_health "${FM_SUP_HEALTH_STATE:-unknown}" \
     --arg supervision_reason "${FM_SUP_HEALTH_REASON:-unknown}" \
     --arg supervision_harness "$HARNESS" \
+    --arg fm_root "$FM_ROOT" \
+    --arg state_dir "$STATE" \
+    --arg cwd "$(guard_caller_cwd)" \
+    --arg hook_source "${HARNESS:-unknown}" \
+    --arg host "$(guard_caller_host)" \
+    --argjson pid "$$" \
     --argjson loop_protection "$([ "$STOP_HOOK_ACTIVE" = true ] && echo true || echo false)" \
     '{ts: $ts, watcher: $watcher, in_flight: $in_flight, needs_firstmate: $nf,
       nf_items: $nf_items, nf_gate: $nf_gate, nf_error: $nf_error,
@@ -433,7 +590,9 @@ log_decision() {  # <decision> <reason>
       beacon_age: $beacon_age, lock_pid: $lock_pid, lock_pid_alive: $lock_pid_alive,
       identity_match: $identity_match, home_match: $home_match, path_match: $path_match,
       watcher_fail: $watcher_fail, supervision_health: $supervision_health,
-      supervision_reason: $supervision_reason, supervision_harness: $supervision_harness}' 2>/dev/null) \
+      supervision_reason: $supervision_reason, supervision_harness: $supervision_harness,
+      fm_root: $fm_root, state_dir: $state_dir, cwd: $cwd, hook_source: $hook_source,
+      host: $host, pid: $pid}' 2>/dev/null) \
     || return 0
   printf '%s\n' "$line" >> "$LOG" 2>/dev/null || return 0
   # Bounded: this is an operational trail, not an archive.
@@ -447,11 +606,13 @@ log_decision() {  # <decision> <reason>
   return 0
 }
 
-# A healthy, genuinely-empty evaluation closes any open block episode and clears the
-# guard-error report markers, so a repaired component that breaks again files a fresh bug.
+# A healthy, genuinely-empty evaluation closes any open block episode. It deliberately does
+# NOT reset the guard-error coalescing store: an INTERMITTENT failure interleaves healthy
+# evaluations with failing ones, and clearing the dedup on every healthy pass is exactly
+# what re-filed a fresh captain bug on each recurrence (ORD-231). The coalescing window
+# alone governs when a genuinely-new recurrence surfaces again.
 mark_healthy() {
   rm -f "$BLOCK_IDS_FILE" 2>/dev/null || true
-  rm -f "$STATE"/.turnend-guard-error-reported-* 2>/dev/null || true
 }
 
 # The FM_TRIAGE_DUTY=off kill switch is a captain-sanctioned operator escape hatch, and an
