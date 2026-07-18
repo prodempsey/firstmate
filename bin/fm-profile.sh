@@ -160,7 +160,14 @@ BINDING_SOURCE=legacy-fallback
 BINDING=
 
 if [ -f "$BINDINGS" ]; then
-  jq -e . "$BINDINGS" >/dev/null 2>&1 || die "invalid JSON in $BINDINGS"
+  # Fail-closed bindings validation (ORD-225 Phase 2E): a present-but-invalid
+  # bindings file stops resolution entirely - no legacy fallback, no default
+  # model, no dispatch. A MISSING file keeps the documented legacy fallback
+  # above (which resolves to the crew harness with an empty model and can never
+  # select Fable), unchanged from pre-slice behavior. The validator prints one
+  # stable BINDINGS_* code to stderr and preserves the invalid file untouched.
+  "$SCRIPT_DIR/fm-bindings-validate.sh" "$BINDINGS" --quiet --write-sidecar ||
+    die "bindings validation failed for $BINDINGS (code above; file preserved for investigation; refusing to resolve or dispatch)"
   BINDING=$(jq -c --arg p "$PROFILE" '.[$p] // empty | objects' "$BINDINGS" || true)
   if [ -n "$BINDING" ]; then
     if [ "$(printf '%s' "$BINDING" | jq 'has("counterpart")')" = "true" ]; then

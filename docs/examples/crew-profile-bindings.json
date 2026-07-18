@@ -1,5 +1,5 @@
 {
-  "_comment": "EXAMPLE ONLY. Copy to state/crew-profile-bindings.json and edit. Never commit the real file.",
+  "_comment": "EXAMPLE ONLY. Copy to state/crew-profile-bindings.json and edit. Never commit the real file. The live copy also requires a metadata sidecar at state/crew-profile-bindings.meta.json; both are validated fail-closed (stable BINDINGS_* codes plus a semantic sha256 fingerprint) by bin/fm-bindings-validate.sh.",
   "scout_fast":           { "harness": "codex",  "model": "gpt-5.4" },
   "scout_balanced":       { "harness": "codex",  "model": "gpt-5.5" },
   "implementer_balanced": {

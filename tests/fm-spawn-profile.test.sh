@@ -26,6 +26,9 @@ require_jq() {
 }
 
 # Synthetic runtime bindings with placeholder model names (never real model IDs).
+# Also writes the metadata sidecar the fail-closed validator (bin/fm-bindings-validate.sh,
+# wired into fm-profile.sh) now requires beside any present bindings file; without it,
+# resolution would abort with BINDINGS_METADATA_INVALID before any routing happens.
 write_bindings() {
   cat > "$1" <<'JSON'
 {
@@ -53,6 +56,18 @@ write_bindings() {
       }
     }
   }
+}
+JSON
+  cat > "${1%.json}.meta.json" <<'JSON'
+{
+  "schema_version": 1,
+  "config_role": "crew-profile-bindings-live",
+  "environment": "sandbox",
+  "authority": "firstmate routing behavior tests",
+  "owner": "sandbox test home",
+  "source_example": "docs/examples/crew-profile-bindings.json",
+  "commit_policy": "never committed",
+  "description": "synthetic routing bindings for fm-spawn-profile behavior checks"
 }
 JSON
 }
@@ -163,13 +178,17 @@ test_missing_primary_harness_selects_backup() {
   require_jq
   home=$(make_profile_home missing-harness)
   bindings="$home/state/crew-profile-bindings.json"
-  jq '.scout_fast.harness = "missing-harness-command"' "$bindings" > "$bindings.tmp"
+  # Use "pi": a verified harness NAME (so the fail-closed validator accepts the
+  # file) whose command is absent from the fakebin and CI PATH, so candidate
+  # availability still fails over to the backup. An invalid name would now be
+  # rejected at validation time, before failover could be exercised.
+  jq '.scout_fast.harness = "pi"' "$bindings" > "$bindings.tmp"
   mv "$bindings.tmp" "$bindings"
 
   out=$(run_profile "$home" file_discovery) || fail "missing harness failover resolution failed"$'\n'"$out"
   assert_contains "$out" "HARNESS=grok" "missing primary harness command should select the backup"
   assert_contains "$out" "CANDIDATE_INDEX=1" "missing harness failover should report backup index one"
-  assert_contains "$out" "harness command 'missing-harness-command' not found" "missing harness reason missing"
+  assert_contains "$out" "harness command 'pi' not found" "missing harness reason missing"
   pass "unavailable primary harness command selects the first healthy backup"
 }
 

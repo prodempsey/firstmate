@@ -48,6 +48,10 @@ The shared no-mistakes gate refusal used by `fm-spawn.sh`, `fm-send.sh`, and `fm
 | `fm-spawn.sh`            | Spawn crewmates, scouts, `id=repo` batches, and secondmates on the resolved harness and runtime backend |
 | `fm-profile.sh`          | Resolve a task class to a capability profile (harness/model/effort) from crew-profiles.json       |
 | `fm-spawn-profile.sh`    | Thin `--class`/`--profile` spawn wrapper that resolves a profile and calls `fm-spawn.sh`          |
+| `fm-bindings-validate.sh` | Fail-closed validator and semantic fingerprint for the live crew-profile bindings file (stable BINDINGS_* codes) |
+| `fm-runtime-deploy.sh`   | Deterministically deploy the manifested implementation artifacts from this template checkout into a target runtime FM_HOME |
+| `fm-runtime-drift.sh`    | Report drift between this template checkout and a target runtime for the manifested artifacts; never touches production-local state |
+| `fm-runtime-manifest-lib.sh` | Shared deploy-manifest schema, artifact iteration, state/ refusal, and checksum helpers for the runtime deploy/drift scripts |
 | `fm-dispatch-select.sh`  | Resolve a matched crew-dispatch rule to one concrete profile, owning `quota-balanced` selection |
 | `fm-backend.sh`          | Runtime-backend selection, meta helpers, selector resolution, and operation dispatch |
 | `fm-backend-hometag-lib.sh` | Shared per-installation home-tag derivation for zellij tab and cmux workspace titles |

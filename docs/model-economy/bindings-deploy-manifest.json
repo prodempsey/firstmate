@@ -1,0 +1,10 @@
+{
+  "manifest_version": 1,
+  "slice": "bindings-validation-phase2",
+  "description": "ORD-226 Phase 2 bindings validation slice. Covers exactly the fail-closed bindings validator, its fm-profile.sh wiring, and the colocated validator tests. The template and a runtime currently differ in unrelated scripts; this manifest deliberately deploys only these three artifacts so the slice never carries unrelated changes. The production-local bindings, metadata sidecar, and fingerprint sidecar under state/ are never listed here and are never deployed.",
+  "artifacts": [
+    { "source": "bin/fm-bindings-validate.sh", "dest": "bin/fm-bindings-validate.sh" },
+    { "source": "bin/fm-profile.sh", "dest": "bin/fm-profile.sh" },
+    { "source": "tests/fm-bindings-validate.test.sh", "dest": "tests/fm-bindings-validate.test.sh" }
+  ]
+}
