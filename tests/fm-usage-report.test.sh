@@ -13,6 +13,9 @@
 #   - empty inputs still produce a valid report
 #   - FM_STATE_OVERRIDE input scoping
 #   - the accumulator survives a fleet larger than the argv limit
+#   - interval overlap: a task spanning the whole window is kept (QA finding 1)
+#   - index.jsonl is physical JSON Lines, one object per line (QA finding 2)
+#   - same-second archive runs do not overwrite each other (QA finding 3)
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -195,5 +198,75 @@ pass "accumulator handles a fleet larger than the argv limit"
 "$USAGE" --nonsense >/dev/null 2>&1 && fail "unknown arg should exit non-zero"
 "$USAGE" --target >/dev/null 2>&1 && fail "flag missing value should exit non-zero"
 pass "argument errors exit non-zero"
+
+# --- 11. interval overlap keeps window-spanning tasks (QA finding 1) --------
+# Window 2026-07-10..2026-07-11 (date-only: 00:00:00Z .. 23:59:59Z), now well
+# after. A task is in the report when its [spawned,ended] interval OVERLAPS the
+# window, not when a single collapsed timestamp lands inside it.
+present() { jq -e --arg m "$2" 'any(.panels.model_mix.by_harness_model_effort[]; .model==$m)' "$1" >/dev/null 2>&1; }
+IH=$(make_home overlap)
+IS=$IH/state
+# live meta spawned BEFORE the window, still running -> interval [spawn, now]
+# overlaps -> kept (the live-meta half of the same interval bug).
+fm_write_meta "$IS/live-span.meta" \
+  project=/home/prode/fleet/firstmate harness=claude kind=ship \
+  model=claude-fable-5 effort=high spawned_at=2026-07-05T00:00:00Z
+IL=$IS/task-runs.jsonl
+# spanning: spawned before --since, ended after --until -> overlaps whole window.
+append_run "$IL" span ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-20T00:00:00Z
+# append_run sets spawned_at==ended_at; overwrite span's spawned_at to 07-01.
+jq -c 'if .task=="span" then .spawned_at="2026-07-01T00:00:00Z" else . end' "$IL" > "$IL.tmp" && mv "$IL.tmp" "$IL"
+# boundary: ended EXACTLY at --since 00:00:00Z -> end>=since is inclusive -> kept.
+append_run "$IL" bend scout /home/prode/fleet/krakenloop codex gpt-5.5 high 2026-07-10T00:00:00Z
+jq -c 'if .task=="bend" then .spawned_at="2026-07-08T00:00:00Z" else . end' "$IL" > "$IL.tmp" && mv "$IL.tmp" "$IL"
+# boundary: spawned EXACTLY at --until 23:59:59Z -> start<=until inclusive -> kept.
+append_run "$IL" bstart ship /home/prode/fleet/fleet-bridge grok grok-4.5 high 2026-07-13T00:00:00Z
+jq -c 'if .task=="bstart" then .spawned_at="2026-07-11T23:59:59Z" else . end' "$IL" > "$IL.tmp" && mv "$IL.tmp" "$IL"
+# entirely before and entirely after -> excluded.
+append_run "$IL" before ship /home/prode/fleet/firstmate claude claude-sonnet-5 default 2026-07-06T00:00:00Z
+append_run "$IL" after ship /home/prode/fleet/firstmate codex gpt-5.6-sol high 2026-07-16T00:00:00Z
+
+FM_USAGE_NOW=2026-07-25T00:00:00Z "$USAGE" --target "$IH" --since 2026-07-10 --until 2026-07-11 >/dev/null
+IJ=$IH/$OUT_SUB/latest.json
+[ "$(jq -r '.totals.tasks' "$IJ")" = 4 ] || fail "overlap totals: got $(jq -c .totals "$IJ")"
+present "$IJ" claude-opus-4-8 || fail "spanning task must be kept"
+present "$IJ" claude-fable-5  || fail "live task spanning into the window must be kept"
+present "$IJ" gpt-5.5         || fail "task ending exactly at --since must be kept"
+present "$IJ" grok-4.5        || fail "task spawned exactly at --until must be kept"
+present "$IJ" claude-sonnet-5 && fail "entirely-before task must be excluded"
+present "$IJ" gpt-5.6-sol     && fail "entirely-after task must be excluded"
+pass "window overlap keeps spanning and boundary tasks, drops disjoint ones"
+
+# --- 12+13. index is real JSONL and archives never overwrite (findings 2,3) --
+# Two runs at the SAME pinned second with DIFFERENT input must each leave a
+# distinct immutable archive and a distinct physical JSONL index line.
+CH=$(make_home collide)
+fm_write_meta "$CH/state/c1.meta" \
+  project=/home/prode/fleet/firstmate harness=claude kind=ship \
+  model=claude-opus-4-8 effort=high spawned_at=2026-07-15T10:00:00Z
+FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" --target "$CH" --since 2026-07-01 --until 2026-07-18 >/dev/null
+# Change the input, then run again with the IDENTICAL clock.
+fm_write_meta "$CH/state/c2.meta" \
+  project=/home/prode/fleet/krakenloop harness=codex kind=scout \
+  model=gpt-5.5 effort=high spawned_at=2026-07-16T10:00:00Z
+FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" --target "$CH" --since 2026-07-01 --until 2026-07-18 >/dev/null
+
+CIDX=$CH/$OUT_SUB/index.jsonl
+# Finding 2: exactly two PHYSICAL lines, each parsing as one object.
+[ "$(wc -l < "$CIDX")" = 2 ] || fail "index.jsonl must have exactly 2 physical lines, got $(wc -l < "$CIDX")"
+li=0
+while IFS= read -r ln; do
+  li=$((li + 1))
+  printf '%s' "$ln" | jq -e 'type=="object"' >/dev/null 2>&1 || fail "index line $li is not a single JSON object"
+done < "$CIDX"
+[ "$li" = 2 ] || fail "index.jsonl line count mismatch"
+# Finding 3: two distinct, non-overwritten archive snapshots.
+CHIST=$CH/$OUT_SUB/history
+[ "$(find "$CHIST" -name 'usage-*.json' | wc -l)" = 2 ] || fail "same-second runs must leave 2 archive json files"
+[ "$(jq -r '.path' "$CIDX" | sort -u | wc -l)" = 2 ] || fail "index must reference 2 distinct archive paths"
+# The two archives preserve the two different reports (1 task, then 2 tasks).
+COUNTS=$(find "$CHIST" -name 'usage-*.json' -exec jq -r '.totals.tasks' {} \; | sort | tr '\n' ' ')
+[ "$COUNTS" = "1 2 " ] || fail "archives must preserve both distinct reports, got '$COUNTS'"
+pass "index.jsonl is real JSONL and same-second archives never overwrite"
 
 echo "ok - fm-usage-report.test.sh"

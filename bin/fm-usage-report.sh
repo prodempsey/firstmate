@@ -139,11 +139,20 @@ UNTIL_EPOCH="$(to_epoch "$UNTIL_ISO")"
 REC_FILE="$(mktemp "${TMPDIR:-/tmp}/fm-usage-recs.XXXXXX")"
 trap 'rm -f "$REC_FILE"' EXIT
 
-# in_window <epoch-or-empty> -> prints "yes"/"no"/"undated"
-in_window() {
-  local e="$1"
-  [ -n "$e" ] || { printf 'undated'; return; }
-  if [ "$e" -ge "$SINCE_EPOCH" ] && [ "$e" -le "$UNTIL_EPOCH" ]; then printf 'yes'; else printf 'no'; fi
+# window_decision <start-epoch-or-empty> <end-epoch-or-empty> -> yes|no|undated
+# A task occupies the interval [start,end]; it belongs in the report when that
+# interval OVERLAPS [SINCE,UNTIL] - i.e. start <= UNTIL and end >= SINCE - not
+# when a single collapsed timestamp lands inside the bounds. Reducing a task to
+# one point wrongly drops a task that spawned before --since and ended after
+# --until (it spans, and overlaps, the whole window). Either bound may be empty
+# (absent/unparseable): a single present bound collapses to a point; both absent
+# means the task cannot be windowed at all (undated) and is always kept.
+window_decision() {
+  local s="$1" e="$2" lo hi t
+  if [ -z "$s" ] && [ -z "$e" ]; then printf 'undated'; return; fi
+  lo="${s:-$e}"; hi="${e:-$s}"
+  if [ "$lo" -gt "$hi" ]; then t="$lo"; lo="$hi"; hi="$t"; fi
+  if [ "$lo" -le "$UNTIL_EPOCH" ] && [ "$hi" -ge "$SINCE_EPOCH" ]; then printf 'yes'; else printf 'no'; fi
 }
 
 emit_record() {  # <task> <source> <live-bool> <harness> <model> <effort> <kind> <repo> <profile> <class> <provider> <dated-bool>
@@ -188,8 +197,15 @@ for meta in "$STATE"/*.meta; do
   done < "$meta"
   SEEN["$task"]=1
   repo=""; [ -n "$project" ] && repo="$(basename "$project")"
-  ts_epoch="$(to_epoch "$spawned_at")"
-  case "$(in_window "$ts_epoch")" in
+  # A live task is still running, so its interval is [spawned_at, now]: it
+  # overlaps any window up to the present, including one that opened after it
+  # spawned. Undated (no spawned_at) stays always-included.
+  sp_epoch="$(to_epoch "$spawned_at")"
+  end_epoch=""
+  if [ -n "$sp_epoch" ]; then
+    end_epoch="$NOW_EPOCH"; [ "$end_epoch" -lt "$sp_epoch" ] && end_epoch="$sp_epoch"
+  fi
+  case "$(window_decision "$sp_epoch" "$end_epoch")" in
     no) continue ;;
     undated) dated=false ;;
     *) dated=true ;;
@@ -209,19 +225,22 @@ if [ -f "$LEDGER" ]; then
     SEEN["$task"]=1
     # Join with the unit separator (0x1f), NOT a tab: with IFS set to a
     # whitespace character, `read` collapses runs of it and drops empty fields
-    # (a null provider would then shift ts_iso off the end). 0x1f is
+    # (a null provider would then shift later fields off the end). 0x1f is
     # non-whitespace, so empty fields are preserved positionally.
     row="$(printf '%s' "$line" | jq -rj '
       [ (.harness // ""), (.model // ""), (.effort // ""), (.kind // ""),
         (.project // ""), (.provider // ""),
-        (.ended_at // .spawned_at // "") ] | join("\u001f")' 2>/dev/null || true)"
+        (.spawned_at // ""), (.ended_at // "") ] | join("\u001f")' 2>/dev/null || true)"
     [ -n "$row" ] || continue
-    IFS=$'\x1f' read -r harness model effort kind project provider ts_iso <<EOF
+    IFS=$'\x1f' read -r harness model effort kind project provider sp_iso en_iso <<EOF
 $row
 EOF
     repo=""; [ -n "$project" ] && repo="$(basename "$project")"
-    ts_epoch="$(to_epoch "$ts_iso")"
-    case "$(in_window "$ts_epoch")" in
+    # A closed task occupies [spawned_at, ended_at]; keep it when that interval
+    # overlaps the window, so a task that spanned the whole window is not dropped.
+    sp_epoch="$(to_epoch "$sp_iso")"
+    en_epoch="$(to_epoch "$en_iso")"
+    case "$(window_decision "$sp_epoch" "$en_epoch")" in
       no) continue ;;
       undated) dated=false ;;
       *) dated=true ;;
@@ -359,17 +378,33 @@ jq -r '
 ' "$LATEST_JSON" > "$LATEST_MD"
 
 # --- dated archive copy + run index ------------------------------------------
+# The archive is an IMMUTABLE per-run snapshot, but the stamp has only second
+# precision, so two runs in the same second (a pinned test clock, or genuinely
+# concurrent/repeated invocations) would collide. Claim a unique slot with an
+# atomic no-clobber create (O_EXCL): the first run at a second gets usage-<STAMP>,
+# the next usage-<STAMP>-1, and so on, so no prior snapshot is ever overwritten.
 STAMP="$(date -u -d "$NOW_ISO" +%Y%m%dT%H%M%SZ)"
-cp "$LATEST_JSON" "$OUT/history/usage-$STAMP.json"
-cp "$LATEST_MD" "$OUT/history/usage-$STAMP.md"
+BASE=""
+i=0
+while [ "$i" -lt 100000 ]; do
+  if [ "$i" -eq 0 ]; then cand="usage-$STAMP"; else cand="usage-$STAMP-$i"; fi
+  if ( set -o noclobber; : > "$OUT/history/$cand.json" ) 2>/dev/null; then BASE="$cand"; break; fi
+  i=$((i + 1))
+done
+[ -n "$BASE" ] || { echo "fm-usage-report: could not allocate a unique archive name in $OUT/history" >&2; exit 2; }
+cp "$LATEST_JSON" "$OUT/history/$BASE.json"
+cp "$LATEST_MD" "$OUT/history/$BASE.md"
 
 # Fingerprint the mix content only (window + totals + model_mix), never the wall
 # clock, so identical inputs over the same window fingerprint identically.
 FINGERPRINT="$(jq -S '{window, totals, model_mix: .panels.model_mix}' "$LATEST_JSON" \
   | sha256sum | cut -d' ' -f1)"
-jq -n \
+# -cn: one COMPACT JSON object per physical line, so index.jsonl is valid JSON
+# Lines (section 3.2); a pretty-printed object would span several lines and break
+# any line-oriented reader.
+jq -cn \
   --arg ts "$NOW_ISO" --arg since "$SINCE_ISO" --arg until "$UNTIL_ISO" \
-  --arg path "history/usage-$STAMP.json" --arg fingerprint "$FINGERPRINT" \
+  --arg path "history/$BASE.json" --arg fingerprint "$FINGERPRINT" \
   '{ts: $ts, since: $since, until: $until, path: $path, fingerprint: $fingerprint}' \
   >> "$OUT/index.jsonl"
 
