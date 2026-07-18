@@ -103,16 +103,29 @@ fm_composer_trim() {  # <string> -> normalized, trimmed string on stdout
   printf '%s' "$out"
 }
 
-# fm_composer_strip_ansi: drop every CSI escape sequence, leaving plain text.
-# Used for STRUCTURAL row/shape detection, where ghost text must be KEPT so the
-# composer box border or bare prompt glyph is still visible; content extraction
-# uses fm_composer_strip_ghost instead. Reads the styled text on stdin and prints
-# plain text (stdin-only, matching fm_composer_strip_ghost). The character class
-# includes ':' so an ITU colon-form SGR (38:2::r:g:b) is stripped whole, not left
-# with a dangling tail.
+# fm_composer_strip_ansi: drop every CSI and string (OSC/DCS/APC/PM/SOS) escape
+# sequence, leaving plain text. Used for STRUCTURAL row/shape detection, where
+# ghost text must be KEPT so the composer box border or bare prompt glyph is still
+# visible; content extraction uses fm_composer_strip_ghost instead. Reads the
+# styled text on stdin and prints plain text (stdin-only, matching
+# fm_composer_strip_ghost). The CSI character class includes ':' so an ITU
+# colon-form SGR (38:2::r:g:b) is stripped whole, not left with a dangling tail.
+#
+# OSC/string sequences (ESC ] ... ST, and the DCS/APC/PM/SOS ESC P/_/^/X forms)
+# must be stripped too: modern terminals and TUIs inject OSC-8 hyperlinks that can
+# wrap a bare agent glyph or an otherwise-empty row. A stripper that dropped only
+# the ESC left the payload (e.g. `]8;;http://...`) as printable garbage, which is
+# non-empty content, so a genuinely empty composer misread as `pending` on the
+# safety-critical empty|pending|unknown contract. A string sequence runs from its
+# introducer to a String Terminator - BEL, or ESC \. The content class excludes
+# both BEL and ESC, so `[^BEL ESC]*` cannot span past one sequence's terminator.
 fm_composer_strip_ansi() {
-  local esc; esc=$(printf '\033')
-  LC_ALL=C sed "s/${esc}\\[[0-9;:?]*[[:alpha:]]//g"
+  local esc bel
+  esc=$(printf '\033')
+  bel=$(printf '\007')
+  LC_ALL=C sed -E \
+    -e "s/${esc}[]P_^X][^${bel}${esc}]*(${bel}|${esc}\\\\)?//g" \
+    -e "s/${esc}\\[[0-9;:?]*[[:alpha:]]//g"
 }
 
 # fm_composer_strip_ghost: the ONE fleet-wide ANSI-aware extractor of "real typed
@@ -174,7 +187,7 @@ fm_composer_strip_ghost() {
       line = $0; out = ""; dim = 0; darkfg = 0; n = length(line); i = 1
       while (i <= n) {
         c = substr(line, i, 1)
-        if (c == "\033") {            # ESC: consume a CSI ... final-byte sequence
+        if (c == "\033") {            # ESC: consume a CSI or string escape sequence
           j = i + 1
           if (substr(line, j, 1) == "[") {
             j++; params = ""
@@ -202,6 +215,21 @@ fm_composer_strip_ghost() {
               }
             }
             if (j <= n) { i = j + 1; continue }
+          }
+          # OSC/DCS/APC/PM/SOS string sequence (ESC ]/P/_/^/X ... ST): consume the
+          # whole run through its String Terminator (BEL, or ESC \), so an OSC-8
+          # hyperlink wrapping a glyph or an empty row is dropped rather than left
+          # as printable garbage that would read as real typed content.
+          nc = substr(line, j, 1)
+          if (nc == "]" || nc == "P" || nc == "_" || nc == "^" || nc == "X") {
+            j++
+            while (j <= n) {
+              sc = substr(line, j, 1)
+              if (sc == "\007") { j++; break }
+              if (sc == "\033" && substr(line, j + 1, 1) == "\\") { j += 2; break }
+              j++
+            }
+            i = j; continue
           }
           i = i + 1; continue          # lone/other ESC: drop the ESC byte only
         }

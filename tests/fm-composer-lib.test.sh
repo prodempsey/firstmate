@@ -179,10 +179,76 @@ test_nbsp_does_not_loosen_the_safety_verdicts() {
   pass "fm_composer_classify_content: NBSP folding keeps unknown/pending verdicts intact"
 }
 
+# --- OSC / string escape sequences (bughunt-fm-h2 finding 2) ----------------
+#
+# Modern terminals and TUIs inject OSC-8 hyperlinks (ESC ] 8 ; ; URL ST ... ST)
+# and other string escape sequences that a plain capture keeps as bytes. The
+# stripper used to remove only CSI (ESC [ ... final) sequences, so an OSC run
+# survived: fm_composer_strip_ansi left the ESC in place and fm_composer_strip_ghost
+# dropped only the ESC byte, turning the payload into printable garbage like
+# "]8;;http://...\". That garbage is non-empty content, so a genuinely empty
+# composer - or a bare agent glyph wrapped in an OSC-8 link - misread as `pending`
+# on the safety-critical empty|pending|unknown contract. Both strippers must now
+# consume the whole string sequence through its String Terminator (BEL or ESC \).
+ESC_BYTE=$(printf '\033'); BEL_BYTE=$(printf '\007')
+
+test_osc_wrapped_agent_glyph_is_empty() {
+  local row plain ghost out
+  # OSC-8 hyperlink (ST=ESC\ terminated) wrapping a bare claude glyph.
+  row="${ESC_BYTE}]8;;http://example.com${ESC_BYTE}\\❯${ESC_BYTE}]8;;${ESC_BYTE}\\"
+  plain=$(printf '%s' "$row" | fm_composer_strip_ansi)
+  [ "$plain" = '❯' ] || fail "strip_ansi must drop the OSC-8 wrapper, got '$plain'"
+  ghost=$(printf '%s' "$row" | fm_composer_strip_ghost)
+  [ "$ghost" = '❯' ] || fail "strip_ghost must drop the OSC-8 wrapper, got '$ghost'"
+  out=$(classify 0 "$(fm_composer_trim "$plain")")
+  [ "$out" = empty ] || fail "an OSC-8-wrapped agent glyph must read empty, got '$out'"
+  # BEL-terminated OSC around codex's glyph resolves the same way.
+  row="${ESC_BYTE}]8;;http://x${BEL_BYTE}›${ESC_BYTE}]8;;${BEL_BYTE}"
+  plain=$(printf '%s' "$row" | fm_composer_strip_ansi)
+  [ "$plain" = '›' ] || fail "strip_ansi must drop a BEL-terminated OSC, got '$plain'"
+  out=$(classify 0 "$(fm_composer_trim "$plain")")
+  [ "$out" = empty ] || fail "a BEL-terminated OSC around '›' must read empty, got '$out'"
+  pass "fm_composer_strip_*: an OSC-8-wrapped agent glyph is stripped and reads empty"
+}
+
+test_osc_only_empty_row_is_empty() {
+  local row plain ghost out
+  # An OSC sequence with no visible text at all (e.g. a title/hyperlink-clear run)
+  # must strip to nothing, not to a `pending` row of leftover bytes.
+  row="${ESC_BYTE}]8;;http://x${ESC_BYTE}\\${ESC_BYTE}]8;;${ESC_BYTE}\\"
+  plain=$(printf '%s' "$row" | fm_composer_strip_ansi)
+  [ -z "$plain" ] || fail "strip_ansi must reduce an OSC-only row to empty, got '$plain'"
+  ghost=$(printf '%s' "$row" | fm_composer_strip_ghost)
+  [ -z "$ghost" ] || fail "strip_ghost must reduce an OSC-only row to empty, got '$ghost'"
+  out=$(classify 0 "$(fm_composer_trim "$plain")")
+  [ "$out" = empty ] || fail "an OSC-only row must read empty, got '$out'"
+  # BEL-terminated OSC-0 window-title sequence, same expectation.
+  row="${ESC_BYTE}]0;my window title${BEL_BYTE}"
+  plain=$(printf '%s' "$row" | fm_composer_strip_ansi)
+  [ -z "$plain" ] || fail "strip_ansi must drop a BEL-terminated OSC title, got '$plain'"
+  pass "fm_composer_strip_*: an OSC-only row strips to empty and reads empty"
+}
+
+test_osc_stripping_preserves_real_text() {
+  local row plain out
+  # A real typed message that merely CONTAINS an OSC-8 link must keep its text and
+  # stay `pending` - the fix drops escape sequences, never real content.
+  row="fix ${ESC_BYTE}]8;;http://bug${ESC_BYTE}\\the bug${ESC_BYTE}]8;;${ESC_BYTE}\\ now"
+  plain=$(printf '%s' "$row" | fm_composer_strip_ansi)
+  [ "$plain" = 'fix the bug now' ] \
+    || fail "strip_ansi must keep the linked text, got '$plain'"
+  out=$(classify 0 "$(fm_composer_trim "$plain")")
+  [ "$out" = pending ] || fail "real text with an OSC-8 link must stay pending, got '$out'"
+  pass "fm_composer_strip_ansi: OSC stripping preserves the real linked text (stays pending)"
+}
+
 test_bare_shell_glyphs_are_unknown
 test_stripped_unbordered_content_uses_plain_content
 test_nbsp_padded_agent_glyph_is_empty
 test_nbsp_does_not_loosen_the_safety_verdicts
+test_osc_wrapped_agent_glyph_is_empty
+test_osc_only_empty_row_is_empty
+test_osc_stripping_preserves_real_text
 test_bare_shell_prompt_with_command_is_not_empty
 test_bordered_shell_glyph_is_empty
 test_agent_glyphs_are_empty_bordered_and_bare

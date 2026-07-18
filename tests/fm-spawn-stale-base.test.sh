@@ -39,6 +39,11 @@ exit 0
 SH
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
+# Record every non-get invocation (notably `return`) so a test can assert that a
+# refused spawn released the lease it acquired (bughunt-fm-h2 finding 1).
+if [ -n "${FM_TEST_TH_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$FM_TEST_TH_LOG"
+fi
 if [ "${1:-}" = get ]; then
   printf '%s\n' "${FM_TEST_LEASE_PATH:-${FM_FAKE_PANE_PATH:-}}"
   exit 0
@@ -162,6 +167,40 @@ test_fresh_base_unaffected() {
   pass "S3: a worktree already containing local main is spawned untouched"
 }
 
+# S4: a spawn refused AFTER the treehouse lease was acquired must RETURN that
+# lease, not leak it (bughunt-fm-h2 finding 1). The dirty stale-base refuse is a
+# convenient post-lease refusal: the lease is held when fm-spawn decides to abort.
+# Before the fix the lease was leaked (only the pre-lease membership path returned
+# it), which exhausts the pool over repeated failed spawns.
+test_refused_spawn_returns_leased_worktree() {
+  local home proj base pool_wt fakebin out status id th_log
+  id=stale-leak-s4
+  home="$TMP_ROOT/s4-home"
+  proj="$TMP_ROOT/s4-proj"
+  th_log="$TMP_ROOT/s4-th.log"
+  : > "$th_log"
+  mkdir -p "$home/data"
+  base=$(make_stale_project "$proj")
+  proj=$(cd "$proj" && pwd)
+  pool_wt="$TMP_ROOT/.treehouse/s4-pool/1/repo"
+  git -C "$proj" worktree add -q --detach "$pool_wt" "$base"
+  pool_wt=$(cd "$pool_wt" && pwd)
+  printf 'leftover\n' > "$pool_wt/leftover.txt"   # dirty => refused after lease
+  fakebin=$(make_spawn_fakebin "$TMP_ROOT/s4-fake")
+
+  export FM_TEST_TH_LOG="$th_log"
+  out=$(run_spawn "$home" "$id" "$proj" "$pool_wt" "$fakebin"); status=$?
+  unset FM_TEST_TH_LOG
+  rm -rf "/tmp/fm-$id" 2>/dev/null || true
+
+  expect_code 1 "$status" "dirty stale-base worktree must refuse"$'\n'"$out"
+  assert_absent "$home/state/$id.meta" "a refused spawn must not leave meta behind"
+  grep -q "return .*$pool_wt" "$th_log" \
+    || fail "refused spawn must return the leased worktree; treehouse calls were:"$'\n'"$(cat "$th_log")"
+  pass "S4: a spawn refused after the lease is acquired returns the leased worktree"
+}
+
 test_stale_base_worktree_is_replaced_onto_local_main
 test_dirty_stale_base_worktree_refused
 test_fresh_base_unaffected
+test_refused_spawn_returns_leased_worktree

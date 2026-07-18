@@ -110,8 +110,16 @@ resolve_pr_head() {
   fi
   n=$(pr_number_from_target "$pr_url") || return 1
   git -C "$WT" remote get-url origin >/dev/null 2>&1 || return 1
-  git -C "$WT" fetch --quiet origin "refs/pull/$n/head" >/dev/null 2>&1 || return 1
-  resolved=$(git -C "$WT" rev-parse --verify 'FETCH_HEAD^{commit}' 2>/dev/null) || return 1
+  # Fetch into a PRIVATE, task-scoped ref rather than reading FETCH_HEAD. FETCH_HEAD
+  # is a single shared ref per repository, so a concurrent `git fetch` in the same
+  # object store (another task, fleet-sync, teardown, a human) can overwrite it
+  # between the fetch and the read - yielding the wrong commit and a confidently
+  # wrong diff, the exact failure this tool exists to prevent. A ref named for this
+  # task ID is written atomically by the fetch and read back by name, immune to any
+  # other fetch racing FETCH_HEAD.
+  local priv="refs/fm-review/$ID/pr-head"
+  git -C "$WT" fetch --quiet origin "+refs/pull/$n/head:$priv" >/dev/null 2>&1 || return 1
+  resolved=$(git -C "$WT" rev-parse --verify "$priv^{commit}" 2>/dev/null) || return 1
   [ -n "$resolved" ] || return 1
   printf '%s' "$resolved"
 }

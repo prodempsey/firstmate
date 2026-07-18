@@ -203,6 +203,13 @@ fi
 ORCA_ABORT_CLEANUP=0
 ORCA_WORKTREE_ID=
 ORCA_TERMINAL=
+# Armed (=1) once a treehouse pool worktree is LEASED for a non-orca backend, and
+# disarmed at spawn success. While armed, an abnormal exit (any post-lease refuse:
+# stale-base, failed re-place, role-marker write, or a later error) triggers the
+# EXIT trap to RETURN the lease and remove the just-created backend endpoint, so a
+# refused spawn never leaks a pool slot or leaves an orphan pane. A completed spawn
+# disarms it, so a live crew's lease is never touched.
+TH_ABORT_CLEANUP=0
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -223,6 +230,25 @@ parse_orca_worktree_result() {
 
 orca_spawn_abort_cleanup() {
   local status=$?
+  # Treehouse lease + endpoint cleanup for a post-lease spawn refusal on a
+  # non-orca backend. treehouse and orca are mutually exclusive (the treehouse
+  # lease path runs only when BACKEND != orca), so at most one of these blocks
+  # fires. Every step is best-effort and status-preserving: a refused spawn must
+  # not leave a leaked pool slot or an orphan pane, but cleanup failures must not
+  # mask the original exit code.
+  if [ "${TH_ABORT_CLEANUP:-0}" = 1 ]; then
+    TH_ABORT_CLEANUP=0
+    if [ -n "${WT:-}" ]; then
+      ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1 || true
+    fi
+    if [ -n "${T:-}" ] && [ -n "${BACKEND:-}" ]; then
+      fm_backend_kill "$BACKEND" "$T" >/dev/null 2>&1 || true
+    fi
+    [ -z "${TASK_TMP:-}" ] || rm -rf "$TASK_TMP" >/dev/null 2>&1 || true
+    if [ -n "${STATE:-}" ]; then
+      rm -f "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" >/dev/null 2>&1 || true
+    fi
+  fi
   [ "$ORCA_ABORT_CLEANUP" = 1 ] || return "$status"
   ORCA_ABORT_CLEANUP=0
   if [ -n "${ORCA_TERMINAL:-}" ]; then
@@ -963,6 +989,9 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     echo "error: treehouse get --lease did not yield a worktree for $PROJ_ABS; inspect window $T" >&2
     exit 1
   fi
+  # Lease is held: arm failure-path cleanup so ANY refuse/exit before spawn success
+  # returns this lease and removes the just-created endpoint (see the EXIT trap).
+  TH_ABORT_CLEANUP=1
 
   # Membership + pool-prefix: fail closed before meta/launch. On failure, best-
   # effort release the lease so a refused path is not left held forever.
@@ -1283,5 +1312,10 @@ sleep 0.3
 spawn_send_literal "$T" "$LAUNCH"
 sleep 0.3
 spawn_send_key "$T" Enter
+
+# Spawn committed: the agent is launched and meta is written, so the leased
+# worktree and endpoint now belong to a live crew. Disarm the failure-path cleanup
+# so the EXIT trap never returns this lease or kills this endpoint.
+TH_ABORT_CLEANUP=0
 
 echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT"
