@@ -217,14 +217,26 @@ land_on_origin_main() {
 }
 
 # Override GitHub lookups to report PR 7 as merged with the supplied head.
+# The teardown safety chain's merged check queries `pr view --json state,headRefOid`
+# and MUST route it through gh-axi (bughunt-fm-h2 finding 5). So the bare `gh` mock
+# here refuses exactly that query while still serving fm-pr-check.sh's own single-
+# field reads (`--json headRefOid`, `--json state`), which legitimately still use
+# bare gh and are out of finding 5's scope. A teardown that regressed to bare gh for
+# the merged check would hit the refusal, lose the merged signal, and fail these
+# tests - so they double as the finding-5 gh->gh-axi routing regression.
 add_gh_pr_merged_for_head() {
   local case_dir=$1 head=$2
-  cat > "$case_dir/fakebin/gh-axi" <<'SH'
+  cat > "$case_dir/fakebin/gh-axi" <<SH
 #!/usr/bin/env bash
-case "${1:-} ${2:-}" in
+case "\${1:-} \${2:-}" in
   "pr list")
     printf '%s\n' "count: 1 (showing first 1)" "pull_requests[1]{number,state}:" "  7,merged" ; exit 0 ;;
   "pr view")
+    case " \$* " in
+      *"state,headRefOid"*) printf '%s\t%s\n' 'MERGED' '$head' ; exit 0 ;;
+      *"headRefOid"*) printf '%s\n' '$head' ; exit 0 ;;
+      *"state"*) printf '%s\n' 'MERGED' ; exit 0 ;;
+    esac
     printf '%s\n' "pull_request:" "  number: 7" "  state: merged" '  merged: "2026-06-26T00:00:00Z"' ; exit 0 ;;
 esac
 exit 0
@@ -234,8 +246,9 @@ SH
 case "\${1:-} \${2:-}" in
   "pr view")
     case " \$* " in
-      *"state,headRefOid"*) printf '%s\t%s\n' 'MERGED' '$head' ; exit 0 ;;
+      *"state,headRefOid"*) echo "error: teardown merged check must use gh-axi, not bare gh" >&2 ; exit 1 ;;
       *"headRefOid"*) printf '%s\n' '$head' ; exit 0 ;;
+      *"state"*) printf '%s\n' 'MERGED' ; exit 0 ;;
     esac
     ;;
 esac
@@ -919,6 +932,65 @@ test_dirty_worktree_refuses() {
   pass "dirty worktree is refused even when its committed work has landed (dirty always wins)"
 }
 
+# bughunt-fm-h2 finding 9: land a branch whose HEAD IS the merged PR head, then
+# add tracked placeholders so .claude/ and .opencode/plugins/ show their untracked
+# contents individually (git collapses an entirely-untracked dir). Used by the two
+# dirty-filter tests below.
+setup_landed_case_with_harness_dirs() {  # <name> -> echoes case_dir
+  local case_dir=$1 pr_head
+  case_dir=$(make_case "$1")
+  write_meta "$case_dir" no-mistakes ship
+  mkdir -p "$case_dir/wt/.claude" "$case_dir/wt/.opencode/plugins"
+  printf '{}\n' > "$case_dir/wt/.claude/settings.json"
+  printf '\n' > "$case_dir/wt/.opencode/plugins/.gitkeep"
+  git -C "$case_dir/wt" add -A
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "tracked harness dirs"
+  append_pr_meta_for_current_head "$case_dir"
+  pr_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  add_gh_pr_merged_for_head "$case_dir" "$pr_head"
+  printf '%s' "$case_dir"
+}
+
+# The exact firstmate-owned untracked files spawn writes - every harness's turn-end
+# hook plus the crew-role marker - must NOT block teardown even when info/exclude
+# failed to hide them (simulated here by writing them without excluding). This is
+# the symmetry fix: opencode's hook is now ignored just like claude's.
+test_teardown_ignores_firstmate_owned_untracked_hooks() {
+  local case_dir rc
+  case_dir=$(setup_landed_case_with_harness_dirs fm-owned-hooks)
+  printf '{}\n'          > "$case_dir/wt/.claude/settings.local.json"
+  printf 'x\n'           > "$case_dir/wt/.opencode/plugins/fm-turn-end.js"
+  printf 'token=fm.x\n'  > "$case_dir/wt/.fm-grok-turnend"
+  printf 'role=crew\n'   > "$case_dir/wt/.fm-crew-role"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "fm-owned-hooks: firstmate's own hook files (every harness + crew-role) must not block teardown"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "fm-owned-hooks: teardown printed a REFUSED line: $(cat "$case_dir/stderr")"
+  pass "teardown ignores every firstmate-owned untracked hook file symmetrically (finding 9)"
+}
+
+# The former broad `.claude/` ignore silently discarded a crewmate's own untracked
+# work under .claude/. That file must now block teardown, since only the exact
+# firstmate-owned names are ignored.
+test_teardown_refuses_crewmate_untracked_under_claude() {
+  local case_dir rc
+  case_dir=$(setup_landed_case_with_harness_dirs crew-claude-file)
+  printf 'important draft\n' > "$case_dir/wt/.claude/crewmate-notes.md"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "crew-claude-file: a crewmate's own untracked .claude/ file must block teardown"
+  grep -q REFUSED "$case_dir/stderr" || fail "crew-claude-file: no REFUSED line in stderr"
+  pass "a crewmate's own untracked file under .claude/ blocks teardown (no longer over-broad, finding 9)"
+}
+
 test_gh_error_and_content_absent_refuses() {
   local case_dir rc
   case_dir=$(make_case gh-error)
@@ -1580,6 +1652,8 @@ test_pr_check_records_remote_head_when_local_lags
 test_content_in_default_fallback_allows
 test_content_fallback_refreshes_stale_origin_ref
 test_dirty_worktree_refuses
+test_teardown_ignores_firstmate_owned_untracked_hooks
+test_teardown_refuses_crewmate_untracked_under_claude
 test_gh_error_and_content_absent_refuses
 test_stale_index_lock_cleared_and_teardown_succeeds
 test_live_index_lock_is_never_removed_and_teardown_refuses

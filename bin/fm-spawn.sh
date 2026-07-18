@@ -1092,10 +1092,16 @@ EOF
       ;;
     opencode*)
       mkdir -p "$WT/.opencode/plugins"
+      # The opencode plugin runs `touch <path>` through Bun's `$` shell, so the
+      # path must be shell-escaped in the emitted source - an unquoted $TURNEND
+      # broke turn-end whenever STATE_REAL held a space or shell metacharacter
+      # (claude's equivalent hook already single-quotes its path). shell_quote
+      # produces a POSIX single-quoted literal Bun's shell parses correctly.
+      sq_opencode_turnend=$(shell_quote "$TURNEND")
       cat > "$WT/.opencode/plugins/fm-turn-end.js" <<EOF
 export const FmTurnEnd = async ({ \$ }) => ({
   event: async ({ event }) => {
-    if (event.type === "session.idle") await \$\`touch $TURNEND\`
+    if (event.type === "session.idle") await \$\`touch $sq_opencode_turnend\`
   },
 })
 EOF

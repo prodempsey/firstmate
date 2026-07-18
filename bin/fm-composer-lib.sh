@@ -292,10 +292,19 @@ fm_composer_classify_content() {  # <bordered> <content> [idle_re] [idle_case] [
   if fm_composer_idle_matches "$content" "$idle_re" "$idle_case"; then
     printf 'empty'; return 0
   fi
-  # Strip a leading prompt glyph, then re-judge the remainder.
+  # Strip a leading prompt glyph, then re-judge the remainder. Strip the LITERAL
+  # glyph, never a counted `?` wildcard: the agent glyphs `❯`/`›` are multi-byte
+  # UTF-8, and under LC_ALL=C (how the watcher/daemon poll path may run) `?`
+  # matches one BYTE, so `${content#??}` would shear a multi-byte glyph and leave
+  # trailing garbage bytes. The trailing whitespace of a `❯ ` row is handled by
+  # the trim below, so stripping only the glyph is sufficient and locale-safe.
   case "$content" in
-    '❯ '*|'› '*|'> '*|'$ '*|'% '*|'# '*) content=${content#??} ;;
-    '❯'*|'›'*|'>'*|'$'*|'%'*|'#'*) content=${content#?} ;;
+    '❯'*) content=${content#'❯'} ;;
+    '›'*) content=${content#'›'} ;;
+    '>'*) content=${content#'>'} ;;
+    '$'*) content=${content#'$'} ;;
+    '%'*) content=${content#'%'} ;;
+    '#'*) content=${content#'#'} ;;
   esac
   fm_composer_trim_into content "$content"
   [ -n "$content" ] || { printf 'empty'; return 0; }

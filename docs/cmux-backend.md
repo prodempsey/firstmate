@@ -57,7 +57,7 @@ No first-run provisioning beyond the socket-access setup above and having `jq` i
 
 Watching and attaching: firstmate uses one workspace per task in whatever cmux window is currently open.
 Task selectors resolve through the shared contract owned by [`docs/configuration.md`](configuration.md) ("Runtime backend"), while the actual cmux workspace title is home-scoped as `fm-<home-label>-<id>`, for example `fm-firstmate-<8hex>-cmux-e2e-t1` in the primary home or `fm-2ndmate-<secondmate-id>-<8hex>-cmux-e2e-t1` in a secondmate home.
-You do not need to bring the window forward for routine supervision: from an active firstmate session, `bin/fm-peek.sh <id>` reads a task's surface without focusing it, and `FM_HOME=<this-firstmate-home> bin/fm-send.sh <id> "<text>"` steers it unless `FM_HOME` is already set to the active firstmate home - workspace/surface/pane creation all default `focus` to `false`, so an unattended spawn never steals your view.
+You do not need to bring the window forward for routine supervision: from an active firstmate session, `FM_HOME=<this-firstmate-home> bin/fm-peek.sh <id>` reads a task's surface without focusing it, and `FM_HOME=<this-firstmate-home> bin/fm-send.sh <id> "<text>"` steers it, both unless `FM_HOME` is already set to the active firstmate home (peek is fail-closed on `FM_HOME` like send, except a fully-qualified target needs none) - workspace/surface/pane creation all default `focus` to `false`, so an unattended spawn never steals your view.
 
 Verify it works by spawning a trivial task with `--backend cmux` and confirming the task's meta records `backend=cmux` plus `cmux_workspace_id=` and `cmux_surface_id=`.
 The cmux sidebar should show a new `fm-firstmate-<8hex>-<id>` workspace in the primary home.

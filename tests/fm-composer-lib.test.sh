@@ -242,8 +242,44 @@ test_osc_stripping_preserves_real_text() {
   pass "fm_composer_strip_ansi: OSC stripping preserves the real linked text (stays pending)"
 }
 
+# --- Multi-byte glyph stripping is locale-safe (bughunt-fm-h2 finding 10) ----
+#
+# Under LC_ALL=C (how the watcher/daemon poll path may run) bash's `?` glob
+# matches one BYTE, not one codepoint. The agent glyphs ❯/› are 3-byte UTF-8, so
+# the old counted `${content#??}` / `${content#?}` strip sheared a glyph and left
+# trailing garbage bytes - which then defeated the post-strip idle-placeholder
+# match (an idle composer misread as `pending`). The literal-glyph strip must give
+# the same verdict in the C and UTF-8 locales.
+classify_c() {  # run the classifier in a fresh bash whose LC_ALL=C is set at startup
+  LC_ALL=C bash -c '. "$1/bin/fm-composer-lib.sh"; shift; fm_composer_classify_content "$@"' _ "$ROOT" "$@"
+}
+
+test_multibyte_glyph_strip_is_locale_safe() {
+  local idle='^Type a message\.\.\.$' out
+  # A fresh LC_ALL=C process makes `?` globs byte-oriented - the locale the old
+  # counted `${content#??}` strip mis-sheared a 3-byte agent glyph under.
+  out=$(classify_c 0 '❯ Type a message...' "$idle")
+  [ "$out" = empty ] \
+    || fail "LC_ALL=C: '❯ '+idle placeholder must strip cleanly to empty, got '$out'"
+  out=$(classify_c 0 '› Type a message...' "$idle" insensitive)
+  [ "$out" = empty ] \
+    || fail "LC_ALL=C: '› '+idle placeholder must strip cleanly to empty, got '$out'"
+  # A glyph with no trailing space still resolves through the single-strip path.
+  out=$(classify_c 0 '❯Type a message...' "$idle")
+  [ "$out" = empty ] \
+    || fail "LC_ALL=C: '❯'+idle (no space) must strip cleanly to empty, got '$out'"
+  # Real text after the glyph stays pending, with no garbage byte prepended.
+  out=$(classify_c 0 '❯ deploy staging now')
+  [ "$out" = pending ] || fail "LC_ALL=C: real text after '❯ ' must stay pending, got '$out'"
+  # The in-process classifier (ambient locale) gives the identical verdict.
+  out=$(classify 0 '❯ Type a message...' "$idle")
+  [ "$out" = empty ] || fail "ambient locale: '❯ '+idle placeholder must read empty, got '$out'"
+  pass "fm_composer_classify_content: multi-byte agent-glyph stripping is locale-safe (LC_ALL=C)"
+}
+
 test_bare_shell_glyphs_are_unknown
 test_stripped_unbordered_content_uses_plain_content
+test_multibyte_glyph_strip_is_locale_safe
 test_nbsp_padded_agent_glyph_is_empty
 test_nbsp_does_not_loosen_the_safety_verdicts
 test_osc_wrapped_agent_glyph_is_empty

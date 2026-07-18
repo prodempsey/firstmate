@@ -709,6 +709,25 @@ test_composer_state_real_text_is_pending() {
   pass "fm_backend_cmux_composer_state: real composer text reads pending"
 }
 
+# bughunt-fm-h2 finding 4: strip only the OUTER border pair, like tmux, never a
+# global delete of every │/┃/| (which mangles composer content that legitimately
+# carries an interior glyph). Observable via a custom idle placeholder holding an
+# interior '│': outer-pair strip preserves it (-> empty), a global delete mangles
+# it (-> pending).
+test_composer_state_interior_border_is_preserved() {
+  local dir fb out
+  dir="$TMP_ROOT/composer-interior-border"; mkdir -p "$dir/responses"
+  cmux_panes_response "$dir" 1 "bbbbbbbb-1111-1111-1111-111111111111"
+  cmux_read_screen_response "$dir" 2 $'  ╭────────────────────────╮\n  │ a │ b │\n  ╰──────── Composer ─────╯'
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    FM_BACKEND_CMUX_IDLE_RE='^a │ b$' \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_composer_state "aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111"' "$ROOT" )
+  [ "$out" = empty ] \
+    || fail "an interior '│' must be preserved by an outer-pair strip like tmux, got '$out' (a global delete mangles composer content identity)"
+  pass "fm_backend_cmux_composer_state: interior border glyphs are preserved (only the outer border pair is stripped)"
+}
+
 # The popup-placeholder/second-Enter regression class (2026-07-03 herdr
 # incident, docs/herdr-backend.md): a slash command's first Enter can close a
 # completion popup and EXPAND the composer into an argument-hint placeholder
@@ -1046,6 +1065,7 @@ test_current_path_probes_with_marker
 test_composer_state_bare_prompt_is_empty
 test_composer_state_ghost_placeholder_is_empty
 test_composer_state_real_text_is_pending
+test_composer_state_interior_border_is_preserved
 test_composer_state_popup_placeholder_fill_is_pending
 test_composer_state_unknown_on_capture_failure
 test_composer_state_unknown_when_no_composer_row_found

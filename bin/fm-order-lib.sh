@@ -107,16 +107,35 @@ fm_order_lock_dir() {  # <inbox>
   printf '%s.lock' "$1"
 }
 
+# Portable file mtime in epoch seconds (GNU `stat -c` vs BSD `stat -f`). Prints
+# nothing on any failure, so callers must guard for an empty/non-numeric result.
+fm_order_path_mtime() {  # <path>
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %m "$1" 2>/dev/null
+  else
+    stat -c %Y "$1" 2>/dev/null
+  fi
+}
+
 # Acquire the dedicated writer lock, waiting up to FM_ORDER_LOCK_TIMEOUT seconds.
 # The lock is an atomic mkdir holding the writer's pid; a lock whose holder is gone is
 # broken so a killed writer can never wedge intake. Returns 1 when the lock is held by a
 # LIVE writer for the whole timeout - a refusal the caller must surface, never swallow,
 # because an unrecorded order that was reported as recorded is the failure this whole
 # feature exists to prevent.
+#
+# The pid write is best-effort (it can lose the race, or fail), so a writer can die
+# after mkdir but before recording its pid, leaving a PID-LESS lockdir. Reclaiming a
+# pid-less lock immediately would race a live writer still inside that mkdir->pid
+# window, so it is reclaimed only once the pid-less lockdir has aged past a short grace
+# (FM_ORDER_LOCK_PIDLESS_GRACE seconds) - long enough that a live writer would have
+# recorded its pid by now. Without this, a pid-less lock nothing ever reclaims wedges
+# intake until an operator removes it, contradicting the killed-writer guarantee above.
 fm_order_lock() {  # <inbox>
-  local lockdir waited=0 timeout holder
+  local lockdir waited=0 timeout grace holder mtime now age
   lockdir=$(fm_order_lock_dir "$1")
   timeout=${FM_ORDER_LOCK_TIMEOUT:-10}
+  grace=${FM_ORDER_LOCK_PIDLESS_GRACE:-3}
   while :; do
     if mkdir "$lockdir" 2>/dev/null; then
       printf '%s\n' "$$" > "$lockdir/pid" 2>/dev/null || true
@@ -124,10 +143,32 @@ fm_order_lock() {  # <inbox>
       return 0
     fi
     holder=$(cat "$lockdir/pid" 2>/dev/null || true)
-    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
-      rm -f "$lockdir/pid" 2>/dev/null || true
-      rmdir "$lockdir" 2>/dev/null || true
-      continue
+    if [ -n "$holder" ]; then
+      if ! kill -0 "$holder" 2>/dev/null; then
+        # Recorded holder is gone: the writer died, break the abandoned lock.
+        rm -f "$lockdir/pid" 2>/dev/null || true
+        rmdir "$lockdir" 2>/dev/null || true
+        continue
+      fi
+    else
+      # No pid recorded: a writer that died in the mkdir->pid window, or a live
+      # one still inside it. Reclaim only after the pid-less lockdir ages past the
+      # grace, so a just-acquired lock is never stolen from a writer about to
+      # record its pid. An unreadable mtime falls through to the normal wait.
+      mtime=$(fm_order_path_mtime "$lockdir")
+      case "$mtime" in
+        ''|*[!0-9]*) : ;;
+        *)
+          now=$(date +%s 2>/dev/null || printf 0)
+          case "$now" in ''|*[!0-9]*) now=0 ;; esac
+          age=$(( now - mtime ))
+          if [ "$age" -ge "$grace" ]; then
+            rm -f "$lockdir/pid" 2>/dev/null || true
+            rmdir "$lockdir" 2>/dev/null || true
+            continue
+          fi
+          ;;
+      esac
     fi
     [ "$waited" -ge "$timeout" ] && return 1
     sleep 1

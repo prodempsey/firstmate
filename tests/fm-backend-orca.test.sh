@@ -197,6 +197,23 @@ test_composer_state_popup_placeholder_fill_is_pending() {
   pass "fm_backend_orca_composer_state: a slash-command popup's argument-hint placeholder still reads pending"
 }
 
+# bughunt-fm-h2 finding 4: strip only the OUTER border pair, like tmux, never a
+# global delete of every │/┃/| (which mangles composer content that legitimately
+# carries an interior glyph). Observable via a custom idle placeholder holding an
+# interior '│': outer-pair strip preserves it (-> empty), a global delete mangles
+# it (-> pending).
+test_composer_state_interior_border_is_preserved() {
+  local out
+  orca_case composer-interior-border
+  printf '{"ok":true,"result":{"terminal":{"tail":["  ╭────────────────────────╮","  │ a │ b │","  ╰──────── Composer ─────╯"]}}}\n' > "$RESP/1.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_BACKEND_ORCA_IDLE_RE='^a │ b$' \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_composer_state term-123' "$ROOT" )
+  [ "$out" = empty ] \
+    || fail "an interior '│' must be preserved by an outer-pair strip like tmux, got '$out' (a global delete mangles composer content identity)"
+  pass "fm_backend_orca_composer_state: interior border glyphs are preserved (only the outer border pair is stripped)"
+}
+
 # Dead-shell injection safety (task fm-composer-shellglyph-safety): a pane whose
 # agent has exited to a bare login shell has no bordered composer row, so the
 # classifier finds nothing and reports `unknown` - NOT a safe (empty) injection
@@ -1281,6 +1298,7 @@ test_send_text_submit_verifies_empty_composer_after_enter
 test_send_text_submit_keeps_current_tail_when_limited
 test_send_text_submit_retries_when_composer_stays_pending
 test_composer_state_popup_placeholder_fill_is_pending
+test_composer_state_interior_border_is_preserved
 test_composer_state_bare_shell_prompt_is_unknown
 test_send_text_submit_popup_autocomplete_requires_second_enter
 test_send_literal_constructs_non_enter_send

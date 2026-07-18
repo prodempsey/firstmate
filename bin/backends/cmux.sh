@@ -558,9 +558,15 @@ fm_backend_cmux_composer_state() {  # <target> [expected-label] -> empty|pending
     found=1
   done < <(printf '%s\n' "$cap")
   [ "$found" -eq 1 ] || { printf 'unknown'; return 0; }
-  stripped=${stripped//│/}
-  stripped=${stripped//┃/}
-  stripped=${stripped//|/}
+  # Strip only a matching OUTER border pair (one leading + one trailing glyph),
+  # exactly like the tmux reader (bin/fm-tmux-lib.sh) - never a global delete of
+  # every │/┃/| glyph, which would mangle composer content that legitimately
+  # contains these glyphs and diverge from tmux's content identity for the same row.
+  case "$stripped" in
+    '│'*'│') stripped=${stripped#│}; stripped=${stripped%│} ;;
+    '┃'*'┃') stripped=${stripped#┃}; stripped=${stripped%┃} ;;
+    '|'*'|') stripped=${stripped#|}; stripped=${stripped%|} ;;
+  esac
   stripped="${stripped#"${stripped%%[![:space:]]*}"}"
   stripped="${stripped%"${stripped##*[![:space:]]}"}"
   # A row was found only by the bordered shape above, so content came from a

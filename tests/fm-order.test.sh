@@ -132,6 +132,32 @@ FM_ORDERS_PATH="$LOCKED" FM_ORDER_LOCK_TIMEOUT=1 "$ORDER" add "request after an 
   || fail "an abandoned lock (dead holder) wedged intake"
 pass "a live writer lock refuses the write loudly; an abandoned one is broken, not obeyed"
 
+# A writer that died AFTER mkdir but BEFORE recording its pid leaves a PID-LESS
+# lockdir (the pid write is best-effort). That must be reclaimed once it ages past
+# the grace, not wedge intake forever. Backdate the lockdir mtime so it is already
+# past a 1-second grace on the first probe.
+rm -rf "$LOCKED.lock"
+mkdir "$LOCKED.lock"                      # no pid file: writer died before the pid write
+touch -t 197001010101 "$LOCKED.lock"      # age it well past the grace
+FM_ORDERS_PATH="$LOCKED" FM_ORDER_LOCK_TIMEOUT=3 FM_ORDER_LOCK_PIDLESS_GRACE=1 \
+  "$ORDER" add "request after a pid-less lock" >/dev/null 2>&1 \
+  || fail "a pid-less abandoned lockdir (writer died before the pid write) wedged intake"
+# And a FRESH pid-less lockdir inside the grace must still be respected, not stolen:
+# with a grace longer than the timeout, the write is refused rather than racing a
+# writer that may be about to record its pid.
+rm -rf "$LOCKED.lock"
+mkdir "$LOCKED.lock"                      # fresh pid-less lockdir (mtime = now)
+set +e
+FROUT=$(FM_ORDERS_PATH="$LOCKED" FM_ORDER_LOCK_TIMEOUT=1 FM_ORDER_LOCK_PIDLESS_GRACE=30 \
+  "$ORDER" add "request against a fresh pid-less lock" 2>&1)
+FRRC=$?
+set -e
+[ "$FRRC" -ne 0 ] || fail "a fresh pid-less lock inside its grace was stolen instead of respected"
+printf '%s' "$FROUT" | grep -q 'NOTHING was recorded' \
+  || fail "a fresh pid-less lock refusal did not report the request was not recorded: $FROUT"
+rm -rf "$LOCKED.lock"
+pass "a pid-less lock is reclaimed only after its grace: aged is broken, fresh is respected"
+
 # --- missing and unreadable state ------------------------------------------------------
 set +e
 MOUT=$(FM_ORDERS_PATH="$TMP_ROOT/gone/captain-orders.jsonl" "$ORDER" list 2>&1)

@@ -864,6 +864,28 @@ test_composer_state_popup_placeholder_fill_is_pending() {
   pass "fm_backend_herdr_composer_state: a slash-command popup's argument-hint placeholder still reads pending (the incident fix)"
 }
 
+# bughunt-fm-h2 finding 4: the non-tmux readers used to GLOBALLY delete every
+# │/┃/| from a composer row, not just the matching OUTER border pair the tmux
+# reader removes. That mangles composer content that legitimately contains an
+# interior border/pipe glyph (a slash-command placeholder with `|` separators,
+# table-like text), giving herdr/cmux/orca a different content identity than tmux
+# for the same composer. It becomes observable through a verdict divergence: with
+# a custom idle placeholder that itself carries an interior '│', the correct
+# outer-pair strip preserves it (matches -> empty) while a global delete mangles
+# it (interior '│' gone -> no match -> pending).
+test_composer_state_interior_border_is_preserved() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/composer-interior-border"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '  ╭────────────────────────╮\n  │ a │ b │\n  ╰──────── Composer ─────╯\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    FM_BACKEND_HERDR_IDLE_RE='^a │ b$' \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = empty ] \
+    || fail "an interior '│' must be preserved by an outer-pair strip like tmux, got '$out' (a global delete mangles composer content identity)"
+  pass "fm_backend_herdr_composer_state: interior border glyphs are preserved (only the outer border pair is stripped)"
+}
+
 test_composer_state_unknown_on_capture_failure() {
   local dir log resp fb out status
   dir="$TMP_ROOT/composer-capture-fail"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -2018,6 +2040,7 @@ test_composer_state_bare_prompt_is_empty
 test_composer_state_ghost_placeholder_is_empty
 test_composer_state_real_text_is_pending
 test_composer_state_popup_placeholder_fill_is_pending
+test_composer_state_interior_border_is_preserved
 test_composer_state_unknown_on_capture_failure
 test_composer_state_unknown_when_no_composer_row_found
 test_composer_state_claude_unbordered_prompt_is_empty

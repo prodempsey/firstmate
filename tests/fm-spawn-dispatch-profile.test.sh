@@ -384,6 +384,36 @@ test_opencode_threads_model_and_ignores_effort_axis() {
   pass "opencode receives --model and omits the unsupported effort axis"
 }
 
+# bughunt-fm-h2 finding 8: the opencode turn-end plugin runs `touch <path>` through
+# Bun's `$` shell, so the TURNEND path must be shell-quoted in the emitted source.
+# An unquoted path with a space (or shell metacharacter) in the state dir would split
+# into multiple arguments and turn-end would never fire. Force a spaced state path and
+# assert the generated hook single-quotes it (matching the claude template).
+test_opencode_turn_end_hook_shell_quotes_turnend_path() {
+  local rec id spaced_state state_real expected hook
+  id=profile-opencode-quote-q9
+  rec=$(make_spawn_case profile-opencode-quote opencode "$id")
+  read_case_record "$rec"
+
+  spaced_state="$CASE_DIR/state with space"
+  mkdir -p "$spaced_state"
+  : > "$LAUNCH_LOG"
+  FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$spaced_state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
+    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$WT_DIR" TMUX="fake,1,0" \
+    FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" GROK_HOME="$HOME_DIR/grok-home" PATH="$FAKEBIN_DIR:$PATH" \
+    "$SPAWN" "$id" "$PROJ_DIR" >/dev/null 2>&1
+
+  state_real=$(cd "$spaced_state" && pwd -P)
+  expected="touch '$state_real/$id.turn-ended'"
+  hook="$WT_DIR/.opencode/plugins/fm-turn-end.js"
+  [ -f "$hook" ] || fail "opencode spawn did not write the turn-end plugin at $hook"
+  assert_contains "$(cat "$hook")" "$expected" \
+    "opencode turn-end hook must shell-quote the (spaced) TURNEND path so Bun's shell keeps it one argument"
+  pass "opencode turn-end hook shell-quotes the TURNEND path (finding 8)"
+}
+
 test_pi_omits_invalid_max_effort() {
   local rec id out status launch
   id=profile-pi-z8
@@ -451,6 +481,7 @@ test_codex_secondmate_launch_omits_codex_home
 test_grok_threads_model_and_reasoning_effort
 test_grok_omits_invalid_max_reasoning_effort
 test_opencode_threads_model_and_ignores_effort_axis
+test_opencode_turn_end_hook_shell_quotes_turnend_path
 test_pi_omits_invalid_max_effort
 test_batch_forwards_shared_profile_flags
 test_active_dispatch_profile_does_not_block_secondmate_launch

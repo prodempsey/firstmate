@@ -356,7 +356,7 @@ pr_is_merged() {
     target=$(pr_number_from_branch "$branch") || return 1
   fi
   [ -n "$target" ] || return 1
-  view=$(cd "$WT" && gh pr view "$target" --json state,headRefOid -q '.state + "\t" + .headRefOid' 2>/dev/null) || return 1
+  view=$(cd "$WT" && gh-axi pr view "$target" --json state,headRefOid -q '.state + "\t" + .headRefOid' 2>/dev/null) || return 1
   state=${view%%$'\t'*}
   head=${view#*$'\t'}
   [ "$state" != "$view" ] || return 1
@@ -653,7 +653,7 @@ teardown_treehouse_return() {
 }
 
 validate_worktree_teardown_safety() {
-  local dirty_raw dirty unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch
+  local dirty_raw dirty unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch fm_owned_untracked
   [ -d "$WT" ] || return 0
   [ "$FORCE" != "--force" ] || return 0
   case "$KIND" in
@@ -668,7 +668,18 @@ validate_worktree_teardown_safety() {
     echo "Restore the git index state, or get the captain's explicit OK to discard, then --force." >&2
     return 1
   fi
-  dirty=$(printf '%s\n' "$dirty_raw" | grep -vE '^\?\? (\.claude/|\.fm-grok-turnend$)' | head -1 || true)
+  # Firstmate-owned, gitignored worktree files that spawn creates and adds to the
+  # worktree's info/exclude (bin/fm-spawn.sh: exclude_path). Teardown must not count
+  # these as crewmate "dirty" work if info/exclude ever fails to hide them - but it
+  # must cover ALL of them symmetrically (every harness's turn-end hook plus the
+  # crew-role marker), and ONLY them by EXACT name. The former broad `.claude/`
+  # prefix was both too loose (a crewmate's own untracked file under .claude/ was
+  # silently discardable) and asymmetric (it ignored claude's hook but not
+  # opencode's .opencode/plugins/fm-turn-end.js, so an exclude failure there refused
+  # teardown while claude's did not). Keep this list in lockstep with fm-spawn.sh's
+  # exclude_path calls.
+  fm_owned_untracked='^\?\? (\.claude/settings\.local\.json|\.opencode/plugins/fm-turn-end\.js|\.fm-grok-turnend|\.fm-crew-role)$'
+  dirty=$(printf '%s\n' "$dirty_raw" | grep -vE "$fm_owned_untracked" | head -1 || true)
 
   if ! unpushed_raw=$(git -C "$WT" log --oneline HEAD --not --remotes -- 2>/dev/null); then
     if worktree_safety_blocked_by_lock "commits not on a remote"; then
