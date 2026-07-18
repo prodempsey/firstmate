@@ -68,7 +68,16 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+# The checkout that SUPPLIED this Stop hook, resolved from the script's own location
+# and NEVER from FM_ROOT_OVERRIDE. The linked-worktree exemption is a question about
+# WHERE THE HOOK LIVES (a crewmate/scout task worktree vs a primary home), which is
+# fixed by the script path, not by the operational root the session reads state from.
+# Production crewmates inherit FM_ROOT_OVERRIDE=<runtime>, a deliberately non-git tree,
+# so an FM_ROOT-based exemption inspected the runtime's absent .git, skipped the
+# exclusion, and let the crew worktree run the primary sweep and fail open - the exact
+# reopening of ORD-231's failure path found by qa-g2-q4 finding 1. HOOK_ROOT closes it.
+HOOK_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+FM_ROOT="${FM_ROOT_OVERRIDE:-$HOOK_ROOT}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
@@ -157,43 +166,66 @@ fm_root_is_secondmate_home() {
   return 0
 }
 
+# Return 0 when <root>/.git identifies a LINKED git worktree, git-binary-independently.
+# A linked worktree's .git is a regular file whose "gitdir:" target lives under the main
+# repo's .git/worktrees/<name>; that /worktrees/ path is the discriminator. It is exactly
+# what bin/fm-spawn.sh hands a crewmate/scout firstmate-on-itself task, and it distinguishes
+# a linked worktree from BOTH a plain checkout (whose .git is a directory) AND a
+# separate-git-dir main checkout (whose .git is also a file but whose "gitdir:" target is
+# its own git dir, outside any worktrees/ path - qa-g2-q4 finding 4). No `git` invocation,
+# so a transient/broken git can never reopen the exemption.
+hook_root_is_linked_worktree() {  # <root>
+  local gitfile="$1/.git" line
+  [ -L "$gitfile" ] && return 1
+  [ -f "$gitfile" ] || return 1
+  IFS= read -r line < "$gitfile" 2>/dev/null || return 1
+  case "$line" in
+    'gitdir: '*'/worktrees/'*) return 0 ;;
+    'gitdir:'*'/worktrees/'*) return 0 ;;
+  esac
+  return 1
+}
+
 # A genuinely-marked secondmate home is force-included as a guarded primary
 # (whether treehouse leased it as a linked worktree or it is a git-cloned plain
 # checkout); only an unmarked root falls through to the linked-worktree
 # exemption below.
+# The secondmate force-include is keyed on the HOOK CHECKOUT first (a secondmate runs its
+# own primary session from its own home, so HOOK_ROOT is that home), then the operational
+# roots for compatibility. A crewmate worktree never carries the gitignored marker, so this
+# can never spoof-include one.
 SECONDMATE_PRIMARY=0
-if fm_root_is_secondmate_home "$FM_ROOT" || fm_root_is_secondmate_home "$FM_HOME"; then
+if fm_root_is_secondmate_home "$HOOK_ROOT" || fm_root_is_secondmate_home "$FM_ROOT" || fm_root_is_secondmate_home "$FM_HOME"; then
   SECONDMATE_PRIMARY=1
 fi
+
+# FAIL-CLOSED linked-worktree exclusion, resolved from the HOOK CHECKOUT (HOOK_ROOT) and
+# git-binary-INDEPENDENT, applied BEFORE any state-shaped check or log write so an excluded
+# crew worktree leaves no trace. bin/fm-spawn.sh only ever hands a crewmate/scout
+# firstmate-on-itself task a genuine linked worktree; hook_root_is_linked_worktree() names
+# one precisely (a .git gitfile targeting a .../worktrees/ path), which no transient/broken
+# git can defeat and which does not misfire on a separate-git-dir primary. A genuinely-marked
+# secondmate home is force-included above and must NOT be excluded here, even though a
+# treehouse-leased one IS a linked worktree.
+if [ "$SECONDMATE_PRIMARY" -eq 0 ] && hook_root_is_linked_worktree "$HOOK_ROOT"; then
+  exit 0
+fi
+
 [ -f "$FM_ROOT/AGENTS.md" ] || exit 0
 [ -d "$FM_ROOT/bin" ] || exit 0
 [ -d "$STATE" ] || exit 0
 
-# FAIL-CLOSED linked-worktree exclusion, git-binary-INDEPENDENT. A linked worktree's .git
-# is a regular FILE ("gitdir: ..."); a real checkout's .git is a DIRECTORY; a non-git
-# rebaselined runtime home has no .git at all. bin/fm-spawn.sh only ever hands a
-# crewmate/scout firstmate-on-itself task a genuine linked worktree, so this identifies one
-# WITHOUT invoking git. It closes the fail-OPEN gap the git-based check below carries: when
-# `git rev-parse` failed for any transient reason (contention under concurrent Stop-hook
-# fan-in), GIT_TOP came back empty, the whole exclusion block was skipped, and the crew
-# worktree ran the primary sweep and failed open - the mechanism behind ORD-231's ~58
-# duplicate guard-error bugs (data/turnend-failopen-x6/report.md section 6.5). A
-# genuinely-marked secondmate home is force-included above and must NOT be excluded here,
-# even though a treehouse-leased one IS a linked worktree.
-if [ "$SECONDMATE_PRIMARY" -eq 0 ] && [ -f "$FM_ROOT/.git" ]; then
-  exit 0
-fi
-
-# The git-based linked-worktree exclusion, kept as a secondary discriminator for the case a
-# checkout's .git is a directory but git-dir still differs from git-common-dir. Applied only
-# where the concept exists and never to a genuinely marked secondmate home. The toplevel
-# comparison keeps this precise: it fires on a task worktree (whose root IS the git
-# toplevel), not on a non-git home that merely happens to sit inside some unrelated
-# repo's tree.
-GIT_TOP=$(git -C "$FM_ROOT" rev-parse --show-toplevel 2>/dev/null || true)
-if [ "$SECONDMATE_PRIMARY" -eq 0 ] && [ -n "$GIT_TOP" ] && [ "$(cd "$GIT_TOP" 2>/dev/null && pwd -P)" = "$(cd "$FM_ROOT" && pwd -P)" ]; then
-  GIT_DIR=$(git -C "$FM_ROOT" rev-parse --git-dir 2>/dev/null || true)
-  GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null || true)
+# The git-based linked-worktree exclusion, kept as a secondary discriminator on HOOK_ROOT for
+# the case a checkout's .git is a directory but git-dir still differs from git-common-dir.
+# Applied only where the concept exists and never to a genuinely marked secondmate home. The
+# toplevel comparison keeps this precise: it fires on a task worktree (whose root IS the git
+# toplevel), not on a non-git home that merely happens to sit inside some unrelated repo's
+# tree. This is a fallback only - the git-independent file check above is authoritative for
+# the linked-worktree shape and never depends on `git` succeeding.
+GIT_TOP=$(git -C "$HOOK_ROOT" rev-parse --show-toplevel 2>/dev/null || true)
+if [ "$SECONDMATE_PRIMARY" -eq 0 ] && [ -n "$GIT_TOP" ] && [ "$(cd "$GIT_TOP" 2>/dev/null && pwd -P)" = "$(cd "$HOOK_ROOT" && pwd -P)" ]; then
+  GIT_DIR=$(git -C "$HOOK_ROOT" rev-parse --git-dir 2>/dev/null || true)
+  GIT_COMMON_DIR=$(git -C "$HOOK_ROOT" rev-parse --git-common-dir 2>/dev/null || true)
   [ -n "$GIT_DIR" ] && [ "$GIT_DIR" != "$GIT_COMMON_DIR" ] && exit 0
 fi
 
@@ -255,6 +287,36 @@ guard_error_coalesce_dir() {
   fi
 }
 
+# Acquire the per-fingerprint coalescing lock with STALE RECOVERY (qa-g2-q4 finding 2). A
+# bare mkdir lock with no owner metadata and no recovery meant a Stop hook killed mid-section
+# left the lock forever, and every later occurrence then waited and gave up WITHOUT ever
+# filing the durable bug again - muting the signal permanently. The lock now records its
+# holder pid and epoch, and a contender reclaims it only when PROVABLY stale: the holder pid
+# is dead, or the lock has aged past FM_GUARD_ERROR_LOCK_STALE. Returns 0 acquired, 1 gave up.
+guard_error_lock_acquire() {  # <lock-dir> <now-epoch>
+  local lock=$1 now=$2 waited=0 hpid hepoch stale
+  stale=${FM_GUARD_ERROR_LOCK_STALE:-30}
+  case "$stale" in *[!0-9]*) stale=30 ;; '') stale=30 ;; esac
+  while ! mkdir "$lock" 2>/dev/null; do
+    hpid=''; hepoch=''
+    IFS= read -r hpid < "$lock/pid" 2>/dev/null || hpid=''
+    IFS= read -r hepoch < "$lock/epoch" 2>/dev/null || hepoch=''
+    case "$hepoch" in *[!0-9]*) hepoch=0 ;; '') hepoch=0 ;; esac
+    if { [ -n "$hpid" ] && ! kill -0 "$hpid" 2>/dev/null; } \
+       || { [ "$hepoch" -gt 0 ] && [ "$((now - hepoch))" -ge "$stale" ]; }; then
+      # Provably stale: reclaim and retry. rm -rf on our own cache dir only.
+      rm -rf "$lock" 2>/dev/null || true
+      continue
+    fi
+    waited=$((waited + 1))
+    [ "$waited" -gt 50 ] && return 1
+    sleep 0.1 2>/dev/null || true
+  done
+  printf '%s\n' "$$" > "$lock/pid" 2>/dev/null || true
+  printf '%s\n' "$now" > "$lock/epoch" 2>/dev/null || true
+  return 0
+}
+
 # Raise the durable health signal through the sanctioned bug CLI (the same one the triage
 # enumerator's bugs lane reads; FM_FLEET_TRIAGE_BUG_CLI overrides it, `off` disables).
 #
@@ -262,15 +324,42 @@ guard_error_coalesce_dir() {
 # DIFFERENT home or worktree from re-filing the identical text, and the next healthy
 # evaluation cleared it, so an INTERMITTENT failure filed a fresh captain bug on every
 # recurrence - ~58 identical open bugs in three days (data/turnend-failopen-x6/report.md
-# sections 5 and 6.4). This keys on the failure fingerprint (the component slug) in a
-# shared store: the FIRST occurrence in a window files ONE bug carrying caller identity;
-# every later occurrence with the same fingerprint only increments the shared record. After
-# the window elapses a genuinely-new recurrence surfaces a fresh bug, so a real regression
-# is never muted forever. Best-effort in every direction: a coalescing failure never changes
-# the fail-open decision.
+# sections 5 and 6.4). This keys on the failure fingerprint (the component slug) in a shared
+# store: the FIRST occurrence in a window files ONE bug carrying caller identity; every later
+# occurrence with the same fingerprint only updates the shared record. After the window
+# elapses a genuinely-new recurrence surfaces a fresh bug, so a real regression is never muted
+# forever. Best-effort in every direction: a coalescing failure never changes the fail-open
+# decision.
+#
+# CRUCIALLY, coalescing suppresses only DUPLICATE bug FILINGS, never the occurrence itself
+# (qa-g2-q4 finding 2, the opposite failure): EVERY occurrence is appended lock-free to a
+# durable, append-atomic occurrences log FIRST, so an occurrence is visible and aggregated
+# even when the summary lock is contended, abandoned, or unwritable. And the coalescing window
+# advances ONLY on a CONFIRMED successful bug filing (finding 3); a failed bug CLI leaves the
+# signal eligible for a bounded retry rather than muting it for the whole window.
 signal_guard_error_bug() {  # <component> <detail>
-  local cli slug dir rec lock window now caller waited k v
-  local count first last_bug bug_id new_id
+  local cli slug dir rec lock occ window retry now caller k v
+  local count first last_bug last_attempt bug_id new_id occ_dropped lines max keep drop
+  local window_ok in_failure_backoff
+
+  slug=$(printf '%s' "$1" | tr -c 'a-zA-Z0-9' '-')
+  dir=$(guard_error_coalesce_dir)
+  mkdir -p "$dir" 2>/dev/null || return 0
+  rec="$dir/$slug.record"
+  lock="$dir/$slug.lock"
+  occ="$dir/$slug.occurrences"
+  window=${FM_GUARD_ERROR_COALESCE_WINDOW:-86400}
+  case "$window" in *[!0-9]*) window=86400 ;; '') window=86400 ;; esac
+  retry=${FM_GUARD_ERROR_BUG_RETRY:-60}
+  case "$retry" in *[!0-9]*) retry=60 ;; '') retry=60 ;; esac
+  now=$(date -u +%s 2>/dev/null || printf 0)
+  caller=$(guard_caller_line)
+
+  # The aggregated VISIBLE record: one append-atomic line per occurrence, written before the
+  # lock and independent of it, so no occurrence is ever silently muted (qa-g2-q4 finding 2).
+  # A single short line under PIPE_BUF is atomic under O_APPEND across concurrent hooks.
+  printf '%s\tpid=%s\t%s\n' "$now" "$$" "$caller" >> "$occ" 2>/dev/null || true
+
   cli=${FM_FLEET_TRIAGE_BUG_CLI:-}
   [ "$cli" = off ] && return 0
   if [ -z "$cli" ]; then
@@ -278,53 +367,71 @@ signal_guard_error_bug() {  # <component> <detail>
   fi
   [ -x "$cli" ] || return 0
 
-  slug=$(printf '%s' "$1" | tr -c 'a-zA-Z0-9' '-')
-  dir=$(guard_error_coalesce_dir)
-  mkdir -p "$dir" 2>/dev/null || return 0
-  rec="$dir/$slug.record"
-  lock="$dir/$slug.lock"
-  window=${FM_GUARD_ERROR_COALESCE_WINDOW:-86400}
-  case "$window" in *[!0-9]*) window=86400 ;; '') window=86400 ;; esac
-  now=$(date -u +%s 2>/dev/null || printf 0)
-  caller=$(guard_caller_line)
-
-  # Serialize concurrent Stop hooks racing the same fingerprint. mkdir is atomic across
-  # processes; a brief bounded wait covers the near-simultaneous pair/triple the incident
-  # showed, and if the lock cannot be taken we treat this occurrence as coalesced rather
-  # than file a racing duplicate.
-  waited=0
-  until mkdir "$lock" 2>/dev/null; do
-    waited=$((waited + 1))
-    [ "$waited" -gt 50 ] && return 0
-    sleep 0.1 2>/dev/null || true
-  done
+  # The lock guards only the SUMMARY record and the bug-filing decision. If it cannot be
+  # taken even after stale recovery, the occurrence is already durable in the occurrences log
+  # above, so returning here coalesces the FILING without losing the occurrence.
+  guard_error_lock_acquire "$lock" "$now" || return 0
 
   count=0
   first=$now
   last_bug=0
+  last_attempt=0
   bug_id='-'
+  occ_dropped=0
   if [ -f "$rec" ]; then
     while IFS='=' read -r k v; do
       case "$k" in
-        count) count=$v ;;
         first_seen) first=$v ;;
         last_bug_epoch) last_bug=$v ;;
+        last_attempt_epoch) last_attempt=$v ;;
         bug_id) bug_id=$v ;;
+        occ_dropped) occ_dropped=$v ;;
       esac
     done < "$rec"
-    case "$count" in *[!0-9]*) count=0 ;; '') count=0 ;; esac
     case "$last_bug" in *[!0-9]*) last_bug=0 ;; '') last_bug=0 ;; esac
+    case "$last_attempt" in *[!0-9]*) last_attempt=0 ;; '') last_attempt=0 ;; esac
     case "$first" in *[!0-9]*) first=$now ;; '') first=$now ;; esac
+    case "$occ_dropped" in *[!0-9]*) occ_dropped=0 ;; '') occ_dropped=0 ;; esac
   fi
-  count=$((count + 1))
 
-  if [ ! -f "$rec" ] || [ "$((now - last_bug))" -ge "$window" ]; then
-    # File exactly one captain bug for this fingerprint in this window, carrying caller
-    # identity and enough context that the ledger stays self-describing.
-    new_id=$("$cli" record "turn-end guard could not inspect fleet state ($1): $2. The unattended-work gate is failing open until this is repaired. Caller: $caller. Coalesced per failure fingerprint ($slug): repeat occurrences update a shared record ($rec) instead of filing new bugs; see state/.turnend-guard.log for guard_error decisions." \
+  # Bound the occurrences log and keep the total count exact across trims: dropped lines are
+  # carried in occ_dropped, so count = occ_dropped + surviving lines is always the true total.
+  lines=$(wc -l < "$occ" 2>/dev/null || printf 0)
+  lines=${lines//[!0-9]/}
+  [ -n "$lines" ] || lines=0
+  max=${FM_GUARD_ERROR_OCC_MAX:-1000}
+  case "$max" in *[!0-9]*) max=1000 ;; '') max=1000 ;; esac
+  if [ "$lines" -gt "$max" ]; then
+    keep=$((max / 2))
+    drop=$((lines - keep))
+    if tail -n "$keep" "$occ" > "$occ.tmp.$$" 2>/dev/null && mv -f "$occ.tmp.$$" "$occ" 2>/dev/null; then
+      occ_dropped=$((occ_dropped + drop))
+      lines=$keep
+    else
+      rm -f "$occ.tmp.$$" 2>/dev/null || true
+    fi
+  fi
+  count=$((occ_dropped + lines))
+
+  # File one captain bug per fingerprint per window - but advance the window ONLY on a
+  # CONFIRMED success (finding 3). A failed CLI keeps last_bug where it was so the signal
+  # stays eligible on the next occurrence. The window gate governs the normal (success) path;
+  # a SEPARATE bounded backoff applies only when we are retrying AFTER a failure - i.e. the
+  # last attempt did not produce a successful filing (last_attempt is ahead of last_bug) - so
+  # a sustained outage does not hammer the CLI on every occurrence, without ever throttling a
+  # legitimate post-window refile.
+  window_ok=0
+  { [ "$last_bug" -eq 0 ] || [ "$((now - last_bug))" -ge "$window" ]; } && window_ok=1
+  in_failure_backoff=0
+  { [ "$last_attempt" -gt "$last_bug" ] && [ "$((now - last_attempt))" -lt "$retry" ]; } && in_failure_backoff=1
+  if [ "$window_ok" -eq 1 ] && [ "$in_failure_backoff" -eq 0 ]; then
+    last_attempt=$now
+    new_id=$("$cli" record "turn-end guard could not inspect fleet state ($1): $2. The unattended-work gate is failing open until this is repaired. Caller: $caller. Coalesced per failure fingerprint ($slug): every occurrence is appended to $occ (aggregated, count=$count) and repeat occurrences update the shared record ($rec) instead of filing new bugs; see state/.turnend-guard.log for guard_error decisions." \
       --quiet 2>/dev/null) || new_id=''
-    [ -n "$new_id" ] && bug_id=$new_id
-    last_bug=$now
+    if [ -n "$new_id" ]; then
+      bug_id=$new_id
+      last_bug=$now
+    fi
   fi
 
   # Persist the shared record (plain key=value; never sourced back, so no code-exec risk).
@@ -332,8 +439,10 @@ signal_guard_error_bug() {  # <component> <detail>
     printf 'fingerprint=%s\n' "$slug"
     printf 'first_seen=%s\n' "$first"
     printf 'last_bug_epoch=%s\n' "$last_bug"
+    printf 'last_attempt_epoch=%s\n' "$last_attempt"
     printf 'last_seen=%s\n' "$now"
     printf 'count=%s\n' "$count"
+    printf 'occ_dropped=%s\n' "$occ_dropped"
     printf 'bug_id=%s\n' "$bug_id"
     printf 'last_caller=%s\n' "$caller"
   } > "$rec.tmp.$$" 2>/dev/null; then
@@ -342,7 +451,7 @@ signal_guard_error_bug() {  # <component> <detail>
     rm -f "$rec.tmp.$$" 2>/dev/null || true
   fi
 
-  rmdir "$lock" 2>/dev/null || true
+  rm -rf "$lock" 2>/dev/null || true
   return 0
 }
 

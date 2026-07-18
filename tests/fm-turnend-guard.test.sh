@@ -909,6 +909,165 @@ test_hook_linked_worktree_excluded_when_git_is_broken() {
   pass "fm-turnend-guard: the linked-worktree exclusion is fail-closed - a broken git no longer opens the gate"
 }
 
+# --- ORD-231 round 3 (qa-g2-q4) --------------------------------------------------
+
+# FINDING 1: the PRODUCTION topology. A crewmate's Stop hook is loaded from its own linked
+# worktree, but the crew session inherits FM_ROOT_OVERRIDE pointed at the non-git runtime
+# home. The exclusion must key on the HOOK CHECKOUT (where the script lives), NOT the
+# overridden operational root - otherwise it inspects the runtime's absent .git, skips the
+# exemption, and reruns the primary sweep in the crew worktree, reopening the exact fail-open
+# path that produced the 58 bugs. The round-2 tests unset FM_ROOT_OVERRIDE globally, so only
+# this case exercises the real inherited-override shape.
+test_hook_exclusion_survives_production_fm_root_override() {
+  local base dir home runtime pid out status bugcli buglog coalesce
+  base="$TMP_ROOT/hook-override-base"
+  dir="$TMP_ROOT/hook-override-wt"
+  make_crewmate_worktree_dir "$base" "$dir" >/dev/null
+  home=$(cd "$dir" && pwd)
+  [ -f "$dir/.git" ] || fail "fixture precondition: a linked worktree's .git must be a regular file"
+  # A separate, primary-shaped, NON-GIT runtime home - exactly what FM_ROOT_OVERRIDE points at
+  # in the fleet. Give it in-flight work so that if the exclusion FOLLOWED the override, it
+  # would evaluate this home (find the absent .git, skip the exemption) and act (block on the
+  # unattended task with no watcher), writing a decision log here.
+  runtime="$TMP_ROOT/hook-override-runtime"
+  mkdir -p "$runtime/bin" "$runtime/state"
+  : > "$runtime/AGENTS.md"
+  : > "$runtime/state/task1.meta"
+  write_nf_signal "$runtime" ship-o1 'done: ready in branch fm/ship-o1'
+  [ -e "$runtime/.git" ] && fail "fixture precondition: the runtime must be non-git"
+  buglog="$TMP_ROOT/hook-override-buglog"
+  coalesce="$TMP_ROOT/hook-override-coalesce"
+  bugcli=$(install_bug_stub "$dir" "$buglog")
+  out=$(printf '{"stop_hook_active":false}' | CLAUDECODE=1 \
+    FM_ROOT_OVERRIDE="$runtime" FM_HOME="$runtime" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$bugcli" \
+    bash "$dir/bin/fm-turnend-guard.sh" 2>&1)
+  status=$?
+  expect_code 0 "$status" "a crew worktree carrying a production FM_ROOT_OVERRIDE must stay inert, never fail open"
+  [ -z "$out" ] || fail "the overridden crew worktree produced output: $out"
+  [ ! -e "$dir/state/.turnend-guard.log" ] || fail "the crew worktree must not write a decision log"
+  [ ! -e "$runtime/state/.turnend-guard.log" ] || fail "the exclusion must not evaluate the overridden runtime at all"
+  [ ! -s "$buglog" ] || fail "an excluded crew worktree must file no bug: $(cat "$buglog" 2>/dev/null)"
+  pass "fm-turnend-guard: the linked-worktree exclusion keys on the hook checkout, so a production FM_ROOT_OVERRIDE cannot reopen the fail-open path"
+}
+
+# FINDING 4: a valid PRIMARY created with a separate git dir (git init --separate-git-dir) has
+# a .git FILE too, but it is a main checkout - its gitfile targets its own git dir, not a
+# .../worktrees/ path, and git-dir equals git-common-dir. The exclusion must guard it, not
+# silently exempt it as if every .git file meant a linked worktree.
+test_hook_separate_git_dir_primary_is_guarded() {
+  local dir home sepgit pid out status
+  dir="$TMP_ROOT/hook-sepgitdir"
+  sepgit="$TMP_ROOT/hook-sepgitdir-gitdir"
+  mkdir -p "$dir/state"
+  git init -q --separate-git-dir="$sepgit" "$dir"
+  git -C "$dir" commit -q --allow-empty -m init
+  : > "$dir/AGENTS.md"
+  install_guard_scripts "$dir"
+  home=$(cd "$dir" && pwd)
+  [ -f "$dir/.git" ] || fail "fixture precondition: a separate-git-dir checkout's .git must be a file"
+  case "$(cat "$dir/.git" 2>/dev/null)" in
+    *"/worktrees/"*) fail "fixture precondition: a separate-git-dir gitfile must not reference /worktrees/" ;;
+  esac
+  pid=$(start_healthy_watcher "$dir")
+  write_nf_signal "$dir" ship-s1 'done: ready in branch fm/ship-s1'
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 2 "$status" "a separate-git-dir PRIMARY must be guarded, not silently exempted as a worktree"
+  assert_contains "$out" "ship-s1" "the guarded separate-git-dir primary must name its unattended work"
+  [ -e "$dir/state/.turnend-guard.log" ] || fail "a guarded primary must write its decision log"
+  pass "fm-turnend-guard: a separate-git-dir primary (a .git FILE that is NOT a worktree) is guarded, not exempted"
+}
+
+# FINDING 2: an ABANDONED coalescing lock (left by a hook killed mid-section) must not mute the
+# durable signal forever. A stale lock - a dead holder pid or one aged past the stale window -
+# is reclaimed, so the occurrence is still recorded and the bug still fires.
+test_hook_guard_error_stale_lock_is_reclaimed() {
+  local dir home pid stub coalesce slug lock
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-stalelock")
+  home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
+  stub=$(install_bug_stub "$dir" "$home/bug-calls.log")
+  install_always_failing_nf_lib "$dir"
+  slug=$(printf '%s' 'fm-nf-attention-lib.sh failed to source' | tr -c 'a-zA-Z0-9' '-')
+  # Pre-plant an abandoned lock: a dead holder pid and an ancient epoch, exactly what a hook
+  # killed after acquiring the lock leaves behind.
+  lock="$coalesce/$slug.lock"
+  mkdir -p "$lock"
+  printf '%s\n' "$(nonexistent_pid)" > "$lock/pid"
+  printf '1\n' > "$lock/epoch"
+  pid=$(start_healthy_watcher "$dir")
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$stub" \
+    bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  stop_watcher "$pid"
+  [ -s "$coalesce/$slug.occurrences" ] || fail "the occurrence must be recorded despite the abandoned lock"
+  [ "$(grep -c 'turn-end guard' "$home/bug-calls.log" 2>/dev/null)" -eq 1 ] \
+    || fail "the abandoned lock must be reclaimed so the durable bug still fires, got: $(cat "$home/bug-calls.log" 2>/dev/null)"
+  [ -f "$coalesce/$slug.record" ] || fail "the shared record must be written after reclaiming the stale lock"
+  pass "fm-turnend-guard: an abandoned coalescing lock is reclaimed, so the durable signal is never muted forever"
+}
+
+# FINDING 2 / the captain's requirement: coalescing suppresses only duplicate FILINGS, never the
+# occurrence itself. A second occurrence in the same window files no new bug, but it MUST still
+# surface in the aggregated visible record - the occurrences log and the count.
+test_hook_coalesced_occurrence_still_surfaces() {
+  local dir home pid stub coalesce slug
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-occrec")
+  home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
+  stub=$(install_bug_stub "$dir" "$home/bug-calls.log")
+  install_always_failing_nf_lib "$dir"
+  slug=$(printf '%s' 'fm-nf-attention-lib.sh failed to source' | tr -c 'a-zA-Z0-9' '-')
+  pid=$(start_healthy_watcher "$dir")
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$stub" \
+    bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$stub" \
+    bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  stop_watcher "$pid"
+  [ "$(grep -c 'turn-end guard' "$home/bug-calls.log" 2>/dev/null)" -eq 1 ] \
+    || fail "the second in-window occurrence must NOT file a new bug: $(cat "$home/bug-calls.log" 2>/dev/null)"
+  [ "$(wc -l < "$coalesce/$slug.occurrences" 2>/dev/null | tr -d ' ')" -eq 2 ] \
+    || fail "both occurrences must be recorded in the aggregated occurrences log"
+  [ "$(grep '^count=' "$coalesce/$slug.record" 2>/dev/null | cut -d= -f2)" = 2 ] \
+    || fail "the aggregated record count must include the coalesced occurrence: $(cat "$coalesce/$slug.record" 2>/dev/null)"
+  pass "fm-turnend-guard: a coalesced occurrence still surfaces in the aggregated visible record (never silently muted)"
+}
+
+# FINDING 3: a FAILED bug filing must not advance the coalescing window as if a bug were filed.
+# The window advances only on a confirmed success; a failed CLI leaves the signal eligible for
+# a bounded retry (FM_GUARD_ERROR_BUG_RETRY) on the next occurrence.
+test_hook_guard_error_failed_filing_stays_eligible() {
+  local dir home pid coalesce slug faillog cli
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-clifail")
+  home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
+  slug=$(printf '%s' 'fm-nf-attention-lib.sh failed to source' | tr -c 'a-zA-Z0-9' '-')
+  install_always_failing_nf_lib "$dir"
+  # A bug CLI that records each attempt then FAILS.
+  faillog="$home/bug-attempts.log"
+  mkdir -p "$dir/stubbin"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\nexit 1\n' "$faillog" > "$dir/stubbin/bugfail"
+  chmod +x "$dir/stubbin/bugfail"
+  cli="$dir/stubbin/bugfail"
+  pid=$(start_healthy_watcher "$dir")
+  # Two occurrences with a zero retry backoff so the second is immediately eligible to retry.
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_GUARD_ERROR_BUG_RETRY=0 \
+    FM_FLEET_TRIAGE_BUG_CLI="$cli" bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_GUARD_ERROR_BUG_RETRY=0 \
+    FM_FLEET_TRIAGE_BUG_CLI="$cli" bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  stop_watcher "$pid"
+  [ "$(grep -c . "$faillog" 2>/dev/null)" -eq 2 ] \
+    || fail "a failed filing must stay eligible: both occurrences must attempt the CLI, got: $(cat "$faillog" 2>/dev/null)"
+  [ "$(grep '^last_bug_epoch=' "$coalesce/$slug.record" 2>/dev/null | cut -d= -f2)" = 0 ] \
+    || fail "a failed filing must NOT advance last_bug_epoch: $(cat "$coalesce/$slug.record" 2>/dev/null)"
+  pass "fm-turnend-guard: a failed bug filing keeps the signal eligible (the window advances only on a confirmed success)"
+}
+
 # The other direction is NOT open: a corrupt ledger must not hide work. The fold skips
 # malformed rows, so an item whose only "disposition" is a garbage line stays unattended.
 test_hook_malformed_ledger_rows_do_not_hide_work() {
@@ -2342,6 +2501,11 @@ test_hook_persistent_source_failure_reports_with_caller_identity
 test_hook_guard_error_bug_is_coalesced_fleet_wide
 test_hook_guard_error_bug_refiles_after_window
 test_hook_linked_worktree_excluded_when_git_is_broken
+test_hook_exclusion_survives_production_fm_root_override
+test_hook_separate_git_dir_primary_is_guarded
+test_hook_guard_error_stale_lock_is_reclaimed
+test_hook_coalesced_occurrence_still_surfaces
+test_hook_guard_error_failed_filing_stays_eligible
 test_hook_malformed_ledger_rows_do_not_hide_work
 test_hook_afk_stands_down_without_losing_work
 test_hook_duty_kill_switch_is_loud_and_logged
