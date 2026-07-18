@@ -287,33 +287,35 @@ guard_error_coalesce_dir() {
   fi
 }
 
-# Acquire the per-fingerprint coalescing lock with STALE RECOVERY (qa-g2-q4 finding 2). A
-# bare mkdir lock with no owner metadata and no recovery meant a Stop hook killed mid-section
-# left the lock forever, and every later occurrence then waited and gave up WITHOUT ever
-# filing the durable bug again - muting the signal permanently. The lock now records its
-# holder pid and epoch, and a contender reclaims it only when PROVABLY stale: the holder pid
-# is dead, or the lock has aged past FM_GUARD_ERROR_LOCK_STALE. Returns 0 acquired, 1 gave up.
-guard_error_lock_acquire() {  # <lock-dir> <now-epoch>
-  local lock=$1 now=$2 waited=0 hpid hepoch stale
+# Round 4 migration helper only: older guard builds used <slug>.lock as a mkdir lock
+# directory with pid/epoch metadata. The flock rewrite below uses that same path as a
+# kernel-owned lock file, so a leftover directory must be cleared first. New code never
+# creates lock directories. Missing, malformed, or dead-owner metadata is therefore safely
+# treated as a stale legacy artifact; a live owner is given a bounded wait and then skipped.
+guard_error_clear_legacy_lock_dir() {  # <lock-path> <now-epoch>
+  local lock=$1 now=$2 waited=0 hpid hepoch stale wait_s
+  [ -d "$lock" ] || return 0
   stale=${FM_GUARD_ERROR_LOCK_STALE:-30}
   case "$stale" in *[!0-9]*) stale=30 ;; '') stale=30 ;; esac
-  while ! mkdir "$lock" 2>/dev/null; do
+  wait_s=${FM_GUARD_ERROR_FLOCK_WAIT:-5}
+  case "$wait_s" in *[!0-9]*) wait_s=5 ;; '') wait_s=5 ;; esac
+  while [ -d "$lock" ]; do
     hpid=''; hepoch=''
     IFS= read -r hpid < "$lock/pid" 2>/dev/null || hpid=''
     IFS= read -r hepoch < "$lock/epoch" 2>/dev/null || hepoch=''
+    case "$hpid" in *[!0-9]*) hpid='' ;; esac
     case "$hepoch" in *[!0-9]*) hepoch=0 ;; '') hepoch=0 ;; esac
-    if { [ -n "$hpid" ] && ! kill -0 "$hpid" 2>/dev/null; } \
+    if [ -z "$hpid" ] \
+       || ! kill -0 "$hpid" 2>/dev/null \
        || { [ "$hepoch" -gt 0 ] && [ "$((now - hepoch))" -ge "$stale" ]; }; then
-      # Provably stale: reclaim and retry. rm -rf on our own cache dir only.
       rm -rf "$lock" 2>/dev/null || true
+      [ -d "$lock" ] || return 0
       continue
     fi
     waited=$((waited + 1))
-    [ "$waited" -gt 50 ] && return 1
-    sleep 0.1 2>/dev/null || true
+    [ "$waited" -ge "$wait_s" ] && return 1
+    sleep 1 2>/dev/null || true
   done
-  printf '%s\n' "$$" > "$lock/pid" 2>/dev/null || true
-  printf '%s\n' "$now" > "$lock/epoch" 2>/dev/null || true
   return 0
 }
 
@@ -331,16 +333,18 @@ guard_error_lock_acquire() {  # <lock-dir> <now-epoch>
 # forever. Best-effort in every direction: a coalescing failure never changes the fail-open
 # decision.
 #
-# CRUCIALLY, coalescing suppresses only DUPLICATE bug FILINGS, never the occurrence itself
-# (qa-g2-q4 finding 2, the opposite failure): EVERY occurrence is appended lock-free to a
-# durable, append-atomic occurrences log FIRST, so an occurrence is visible and aggregated
-# even when the summary lock is contended, abandoned, or unwritable. And the coalescing window
-# advances ONLY on a CONFIRMED successful bug filing (finding 3); a failed bug CLI leaves the
-# signal eligible for a bounded retry rather than muting it for the whole window.
+# CRUCIALLY, coalescing suppresses only DUPLICATE bug FILINGS, never the occurrence itself.
+# The round-3 lock-directory/lock-free append design is deliberately gone: it could lose a
+# line during compaction and could strand an ownerless lock directory forever. Round 4 uses
+# one kernel-owned flock for rotation, append, summary update, and bug-filing eligibility;
+# rotation happens before the current append, so no append can land on an inode about to be
+# replaced. The coalescing window advances ONLY on a CONFIRMED successful bug filing; a
+# failed bug CLI leaves the signal eligible for a bounded retry rather than muting it for
+# the whole window.
 signal_guard_error_bug() {  # <component> <detail>
   local cli slug dir rec lock occ window retry now caller k v
   local count first last_bug last_attempt bug_id new_id occ_dropped lines max keep drop
-  local window_ok in_failure_backoff
+  local window_ok in_failure_backoff flock_wait
 
   slug=$(printf '%s' "$1" | tr -c 'a-zA-Z0-9' '-')
   dir=$(guard_error_coalesce_dir)
@@ -355,103 +359,108 @@ signal_guard_error_bug() {  # <component> <detail>
   now=$(date -u +%s 2>/dev/null || printf 0)
   caller=$(guard_caller_line)
 
-  # The aggregated VISIBLE record: one append-atomic line per occurrence, written before the
-  # lock and independent of it, so no occurrence is ever silently muted (qa-g2-q4 finding 2).
-  # A single short line under PIPE_BUF is atomic under O_APPEND across concurrent hooks.
-  printf '%s\tpid=%s\t%s\n' "$now" "$$" "$caller" >> "$occ" 2>/dev/null || true
-
   cli=${FM_FLEET_TRIAGE_BUG_CLI:-}
-  [ "$cli" = off ] && return 0
-  if [ -z "$cli" ]; then
-    cli=$(command -v bug 2>/dev/null) || return 0
+  if [ "$cli" != off ] && [ -z "$cli" ]; then
+    cli=$(command -v bug 2>/dev/null || true)
   fi
-  [ -x "$cli" ] || return 0
-
-  # The lock guards only the SUMMARY record and the bug-filing decision. If it cannot be
-  # taken even after stale recovery, the occurrence is already durable in the occurrences log
-  # above, so returning here coalesces the FILING without losing the occurrence.
-  guard_error_lock_acquire "$lock" "$now" || return 0
-
-  count=0
-  first=$now
-  last_bug=0
-  last_attempt=0
-  bug_id='-'
-  occ_dropped=0
-  if [ -f "$rec" ]; then
-    while IFS='=' read -r k v; do
-      case "$k" in
-        first_seen) first=$v ;;
-        last_bug_epoch) last_bug=$v ;;
-        last_attempt_epoch) last_attempt=$v ;;
-        bug_id) bug_id=$v ;;
-        occ_dropped) occ_dropped=$v ;;
-      esac
-    done < "$rec"
-    case "$last_bug" in *[!0-9]*) last_bug=0 ;; '') last_bug=0 ;; esac
-    case "$last_attempt" in *[!0-9]*) last_attempt=0 ;; '') last_attempt=0 ;; esac
-    case "$first" in *[!0-9]*) first=$now ;; '') first=$now ;; esac
-    case "$occ_dropped" in *[!0-9]*) occ_dropped=0 ;; '') occ_dropped=0 ;; esac
+  if [ "$cli" != off ] && { [ -z "$cli" ] || [ ! -x "$cli" ]; }; then
+    cli=''
   fi
 
-  # Bound the occurrences log and keep the total count exact across trims: dropped lines are
-  # carried in occ_dropped, so count = occ_dropped + surviving lines is always the true total.
-  lines=$(wc -l < "$occ" 2>/dev/null || printf 0)
-  lines=${lines//[!0-9]/}
-  [ -n "$lines" ] || lines=0
-  max=${FM_GUARD_ERROR_OCC_MAX:-1000}
-  case "$max" in *[!0-9]*) max=1000 ;; '') max=1000 ;; esac
-  if [ "$lines" -gt "$max" ]; then
-    keep=$((max / 2))
-    drop=$((lines - keep))
-    if tail -n "$keep" "$occ" > "$occ.tmp.$$" 2>/dev/null && mv -f "$occ.tmp.$$" "$occ" 2>/dev/null; then
-      occ_dropped=$((occ_dropped + drop))
-      lines=$keep
+  command -v flock >/dev/null 2>&1 || return 0
+  guard_error_clear_legacy_lock_dir "$lock" "$now" || return 0
+  flock_wait=${FM_GUARD_ERROR_FLOCK_WAIT:-5}
+  case "$flock_wait" in *[!0-9]*) flock_wait=5 ;; '') flock_wait=5 ;; esac
+
+  (
+    trap 'rm -f "$rec.tmp.$$" "$occ.tmp.$$" 2>/dev/null || true; exec 9>&- 2>/dev/null || true' EXIT HUP INT TERM
+    exec 9>"$lock" || exit 0
+    if [ "$flock_wait" -gt 0 ]; then
+      flock -w "$flock_wait" 9 || exit 0
     else
-      rm -f "$occ.tmp.$$" 2>/dev/null || true
+      flock -n 9 || exit 0
     fi
-  fi
-  count=$((occ_dropped + lines))
 
-  # File one captain bug per fingerprint per window - but advance the window ONLY on a
-  # CONFIRMED success (finding 3). A failed CLI keeps last_bug where it was so the signal
-  # stays eligible on the next occurrence. The window gate governs the normal (success) path;
-  # a SEPARATE bounded backoff applies only when we are retrying AFTER a failure - i.e. the
-  # last attempt did not produce a successful filing (last_attempt is ahead of last_bug) - so
-  # a sustained outage does not hammer the CLI on every occurrence, without ever throttling a
-  # legitimate post-window refile.
-  window_ok=0
-  { [ "$last_bug" -eq 0 ] || [ "$((now - last_bug))" -ge "$window" ]; } && window_ok=1
-  in_failure_backoff=0
-  { [ "$last_attempt" -gt "$last_bug" ] && [ "$((now - last_attempt))" -lt "$retry" ]; } && in_failure_backoff=1
-  if [ "$window_ok" -eq 1 ] && [ "$in_failure_backoff" -eq 0 ]; then
-    last_attempt=$now
-    new_id=$("$cli" record "turn-end guard could not inspect fleet state ($1): $2. The unattended-work gate is failing open until this is repaired. Caller: $caller. Coalesced per failure fingerprint ($slug): every occurrence is appended to $occ (aggregated, count=$count) and repeat occurrences update the shared record ($rec) instead of filing new bugs; see state/.turnend-guard.log for guard_error decisions." \
-      --quiet 2>/dev/null) || new_id=''
-    if [ -n "$new_id" ]; then
-      bug_id=$new_id
-      last_bug=$now
+    count=0
+    first=$now
+    last_bug=0
+    last_attempt=0
+    bug_id='-'
+    occ_dropped=0
+    if [ -f "$rec" ]; then
+      while IFS='=' read -r k v; do
+        case "$k" in
+          first_seen) first=$v ;;
+          last_bug_epoch) last_bug=$v ;;
+          last_attempt_epoch) last_attempt=$v ;;
+          bug_id) bug_id=$v ;;
+          occ_dropped) occ_dropped=$v ;;
+        esac
+      done < "$rec"
+      case "$last_bug" in *[!0-9]*) last_bug=0 ;; '') last_bug=0 ;; esac
+      case "$last_attempt" in *[!0-9]*) last_attempt=0 ;; '') last_attempt=0 ;; esac
+      case "$first" in *[!0-9]*) first=$now ;; '') first=$now ;; esac
+      case "$occ_dropped" in *[!0-9]*) occ_dropped=0 ;; '') occ_dropped=0 ;; esac
     fi
-  fi
 
-  # Persist the shared record (plain key=value; never sourced back, so no code-exec risk).
-  if {
-    printf 'fingerprint=%s\n' "$slug"
-    printf 'first_seen=%s\n' "$first"
-    printf 'last_bug_epoch=%s\n' "$last_bug"
-    printf 'last_attempt_epoch=%s\n' "$last_attempt"
-    printf 'last_seen=%s\n' "$now"
-    printf 'count=%s\n' "$count"
-    printf 'occ_dropped=%s\n' "$occ_dropped"
-    printf 'bug_id=%s\n' "$bug_id"
-    printf 'last_caller=%s\n' "$caller"
-  } > "$rec.tmp.$$" 2>/dev/null; then
-    mv -f "$rec.tmp.$$" "$rec" 2>/dev/null || rm -f "$rec.tmp.$$" 2>/dev/null
-  else
-    rm -f "$rec.tmp.$$" 2>/dev/null || true
-  fi
+    # Rotate before appending the current occurrence. Because rotation and append share one
+    # flock, no concurrent append can target an old inode that is about to be replaced.
+    lines=$(wc -l < "$occ" 2>/dev/null || printf 0)
+    lines=${lines//[!0-9]/}
+    [ -n "$lines" ] || lines=0
+    max=${FM_GUARD_ERROR_OCC_MAX:-1000}
+    case "$max" in *[!0-9]*) max=1000 ;; '') max=1000 ;; esac
+    if [ "$lines" -ge "$max" ]; then
+      keep=$((max / 2))
+      [ "$keep" -ge 1 ] || keep=1
+      drop=$((lines - keep))
+      if tail -n "$keep" "$occ" > "$occ.tmp.$$" 2>/dev/null && mv -f "$occ.tmp.$$" "$occ" 2>/dev/null; then
+        occ_dropped=$((occ_dropped + drop))
+        lines=$keep
+      else
+        rm -f "$occ.tmp.$$" 2>/dev/null || true
+      fi
+    fi
 
-  rm -rf "$lock" 2>/dev/null || true
+    if printf '%s\tpid=%s\t%s\n' "$now" "$$" "$caller" >> "$occ" 2>/dev/null; then
+      lines=$((lines + 1))
+    fi
+    count=$((occ_dropped + lines))
+
+    # File one captain bug per fingerprint per window - but advance the window ONLY on a
+    # CONFIRMED success. A failed CLI keeps last_bug where it was so the signal stays
+    # eligible on the next occurrence, with a short retry backoff only after failed attempts.
+    window_ok=0
+    { [ "$last_bug" -eq 0 ] || [ "$((now - last_bug))" -ge "$window" ]; } && window_ok=1
+    in_failure_backoff=0
+    { [ "$last_attempt" -gt "$last_bug" ] && [ "$((now - last_attempt))" -lt "$retry" ]; } && in_failure_backoff=1
+    if [ -n "$cli" ] && [ "$cli" != off ] && [ "$window_ok" -eq 1 ] && [ "$in_failure_backoff" -eq 0 ]; then
+      last_attempt=$now
+      new_id=$("$cli" record "turn-end guard could not inspect fleet state ($1): $2. The unattended-work gate is failing open until this is repaired. Caller: $caller. Coalesced per failure fingerprint ($slug): every occurrence is serialized under flock into $occ (aggregated, count=$count) and repeat occurrences update the shared record ($rec) instead of filing new bugs; see state/.turnend-guard.log for guard_error decisions." \
+        --quiet 2>/dev/null) || new_id=''
+      if [ -n "$new_id" ]; then
+        bug_id=$new_id
+        last_bug=$now
+      fi
+    fi
+
+    # Persist the shared record (plain key=value; never sourced back, so no code-exec risk).
+    if {
+      printf 'fingerprint=%s\n' "$slug"
+      printf 'first_seen=%s\n' "$first"
+      printf 'last_bug_epoch=%s\n' "$last_bug"
+      printf 'last_attempt_epoch=%s\n' "$last_attempt"
+      printf 'last_seen=%s\n' "$now"
+      printf 'count=%s\n' "$count"
+      printf 'occ_dropped=%s\n' "$occ_dropped"
+      printf 'bug_id=%s\n' "$bug_id"
+      printf 'last_caller=%s\n' "$caller"
+    } > "$rec.tmp.$$" 2>/dev/null; then
+      mv -f "$rec.tmp.$$" "$rec" 2>/dev/null || rm -f "$rec.tmp.$$" 2>/dev/null
+    else
+      rm -f "$rec.tmp.$$" 2>/dev/null || true
+    fi
+  )
   return 0
 }
 

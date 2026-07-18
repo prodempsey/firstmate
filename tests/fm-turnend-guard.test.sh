@@ -766,6 +766,33 @@ install_bug_stub() {  # <dir> <log-path>
   printf '%s\n' "$dir/stubbin/bugstub"
 }
 
+install_pausing_tail_stub() {  # <fakebin-dir>
+  local fb=$1 real_tail
+  real_tail=$(command -v tail)
+  mkdir -p "$fb"
+  cat > "$fb/tail" <<'SH'
+#!/usr/bin/env bash
+if [ "${FM_GUARD_TEST_PAUSE_TAIL:-}" = 1 ] \
+   && [ -n "${FM_GUARD_TEST_REAL_TAIL:-}" ] \
+   && [ -n "${FM_GUARD_TEST_OCC:-}" ] \
+   && [ -n "${FM_GUARD_TEST_TAIL_ONCE:-}" ] \
+   && [ -n "${FM_GUARD_TEST_TAIL_PAUSED:-}" ] \
+   && [ -n "${FM_GUARD_TEST_TAIL_RELEASE:-}" ] \
+   && [ "${3:-}" = "$FM_GUARD_TEST_OCC" ] \
+   && [ ! -e "$FM_GUARD_TEST_TAIL_ONCE" ]; then
+  "$FM_GUARD_TEST_REAL_TAIL" "$@"
+  rc=$?
+  : > "$FM_GUARD_TEST_TAIL_ONCE"
+  : > "$FM_GUARD_TEST_TAIL_PAUSED"
+  while [ ! -e "$FM_GUARD_TEST_TAIL_RELEASE" ]; do sleep 0.05; done
+  exit "$rc"
+fi
+exec "$FM_GUARD_TEST_REAL_TAIL" "$@"
+SH
+  chmod +x "$fb/tail"
+  printf '%s\n' "$real_tail" > "$fb/real-tail.path"
+}
+
 # A single transient source failure must be ABSORBED by the bounded retry, not reported as a
 # guard_error and not filed as a bug. This is the exact condition the incident was made of.
 test_hook_source_failure_is_absorbed_by_retry() {
@@ -1008,6 +1035,40 @@ test_hook_guard_error_stale_lock_is_reclaimed() {
   pass "fm-turnend-guard: an abandoned coalescing lock is reclaimed, so the durable signal is never muted forever"
 }
 
+# ROUND 4: the old mkdir-lock protocol is gone. A leftover empty directory (kill between
+# mkdir and owner publication) or pid-only directory (partial publication) must be migrated
+# out of the way so flock can restore the aggregate summary and bug eligibility.
+test_hook_guard_error_empty_and_partial_legacy_locks_recover() {
+  local case_name dir home pid stub coalesce slug lock occ_lines count bug_calls
+  for case_name in empty partial; do
+    dir=$(make_primary_dir "$TMP_ROOT/hook-nf-${case_name}-legacy-lock")
+    home=$(cd "$dir" && pwd)
+    coalesce="$dir/coalesce"
+    stub=$(install_bug_stub "$dir" "$home/bug-calls.log")
+    install_always_failing_nf_lib "$dir"
+    slug=$(printf '%s' 'fm-nf-attention-lib.sh failed to source' | tr -c 'a-zA-Z0-9' '-')
+    lock="$coalesce/$slug.lock"
+    mkdir -p "$lock"
+    if [ "$case_name" = partial ]; then
+      printf '%s\n' "$(nonexistent_pid)" > "$lock/pid"
+    fi
+    pid=$(start_healthy_watcher "$dir")
+    printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+      FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$stub" \
+      bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+    stop_watcher "$pid"
+    [ ! -d "$lock" ] || fail "$case_name legacy lock directory still blocks flock"
+    [ -f "$lock" ] || fail "$case_name legacy lock was not replaced by a flock file"
+    occ_lines=$(wc -l < "$coalesce/$slug.occurrences" 2>/dev/null | tr -d ' ')
+    count=$(grep '^count=' "$coalesce/$slug.record" 2>/dev/null | cut -d= -f2)
+    bug_calls=$(grep -c 'turn-end guard' "$home/bug-calls.log" 2>/dev/null)
+    [ "$occ_lines" = 1 ] || fail "$case_name legacy lock did not preserve the occurrence line"
+    [ "$count" = 1 ] || fail "$case_name legacy lock did not restore the summary: $(cat "$coalesce/$slug.record" 2>/dev/null)"
+    [ "$bug_calls" -eq 1 ] || fail "$case_name legacy lock did not restore bug eligibility: $(cat "$home/bug-calls.log" 2>/dev/null)"
+  done
+  pass "fm-turnend-guard: empty and partially published legacy lock directories recover under flock"
+}
+
 # FINDING 2 / the captain's requirement: coalescing suppresses only duplicate FILINGS, never the
 # occurrence itself. A second occurrence in the same window files no new bug, but it MUST still
 # surface in the aggregated visible record - the occurrences log and the count.
@@ -1066,6 +1127,71 @@ test_hook_guard_error_failed_filing_stays_eligible() {
   [ "$(grep '^last_bug_epoch=' "$coalesce/$slug.record" 2>/dev/null | cut -d= -f2)" = 0 ] \
     || fail "a failed filing must NOT advance last_bug_epoch: $(cat "$coalesce/$slug.record" 2>/dev/null)"
   pass "fm-turnend-guard: a failed bug filing keeps the signal eligible (the window advances only on a confirmed success)"
+}
+
+# ROUND 4: compaction and append must share one kernel-owned lock. This fixture preloads the
+# default 1,000-line cap, pauses the first hook after tail has produced its compaction snapshot
+# but before rotation can finish, then starts a second hook. The second hook must wait on flock
+# and append only after rotation; the final exact count must include both new occurrences.
+test_hook_guard_error_compaction_serializes_concurrent_append() {
+  local dir home pid stub coalesce slug occ tailfb real_tail paused release once p1 p2 rc1 rc2
+  local count occ_dropped surviving bug_calls
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-flock-compact")
+  home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
+  slug=$(printf '%s' 'fm-nf-attention-lib.sh failed to source' | tr -c 'a-zA-Z0-9' '-')
+  occ="$coalesce/$slug.occurrences"
+  mkdir -p "$coalesce"
+  for i in $(seq 1 1000); do
+    printf 'old-%s\n' "$i"
+  done > "$occ"
+  stub=$(install_bug_stub "$dir" "$home/bug-calls.log")
+  install_always_failing_nf_lib "$dir"
+  tailfb="$dir/tailbin"
+  install_pausing_tail_stub "$tailfb"
+  real_tail=$(cat "$tailfb/real-tail.path")
+  paused="$dir/tail.paused"
+  release="$dir/tail.release"
+  once="$dir/tail.once"
+  pid=$(start_healthy_watcher "$dir")
+
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    PATH="$tailfb:$PATH" FM_GUARD_TEST_PAUSE_TAIL=1 FM_GUARD_TEST_REAL_TAIL="$real_tail" \
+    FM_GUARD_TEST_OCC="$occ" FM_GUARD_TEST_TAIL_ONCE="$once" \
+    FM_GUARD_TEST_TAIL_PAUSED="$paused" FM_GUARD_TEST_TAIL_RELEASE="$release" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$stub" \
+    bash "$dir/bin/fm-turnend-guard.sh" > "$dir/first.out" 2>&1 &
+  p1=$!
+  for _ in $(seq 1 100); do
+    [ -e "$paused" ] && break
+    sleep 0.05
+  done
+  [ -e "$paused" ] || fail "first hook never paused inside compaction"
+
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    PATH="$tailfb:$PATH" FM_GUARD_TEST_PAUSE_TAIL=1 FM_GUARD_TEST_REAL_TAIL="$real_tail" \
+    FM_GUARD_TEST_OCC="$occ" FM_GUARD_TEST_TAIL_ONCE="$once" \
+    FM_GUARD_TEST_TAIL_PAUSED="$paused" FM_GUARD_TEST_TAIL_RELEASE="$release" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$stub" \
+    bash "$dir/bin/fm-turnend-guard.sh" > "$dir/second.out" 2>&1 &
+  p2=$!
+  sleep 0.2
+  kill -0 "$p2" 2>/dev/null || fail "second hook did not wait for the flock during paused compaction"
+  : > "$release"
+  wait "$p1"; rc1=$?
+  wait "$p2"; rc2=$?
+  stop_watcher "$pid"
+  expect_code 0 "$rc1" "first compaction hook should fail open cleanly"
+  expect_code 0 "$rc2" "second concurrent hook should fail open cleanly"
+  count=$(grep '^count=' "$coalesce/$slug.record" 2>/dev/null | cut -d= -f2)
+  occ_dropped=$(grep '^occ_dropped=' "$coalesce/$slug.record" 2>/dev/null | cut -d= -f2)
+  surviving=$(wc -l < "$occ" 2>/dev/null | tr -d ' ')
+  bug_calls=$(grep -c 'turn-end guard' "$home/bug-calls.log" 2>/dev/null)
+  [ "$count" = 1002 ] || fail "summary count lost a concurrent occurrence: $(cat "$coalesce/$slug.record" 2>/dev/null)"
+  [ "$occ_dropped" = 500 ] || fail "dropped accounting should carry exactly the rotated 500 lines: $(cat "$coalesce/$slug.record" 2>/dev/null)"
+  [ "$surviving" = 502 ] || fail "retained occurrences should be 500 old + 2 new, got $surviving"
+  [ "$bug_calls" -eq 1 ] || fail "concurrent identical guard errors should file exactly one bug: $(cat "$home/bug-calls.log" 2>/dev/null)"
+  pass "fm-turnend-guard: flock serializes paused compaction and concurrent append with exact aggregate counts"
 }
 
 # The other direction is NOT open: a corrupt ledger must not hide work. The fold skips
@@ -2504,8 +2630,10 @@ test_hook_linked_worktree_excluded_when_git_is_broken
 test_hook_exclusion_survives_production_fm_root_override
 test_hook_separate_git_dir_primary_is_guarded
 test_hook_guard_error_stale_lock_is_reclaimed
+test_hook_guard_error_empty_and_partial_legacy_locks_recover
 test_hook_coalesced_occurrence_still_surfaces
 test_hook_guard_error_failed_filing_stays_eligible
+test_hook_guard_error_compaction_serializes_concurrent_append
 test_hook_malformed_ledger_rows_do_not_hide_work
 test_hook_afk_stands_down_without_losing_work
 test_hook_duty_kill_switch_is_loud_and_logged
