@@ -388,20 +388,27 @@ test_opencode_threads_model_and_ignores_effort_axis() {
 # JavaScript source layer and the (now absent) shell layer. The old approach
 # injected a shell-quoted path into a JS backtick template, so a path with a
 # backtick broke the JS source and a ${...} or backslash was reinterpreted by the
-# template before any shell ran. The fix emits the path as a JS STRING literal and
-# touches it through the filesystem API (no shell). This exercises the full
-# metacharacter matrix - space, single quote, backtick, ${...}, backslash - and
-# requires the emitted plugin to be valid JavaScript for every one, with the path
-# faithfully recoverable.
+# template before any shell ran. The round-2 fix emitted a JS string literal but
+# with incomplete (backslash/quote-only) escaping, so a legal newline in the path
+# still emitted invalid JS. The fix uses FULL JSON-string escaping semantics, so
+# this exercises the whole metacharacter matrix - space, single quote, backtick,
+# ${...}, backslash, double quote, newline, carriage return, tab, and the
+# U+2028/U+2029 line/paragraph separators (legal in JSON but illegal unescaped in a
+# pre-ES2019 JS string) - and for every one requires the emitted plugin to be valid
+# JavaScript, to decode the path faithfully, AND to actually touch the exact
+# turn-end file when its idle handler runs.
 test_opencode_turn_end_hook_is_js_and_shell_safe() {
-  local rec idx mchar sd id state_real turnend esc hook decoded
+  local rec idx mchar sd id state_real turnend hook decoded have_node
   rec=$(make_spawn_case profile-opencode-meta opencode)
   read_case_record "$rec"
+  have_node=0; command -v node >/dev/null 2>&1 && have_node=1
 
   idx=0
-  # Each metacharacter is a LITERAL filename part, not a shell expansion.
+  # Each metacharacter is a LITERAL filename part, not a shell expansion; the last
+  # five carry a real newline, CR, tab, and the U+2028/U+2029 separators.
   # shellcheck disable=SC2016
-  for mchar in 'state with space' "state'quote" 'state`tick`' 'state${x}y' 'state\back'; do
+  for mchar in 'state with space' "state'quote" 'state`tick`' 'state${x}y' 'state\back' \
+               'state"dq' $'state\nnl' $'state\rcr' $'state\ttab' $'state\u2028ls' $'state\u2029ps'; do
     idx=$((idx + 1))
     id="oc-meta-$idx"
     mkdir -p "$HOME_DIR/data/$id"; printf 'brief\n' > "$HOME_DIR/data/$id/brief.md"
@@ -416,30 +423,39 @@ test_opencode_turn_end_hook_is_js_and_shell_safe() {
       "$SPAWN" "$id" "$PROJ_DIR" >/dev/null 2>&1
 
     hook="$WT_DIR/.opencode/plugins/fm-turn-end.js"
-    [ -f "$hook" ] || fail "opencode spawn did not write the turn-end plugin for path '$mchar'"
+    [ -f "$hook" ] || fail "opencode spawn did not write the turn-end plugin for case $idx"
     # The shell-in-a-JS-template stack is gone entirely.
     ! grep -q 'await \$`' "$hook" \
-      || fail "opencode hook still shells out via a template literal for '$mchar'"
-    # The path is a double-quoted JS string literal that decodes back to TURNEND.
+      || fail "opencode hook still shells out via a template literal for case $idx"
+
     state_real=$(cd "$sd" && pwd -P)
     turnend="$state_real/$id.turn-ended"
-    esc=$(printf '%s' "$turnend" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    assert_contains "$(cat "$hook")" "const p = \"$esc\"" \
-      "opencode hook must embed the JS-escaped path literal for '$mchar'"
-    # Valid JavaScript module for every metacharacter (the backtick case is exactly
-    # what broke the old shell-quoted-in-a-JS-template approach), and the embedded
-    # literal decodes to the exact TURNEND path.
-    if command -v node >/dev/null 2>&1; then
-      cp "$hook" "$CASE_DIR/check-$idx.mjs"
-      node --check "$CASE_DIR/check-$idx.mjs" 2>"$CASE_DIR/check-$idx.err" \
-        || fail "opencode hook is not valid JS for path '$mchar': $(cat "$CASE_DIR/check-$idx.err")"
-      decoded=$(node -e 'const fs=require("node:fs");const s=fs.readFileSync(process.argv[1],"utf8");const m=s.match(/const p = ("(?:[^"\\]|\\.)*")/);if(!m){process.exit(3)}process.stdout.write(JSON.parse(m[1]))' "$hook" 2>/dev/null) \
-        || fail "could not extract the path literal from the opencode hook for '$mchar'"
-      [ "$decoded" = "$turnend" ] \
-        || fail "opencode hook path literal for '$mchar' decoded to '$decoded', expected '$turnend'"
-    fi
+    [ "$have_node" -eq 1 ] || continue
+
+    # Valid JavaScript module for every metacharacter (a newline or U+2028 in the
+    # path is exactly what an incomplete escaper leaves raw and illegal).
+    cp "$hook" "$CASE_DIR/check-$idx.mjs"
+    node --check "$CASE_DIR/check-$idx.mjs" 2>"$CASE_DIR/check-$idx.err" \
+      || fail "opencode hook is not valid JS for case $idx: $(cat "$CASE_DIR/check-$idx.err")"
+    # The embedded literal decodes to the exact TURNEND path.
+    decoded=$(node -e 'const fs=require("node:fs");const s=fs.readFileSync(process.argv[1],"utf8");const m=s.match(/const p = ("(?:[^"\\]|\\.)*")/);if(!m){process.exit(3)}process.stdout.write(JSON.parse(m[1]))' "$hook" 2>/dev/null) \
+      || fail "could not extract the path literal from the opencode hook for case $idx"
+    [ "$decoded" = "$turnend" ] \
+      || fail "opencode hook path literal for case $idx decoded to '$decoded', expected '$turnend'"
+    # Execute the generated idle handler: it must touch the exact turn-end file.
+    rm -f "$turnend"
+    cat > "$CASE_DIR/run-$idx.mjs" <<'RUNNER'
+import { pathToFileURL } from "node:url"
+const m = await import(pathToFileURL(process.argv[2]).href)
+const h = await m.FmTurnEnd()
+await h.event({ event: { type: "session.idle" } })
+RUNNER
+    node "$CASE_DIR/run-$idx.mjs" "$hook" 2>"$CASE_DIR/run-$idx.err" \
+      || fail "opencode idle handler threw for case $idx: $(cat "$CASE_DIR/run-$idx.err")"
+    [ -e "$turnend" ] \
+      || fail "opencode idle handler did not touch the turn-end file for case $idx"
   done
-  pass "opencode turn-end hook is valid JS and path-safe for spaces, quotes, backticks, \${...}, and backslashes (finding 8)"
+  pass "opencode turn-end hook is valid JS, decodes, and touches the right file across the full metacharacter matrix incl. newline and U+2028/U+2029 (finding 8)"
 }
 
 test_pi_omits_invalid_max_effort() {

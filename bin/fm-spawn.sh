@@ -532,6 +532,54 @@ json_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+# fm_js_string_literal: encode <string> as a COMPLETE JavaScript string literal
+# (surrounding double quotes included), using full JSON-string escaping semantics
+# rather than an enumerated metacharacter list. Every C0 control byte (0x00-0x1F)
+# is escaped (\b \t \n \f \r, else \u00XX), " and \ are escaped, and U+2028 /
+# U+2029 - legal in JSON but illegal unescaped in a pre-ES2019 JS string literal -
+# are escaped to their \u2028 / \u2029 forms. Every other byte, including the rest of a UTF-8
+# path, passes through literally (valid inside a JS double-quoted string). So a path
+# containing a newline, carriage return, tab, any other control character, or a
+# line/paragraph separator still emits VALID JavaScript. Uses awk (POSIX-baseline,
+# already an unguarded fleet dependency in bin/fm-composer-lib.sh) rather than jq,
+# which is NOT required for the tmux/opencode path (bin/fm-backend.sh
+# fm_backend_required_tools gates jq only for the herdr/zellij/cmux adapters), so
+# this never adds a spawn-time dependency that path would otherwise lack. The value
+# is passed through the environment, which preserves newlines (a NUL cannot occur in
+# a pathname), and read byte-wise under LC_ALL=C so the U+2028/U+2029 byte sequences
+# (E2 80 A8 / E2 80 A9) are detected without locale-dependent character classes.
+fm_js_string_literal() {  # <string> -> quoted JS/JSON string literal on stdout
+  FM_JS_ENC_INPUT=$1 LC_ALL=C awk '
+    BEGIN {
+      for (k = 0; k < 256; k++) ord[sprintf("%c", k)] = k;
+      s = ENVIRON["FM_JS_ENC_INPUT"];
+      out = "\"";
+      n = length(s);
+      i = 1;
+      while (i <= n) {
+        c = substr(s, i, 1);
+        b = ord[c];
+        if (c == "\\") out = out "\\\\";
+        else if (c == "\"") out = out "\\\"";
+        else if (b == 8) out = out "\\b";
+        else if (b == 9) out = out "\\t";
+        else if (b == 10) out = out "\\n";
+        else if (b == 12) out = out "\\f";
+        else if (b == 13) out = out "\\r";
+        else if (b < 32) out = out sprintf("\\u%04x", b);
+        else if (b == 226 && i + 2 <= n && ord[substr(s, i + 1, 1)] == 128 && \
+                 (ord[substr(s, i + 2, 1)] == 168 || ord[substr(s, i + 2, 1)] == 169)) {
+          out = out (ord[substr(s, i + 2, 1)] == 168 ? "\\u2028" : "\\u2029");
+          i += 2;
+        }
+        else out = out c;
+        i++;
+      }
+      print out "\"";
+    }
+  '
+}
+
 resolved_existing_dir() {
   local path=$1
   [ -d "$path" ] || { echo "error: firstmate home does not exist or is not a directory: $path" >&2; return 1; }
@@ -1097,17 +1145,17 @@ EOF
       # shell-safe path still had to survive the JavaScript backtick template it was
       # injected into, so a path with a backtick broke the JS source and ${...} or a
       # backslash was reinterpreted by the template before Bun's shell ever ran.
-      # Emit the path as a JS STRING literal (json_escape covers the backslash and
-      # double-quote a double-quoted JS string needs; a backtick, ${...}, single
-      # quote, or space is inert inside a double-quoted string) and open+utimes it -
-      # a create-if-missing, bump-mtime `touch` equivalent with no shell at all.
-      js_opencode_turnend=$(json_escape "$TURNEND")
+      # Emit the path as a COMPLETE JS string literal (fm_js_string_literal applies
+      # full JSON-string escaping semantics - every control char, ", \, and
+      # U+2028/U+2029 - so even a newline-containing path stays valid JavaScript) and
+      # open+utimes it - a create-if-missing, bump-mtime `touch` with no shell at all.
+      js_opencode_turnend=$(fm_js_string_literal "$TURNEND")
       cat > "$WT/.opencode/plugins/fm-turn-end.js" <<EOF
 import { open, utimes } from "node:fs/promises"
 export const FmTurnEnd = async () => ({
   event: async ({ event }) => {
     if (event.type !== "session.idle") return
-    const p = "$js_opencode_turnend"
+    const p = $js_opencode_turnend
     await (await open(p, "a")).close()
     const t = new Date()
     await utimes(p, t, t)
