@@ -11,12 +11,12 @@ import { mkFixtureHome, cleanupAll } from './helpers.mjs';
 
 after(cleanupAll);
 
-const CP_BIN = fileURLToPath(new URL('../bin/cp.mjs', import.meta.url));
+const PROBE_WORKER = fileURLToPath(new URL('./workers/probe-worker.mjs', import.meta.url));
 
-function runCp(args, env) {
+function runWorker(fmHome) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [CP_BIN, ...args], {
-      env: { ...process.env, ...env },
+    const child = spawn(process.execPath, [PROBE_WORKER], {
+      env: { ...process.env, FM_HOME: fmHome },
       stdio: ['ignore', 'pipe', 'pipe']
     });
     let out = '';
@@ -27,36 +27,21 @@ function runCp(args, env) {
   });
 }
 
-test('concurrent cp processes serialize: no lost domain-revision updates', async () => {
+test('concurrent cp processes serialize: no lost commit_sequence updates', async () => {
   const { fmHome } = mkFixtureHome();
   await new PgliteLocalStore({ fmHome }).init();
 
-  // Five separate OS processes racing to create tasks on the same pgdata. If the
-  // exclusive flock did not serialize every open, PGlite opens would collide or
-  // the read-modify-write of domain_revision would lose updates.
-  const N = 5;
-  const runs = [];
-  for (let i = 0; i < N; i += 1) {
-    runs.push(
-      runCp(
-        ['create-task', `race-${i}`, '--kind', 'ship', '--title', `t${i}`,
-          '--origin', 'captain_order', '--order-ref', 'ORD-228'],
-        { FM_HOME: fmHome }
-      )
-    );
-  }
-  const results = await Promise.all(runs);
+  // N separate OS processes racing to bump commit_sequence on the same pgdata. If
+  // the exclusive flock did not serialize every open, PGlite opens would collide
+  // or the read-modify-write would lose updates.
+  const N = 6;
+  const results = await Promise.all(Array.from({ length: N }, () => runWorker(fmHome)));
   for (const r of results) {
-    assert.equal(r.code, 0, `child failed: ${r.err}`);
+    assert.equal(r.code, 0, `worker failed: ${r.err}`);
   }
 
-  const state = await new PgliteLocalStore({ fmHome }).runExclusive(async (conn) => {
-    const cs = await conn.query('SELECT domain_revision FROM coordinator_state WHERE id=1');
-    const tc = await conn.query('SELECT count(*)::int n FROM tasks');
-    return { domainRevision: Number(cs.rows[0].domain_revision), tasks: Number(tc.rows[0].n) };
-  });
-  assert.equal(state.tasks, N, 'every task committed');
-  assert.equal(state.domainRevision, N, 'every commit advanced domain_revision exactly once');
+  const state = await new PgliteLocalStore({ fmHome }).coordinatorState();
+  assert.equal(state.commitSequence, N, 'every commit advanced commit_sequence exactly once');
 });
 
 test('reads also acquire the exclusive lock (blocked while held)', async () => {
@@ -69,14 +54,15 @@ test('reads also acquire the exclusive lock (blocked while held)', async () => {
   const holder = await acquireFlock(lockPath, { exclusive: true, timeoutMs: 5000 });
 
   try {
-    // A pure read (task-head) must fail to acquire the lock while it is held.
+    // A pure read (coordinatorState) must fail to acquire the lock while it is held.
     const store = new PgliteLocalStore({ fmHome, env: { CP_LOCK_TIMEOUT_MS: '600' } });
-    await assert.rejects(() => store.taskHead('anything'), LockTimeoutError);
+    await assert.rejects(() => store.coordinatorState(), LockTimeoutError);
   } finally {
     await holder.release();
   }
 
   // Once released, the same read proceeds.
   const store = new PgliteLocalStore({ fmHome });
-  assert.equal(await store.taskHead('anything'), null);
+  const state = await store.coordinatorState();
+  assert.equal(state.commitSequence, 0);
 });

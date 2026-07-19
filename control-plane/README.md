@@ -2,94 +2,91 @@
 
 The canonical per-`FM_HOME` control-plane coordinator for ORD-228. This package
 is the **first implementation code** of the recovery program. It builds the
-storage foundation only (slice **S0**); every later slice's verbs are deliberately
-absent.
+storage foundation only — slice **S0** — cut to the authoritative slice boundary.
+Domain tables and their verbs ship in the slices that own them (S1+); none of
+them exist here.
 
-Authority: `firstmate-runtime/data/spec-amend-s4/report.md` (the PASSED spec). Build
-to that spec; this README does not restate it, only points into it.
+Authority: `firstmate-runtime/data/spec-amend-s4/report.md` (the PASSED spec),
+S0 row at lines 883-886. Build to that spec; this README points into it rather
+than restating it.
 
-## What S0 provides
+## What S0 owns (and only this)
 
 - **Storage seam** (`lib/control-plane-store.mjs`): an engine-neutral base that
-  owns all domain logic behind one primitive, `runExclusive(fn)`. Adapters supply
-  only exclusivity + a connection.
+  owns all domain logic behind one primitive. That primitive is a symbol-keyed
+  method (`internal-symbols.mjs` `RUN_EXCLUSIVE`), NOT a public method, so the
+  raw SQL surface is not part of the public contract (spec §3.1). Public callers
+  see only domain-level methods (`init`, `schemaMeta`, `coordinatorState`,
+  `tableNames`, `contractProbe`).
 - **PGlite production adapter** (`lib/pglite-local-store.mjs`): PGlite persistent
   NodeFS at `FM_HOME/state/control-plane/pgdata`, serialized by real POSIX
   `flock(2)`. First-init and steady-state protocols per spec §2.2. One PGlite
   instance is opened and closed per exclusive section; **every** open — reads
-  included — is gated by an exclusive flock, and close precedes unlock.
+  included — is gated by an exclusive flock, close precedes unlock, and a lost
+  lock (dead holder) mid-section aborts the transaction rather than committing.
 - **Test-only hosted contract adapter** (`lib/pg-hosted-contract-store.mjs`): a
-  skeleton (spec §2.1) that runs the storage-seam contract against a real
-  multi-connection Postgres fixture, proving the seam is not tied to PGlite's
-  single-connection serialization. Depends on `pg` via dynamic import so `pg`
-  never becomes a production dependency; skips when no `CP_HOSTED_TEST_URL`/`pg`.
+  skeleton (spec §2.1) that runs the storage-seam contract against a **real**
+  multi-connection Postgres (started by the ephemeral `test/pg-fixture.mjs`),
+  proving the seam is not tied to PGlite's single-connection serialization. `pg`
+  is a devDependency only, imported dynamically; it is never a production dep.
 - **Real `flock(2)`** (`lib/flock.mjs`): held in a `flock(1)` holder subprocess
   with a ready handshake; released by closing the holder's stdin. The handle is a
-  capability the runtime owner guard checks.
+  capability the runtime owner guard checks — and it is **invalidated the moment
+  the holder dies** (WeakSet removal on `exit` plus a live-child check), so a
+  stale capability from a dead holder cannot authorize an unlocked open.
 - **Owner guard**, two halves (spec §2.2): the runtime half
-  (`lib/pglite-engine.mjs`) refuses to open PGlite without a currently-held
+  (`lib/pglite-engine.mjs`) refuses to open PGlite without a currently-live
   exclusive lock handle; the static half (`scripts/check-no-direct-pglite.mjs`)
-  fails CI if any shipped file constructs PGlite outside the engine module.
-- **Full schema/DDL** (`sql/core-schema.sql`, `sql/domain-schema.sql`): the
-  complete spec §3 DDL, applied idempotently by `cp init`.
-- **Typed errors** (`lib/errors.mjs`): the S0 store/guard errors plus the spec's
-  command-conflict error taxonomy.
+  scans the **whole repository** and fails if any shipped module outside the one
+  sanctioned engine file imports or constructs PGlite. It is wired into repo CI.
+- **Core schema** (`sql/core-schema.sql`): only `schema_meta` and
+  `coordinator_state`, applied idempotently by `cp init`.
+- **Typed errors** (`lib/errors.mjs`): the S0 store/lock/guard errors only.
 - **Coordinator entrypoint skeleton** (`lib/coordinator.mjs`, `bin/cp.mjs`): the
-  three S0 verbs `init`, `create-task`, `task-head`.
+  single S0 verb, `init`.
 
-## Scope note — S0 boundary and a brief↔spec reconciliation
+## Scope (S0 boundary)
 
-The spec's slice plan (§12) lists S0 as owning only `schema_meta` and
-`coordinator_state`, with domain-table constraints and `create-task` formally
-assigned to S1. The S0 **task brief**, however, sets the acceptance as: *DDL
-applies clean; constraints reject duplicate event ids, duplicate
-(task,gen,producer,seq), and a second terminal event per generation; illegal
-transitions rejected; create-task read-back verified.*
+`cp init` seeds exactly the two S0-owned core tables and `home_uuid` — nothing
+else. There are no domain tables, no `create-task`/`task-head`, and no
+command-conflict taxonomy in S0; those belong to the slices that own the tables
+and verbs they concern (S1 for tasks/runs/events and command idempotency, S2 for
+outbox/terminals, etc. — spec §12). The seam contract runs on the core tables
+alone, satisfying the spec's "contract skeleton runs … without domain tables."
 
-That acceptance cannot be met with only the two core tables — it requires the
-full DDL (for `task_events`/`tasks` constraints) and a `create-task` path. The
-brief's own scope line explicitly authorizes "schema/DDL application," and a
-schema is applied as one coherent unit. So S0 here:
+(An earlier candidate applied the full DDL and a minimal `create-task`; round-1
+independent QA — `firstmate-runtime/data/qa-s0-q20/report.md` — correctly
+rejected that as crossing the slice boundary. This is the round-2 recut.)
 
-- applies the **complete** §3 DDL (all 13 tables), and
-- implements **only** `create-task` + `task-head` on top of it,
-
-and implements **nothing else** from later slices (no `begin-run`, `event`,
-`complete`/`fail`, cleanup saga, consumer, reconciler, snapshots, projections).
-The seam contract probe still runs on core tables alone, satisfying the spec's
-"contract skeleton runs … without domain tables." This reconciliation is
-surfaced here and in the commit message for the review gate; it is a scope call,
-not a spec change.
-
-## Verbs (S0)
+## Verb (S0)
 
 ```
 cp init [--data-dir <path>] [--home-label <label>]
-cp create-task <task_id> --kind <ship|scout|secondmate> --title <title>
-   [--repo <repo>] --origin <captain_order|internal>
-   (--order-ref <ref> | --internal-reason <reason>) [--command-id <id>]
-cp task-head <task_id>
 ```
 
-`--data-dir` overrides the `FM_HOME`-derived location. `create-task` is idempotent
-under a repeated `--command-id`.
+Applies the core schema and seeds `home_uuid` (idempotent). `--data-dir`
+overrides the `FM_HOME`-derived location.
 
 ## Tests
 
-Colocated under `test/`, run with the Node test runner (repo convention):
+Colocated under `test/`, run with the Node test runner. `npm test` runs the
+static owner guard first, then the suite:
 
 ```
-npm test            # node --test ./test/*.test.mjs
+npm test            # owner-guard scan + node --test ./test/*.test.mjs
+npm run test:only   # tests without the owner-guard prefix (iteration)
 npm run lint:owner-guard
 ```
 
 All fixtures are sandboxed `mktemp` homes; tests never touch a real `FM_HOME`,
-production state, or any production ledger. Set `CP_HOSTED_TEST_URL` (and install
-`pg`) to additionally run the hosted-adapter contract.
+production state, or any production ledger. The hosted-adapter contract boots a
+real ephemeral Postgres via `embedded-postgres` (a devDependency), so
+`npm ci && npm test` exercises both engines with no external setup; it skips only
+on a platform where that fixture cannot start.
 
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future session in this
 package. Point to the authoritative spec and source files rather than restating
 them. Prefer rewriting or pruning entries over appending. When a later slice adds
-verbs, update the Scope note and Verbs section rather than leaving them stale.
+tables/verbs, update the Scope and Verb sections rather than leaving them stale.

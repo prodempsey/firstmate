@@ -20,10 +20,13 @@ test('first init works when pgdata is absent', async () => {
   assert.match(result.homeUuid, /^[0-9a-f-]{36}$/, 'home_uuid minted');
   assert.equal(result.schemaVersion, 's0');
 
-  // Seeded core state is readable.
+  // Seeded core state is readable and starts at zero.
   const state = await new PgliteLocalStore({ fmHome }).coordinatorState();
-  assert.equal(Number(state.domain_revision), 0);
-  assert.equal(Number(state.commit_sequence), 0);
+  assert.deepEqual(state, { domainRevision: 0, projectionRevision: 0, commitSequence: 0 });
+
+  const meta = await new PgliteLocalStore({ fmHome }).schemaMeta();
+  assert.equal(meta.schema_version, 's0');
+  assert.equal(meta.home_label, 'fixture-a');
 });
 
 test('init is idempotent and home_uuid is stable', async () => {
@@ -46,8 +49,7 @@ test('pgdata is never world-accessible at rest', async () => {
   const { fmHome, dataDir } = mkFixtureHome();
   await new PgliteLocalStore({ fmHome }).init();
   // PGlite's embedded Postgres normalizes the data dir to its own secure mode
-  // (0750) during initdb. The durable invariant is: owner has full access and the
-  // world has none.
+  // (0750) during initdb. The durable invariant: owner has full access, world none.
   const mode = fs.statSync(dataDir).mode & 0o777;
   assert.equal(mode & 0o700, 0o700, 'owner retains full access');
   assert.equal(mode & 0o007, 0, `no world permissions, got ${mode.toString(8)}`);

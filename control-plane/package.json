@@ -11,10 +11,15 @@
     "node": ">=20.11.0 <23"
   },
   "scripts": {
-    "test": "node --test ./test/*.test.mjs",
+    "test": "node ./scripts/check-no-direct-pglite.mjs && node --test ./test/*.test.mjs",
+    "test:only": "node --test ./test/*.test.mjs",
     "lint:owner-guard": "node ./scripts/check-no-direct-pglite.mjs"
   },
   "dependencies": {
     "@electric-sql/pglite": "0.3.10"
+  },
+  "devDependencies": {
+    "embedded-postgres": "17.5.0-beta.15",
+    "pg": "8.13.1"
   }
 }

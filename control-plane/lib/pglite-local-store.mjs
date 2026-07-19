@@ -2,9 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ControlPlaneStore } from './control-plane-store.mjs';
 import { openPglite } from './pglite-engine.mjs';
-import { acquireFlock, withFlock } from './flock.mjs';
+import { acquireFlock, withFlock, isFlockHandleLive } from './flock.mjs';
 import { resolveDataPaths } from './paths.mjs';
-import { PathIntegrityError } from './errors.mjs';
+import { PathIntegrityError, LockLostError } from './errors.mjs';
+import { RUN_EXCLUSIVE } from './internal-symbols.mjs';
 
 // Production S0 storage adapter: PGlite persistent NodeFS behind the storage
 // seam, serialized by real flock(2). Implements the first-init and steady-state
@@ -77,10 +78,14 @@ export class PgliteLocalStore extends ControlPlaneStore {
     return { pgdata: canonicalChild, lock };
   }
 
-  // The one seam primitive. Acquire exclusive flock, open exactly one PGlite,
-  // run fn inside an explicit transaction, then close PGlite before releasing the
-  // lock (close-before-unlock is mandatory - spec section 2.2).
-  async runExclusive(fn) {
+  // The one seam primitive (symbol-keyed, not a public method). Acquire exclusive
+  // flock, open exactly one PGlite, run fn inside an explicit transaction, then
+  // close PGlite before releasing the lock (close-before-unlock is mandatory -
+  // spec section 2.2).
+  //
+  // Lock-loss guard: if the flock holder dies mid-section, the handle is no longer
+  // live, so we roll back rather than commit under a lock we no longer hold.
+  async [RUN_EXCLUSIVE](fn) {
     const { pgdata, lock } = await this._resolveCanonical();
     const handle = await acquireFlock(lock, { exclusive: true, timeoutMs: this._lockTimeoutMs });
     let db;
@@ -91,6 +96,9 @@ export class PgliteLocalStore extends ControlPlaneStore {
       let result;
       try {
         result = await fn(conn);
+        if (!isFlockHandleLive(handle)) {
+          throw new LockLostError('exclusive lock was lost before commit; rolling back', { pgdata });
+        }
         await db.query('COMMIT');
       } catch (error) {
         try {
@@ -111,7 +119,7 @@ export class PgliteLocalStore extends ControlPlaneStore {
 }
 
 // Adapt a PGlite instance to the seam's connection shape: parameterized `query`
-// plus multi-statement `exec` (schema application).
+// plus multi-statement `exec` (schema application). Never handed to public callers.
 function makeConn(db) {
   return {
     query: (sql, params) => db.query(sql, params),

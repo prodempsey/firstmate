@@ -1,5 +1,6 @@
 import { ControlPlaneStore } from './control-plane-store.mjs';
 import { ControlPlaneError } from './errors.mjs';
+import { RUN_EXCLUSIVE } from './internal-symbols.mjs';
 
 // TEST-ONLY, NONPRODUCTION hosted adapter skeleton (spec section 2.1).
 //
@@ -9,8 +10,8 @@ import { ControlPlaneError } from './errors.mjs';
 // wired into FirstMate runtime and is NOT a hosted deployment.
 //
 // It depends on `pg` via dynamic import so `pg` never becomes a production
-// dependency. If `pg` is absent or no connection string is provided, `create`
-// throws HostedAdapterUnavailable and the contract suite skips the hosted variant.
+// dependency (`pg` is a devDependency only). If `pg` is absent or no connection
+// string is provided, `create` throws HostedAdapterUnavailable.
 //
 // Exclusivity here is achieved by a Postgres session-level advisory lock plus an
 // explicit transaction - a genuinely different mechanism from flock - so a green
@@ -47,7 +48,7 @@ export class PgHostedContractStore extends ControlPlaneStore {
     return new PgHostedContractStore(pool);
   }
 
-  async runExclusive(fn) {
+  async [RUN_EXCLUSIVE](fn) {
     const client = await this._pool.connect();
     try {
       await client.query('SELECT pg_advisory_lock($1)', [ADVISORY_LOCK_KEY]);

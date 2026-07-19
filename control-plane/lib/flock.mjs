@@ -29,11 +29,19 @@ const READY_BYTE = 'R';
 const FLOCK_BRAND = Symbol('control-plane.flock.handle');
 const liveHandles = new WeakSet();
 
-// True iff `handle` was minted by acquireFlock and has not been released. The
-// PGlite engine factory uses this as the runtime owner guard: you cannot open
-// PGlite without presenting a currently-held exclusive lock handle.
+// True iff `handle` was minted by acquireFlock AND its holder subprocess is still
+// alive AND it has not been released. The moment the holder exits - explicitly or
+// by an unexpected death - the handle is invalidated (removed from liveHandles by
+// the holder's exit listener), and the child-state check below also refuses a
+// handle whose holder has already exited even before that event is delivered.
+//
+// The PGlite engine factory uses this as the runtime owner guard: a stale
+// capability from a dead holder can no longer authorize an unlocked open.
 export function isFlockHandleLive(handle) {
-  return Boolean(handle) && handle.brand === FLOCK_BRAND && liveHandles.has(handle);
+  if (!handle || handle.brand !== FLOCK_BRAND) return false;
+  if (!liveHandles.has(handle)) return false;
+  const child = handle._child;
+  return Boolean(child) && child.exitCode === null && child.signalCode === null;
 }
 
 // Acquire a flock on lockPath. Returns a handle { release, exclusive } where
@@ -57,6 +65,7 @@ export function acquireFlock(lockPath, { exclusive = true, timeoutMs = 15000 } =
     }
 
     let settled = false;
+    let handle = null;
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
@@ -77,9 +86,10 @@ export function acquireFlock(lockPath, { exclusive = true, timeoutMs = 15000 } =
       if (buf.toString().includes(READY_BYTE)) {
         settled = true;
         clearTimeout(timer);
-        const handle = {
+        handle = {
           brand: FLOCK_BRAND,
           exclusive,
+          _child: child,
           release() {
             liveHandles.delete(handle);
             return new Promise((res) => {
@@ -103,9 +113,13 @@ export function acquireFlock(lockPath, { exclusive = true, timeoutMs = 15000 } =
       }
     });
 
-    // If the holder exits before we ever saw READY, the lock was not acquired
-    // (contention past -w, or a failed helper).
+    // Holder exit: if it happened before readiness, the lock was never acquired.
+    // If it happened AFTER readiness, the lock has been dropped by the kernel, so
+    // the capability is now stale and must be invalidated immediately.
     child.on('exit', (code, signal) => {
+      if (handle) {
+        liveHandles.delete(handle);
+      }
       if (settled) return;
       settled = true;
       clearTimeout(timer);
