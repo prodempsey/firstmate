@@ -77,7 +77,7 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function sha256hex(input) {
+export function sha256hex(input) {
   return crypto.createHash('sha256').update(input).digest('hex');
 }
 
@@ -88,7 +88,7 @@ export function launchMarkerFor(homeUuid, taskId, generation, bindNonce) {
 }
 
 // Deterministic JSON (recursively key-sorted) for request/payload hashing.
-function canonicalJson(value) {
+export function canonicalJson(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
   const keys = Object.keys(value).sort();
@@ -96,7 +96,7 @@ function canonicalJson(value) {
 }
 
 // jsonb columns come back parsed on most drivers; tolerate a text form too.
-function coerceJson(value) {
+export function coerceJson(value) {
   return typeof value === 'string' ? JSON.parse(value) : value;
 }
 
@@ -112,7 +112,7 @@ function anomalyFingerprint(f) {
   return sha256hex(parts.map((p) => (p === null || p === undefined ? '' : String(p))).join('\u0000'));
 }
 
-async function ensureInitialized(conn) {
+export async function ensureInitialized(conn) {
   const r = await conn.query(
     "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'coordinator_state'"
   );
@@ -134,7 +134,7 @@ async function applyDomainSchema(conn) {
   );
 }
 
-async function readHomeUuid(conn) {
+export async function readHomeUuid(conn) {
   const r = await conn.query("SELECT value FROM schema_meta WHERE key = 'home_uuid'");
   if (r.rows.length === 0) {
     throw new ValidationError('control-plane store is not initialized (home_uuid missing)');
@@ -142,7 +142,7 @@ async function readHomeUuid(conn) {
   return r.rows[0].value;
 }
 
-async function readTask(conn, taskId) {
+export async function readTask(conn, taskId) {
   const r = await conn.query(
     'SELECT task_id, status, revision, current_generation FROM tasks WHERE task_id = $1',
     [taskId]
@@ -150,7 +150,7 @@ async function readTask(conn, taskId) {
   return r.rows[0] || null;
 }
 
-async function insertEvent(conn, e) {
+export async function insertEvent(conn, e) {
   const eventId = crypto.randomUUID();
   const payload = e.payload ?? {};
   await conn.query(
@@ -167,7 +167,7 @@ async function insertEvent(conn, e) {
   return eventId;
 }
 
-async function upsertHighwater(conn, h) {
+export async function upsertHighwater(conn, h) {
   await conn.query(
     `INSERT INTO producer_highwater (task_id, run_generation, producer_id, last_seq, last_command_id, updated_at)
        VALUES ($1,$2,$3,$4,$5,$6)
@@ -181,7 +181,7 @@ async function upsertHighwater(conn, h) {
 
 // Insert-or-coalesce an anomaly (spec section 6.2/10). Reobserving a fingerprint
 // increments occurrence_count and last_seen_at; historical rows are never deleted.
-async function recordAnomaly(conn, a, now) {
+export async function recordAnomaly(conn, a, now) {
   const fingerprint = anomalyFingerprint({
     homeUuid: a.homeUuid,
     anomalyClass: a.anomalyClass,
@@ -216,18 +216,32 @@ async function recordAnomaly(conn, a, now) {
 // causal). A `mutate` raises it AFTER attempting whatever domain writes it needs;
 // executeCommand rolls the mutation back to the savepoint, persists the anomaly,
 // and advances the audit counters. It never escapes this module.
-class ConflictSignal extends Error {
+export class ConflictSignal extends Error {
   constructor(kind, anomaly) {
     super(`command conflict: ${kind}`);
-    this.kind = kind; // 'idempotency' | 'causal'
+    this.kind = kind; // 'idempotency' | 'causal' | (S2) 'terminal'
     this.anomaly = anomaly;
   }
 }
 
+// Conflict kind -> typed error, as data. S1's own two classes are the DEFAULT, so
+// every existing S1 call site (which passes no conflictErrors) resolves exactly the
+// pair it resolved before this map existed and its runtime behavior is unchanged.
+// A later slice that owns a new conflict kind supplies only its own entry and
+// inherits these two (S2 passes { terminal: ... } for TerminalConflictError). This
+// is the ONLY generalization made to the S1 envelope for S2 reuse; see the
+// executeCommand `conflictErrors` param (ORD-228 ruling RISK#1).
+const DEFAULT_CONFLICT_ERRORS = Object.freeze({
+  idempotency: (detail) =>
+    new IdempotencyConflictError('command-id reused with a different request payload', detail),
+  causal: (detail) =>
+    new CausalOrderingError('mutation rejected on a stale causal token', detail)
+});
+
 // An anomaly audit is itself a canonical domain change: a committed write that
 // advances domain_revision and commit_sequence exactly once, without touching the
 // task revision or projection_revision (spec section 2.3; QA-s1-q49 finding 1).
-async function bumpAuditCounters(conn) {
+export async function bumpAuditCounters(conn) {
   await conn.query(
     'UPDATE coordinator_state SET domain_revision = domain_revision + 1, commit_sequence = commit_sequence + 1 WHERE id = 1'
   );
@@ -242,7 +256,9 @@ async function bumpAuditCounters(conn) {
 // ConflictSignal for an auditable conflict; a StateTransitionError/ValidationError
 // is a non-audited rejection that abandons the whole transaction, persisting
 // nothing.
-async function executeCommand(store, { verb, commandId, requestHash, taskId = null, now, mutate, fault }) {
+export async function executeCommand(store, {
+  verb, commandId, requestHash, taskId = null, now, mutate, fault, conflictErrors = {}
+}) {
   if (typeof commandId !== 'string' || commandId.length === 0) {
     throw new ValidationError('--command-id is required for every mutating command', { verb });
   }
@@ -315,10 +331,18 @@ async function executeCommand(store, { verb, commandId, requestHash, taskId = nu
   });
 
   if (outcome.status === 'conflict') {
-    if (outcome.kind === 'idempotency') {
-      throw new IdempotencyConflictError('command-id reused with a different request payload', outcome.detail);
+    // Caller-supplied entries override/extend the S1 defaults; a caller that
+    // supplies none (every S1 verb) resolves the identical pair as before.
+    const make = { ...DEFAULT_CONFLICT_ERRORS, ...conflictErrors }[outcome.kind];
+    if (!make) {
+      // An audited conflict kind with no typed error is a programming error. Fail
+      // loudly rather than degrading to a generic throw that a caller would then
+      // have to classify by string.
+      throw new Error(
+        `no typed error registered for conflict kind '${outcome.kind}' (verb ${verb})`
+      );
     }
-    throw new CausalOrderingError('mutation rejected on a stale causal token', outcome.detail);
+    throw make(outcome.detail);
   }
   return outcome.result;
 }
