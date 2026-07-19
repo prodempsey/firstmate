@@ -33,9 +33,9 @@
 #                            <uuid>/subagents/ subtree is excluded by design (a
 #                            separate transcript for spawned subagents, not this
 #                            task's own usage). Only top-level events with
-#                            "type":"assistant" and a "message.usage" object
-#                            contribute (report's Aggregation rule: "Sum every
-#                            assistant message.usage"); a session file is
+#                            "type":"assistant" and a SCHEMA-VALID "message.usage"
+#                            object contribute (report's Aggregation rule: "Sum
+#                            every assistant message.usage"); a session file is
 #                            included only when its own [min,max] event
 #                            timestamp range overlaps the task's
 #                            [spawned_at, window_end + grace] interval (report
@@ -44,13 +44,24 @@
 #                            falls back to spawned_at when no better bound
 #                            exists. A task with no parseable spawned_at cannot
 #                            be time-filtered at all: every top-level session
-#                            under its worktree dir is summed instead, and the
-#                            result is labeled tokens_status=ambiguous_join
-#                            (report 3.4, 3.5). A malformed/unparsable session
-#                            file is skipped (data tolerance, like a malformed
-#                            task-runs.jsonl row); a session file that cannot be
-#                            READ at all (permissions, I/O) is an operational
-#                            failure and aborts the run via run_or_die.
+#                            under its worktree dir is a candidate instead, and
+#                            the result is labeled tokens_status=ambiguous_join
+#                            (report 3.4, 3.5). A session claimed by MORE THAN
+#                            ONE task (a reused worktree with overlapping
+#                            windows) is excluded from every claiming task's sum
+#                            rather than being double-counted or arbitrarily
+#                            assigned; every affected task is also
+#                            ambiguous_join. A malformed/schema-invalid/
+#                            concurrently-mutated session file is data
+#                            tolerance, like a malformed task-runs.jsonl row,
+#                            but - unlike a merely out-of-window sibling - it
+#                            downgrades its whole task to tokens_status=partial
+#                            (a floor, never a false ok/high); a session file
+#                            that cannot be READ at all (permissions, I/O) is an
+#                            operational failure and aborts the run via
+#                            run_or_die. See the "Claude token join (slice M2
+#                            round 2)" section below for the full per-finding
+#                            rationale (data/qa-m2-q34/report.md).
 #                            CLAUDE_PROJECTS defaults to $HOME/.claude/projects;
 #                            override with FM_CLAUDE_PROJECTS_OVERRIDE (same
 #                            override pattern as FM_STATE_OVERRIDE) so tests
@@ -80,11 +91,14 @@
 # described above (a task can be report-included via ended_at alone while still
 # being ambiguous_join for tokens because spawned_at itself is missing).
 #
-# DETERMINISM: given fixed inputs and an explicit window, the mix tables and the
-# fingerprint are deterministic (the fingerprint deliberately excludes the wall
-# clock, and - unchanged from M1 - deliberately excludes the tokens panel too,
-# so the concurrency-critical publish/fingerprint path stays exactly as hardened
-# in the M1 QA rounds). Claude token sums are deterministic for fixed session
+# DETERMINISM: given fixed inputs and an explicit window, the mix tables, the
+# Claude token join, and the fingerprint are all deterministic (the fingerprint
+# deliberately excludes the wall clock, but DOES cover the tokens panel - see
+# "fingerprint this run's own private JSON" below; QA round 1 found the
+# original mix-only canonical form let two archives with different Claude
+# usage share one fingerprint). The concurrency-critical publish/lock mechanism
+# itself is unchanged from the M1 QA rounds; only the data folded into the
+# fingerprint widened. Claude token sums are deterministic for fixed session
 # file content and a fixed FM_USAGE_NOW. Set FM_USAGE_NOW=<ISO-8601 UTC> to pin
 # "now" for reproducible runs.
 #
@@ -105,7 +119,7 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
 usage() {
   cat <<'EOF'
-fm-usage-report.sh - model-economy usage report (slice M1: model mix only)
+fm-usage-report.sh - model-economy usage report (slice M2: model mix + Claude tokens)
 
 Usage:
   fm-usage-report.sh [--target DIR] [--since DATE] [--until DATE]
@@ -403,140 +417,332 @@ EOF
   done < "$LEDGER"
 fi
 
-# --- Claude token join (slice M2) --------------------------------------------
-# Per report 3.4's normative "claude:" case: for every harness=claude record,
-# encode its worktree into a Claude projects dir, sum every top-level session
-# file's assistant usage, time-filtering by [spawned_at, window_end+grace] when
-# spawned_at is parseable, else summing every top-level session unfiltered and
-# marking the result ambiguous_join. Non-claude records are not attempted here
-# (M3+); they are tallied straight from $REC_FILE in the final jq step below.
+# --- Claude token join (slice M2 round 2) -------------------------------------
+# Redesigned after independent QA (data/qa-m2-q34/report.md) found the round-1
+# joiner could publish confidently-wrong numbers. Every fix below traces to a
+# numbered finding in that report:
 #
-# One TOKENS_FILE NDJSON record per claude task, built the same run-private-
-# accumulator way as REC_FILE: never through argv, so a large claude fleet
-# cannot hit the shell argument limit either.
-TOKENS_FILE="$(mktemp "${TMPDIR:-/tmp}/fm-usage-tokens.XXXXXX")"
+#   F1 (malformed/truncated/concurrent/schema-incomplete sessions counted as
+#      ok/high): a session file is now SCHEMA-VALIDATED, not just parsed. Every
+#      assistant event must carry a message.usage object with valid
+#      input_tokens/output_tokens (cache fields may be legitimately absent, but
+#      if present must also validate). ANY schema failure, ANY jq parse error,
+#      or a file whose size/mtime CHANGES between a stat taken before and after
+#      the read (a concurrent writer) marks that whole session file "invalid".
+#      A task with ANY invalid candidate session in its directory is reported
+#      tokens_status=partial (a floor, not a total), confidence=low - NEVER
+#      ok/high - even when other sibling sessions parsed cleanly.
+#   F2 (one session double-counted across reused-worktree tasks as high each):
+#      sessions are no longer processed one task at a time. Every session file
+#      under a directory is parsed ONCE, tagged with a unique id, and matched
+#      against EVERY task that shares its directory (worktree pool reuse is
+#      normal - report 4.3/6.3). A session claimed by more than one task's
+#      window is EXCLUDED from all of their sums (never split, never double
+#      counted); every affected task is downgraded to tokens_status=
+#      ambiguous_join and carries an explicit ambiguous_sessions_excluded count.
+#      Only a session claimed by EXACTLY ONE task may contribute to a high-
+#      confidence row.
+#   F3 (confidence stayed high with model=default, and the real transcript
+#      model was never surfaced): the resolved model for token rollups now
+#      prefers the transcript's OWN message.model when it is a single
+#      consistent value, and confidence is capped to low whenever the routing
+#      model is "default" or the transcript models disagree with routing or
+#      with each other (report 3.5's model=default rule).
+#   F4 (unvalidated numbers overflowed signed Bash arithmetic into negative
+#      high-confidence totals): every usage field is validated in jq as a
+#      finite, non-negative, whole number under a 1e9-per-field ceiling before
+#      it is ever trusted, and ALL cross-session arithmetic (the actual sum)
+#      now happens in jq too - bash never accumulates a raw untrusted token
+#      count. An out-of-range or negative field fails validation (F1's schema
+#      check), it does not silently become a huge or negative total.
+#   F5 (an inaccessible Claude root looked like ordinary absence): the
+#      directory listing no longer pre-checks with a plain `[ -d ]` test, which
+#      cannot distinguish "does not exist" from "exists but is unsearchable".
+#      `find` always runs through run_or_die with an allowed-regex that
+#      tolerates ONLY "No such file or directory"; any other find failure
+#      (permission denied, I/O error) is an operational failure that aborts the
+#      whole run loudly, per the M1 absent-versus-operational invariant.
+#   F6 (incomplete output contract, and the fingerprint ignored tokens): every
+#      task - Claude AND every other harness - gets one normalized by_task row
+#      (join_method/tokens_status/confidence included) in the final report
+#      builder below; the report fingerprint now covers panels.tokens too (see
+#      the fingerprint step further down).
+#   F7 (new mktemp/cat/cp calls bypassed the checked-invocation invariant):
+#      every mktemp below is checked with the same `|| { diagnostic; exit 2; }`
+#      form the M1 publish path already uses for TMP_JSON/TMP_MD/PUB_JSON/
+#      PUB_MD, and every cat/cp append is checked the same way; find/jq/stat
+#      route through run_or_die as with every other external call in this
+#      script.
+#
+# Architecture: bash owns only what jq cannot do (date parsing tolerant of
+# fractional seconds, and the run_or_die-guarded external calls). Every
+# comparison, validation, and arithmetic sum - the parts a QA fixture could
+# catch bash getting subtly wrong - happens in jq, once, at the end, over
+# structured facts bash already gathered. Two NDJSON accumulators:
+#   CLAUDE_TASK_RECORDS_FILE  one row per claude task: task, model, dir,
+#                             has_worktree, dir_found, sp_epoch, task_hi_epoch
+#                             (epochs are null when unparseable/absent, i.e.
+#                             "no time filter possible" per report 3.4).
+#   CLAUDE_SESSIONS_FILE      one row per session FILE FOUND (not per task; a
+#                             shared directory is scanned once), each with a
+#                             unique id, valid flag, epoch range, per-field
+#                             sums, and the distinct message.model values seen.
+# A single jq pass at the end joins them: for every task it finds the sessions
+# in its directory, splits them into "candidate" (valid) and "problem"
+# (invalid) counts, computes this task's OWN claim set (time-overlap for a
+# dated task, every valid session for an undated one), tallies how many OTHER
+# tasks in the fleet also claim each of those same session ids, keeps only the
+# uniquely-claimed ones, sums their fields, resolves the model, and derives
+# tokens_status/confidence from problem/ambiguity/uniqueness in that priority
+# order (a data-quality problem always outranks a windowing ambiguity, which
+# always outranks a clean uniquely-claimed sum).
+
+CLAUDE_TOKEN_MAX_FIELD=1000000000
+
+TOKENS_FILE="$(mktemp "${TMPDIR:-/tmp}/fm-usage-tokens.XXXXXX")" \
+  || { echo "fm-usage-report: cannot create a claude-tokens temp file" >&2; exit 2; }
 CLEANUP_FILES+=("$TOKENS_FILE")
 
+CLAUDE_TASK_RECORDS_FILE="$(mktemp "${TMPDIR:-/tmp}/fm-usage-claude-task-records.XXXXXX")" \
+  || { echo "fm-usage-report: cannot create a claude task-records temp file" >&2; exit 2; }
+CLEANUP_FILES+=("$CLAUDE_TASK_RECORDS_FILE")
+
+CLAUDE_SESSIONS_FILE="$(mktemp "${TMPDIR:-/tmp}/fm-usage-claude-sessions.XXXXXX")" \
+  || { echo "fm-usage-report: cannot create a claude-sessions temp file" >&2; exit 2; }
+CLEANUP_FILES+=("$CLAUDE_SESSIONS_FILE")
+
+SESSION_LIST_FILE="$(mktemp "${TMPDIR:-/tmp}/fm-usage-sessionlist.XXXXXX")" \
+  || { echo "fm-usage-report: cannot create a claude session-list temp file" >&2; exit 2; }
+CLEANUP_FILES+=("$SESSION_LIST_FILE")
+
 # Claude task rows to join, extracted from the already-deduplicated REC_FILE.
-# jq applied to a file of concatenated JSON values (REC_FILE's NDJSON) streams
-# each value as a separate input; -r (not -j) so jq's own per-result newline
-# separates rows, since this single invocation emits MANY rows, unlike the
-# single-line ledger-row extraction above. Fields are unit-separator joined,
-# same rationale as the ledger row extraction: preserves empty fields
-# positionally under IFS-based `read`.
 run_or_die "failed to extract claude task rows with jq" "" -- "$JQ_BIN" -r '
   select(.harness == "claude") |
   [ .task, (.worktree // ""), (.model // ""), (.spawned_at // ""), (.window_end // "") ]
   | join("\u001f")
 ' "$REC_FILE"
-CLAUDE_TASKS_FILE="$(mktemp "${TMPDIR:-/tmp}/fm-usage-claude-tasks.XXXXXX")"
-CLEANUP_FILES+=("$CLAUDE_TASKS_FILE")
-cat "$RUN_OUT" > "$CLAUDE_TASKS_FILE" \
+CLAUDE_TASKS_RAW_FILE="$(mktemp "${TMPDIR:-/tmp}/fm-usage-claude-tasks-raw.XXXXXX")" \
+  || { echo "fm-usage-report: cannot create a claude task extraction temp file" >&2; exit 2; }
+CLEANUP_FILES+=("$CLAUDE_TASKS_RAW_FILE")
+cat "$RUN_OUT" > "$CLAUDE_TASKS_RAW_FILE" \
   || { echo "fm-usage-report: failed to write claude task extraction temp" >&2; exit 2; }
 
-# emit_token_record <task> <model> <join_method> <status> <confidence> <input> <output> <cache_read> <cache_write> <total> <sessions_matched>
-emit_token_record() {
+# emit_claude_task_record <task> <model> <dir> <has_worktree true|false> <dir_found true|false> <sp_epoch-or-empty> <task_hi_epoch-or-empty>
+emit_claude_task_record() {
   # shellcheck disable=SC2016 # jq variables are expanded by jq, not the shell.
-  run_or_die "failed to build claude token record with jq" "" -- "$JQ_BIN" -n \
-    --arg task "$1" --arg model "$2" --arg join_method "$3" \
-    --arg status "$4" --arg confidence "$5" \
-    --argjson input "$6" --argjson output "$7" \
-    --argjson cache_read "$8" --argjson cache_write "$9" \
-    --argjson total "${10}" --argjson sessions "${11}" '
-    { task: $task, model: $model, join_method: $join_method,
-      tokens_status: $status, confidence: $confidence,
-      input_tokens: $input, output_tokens: $output,
-      cache_read_tokens: $cache_read, cache_write_tokens: $cache_write,
-      reasoning_tokens: null, total_tokens: $total, sessions_matched: $sessions }'
-  cat "$RUN_OUT" >> "$TOKENS_FILE" \
-    || { echo "fm-usage-report: failed to append claude token record" >&2; exit 2; }
+  run_or_die "failed to build claude task record with jq" "" -- "$JQ_BIN" -n \
+    --arg task "$1" --arg model "$2" --arg dir "$3" \
+    --argjson has_worktree "$4" --argjson dir_found "$5" \
+    --arg sp "${6:-}" --arg hi "${7:-}" '
+    def numOrNull(x): if x == "" then null else (x|tonumber) end;
+    { task:$task, model:$model, dir:(if $dir=="" then null else $dir end),
+      has_worktree:$has_worktree, dir_found:$dir_found,
+      sp_epoch: numOrNull($sp), task_hi_epoch: numOrNull($hi) }'
+  cat "$RUN_OUT" >> "$CLAUDE_TASK_RECORDS_FILE" \
+    || { echo "fm-usage-report: failed to append claude task record" >&2; exit 2; }
 }
 
-SESSION_LIST_FILE="$(mktemp "${TMPDIR:-/tmp}/fm-usage-sessions.XXXXXX")"
-CLEANUP_FILES+=("$SESSION_LIST_FILE")
+# emit_claude_session_record <dir> <valid true|false> <ts_min_epoch-or-empty> <ts_max_epoch-or-empty> <input> <output> <cache_read> <cache_write> <models-json-array>
+CLAUDE_SESSION_ID=0
+emit_claude_session_record() {
+  CLAUDE_SESSION_ID=$((CLAUDE_SESSION_ID + 1))
+  # shellcheck disable=SC2016 # jq variables are expanded by jq, not the shell.
+  run_or_die "failed to build claude session record with jq" "" -- "$JQ_BIN" -n \
+    --argjson id "$CLAUDE_SESSION_ID" --arg dir "$1" --argjson valid "$2" \
+    --arg tsmin "${3:-}" --arg tsmax "${4:-}" \
+    --argjson input "$5" --argjson output "$6" --argjson cr "$7" --argjson cw "$8" \
+    --argjson models "$9" '
+    def numOrNull(x): if x == "" then null else (x|tonumber) end;
+    { id:$id, dir:$dir, valid:$valid,
+      ts_min_epoch: numOrNull($tsmin), ts_max_epoch: numOrNull($tsmax),
+      input_tokens:$input, output_tokens:$output,
+      cache_read_tokens:$cr, cache_write_tokens:$cw, models:$models }'
+  cat "$RUN_OUT" >> "$CLAUDE_SESSIONS_FILE" \
+    || { echo "fm-usage-report: failed to append claude session record" >&2; exit 2; }
+}
+
+# A directory is scanned at most once even when several tasks share a worktree
+# (F2's reuse hazard is exactly this sharing); CLAUDE_DIR_FOUND records find's
+# outcome (F5) so every task referencing that directory reuses it.
+declare -A CLAUDE_DIR_SEEN=()
+declare -A CLAUDE_DIR_FOUND=()
 
 while IFS=$'\x1f' read -r ctask cworktree cmodel cspawned cwindow_end; do
   [ -n "$ctask" ] || continue
-  in_tok=0; out_tok=0; cr_tok=0; cw_tok=0; sessions_matched=0
-  join_method="claude_project_dir"
-  if [ -z "$cworktree" ]; then
-    status="absent"; confidence="none"; join_method="none"
-  else
-    cdir="$CLAUDE_PROJECTS/$(encode_claude_dir "$cworktree")"
-    if [ ! -d "$cdir" ]; then
-      status="absent"; confidence="none"
-    else
-      # Top-level session files only: a session's own <uuid>/subagents/ subtree
-      # is a separate transcript for spawned subagents, excluded by design.
-      run_or_die "failed to list claude session files in $cdir with find" "" \
-        -- find "$cdir" -maxdepth 1 -type f -name '*.jsonl' -print0
-      cp "$RUN_OUT" "$SESSION_LIST_FILE" \
-        || { echo "fm-usage-report: failed to stage claude session file list" >&2; exit 2; }
+  has_worktree="false"; cdirkey=""
+  if [ -n "$cworktree" ]; then
+    has_worktree="true"
+    cdirkey="$(encode_claude_dir "$cworktree")"
+    if [ -z "${CLAUDE_DIR_SEEN[$cdirkey]:-}" ]; then
+      CLAUDE_DIR_SEEN["$cdirkey"]=1
+      cdir="$CLAUDE_PROJECTS/$cdirkey"
+      # F5: only a genuinely-missing directory is tolerated as absent; any
+      # other find failure (permission denied, I/O) aborts the run loudly.
+      if run_or_die "failed to list claude session files in $cdir with find" 'No such file or directory' \
+          -- find "$cdir" -maxdepth 1 -type f -name '*.jsonl' -print0; then
+        CLAUDE_DIR_FOUND["$cdirkey"]="true"
+        cp "$RUN_OUT" "$SESSION_LIST_FILE" \
+          || { echo "fm-usage-report: failed to stage claude session file list" >&2; exit 2; }
+        while IFS= read -r -d '' sfile; do
+          # F1: bracket the read with a stat before and after. A file that
+          # vanishes before we can even stat it, or whose size/mtime changes
+          # across the read, was being written concurrently - the read cannot
+          # be trusted, so the whole file is invalid regardless of what jq saw.
+          if ! run_or_die "failed to stat claude session file: $sfile" 'No such file or directory' \
+              -- stat -c '%s %Y' "$sfile"; then
+            emit_claude_session_record "$cdirkey" false "" "" 0 0 0 0 '[]'
+            continue
+          fi
+          stat_before="$(cat "$RUN_OUT")"
 
-      sp_epoch=""; [ -n "$cspawned" ] && sp_epoch="$(to_epoch "$cspawned")"
-      we_epoch=""; [ -n "$cwindow_end" ] && we_epoch="$(to_epoch "$cwindow_end")"
-      task_hi_epoch=""
-      [ -n "$we_epoch" ] && task_hi_epoch=$((we_epoch + CLAUDE_GRACE_SECONDS))
-      # A time filter is only possible when BOTH the task's own spawned_at AND
-      # its window_end parsed to a real epoch; report 3.4: "If spawned_at
-      # missing, mark ambiguous_join" - sum every session unfiltered instead.
-      dated_join=0
-      if [ -n "$sp_epoch" ] && [ -n "$task_hi_epoch" ]; then dated_join=1; fi
+          # F1/F4: schema-validate every assistant usage field (finite,
+          # non-negative, whole, bounded) before trusting it; any parse error
+          # (truncated/malformed JSON, e.g. a concurrent writer's torn tail)
+          # is tolerated as data, not an operational failure, but marks this
+          # session invalid rather than silently skipping it.
+          # shellcheck disable=SC2016 # jq variables are expanded by jq, not the shell.
+          if ! run_or_die "failed to parse claude session file with jq: $sfile" '^jq: parse error:' \
+              -- "$JQ_BIN" -rs --argjson maxv "$CLAUDE_TOKEN_MAX_FIELD" '
+            def MAXV: $maxv;
+            def numOK(x): (x != null) and (x|type=="number") and ((x|floor)==x) and (x>=0) and (x<=MAXV);
+            def evOK(e): (e.message.usage? != null) and
+              numOK(e.message.usage.input_tokens) and
+              numOK(e.message.usage.output_tokens) and
+              ((e.message.usage.cache_read_input_tokens==null) or numOK(e.message.usage.cache_read_input_tokens)) and
+              ((e.message.usage.cache_creation_input_tokens==null) or numOK(e.message.usage.cache_creation_input_tokens));
+            ( [ .[] | select(type=="object") ] ) as $evs |
+            ( [ $evs[] | select(type=="object" and .type=="assistant") ] ) as $asst |
+            ( $asst | all(evOK(.)) ) as $schemaOk |
+            {
+              valid: $schemaOk,
+              ts_min: ([ $evs[] | .timestamp? // empty ] | map(select(type=="string")) | if length>0 then min else null end),
+              ts_max: ([ $evs[] | .timestamp? // empty ] | map(select(type=="string")) | if length>0 then max else null end),
+              input_tokens: (if $schemaOk then ([ $asst[] | (.message.usage.input_tokens? // 0) ] | add // 0) else 0 end),
+              output_tokens: (if $schemaOk then ([ $asst[] | (.message.usage.output_tokens? // 0) ] | add // 0) else 0 end),
+              cache_read_tokens: (if $schemaOk then ([ $asst[] | (.message.usage.cache_read_input_tokens? // 0) ] | add // 0) else 0 end),
+              cache_write_tokens: (if $schemaOk then ([ $asst[] | (.message.usage.cache_creation_input_tokens? // 0) ] | add // 0) else 0 end),
+              models: (if $schemaOk then ([ $asst[] | .message.model? // empty ] | map(select(type=="string")) | unique) else [] end)
+            }
+            | [ (.valid|tostring), (.ts_min // ""), (.ts_max // ""), (.input_tokens|tostring), (.output_tokens|tostring),
+                (.cache_read_tokens|tostring), (.cache_write_tokens|tostring), (.models|tojson) ]
+            | join("\u001f")' \
+              "$sfile"; then
+            emit_claude_session_record "$cdirkey" false "" "" 0 0 0 0 '[]'
+            continue
+          fi
+          sess_row="$(cat "$RUN_OUT")"
 
-      while IFS= read -r -d '' sfile; do
-        # A malformed session file is data tolerance (skip, keep scanning); jq
-        # failing to even open/read the file is operational and aborts loudly.
-        if ! run_or_die "failed to parse claude session file with jq: $sfile" '^jq: parse error:' \
-          -- "$JQ_BIN" -rs '{
-            ts_min: ([ .[] | .timestamp? // empty ] | map(select(type=="string")) | if length>0 then min else null end),
-            ts_max: ([ .[] | .timestamp? // empty ] | map(select(type=="string")) | if length>0 then max else null end),
-            input_tokens: ([ .[] | select(.type=="assistant") | (.message.usage.input_tokens? // 0) ] | add // 0),
-            output_tokens: ([ .[] | select(.type=="assistant") | (.message.usage.output_tokens? // 0) ] | add // 0),
-            cache_read_tokens: ([ .[] | select(.type=="assistant") | (.message.usage.cache_read_input_tokens? // 0) ] | add // 0),
-            cache_write_tokens: ([ .[] | select(.type=="assistant") | (.message.usage.cache_creation_input_tokens? // 0) ] | add // 0)
-          } | [.ts_min, .ts_max, .input_tokens, .output_tokens, .cache_read_tokens, .cache_write_tokens] | @tsv' \
-          "$sfile"; then
-          continue
-        fi
-        sess_row="$(cat "$RUN_OUT")"
-        [ -n "$sess_row" ] || continue
-        IFS=$'\t' read -r ts_min ts_max s_in s_out s_cr s_cw <<EOF
+          if ! run_or_die "failed to stat claude session file: $sfile" 'No such file or directory' \
+              -- stat -c '%s %Y' "$sfile"; then
+            stat_after=""
+          else
+            stat_after="$(cat "$RUN_OUT")"
+          fi
+
+          if [ "$stat_before" != "$stat_after" ]; then
+            emit_claude_session_record "$cdirkey" false "" "" 0 0 0 0 '[]'
+            continue
+          fi
+
+          IFS=$'\x1f' read -r v_valid v_tsmin v_tsmax v_in v_out v_cr v_cw v_models <<EOF
 $sess_row
 EOF
-        include=0
-        if [ "$dated_join" -eq 1 ]; then
-          slo=""; shi=""
-          [ -n "$ts_min" ] && slo="$(to_epoch "$ts_min")"
-          [ -n "$ts_max" ] && shi="$(to_epoch "$ts_max")"
-          if [ -n "$slo" ] && [ -n "$shi" ]; then
-            lo="$slo"; hi="$shi"
-            if [ "$lo" -gt "$hi" ]; then local_t="$lo"; lo="$hi"; hi="$local_t"; fi
-            if [ "$lo" -le "$task_hi_epoch" ] && [ "$hi" -ge "$sp_epoch" ]; then include=1; fi
-          fi
-        else
-          # No time filter possible: every readable top-level session counts.
-          include=1
-        fi
-        if [ "$include" -eq 1 ]; then
-          sessions_matched=$((sessions_matched + 1))
-          in_tok=$((in_tok + s_in)); out_tok=$((out_tok + s_out))
-          cr_tok=$((cr_tok + s_cr)); cw_tok=$((cw_tok + s_cw))
-        fi
-      done < "$SESSION_LIST_FILE"
-
-      if [ "$dated_join" -eq 1 ]; then
-        if [ "$sessions_matched" -gt 0 ]; then status="ok"; confidence="high"
-        else status="absent"; confidence="none"; fi
+          v_tsmin_epoch=""; [ -n "$v_tsmin" ] && v_tsmin_epoch="$(to_epoch "$v_tsmin")"
+          v_tsmax_epoch=""; [ -n "$v_tsmax" ] && v_tsmax_epoch="$(to_epoch "$v_tsmax")"
+          emit_claude_session_record "$cdirkey" "$v_valid" "$v_tsmin_epoch" "$v_tsmax_epoch" \
+            "$v_in" "$v_out" "$v_cr" "$v_cw" "$v_models"
+        done < "$SESSION_LIST_FILE"
       else
-        if [ "$sessions_matched" -gt 0 ]; then status="ambiguous_join"; confidence="low"
-        else status="absent"; confidence="none"; fi
+        CLAUDE_DIR_FOUND["$cdirkey"]="false"
       fi
     fi
   fi
-  total_tok=$((in_tok + out_tok + cr_tok + cw_tok))
-  emit_token_record "$ctask" "$cmodel" "$join_method" "$status" "$confidence" \
-    "$in_tok" "$out_tok" "$cr_tok" "$cw_tok" "$total_tok" "$sessions_matched"
-done < "$CLAUDE_TASKS_FILE"
+  sp_epoch=""; [ -n "$cspawned" ] && sp_epoch="$(to_epoch "$cspawned")"
+  we_epoch=""; [ -n "$cwindow_end" ] && we_epoch="$(to_epoch "$cwindow_end")"
+  task_hi_epoch=""; [ -n "$we_epoch" ] && task_hi_epoch=$((we_epoch + CLAUDE_GRACE_SECONDS))
+  dir_found="false"; [ -n "$cdirkey" ] && dir_found="${CLAUDE_DIR_FOUND[$cdirkey]:-false}"
+  emit_claude_task_record "$ctask" "$cmodel" "$cdirkey" "$has_worktree" "$dir_found" "$sp_epoch" "$task_hi_epoch"
+done < "$CLAUDE_TASKS_RAW_FILE"
+
+# F2/F3/F4: one jq pass resolves global session-claim uniqueness (never split
+# or double-count a shared session), sums validated fields in jq (never signed
+# Bash arithmetic), and resolves the reported model/confidence.
+# shellcheck disable=SC2016 # jq variables are expanded by jq, not the shell.
+run_or_die "failed to aggregate claude token joins with jq" "" -- "$JQ_BIN" -nc \
+  --slurpfile tasks "$CLAUDE_TASK_RECORDS_FILE" \
+  --slurpfile sessions "$CLAUDE_SESSIONS_FILE" '
+  ($tasks) as $T | ($sessions) as $S |
+  ($T | map(
+    . as $t |
+    ($S | map(select(.dir == $t.dir))) as $dirSessions |
+    ($dirSessions | map(select(.valid))) as $validSessions |
+    ($dirSessions | map(select(.valid|not)) | length) as $problemCount |
+    (if $t.sp_epoch == null then
+       ($validSessions | map(.id))
+     else
+       ($validSessions | map(select(
+          (.ts_min_epoch != null) and (.ts_max_epoch != null) and
+          (([.ts_min_epoch, .ts_max_epoch] | min) <= $t.task_hi_epoch) and
+          (([.ts_min_epoch, .ts_max_epoch] | max) >= $t.sp_epoch)
+        )) | map(.id))
+     end) as $claimIds |
+    { task: $t.task, model_meta: $t.model, has_worktree: $t.has_worktree, dir_found: $t.dir_found,
+      undated: ($t.sp_epoch == null), problem_count: $problemCount, claim_ids: $claimIds }
+  )) as $claims |
+  ($claims | map(.claim_ids[]) | group_by(.) | map({key: (.[0]|tostring), value: length}) | from_entries) as $claimCounts |
+  ($S | map({(.id|tostring): .}) | add // {}) as $sessById |
+  ($claims | map(
+    . as $c |
+    ($c.claim_ids | map(select(($claimCounts[(.|tostring)] // 0) == 1))) as $uniqueIds |
+    ($c.claim_ids | map(select(($claimCounts[(.|tostring)] // 0) > 1)) | length) as $ambiguousCount |
+    ($uniqueIds | map($sessById[(.|tostring)])) as $uniqueSessions |
+    {
+      task: $c.task, model_meta: $c.model_meta, has_worktree: $c.has_worktree, dir_found: $c.dir_found,
+      undated: $c.undated, problem_count: $c.problem_count, ambiguous_excluded: $ambiguousCount,
+      sessions_matched: ($uniqueSessions | length),
+      input_tokens: ([$uniqueSessions[].input_tokens] | add // 0),
+      output_tokens: ([$uniqueSessions[].output_tokens] | add // 0),
+      cache_read_tokens: ([$uniqueSessions[].cache_read_tokens] | add // 0),
+      cache_write_tokens: ([$uniqueSessions[].cache_write_tokens] | add // 0),
+      transcript_models: ([$uniqueSessions[].models[]] | unique)
+    }
+  ))
+  | map(
+    . as $r |
+    (if $r.problem_count > 0 then "partial"
+     elif $r.ambiguous_excluded > 0 then "ambiguous_join"
+     elif $r.undated and $r.sessions_matched > 0 then "ambiguous_join"
+     elif $r.sessions_matched > 0 then "ok"
+     else "absent"
+     end) as $status |
+    (if ($r.has_worktree | not) then "none" else "claude_project_dir" end) as $join_method |
+    ($r.transcript_models) as $tm |
+    (if ($tm | length) == 1 then $tm[0] else null end) as $single |
+    (if $r.model_meta == "default" then
+       (if $single != null then $single else "default" end)
+     elif ($single != null and $single != $r.model_meta) then $single
+     else $r.model_meta end) as $resolved_model |
+    ( ($r.model_meta == "default") or (($tm|length) > 1) or ($single != null and $single != $r.model_meta) ) as $model_uncertain |
+    (if $status == "ok" then (if $model_uncertain then "low" else "high" end)
+     elif $status == "ambiguous_join" then "low"
+     elif $status == "partial" then "low"
+     else "none" end) as $confidence |
+    {
+      task: $r.task, harness: "claude", model: $resolved_model, join_method: $join_method,
+      tokens_status: $status, confidence: $confidence,
+      input_tokens: $r.input_tokens, output_tokens: $r.output_tokens,
+      cache_read_tokens: $r.cache_read_tokens, cache_write_tokens: $r.cache_write_tokens,
+      reasoning_tokens: null,
+      total_tokens: ($r.input_tokens + $r.output_tokens + $r.cache_read_tokens + $r.cache_write_tokens),
+      sessions_matched: $r.sessions_matched,
+      sessions_problem: $r.problem_count,
+      ambiguous_sessions_excluded: $r.ambiguous_excluded,
+      model_source: (if $r.model_meta == "default" and $resolved_model != "default" then "transcript"
+                     elif $r.model_meta == "default" then "unknown" else "routing" end)
+    }
+  )[]'
+cat "$RUN_OUT" > "$TOKENS_FILE" \
+  || { echo "fm-usage-report: failed to write claude token join output" >&2; exit 2; }
 
 # --- build machine report into a RUN-PRIVATE temp ----------------------------
 # Everything below writes to this run's own temp files, never the shared
@@ -606,39 +812,49 @@ run_or_die "failed to build machine report with jq" "" -- "$JQ_BIN" -n \
           total: ($t | length)
         }
       },
-      tokens: {
-        status: "partial",
-        note: "Claude token join implemented (slice M2, join_method=claude_project_dir, grace=\($grace_hours)h). Codex/Grok/Gemini token joins land in later slices (M3+); those tasks report tokens_status=\"unsupported\".",
-        claude: {
-          source_dir: $claude_projects,
-          tasks_total: ($tok | length),
-          tasks_joined: ([ $tok[] | select(.tokens_status == "ok" or .tokens_status == "ambiguous_join") ] | length),
-          by_task: ( $tok | sort_by(.task) ),
-          by_model: (
-            $tok | group_by(.model)
+      tokens: (
+        # F6: one normalized row per task, EVERY harness - claude rows already
+        # fully resolved (status/confidence/model/uniqueness) by the join
+        # stage above; every other harness gets an explicit unsupported
+        # placeholder row here rather than being reduced to an aggregate-only
+        # count. by_task is therefore a complete, captain-checkable ledger.
+        ( $tok + ( [ $t[] | select(.harness != "claude") ] | map({
+            task: .task, harness: .harness, model: .model, join_method: "none",
+            tokens_status: "unsupported", confidence: "none",
+            input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0,
+            reasoning_tokens: null, total_tokens: 0, sessions_matched: 0,
+            sessions_problem: 0, ambiguous_sessions_excluded: 0, model_source: "n/a"
+          }) )
+        | sort_by(.task) ) as $byTask |
+        {
+          status: "partial",
+          note: "Claude token join implemented (slice M2, join_method=claude_project_dir, grace=\($grace_hours)h, source_dir=\($claude_projects)). Codex/Grok/Gemini token joins land in later slices (M3+); those tasks report tokens_status=\"unsupported\".",
+          by_task: $byTask,
+          by_harness_model: (
+            $byTask | group_by([.harness, .model])
             | map({
-                model: .[0].model,
+                harness: .[0].harness, model: .[0].model,
                 tasks: length,
-                tasks_joined: ([ .[] | select(.tokens_status == "ok" or .tokens_status == "ambiguous_join") ] | length),
+                tasks_with_data: ([ .[] | select(.tokens_status == "ok" or .tokens_status == "ambiguous_join" or .tokens_status == "partial") ] | length),
                 input_tokens: ([ .[].input_tokens ] | add // 0),
                 output_tokens: ([ .[].output_tokens ] | add // 0),
                 cache_read_tokens: ([ .[].cache_read_tokens ] | add // 0),
                 cache_write_tokens: ([ .[].cache_write_tokens ] | add // 0),
                 total_tokens: ([ .[].total_tokens ] | add // 0)
               })
-            | sort_by([ (-.tasks), .model ])
-          )
-        },
-        unsupported: {
-          tasks_total: ([ $t[] | select(.harness != "claude") ] | length),
-          by_harness: (
-            [ $t[] | select(.harness != "claude") ]
-            | group_by(.harness)
-            | map({ harness: .[0].harness, count: length })
-            | sort_by([ (-.count), .harness ])
-          )
+            | sort_by([ (-.tasks), .harness, .model ])
+          ),
+          totals: {
+            tasks_total: ($byTask | length),
+            ok: ([ $byTask[] | select(.tokens_status == "ok") ] | length),
+            ambiguous_join: ([ $byTask[] | select(.tokens_status == "ambiguous_join") ] | length),
+            partial: ([ $byTask[] | select(.tokens_status == "partial") ] | length),
+            absent: ([ $byTask[] | select(.tokens_status == "absent") ] | length),
+            unsupported: ([ $byTask[] | select(.tokens_status == "unsupported") ] | length),
+            ambiguous_sessions_excluded: ([ $byTask[].ambiguous_sessions_excluded ] | add // 0)
+          }
         }
-      },
+      ),
       spend: {
         status: "not_implemented",
         confidence: "none",
@@ -699,34 +915,24 @@ run_or_die "failed to render human report with jq" "" -- "$JQ_BIN" -r '
   "",
   .panels.tokens.note,
   "",
-  "### Claude (join_method: claude_project_dir)",
+  "Totals: \(.panels.tokens.totals.ok) ok, \(.panels.tokens.totals.ambiguous_join) ambiguous_join, \(.panels.tokens.totals.partial) partial, \(.panels.tokens.totals.absent) absent, \(.panels.tokens.totals.unsupported) unsupported (of \(.panels.tokens.totals.tasks_total) tasks; \(.panels.tokens.totals.ambiguous_sessions_excluded) session(s) excluded fleet-wide for reused-worktree ambiguity).",
   "",
-  "Joined \(.panels.tokens.claude.tasks_joined)/\(.panels.tokens.claude.tasks_total) claude tasks.",
+  "### By task",
   "",
-  ( if (.panels.tokens.claude.by_task | length) > 0
-    then ( "| task | model | status | confidence | input | output | cache_read | cache_write | total |",
-           "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
-           (.panels.tokens.claude.by_task[]
-             | "| \(.task) | \(.model) | \(.tokens_status) | \(.confidence) | \(.input_tokens) | \(.output_tokens) | \(.cache_read_tokens) | \(.cache_write_tokens) | \(.total_tokens) |"),
+  ( if (.panels.tokens.by_task | length) > 0
+    then ( "| task | harness | model | join_method | status | confidence | input | output | cache_read | cache_write | total | sessions | problems | excluded |",
+           "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+           (.panels.tokens.by_task[]
+             | "| \(.task) | \(.harness) | \(.model) | \(.join_method) | \(.tokens_status) | \(.confidence) | \(.input_tokens) | \(.output_tokens) | \(.cache_read_tokens) | \(.cache_write_tokens) | \(.total_tokens) | \(.sessions_matched) | \(.sessions_problem) | \(.ambiguous_sessions_excluded) |"),
            "" )
     else empty end ),
-  ( if (.panels.tokens.claude.by_model | length) > 0
-    then ( "#### By model",
+  ( if (.panels.tokens.by_harness_model | length) > 0
+    then ( "### By harness / model",
            "",
-           "| model | tasks | joined | input | output | cache_read | cache_write | total |",
-           "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-           (.panels.tokens.claude.by_model[]
-             | "| \(.model) | \(.tasks) | \(.tasks_joined) | \(.input_tokens) | \(.output_tokens) | \(.cache_read_tokens) | \(.cache_write_tokens) | \(.total_tokens) |"),
-           "" )
-    else empty end ),
-  "### Not yet joinable",
-  "",
-  "\(.panels.tokens.unsupported.tasks_total) tasks on other harnesses are not token-joined in this slice.",
-  "",
-  ( if (.panels.tokens.unsupported.by_harness | length) > 0
-    then ( "| tasks | harness |",
-           "| ---: | --- |",
-           (.panels.tokens.unsupported.by_harness[] | "| \(.count) | \(.harness) |"),
+           "| harness | model | tasks | with data | input | output | cache_read | cache_write | total |",
+           "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+           (.panels.tokens.by_harness_model[]
+             | "| \(.harness) | \(.model) | \(.tasks) | \(.tasks_with_data) | \(.input_tokens) | \(.output_tokens) | \(.cache_read_tokens) | \(.cache_write_tokens) | \(.total_tokens) |"),
            "" )
     else empty end ),
   "## Panel C - Estimated spend (\(.panels.spend.status), confidence: \(.panels.spend.confidence))",
@@ -743,9 +949,14 @@ cat "$RUN_OUT" > "$TMP_MD" || { echo "fm-usage-report: failed to write human rep
 # Computed from THIS run's finalized content (which is byte-identical to what
 # gets renamed into the archive), so the fingerprint always matches its archive.
 # Canonicalize in a checked step first, so a jq failure is reported on its own.
-# The canonical form is bounded (mix only).
+# The canonical form is bounded (mix + tokens, still excluding the not-yet-
+# implemented spend/counterfactual scaffolding, which never varies at this
+# slice). QA round 1 (data/qa-m2-q34/report.md finding 6) found that omitting
+# panels.tokens let two archives with different Claude usage share one
+# fingerprint; tokens is deterministic for fixed inputs and a fixed
+# FM_USAGE_NOW exactly like model_mix, so it belongs in the canonical form too.
 run_or_die "failed to canonicalize report for fingerprint with jq" "" \
-  -- "$JQ_BIN" -S '{window, totals, model_mix: .panels.model_mix}' "$TMP_JSON"
+  -- "$JQ_BIN" -S '{window, totals, model_mix: .panels.model_mix, tokens: .panels.tokens}' "$TMP_JSON"
 CANON="$(cat "$RUN_OUT")"
 # printf '%s\n' restores the single trailing newline that $() stripped from jq's
 # output, so this digest is byte-identical to a plain

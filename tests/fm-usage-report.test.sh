@@ -199,17 +199,17 @@ pass "spend/counterfactual panels are labeled scaffolding; tokens is partial (M2
 
 # --- 3b. tokens panel: fixture 1's two claude metas carry no worktree=, so
 # both are legitimately absent (no join possible); the two codex tasks (t2,
-# r1) land in the unsupported tally (M2 does not join codex).
-[ "$(jq -r '.panels.tokens.claude.tasks_total' "$J")" = 2 ] || fail "claude tasks_total"
-[ "$(jq -r '.panels.tokens.claude.tasks_joined' "$J")" = 0 ] || fail "claude tasks_joined (no worktree in fixture)"
-EXPECT_CBYTASK='[["t1","claude-opus-4-8","none","absent"],["t3","claude-opus-4-8","none","absent"]]'
-GOT_CBYTASK=$(jq -c '[.panels.tokens.claude.by_task[]|[.task,.model,.join_method,.tokens_status]]' "$J")
-[ "$GOT_CBYTASK" = "$EXPECT_CBYTASK" ] || fail "claude by_task: got $GOT_CBYTASK want $EXPECT_CBYTASK"
-[ "$(jq -r '.panels.tokens.unsupported.tasks_total' "$J")" = 2 ] || fail "unsupported tasks_total"
-EXPECT_UNSUP='[["codex",2]]'
-GOT_UNSUP=$(jq -c '[.panels.tokens.unsupported.by_harness[]|[.harness,.count]]' "$J")
-[ "$GOT_UNSUP" = "$EXPECT_UNSUP" ] || fail "unsupported by_harness: got $GOT_UNSUP want $EXPECT_UNSUP"
-pass "tokens panel tallies claude tasks without a worktree as absent, codex as unsupported"
+# r1) land in by_task as explicit unsupported rows (M2 does not join codex).
+# QA round-1 finding 6a: by_task is UNIFIED across every harness, not a
+# claude-only list plus an aggregate-only unsupported tally.
+EXPECT_BYTASK='[["t1","claude","claude-opus-4-8","none","absent"],["t2","codex","gpt-5.5","none","unsupported"],["t3","claude","claude-opus-4-8","none","absent"],["r1","codex","gpt-5.6-sol","none","unsupported"]]'
+GOT_BYTASK=$(jq -c '[.panels.tokens.by_task[]|[.task,.harness,.model,.join_method,.tokens_status]] | sort' "$J")
+EXPECT_SORTED=$(jq -c 'sort' <<< "$EXPECT_BYTASK")
+[ "$GOT_BYTASK" = "$EXPECT_SORTED" ] || fail "unified by_task: got $GOT_BYTASK want $EXPECT_SORTED"
+[ "$(jq -r '.panels.tokens.totals.absent' "$J")" = 2 ] || fail "totals.absent"
+[ "$(jq -r '.panels.tokens.totals.unsupported' "$J")" = 2 ] || fail "totals.unsupported"
+[ "$(jq -r '.panels.tokens.totals.tasks_total' "$J")" = 4 ] || fail "tokens totals.tasks_total"
+pass "tokens panel by_task is unified: claude tasks without a worktree are absent, codex is unsupported"
 
 # --- 4. dated archive + index -----------------------------------------------
 HIST=$H/$OUT_SUB/history
@@ -412,7 +412,7 @@ while IFS= read -r ln; do
   [ -f "$CSHARED/$cp_md" ] || fail "concurrent: md pair missing for $cp_path"
   cp_tasks=$(jq -r '.totals.tasks' "$CSHARED/$cp_path")
   grep -q "Total tasks: $cp_tasks " "$CSHARED/$cp_md" || fail "concurrent: json/md pair disagree for $cp_path"
-  cp_recompute=$(jq -S '{window, totals, model_mix: .panels.model_mix}' "$CSHARED/$cp_path" | sha256sum | cut -d' ' -f1)
+  cp_recompute=$(jq -S '{window, totals, model_mix: .panels.model_mix, tokens: .panels.tokens}' "$CSHARED/$cp_path" | sha256sum | cut -d' ' -f1)
   [ "$cp_fp" = "$cp_recompute" ] || fail "concurrent: fingerprint does not recompute for $cp_path ($cp_fp vs $cp_recompute)"
 done < "$CSHARED/index.jsonl"
 # The published latest pair must itself be a coherent single run: latest.md must
@@ -815,10 +815,12 @@ pass "a failed default-since date computation fails loud and nonzero"
 
 
 # ============================================================================
-# Slice M2 - Claude token joiner
+# Slice M2 - Claude token joiner (round 2, redesigned after independent QA
+# data/qa-m2-q34/report.md found round 1 could publish confidently-wrong
+# numbers). Every block below is keyed to the QA finding it regresses.
 # ============================================================================
 
-# --- 19. happy path: single matched session, correct sums, high confidence --
+# --- 19. happy path: single uniquely-claimed session, correct sums, high ----
 HP=$(make_home claude-happy)
 CP19="$HP/claude-projects"
 append_run "$HP/state/task-runs.jsonl" happy1 ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
@@ -832,14 +834,15 @@ FM_CLAUDE_PROJECTS_OVERRIDE="$CP19" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
   --target "$HP" --since 2026-07-01 --until 2026-07-31 >/dev/null \
   || fail "happy-path run exited non-zero"
 HPJ=$HP/$OUT_SUB/latest.json
-[ "$(jq -r '.panels.tokens.claude.tasks_total' "$HPJ")" = 1 ] || fail "happy-path claude tasks_total"
-[ "$(jq -r '.panels.tokens.claude.tasks_joined' "$HPJ")" = 1 ] || fail "happy-path claude tasks_joined"
-EXPECT_HP='{"task":"happy1","model":"claude-opus-4-8","join_method":"claude_project_dir","tokens_status":"ok","confidence":"high","input_tokens":300,"output_tokens":130,"cache_read_tokens":30,"cache_write_tokens":13,"reasoning_tokens":null,"total_tokens":473,"sessions_matched":1}'
-GOT_HP=$(jq -cS '.panels.tokens.claude.by_task[0]' "$HPJ")
-[ "$GOT_HP" = "$(jq -cS . <<< "$EXPECT_HP")" ] || fail "happy-path by_task row: got $GOT_HP want $EXPECT_HP"
-pass "claude happy path: encode+sum+time-filter yields tokens_status=ok, confidence=high"
+row_of() { jq -r --arg t "$2" --arg f "$3" '.panels.tokens.by_task[] | select(.task==$t) | .[$f]' "$1"; }
+[ "$(row_of "$HPJ" happy1 tokens_status)" = ok ] || fail "happy-path status"
+[ "$(row_of "$HPJ" happy1 confidence)" = high ] || fail "happy-path confidence"
+EXPECT_HP='{"task":"happy1","harness":"claude","model":"claude-opus-4-8","join_method":"claude_project_dir","tokens_status":"ok","confidence":"high","input_tokens":300,"output_tokens":130,"cache_read_tokens":30,"cache_write_tokens":13,"reasoning_tokens":null,"total_tokens":473,"sessions_matched":1,"sessions_problem":0,"ambiguous_sessions_excluded":0,"model_source":"routing"}'
+GOT_HP=$(jq -cS '.panels.tokens.by_task[] | select(.task=="happy1")' "$HPJ")
+[ "$GOT_HP" = "$(jq -cS . <<< "$EXPECT_HP")" ] || fail "happy-path row: got $GOT_HP want $EXPECT_HP"
+pass "claude happy path: unique claim yields tokens_status=ok, confidence=high"
 
-# --- 20. session-file-level exclusion (worktree pool-reuse hazard) ----------
+# --- 20. session-file-level exclusion (worktree pool-reuse hazard, single task)
 RH=$(make_home claude-reuse)
 CP20="$RH/claude-projects"
 append_run "$RH/state/task-runs.jsonl" reuse1 ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
@@ -851,8 +854,8 @@ FM_CLAUDE_PROJECTS_OVERRIDE="$CP20" FM_USAGE_NOW=2026-07-25T00:00:00Z "$USAGE" \
   --target "$RH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
   || fail "reuse-hazard run exited non-zero"
 RJ=$RH/$OUT_SUB/latest.json
-[ "$(jq -r '.panels.tokens.claude.by_task[0].sessions_matched' "$RJ")" = 1 ] || fail "reuse: only one session should match"
-[ "$(jq -r '.panels.tokens.claude.by_task[0].total_tokens' "$RJ")" = 20 ] || fail "reuse: unrelated out-of-window session must not be summed"
+[ "$(row_of "$RJ" reuse1 sessions_matched)" = 1 ] || fail "reuse: only one session should match"
+[ "$(row_of "$RJ" reuse1 total_tokens)" = 20 ] || fail "reuse: unrelated out-of-window session must not be summed"
 pass "an unrelated out-of-window session in the same directory is excluded wholesale"
 
 # --- 21. inclusive lower/upper join-window boundaries (default grace=2h) ---
@@ -869,9 +872,9 @@ FM_CLAUDE_PROJECTS_OVERRIDE="$CP21" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
   --target "$BH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
   || fail "boundary run exited non-zero"
 BJ=$BH/$OUT_SUB/latest.json
-[ "$(jq -r '.panels.tokens.claude.by_task[0].sessions_matched' "$BJ")" = 2 ] || fail "boundary: expected exactly the two inclusive-boundary sessions"
-[ "$(jq -r '.panels.tokens.claude.by_task[0].input_tokens' "$BJ")" = 1 ] || fail "boundary: input tokens (lo_in only)"
-[ "$(jq -r '.panels.tokens.claude.by_task[0].output_tokens' "$BJ")" = 1 ] || fail "boundary: output tokens (hi_in only)"
+[ "$(row_of "$BJ" bound1 sessions_matched)" = 2 ] || fail "boundary: expected exactly the two inclusive-boundary sessions"
+[ "$(row_of "$BJ" bound1 input_tokens)" = 1 ] || fail "boundary: input tokens (lo_in only)"
+[ "$(row_of "$BJ" bound1 output_tokens)" = 1 ] || fail "boundary: output tokens (hi_in only)"
 pass "join window is inclusive on both ends, one second outside excludes"
 
 # --- 22. grace-hours configurability -----------------------------------------
@@ -886,8 +889,8 @@ FM_CLAUDE_PROJECTS_OVERRIDE="$CP22" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
   --target "$GH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
   || fail "default-grace run exited non-zero"
 GJ=$GH/$OUT_SUB/latest.json
-[ "$(jq -r '.panels.tokens.claude.by_task[0].sessions_matched' "$GJ")" = 2 ] || fail "default grace (2h) should include the +1h session"
-[ "$(jq -r '.panels.tokens.claude.by_task[0].input_tokens' "$GJ")" = 505 ] || fail "default grace (2h) token sum"
+[ "$(row_of "$GJ" grace1 sessions_matched)" = 2 ] || fail "default grace (2h) should include the +1h session"
+[ "$(row_of "$GJ" grace1 input_tokens)" = 505 ] || fail "default grace (2h) token sum"
 GH0=$(make_home claude-grace0)
 CP220="$GH0/claude-projects"
 append_run "$GH0/state/task-runs.jsonl" grace1 ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
@@ -898,8 +901,8 @@ FM_CLAUDE_PROJECTS_OVERRIDE="$CP220" FM_USAGE_CLAUDE_GRACE_HOURS=0 FM_USAGE_NOW=
   --target "$GH0" --since 2026-07-01 --until 2026-07-31 >/dev/null \
   || fail "zero-grace run exited non-zero"
 GJ0=$GH0/$OUT_SUB/latest.json
-[ "$(jq -r '.panels.tokens.claude.by_task[0].sessions_matched' "$GJ0")" = 1 ] || fail "zero grace should exclude the +1h session"
-[ "$(jq -r '.panels.tokens.claude.by_task[0].input_tokens' "$GJ0")" = 5 ] || fail "zero grace token sum"
+[ "$(row_of "$GJ0" grace1 sessions_matched)" = 1 ] || fail "zero grace should exclude the +1h session"
+[ "$(row_of "$GJ0" grace1 input_tokens)" = 5 ] || fail "zero grace token sum"
 pass "FM_USAGE_CLAUDE_GRACE_HOURS changes which sessions are within the join window"
 
 # --- 23. invalid FM_USAGE_CLAUDE_GRACE_HOURS exits nonzero -------------------
@@ -929,10 +932,11 @@ FM_CLAUDE_PROJECTS_OVERRIDE="$CP24" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
   --target "$UDH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
   || fail "undated claude run exited non-zero"
 UDJ=$UDH/$OUT_SUB/latest.json
-[ "$(jq -r '.panels.tokens.claude.by_task[0].tokens_status' "$UDJ")" = ambiguous_join ] || fail "undated claude task must be ambiguous_join"
-[ "$(jq -r '.panels.tokens.claude.by_task[0].confidence' "$UDJ")" = low ] || fail "ambiguous_join confidence must be low"
-[ "$(jq -r '.panels.tokens.claude.by_task[0].sessions_matched' "$UDJ")" = 2 ] || fail "undated claude task must sum every session unfiltered"
-[ "$(jq -r '.panels.tokens.claude.by_task[0].input_tokens' "$UDJ")" = 30 ] || fail "undated claude token sum"
+[ "$(row_of "$UDJ" undated1 tokens_status)" = ambiguous_join ] || fail "undated claude task must be ambiguous_join"
+[ "$(row_of "$UDJ" undated1 confidence)" = low ] || fail "ambiguous_join confidence must be low"
+[ "$(row_of "$UDJ" undated1 sessions_matched)" = 2 ] || fail "undated claude task must sum every session unfiltered"
+[ "$(row_of "$UDJ" undated1 input_tokens)" = 30 ] || fail "undated claude token sum"
+[ "$(row_of "$UDJ" undated1 ambiguous_sessions_excluded)" = 0 ] || fail "undated task alone shares nothing, no exclusion expected"
 pass "an undated claude task falls back to ambiguous_join over every top-level session"
 
 # --- 25/26/27. absent cases: no worktree, missing dir, empty dir -----------
@@ -952,16 +956,17 @@ FM_CLAUDE_PROJECTS_OVERRIDE="$CP25" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
   --target "$AH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
   || fail "absent-cases run exited non-zero"
 AJ=$AH/$OUT_SUB/latest.json
-row_of() { jq -r --arg t "$1" --arg f "$2" '.panels.tokens.claude.by_task[] | select(.task==$t) | .[$f]' "$AJ"; }
-[ "$(row_of noworktree tokens_status)" = absent ] || fail "no-worktree claude task must be absent"
-[ "$(row_of noworktree join_method)" = none ] || fail "no-worktree join_method must be none"
-[ "$(row_of nodir tokens_status)" = absent ] || fail "missing-directory claude task must be absent"
-[ "$(row_of nodir join_method)" = claude_project_dir ] || fail "missing-directory join_method is still claude_project_dir (attempted)"
-[ "$(row_of emptydir tokens_status)" = absent ] || fail "empty-directory claude task must be absent"
-[ "$(row_of noworktree sessions_matched)" = 0 ] || fail "no-worktree sessions_matched must be 0"
-[ "$(row_of nodir sessions_matched)" = 0 ] || fail "missing-directory sessions_matched must be 0"
-[ "$(row_of emptydir sessions_matched)" = 0 ] || fail "empty-directory sessions_matched must be 0"
-[ "$(jq -rc '[.panels.tokens.claude.by_task[]|.confidence]|unique' "$AJ")" = '["none"]' ] || fail "all three absent rows must carry confidence=none"
+[ "$(row_of "$AJ" noworktree tokens_status)" = absent ] || fail "no-worktree claude task must be absent"
+[ "$(row_of "$AJ" noworktree join_method)" = none ] || fail "no-worktree join_method must be none"
+[ "$(row_of "$AJ" nodir tokens_status)" = absent ] || fail "missing-directory claude task must be absent"
+[ "$(row_of "$AJ" nodir join_method)" = claude_project_dir ] || fail "missing-directory join_method is still claude_project_dir (attempted)"
+[ "$(row_of "$AJ" emptydir tokens_status)" = absent ] || fail "empty-directory claude task must be absent"
+[ "$(row_of "$AJ" noworktree sessions_matched)" = 0 ] || fail "no-worktree sessions_matched must be 0"
+[ "$(row_of "$AJ" nodir sessions_matched)" = 0 ] || fail "missing-directory sessions_matched must be 0"
+[ "$(row_of "$AJ" emptydir sessions_matched)" = 0 ] || fail "empty-directory sessions_matched must be 0"
+[ "$(row_of "$AJ" noworktree sessions_problem)" = 0 ] || fail "no-worktree sessions_problem must be 0 (absent is not the same as a data problem)"
+[ "$(jq -rc '[.panels.tokens.by_task[] | select(.task=="noworktree" or .task=="nodir" or .task=="emptydir") | .confidence] | unique' "$AJ")" = '["none"]' ] \
+  || fail "all three absent rows must carry confidence=none"
 pass "no worktree, a missing session directory, and an empty session directory are all absent, not errors"
 
 # --- 28. subagents/ subdirectory is excluded from the sum -------------------
@@ -976,11 +981,11 @@ FM_CLAUDE_PROJECTS_OVERRIDE="$CP28" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
   --target "$SAH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
   || fail "subagents run exited non-zero"
 SAJ=$SAH/$OUT_SUB/latest.json
-[ "$(jq -r '.panels.tokens.claude.by_task[0].input_tokens' "$SAJ")" = 7 ] || fail "subagents/ transcript must not be summed into the parent task"
-[ "$(jq -r '.panels.tokens.claude.by_task[0].sessions_matched' "$SAJ")" = 1 ] || fail "only the top-level session file should be counted"
+[ "$(row_of "$SAJ" subtask1 input_tokens)" = 7 ] || fail "subagents/ transcript must not be summed into the parent task"
+[ "$(row_of "$SAJ" subtask1 sessions_matched)" = 1 ] || fail "only the top-level session file should be counted"
 pass "a session's own subagents/ subtree is excluded from the sum"
 
-# --- 29. missing usage subfields default to 0 --------------------------------
+# --- 29. missing usage subfields default to 0 (legitimate: no cache activity)
 MFH=$(make_home claude-missingfields)
 CP29="$MFH/claude-projects"
 append_run "$MFH/state/task-runs.jsonl" missing1 ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
@@ -993,11 +998,64 @@ FM_CLAUDE_PROJECTS_OVERRIDE="$CP29" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
   --target "$MFH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
   || fail "missing-fields run exited non-zero"
 MFJ=$MFH/$OUT_SUB/latest.json
-[ "$(jq -c '.panels.tokens.claude.by_task[0] | [.input_tokens,.output_tokens,.cache_read_tokens,.cache_write_tokens,.total_tokens]' "$MFJ")" = '[3,4,0,0,7]' ] \
+[ "$(row_of "$MFJ" missing1 tokens_status)" = ok ] || fail "a legitimately cache-less event must still join as ok"
+[ "$(jq -c '.panels.tokens.by_task[] | select(.task=="missing1") | [.input_tokens,.output_tokens,.cache_read_tokens,.cache_write_tokens,.total_tokens]' "$MFJ")" = '[3,4,0,0,7]' ] \
   || fail "missing cache fields must default to 0, not error"
-pass "a usage block missing cache fields defaults them to 0"
+pass "a usage block missing ONLY cache fields defaults them to 0 and still joins ok (not a schema problem)"
 
-# --- 30. a malformed session file is tolerated; a valid sibling still counts
+# --- 30 (QA F1). a session with NO usage object at all is a SCHEMA problem: the
+# task must be downgraded to partial, never silently ok/high on a reduced sum.
+NUH=$(make_home claude-nousage)
+CPNU="$NUH/claude-projects"
+append_run "$NUH/state/task-runs.jsonl" nousage1 ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+ENCNU=$(encode_worktree /wt/nousage1)
+mkdir -p "$CPNU/$ENCNU"
+jq -nc --arg ts 2026-07-15T12:30:00Z '{type:"assistant", timestamp:$ts, message:{model:"claude-opus-4-8"}}' \
+  > "$CPNU/$ENCNU/nousage.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPNU" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$NUH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "no-usage-object run exited non-zero"
+NUJ=$NUH/$OUT_SUB/latest.json
+[ "$(row_of "$NUJ" nousage1 tokens_status)" = partial ] || fail "QA F1: an assistant event with no usage object must never be reported ok"
+[ "$(row_of "$NUJ" nousage1 confidence)" = low ] || fail "QA F1: partial status must carry confidence=low, never high"
+[ "$(row_of "$NUJ" nousage1 sessions_problem)" = 1 ] || fail "QA F1: the schema-invalid session must be counted as a problem"
+[ "$(row_of "$NUJ" nousage1 total_tokens)" = 0 ] || fail "QA F1: an all-invalid session yields a zero floor, not a fabricated total"
+pass "QA F1: an assistant event missing its usage object makes the task partial/low, never ok/high"
+
+# --- 31 (QA F1/F4). numeric field validation: negative, huge (overflow),
+# fractional, and string values are all schema-invalid, and their WHOLE
+# session downgrades the task to partial - never a garbage or negative total.
+NVH=$(make_home claude-numvalid)
+CPNV="$NVH/claude-projects"
+append_run "$NVH/state/task-runs.jsonl" negtask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+append_run "$NVH/state/task-runs.jsonl" hugetask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+append_run "$NVH/state/task-runs.jsonl" fractask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+append_run "$NVH/state/task-runs.jsonl" strtask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+mkdir -p "$CPNV/$(encode_worktree /wt/negtask)" "$CPNV/$(encode_worktree /wt/hugetask)" \
+  "$CPNV/$(encode_worktree /wt/fractask)" "$CPNV/$(encode_worktree /wt/strtask)"
+jq -nc --arg ts 2026-07-15T12:30:00Z '{type:"assistant", timestamp:$ts, message:{model:"claude-opus-4-8", usage:{input_tokens:-5, output_tokens:10}}}' \
+  > "$CPNV/$(encode_worktree /wt/negtask)/s.jsonl"
+jq -nc --arg ts 2026-07-15T12:30:00Z '{type:"assistant", timestamp:$ts, message:{model:"claude-opus-4-8", usage:{input_tokens:10000000000000000000, output_tokens:10}}}' \
+  > "$CPNV/$(encode_worktree /wt/hugetask)/s.jsonl"
+jq -nc --arg ts 2026-07-15T12:30:00Z '{type:"assistant", timestamp:$ts, message:{model:"claude-opus-4-8", usage:{input_tokens:3.5, output_tokens:10}}}' \
+  > "$CPNV/$(encode_worktree /wt/fractask)/s.jsonl"
+jq -nc --arg ts 2026-07-15T12:30:00Z '{type:"assistant", timestamp:$ts, message:{model:"claude-opus-4-8", usage:{input_tokens:"5", output_tokens:10}}}' \
+  > "$CPNV/$(encode_worktree /wt/strtask)/s.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPNV" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$NVH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "numeric-validation run exited non-zero"
+NVJ=$NVH/$OUT_SUB/latest.json
+for t in negtask hugetask fractask strtask; do
+  [ "$(row_of "$NVJ" "$t" tokens_status)" = partial ] || fail "QA F4: $t with an invalid numeric field must be partial, got $(row_of "$NVJ" "$t" tokens_status)"
+  tt=$(row_of "$NVJ" "$t" total_tokens)
+  [ "$tt" = 0 ] || fail "QA F4: $t must never publish a fabricated/negative total, got $tt"
+  case "$tt" in -*) fail "QA F4: $t total_tokens must never be negative (bash arithmetic overflow), got $tt" ;; esac
+done
+pass "QA F4: negative, overflowing, fractional, and string numeric fields are rejected, never summed"
+
+# --- 32 (QA F1). a malformed (truncated) session file is data tolerance, but
+# now correctly downgrades the task to partial - the valid sibling's tokens
+# are still shown as an honest floor, not silently promoted to ok/high.
 MDH=$(make_home claude-malformed)
 CP30="$MDH/claude-projects"
 append_run "$MDH/state/task-runs.jsonl" malf1 ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
@@ -1009,14 +1067,238 @@ FM_CLAUDE_PROJECTS_OVERRIDE="$CP30" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
   --target "$MDH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
   || fail "malformed-session run must still exit zero (tolerated data issue)"
 MDJ=$MDH/$OUT_SUB/latest.json
-[ "$(jq -r '.panels.tokens.claude.by_task[0].tokens_status' "$MDJ")" = ok ] || fail "valid sibling session must still be joined"
-[ "$(jq -r '.panels.tokens.claude.by_task[0].sessions_matched' "$MDJ")" = 1 ] || fail "malformed session must be skipped, not counted"
-[ "$(jq -r '.panels.tokens.claude.by_task[0].input_tokens' "$MDJ")" = 5 ] || fail "malformed session must not corrupt the sum"
-pass "a malformed session file is skipped; a valid sibling in the same directory still contributes"
+[ "$(row_of "$MDJ" malf1 tokens_status)" = partial ] || fail "QA F1: a malformed sibling must downgrade the task to partial, not leave it ok"
+[ "$(row_of "$MDJ" malf1 confidence)" = low ] || fail "QA F1: partial confidence must be low"
+[ "$(row_of "$MDJ" malf1 sessions_matched)" = 1 ] || fail "the valid sibling must still be counted toward the floor"
+[ "$(row_of "$MDJ" malf1 sessions_problem)" = 1 ] || fail "the malformed file must be counted as a problem"
+[ "$(row_of "$MDJ" malf1 input_tokens)" = 5 ] || fail "the valid sibling's tokens are still an honest floor"
+pass "QA F1: a malformed session file downgrades the task to partial; the valid sibling is still an honest floor, not a false ok"
 
-# --- 31. an OPERATIONAL jq failure on a session file aborts loud (QA-style
-# mutation-sensitive counterpart to test 30: this must NOT be silently
-# tolerated the way a parse error is).
+# --- 33 (QA F1). a concurrently-mutated session file (size/mtime changes
+# between the before and after stat) is treated as unreadable, not trusted.
+CTH=$(make_home claude-concurrent)
+CTP="$CTH/claude-projects"
+append_run "$CTH/state/task-runs.jsonl" conctask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+ENCCT=$(encode_worktree /wt/conctask)
+mkdir -p "$CTP/$ENCCT"
+claude_event 2026-07-15T12:30:00Z 5 5 0 0 > "$CTP/$ENCCT/mutating.jsonl"
+CTB=$(fm_fakebin "$CTH")
+CT_REAL_STAT="$(command -v stat)"
+# Shim stat: the SECOND call for this file reports a different size than the
+# first, simulating a writer appending mid-read.
+cat > "$CTB/stat" <<'SH'
+#!/usr/bin/env bash
+real="${REAL_STAT:-/usr/bin/stat}"
+last="${*: -1}"
+case "$last" in
+  */mutating.jsonl)
+    if [ ! -e "${MUTATE_MARK:?}" ]; then
+      : > "$MUTATE_MARK"
+      exec "$real" "$@"
+    else
+      echo "999999 9999999999"
+    fi
+    ;;
+  *) exec "$real" "$@" ;;
+esac
+SH
+chmod +x "$CTB/stat"
+PATH="$CTB:$PATH" REAL_STAT="$CT_REAL_STAT" MUTATE_MARK="$CTH/mutate-seen" \
+  FM_CLAUDE_PROJECTS_OVERRIDE="$CTP" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$CTH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "concurrent-mutation run must still exit zero (tolerated data issue)"
+CTJ=$CTH/$OUT_SUB/latest.json
+[ "$(row_of "$CTJ" conctask tokens_status)" = partial ] || fail "QA F1: a file whose stat changed mid-read must not be trusted"
+[ "$(row_of "$CTJ" conctask sessions_matched)" = 0 ] || fail "QA F1: the mutated file must not contribute to the sum"
+[ "$(row_of "$CTJ" conctask sessions_problem)" = 1 ] || fail "QA F1: the mutated file must be counted as a problem"
+pass "QA F1: a session file whose size/mtime changes across the read is treated as unstable, not trusted"
+
+# --- 34 (QA F2). ONE session shared by two tasks with overlapping windows on
+# the SAME reused worktree must never be double-counted; both affected tasks
+# are downgraded to ambiguous_join/low and the session is excluded from both.
+DUP=$(make_home claude-duplicate)
+CPDUP="$DUP/claude-projects"
+L=$DUP/state/task-runs.jsonl
+append_run "$L" task-a ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+jq -c 'if .task=="task-a" then .worktree="/wt/shared" | .spawned_at="2026-07-15T10:00:00Z" | .ended_at="2026-07-15T12:00:00Z" else . end' "$L" > "$L.tmp" && mv "$L.tmp" "$L"
+append_run "$L" task-b ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T13:00:00Z
+jq -c 'if .task=="task-b" then .worktree="/wt/shared" | .spawned_at="2026-07-15T11:00:00Z" | .ended_at="2026-07-15T13:00:00Z" else . end' "$L" > "$L.tmp" && mv "$L.tmp" "$L"
+ENCDUP=$(encode_worktree /wt/shared)
+mkdir -p "$CPDUP/$ENCDUP"
+# One session at 11:30, inside BOTH tasks' windows (a-window 10:00-14:00 with
+# grace, b-window 11:00-15:00 with grace) - genuinely ambiguous.
+claude_event 2026-07-15T11:30:00Z 10 0 0 0 > "$CPDUP/$ENCDUP/shared.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPDUP" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$DUP" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "duplicate-claim run exited non-zero"
+DUPJ=$DUP/$OUT_SUB/latest.json
+for t in task-a task-b; do
+  [ "$(row_of "$DUPJ" "$t" tokens_status)" = ambiguous_join ] || fail "QA F2: $t sharing an ambiguous session must be ambiguous_join, got $(row_of "$DUPJ" "$t" tokens_status)"
+  [ "$(row_of "$DUPJ" "$t" confidence)" = low ] || fail "QA F2: $t confidence must be low"
+  [ "$(row_of "$DUPJ" "$t" total_tokens)" = 0 ] || fail "QA F2: $t must not receive any of the ambiguous session's tokens"
+  [ "$(row_of "$DUPJ" "$t" ambiguous_sessions_excluded)" = 1 ] || fail "QA F2: $t must record the excluded ambiguous session"
+done
+SUMTOK=$(jq '[.panels.tokens.by_task[] | select(.task=="task-a" or .task=="task-b") | .total_tokens] | add' "$DUPJ")
+[ "$SUMTOK" = 0 ] || fail "QA F2: the fleet-wide sum across both tasks must be 0, not 10+10=20 (double count), got $SUMTOK"
+pass "QA F2: a session claimed by two reused-worktree tasks is excluded from both, never double counted"
+
+# --- 35 (QA F2). the SAME scenario but with a session uniquely inside only
+# task-a's window: task-a must join normally (ok/high); task-b (which never
+# claims it) is unaffected.
+UNQ=$(make_home claude-unique-share)
+CPUNQ="$UNQ/claude-projects"
+LU=$UNQ/state/task-runs.jsonl
+append_run "$LU" uniq-a ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+jq -c 'if .task=="uniq-a" then .worktree="/wt/uniqshared" | .spawned_at="2026-07-15T09:00:00Z" | .ended_at="2026-07-15T09:30:00Z" else . end' "$LU" > "$LU.tmp" && mv "$LU.tmp" "$LU"
+append_run "$LU" uniq-b ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-16T12:00:00Z
+jq -c 'if .task=="uniq-b" then .worktree="/wt/uniqshared" | .spawned_at="2026-07-16T09:00:00Z" | .ended_at="2026-07-16T09:30:00Z" else . end' "$LU" > "$LU.tmp" && mv "$LU.tmp" "$LU"
+ENCUNQ=$(encode_worktree /wt/uniqshared)
+mkdir -p "$CPUNQ/$ENCUNQ"
+claude_event 2026-07-15T09:15:00Z 42 0 0 0 > "$CPUNQ/$ENCUNQ/only-a.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPUNQ" FM_USAGE_NOW=2026-07-20T00:00:00Z "$USAGE" \
+  --target "$UNQ" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "unique-share run exited non-zero"
+UNQJ=$UNQ/$OUT_SUB/latest.json
+[ "$(row_of "$UNQJ" uniq-a tokens_status)" = ok ] || fail "a session inside only one task's window must still join ok for that task"
+[ "$(row_of "$UNQJ" uniq-a input_tokens)" = 42 ] || fail "uniquely-claimed session tokens"
+[ "$(row_of "$UNQJ" uniq-b tokens_status)" = absent ] || fail "a task sharing a worktree but not claiming the session must be unaffected (absent)"
+pass "worktree reuse alone does not force ambiguity - only a session genuinely claimed by more than one task does"
+
+# --- 36 (QA F3). meta model=default resolves to the transcript's single
+# observed model, and confidence is capped to low even though the join
+# itself is otherwise clean (single uniquely-claimed session).
+DMH=$(make_home claude-defaultmodel)
+CPDM="$DMH/claude-projects"
+fm_write_meta "$DMH/state/defaulttask.meta" \
+  project=/home/prode/fleet/firstmate harness=claude kind=ship \
+  model=default effort=high spawned_at=2026-07-15T10:00:00Z worktree=/wt/defaulttask
+ENCDM=$(encode_worktree /wt/defaulttask)
+mkdir -p "$CPDM/$ENCDM"
+claude_event 2026-07-15T10:15:00Z 5 0 0 0 > "$CPDM/$ENCDM/s.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPDM" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$DMH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "default-model run exited non-zero"
+DMJ=$DMH/$OUT_SUB/latest.json
+[ "$(row_of "$DMJ" defaulttask model)" = claude-opus-4-8 ] || fail "QA F3: model=default must resolve to the transcript's observed model"
+[ "$(row_of "$DMJ" defaulttask tokens_status)" = ok ] || fail "QA F3: the token count itself is still trustworthy"
+[ "$(row_of "$DMJ" defaulttask confidence)" = low ] || fail "QA F3: confidence must be capped to low when the routing model was default"
+[ "$(row_of "$DMJ" defaulttask model_source)" = transcript ] || fail "QA F3: model_source must say the model came from the transcript"
+pass "QA F3: model=default resolves to the transcript's real model and caps confidence to low"
+
+# --- 37 (QA F3). routing declared a concrete model that DISAGREES with the
+# transcript's single observed model - confidence still capped to low.
+MMH=$(make_home claude-modelmismatch)
+CPMM="$MMH/claude-projects"
+append_run "$MMH/state/task-runs.jsonl" mismatch1 ship /home/prode/fleet/firstmate claude claude-sonnet-5 high 2026-07-15T12:00:00Z
+ENCMM=$(encode_worktree /wt/mismatch1)
+mkdir -p "$CPMM/$ENCMM"
+claude_event 2026-07-15T12:15:00Z 8 0 0 0 > "$CPMM/$ENCMM/s.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPMM" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$MMH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "model-mismatch run exited non-zero"
+MMJ=$MMH/$OUT_SUB/latest.json
+[ "$(row_of "$MMJ" mismatch1 model)" = claude-opus-4-8 ] || fail "QA F3: the transcript's ground truth model should be reported over a disagreeing routing label"
+[ "$(row_of "$MMJ" mismatch1 confidence)" = low ] || fail "QA F3: a routing/transcript model mismatch must cap confidence to low"
+pass "QA F3: a routing/transcript model mismatch resolves to the transcript and caps confidence to low"
+
+# --- 38 (QA F3). multiple DISTINCT transcript models observed across the
+# uniquely-claimed sessions of one task - heterogeneous, confidence capped.
+HMH=$(make_home claude-heteromodel)
+CPHM="$HMH/claude-projects"
+append_run "$HMH/state/task-runs.jsonl" hetero1 ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+ENCHM=$(encode_worktree /wt/hetero1)
+mkdir -p "$CPHM/$ENCHM"
+jq -nc --arg ts 2026-07-15T12:15:00Z '{type:"assistant", timestamp:$ts, message:{model:"claude-opus-4-8", usage:{input_tokens:5, output_tokens:0}}}' > "$CPHM/$ENCHM/s1.jsonl"
+jq -nc --arg ts 2026-07-15T12:30:00Z '{type:"assistant", timestamp:$ts, message:{model:"claude-fable-5", usage:{input_tokens:5, output_tokens:0}}}' > "$CPHM/$ENCHM/s2.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPHM" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$HMH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "heterogeneous-model run exited non-zero"
+HMJ=$HMH/$OUT_SUB/latest.json
+[ "$(row_of "$HMJ" hetero1 tokens_status)" = ok ] || fail "QA F3: heterogeneous models is a confidence concern, not a data problem"
+[ "$(row_of "$HMJ" hetero1 confidence)" = low ] || fail "QA F3: two distinct transcript models must cap confidence to low"
+[ "$(row_of "$HMJ" hetero1 total_tokens)" = 10 ] || fail "QA F3: the token sum itself is still summed normally"
+pass "QA F3: disagreeing transcript models across sessions cap confidence to low without discarding the tokens"
+
+# --- 39 (QA F5). an unsearchable Claude root (mode 000 parent, not ENOENT) is
+# an OPERATIONAL failure - loud, nonzero, no publication - never absent/none.
+UPH=$(make_home claude-unsearchable)
+CPUP="$UPH/claude-projects"
+append_run "$UPH/state/task-runs.jsonl" blockedtask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+ENCUP=$(encode_worktree /wt/blockedtask)
+mkdir -p "$CPUP/blocked-parent/$ENCUP"
+claude_event 2026-07-15T12:15:00Z 10 0 0 0 > "$CPUP/blocked-parent/$ENCUP/s.jsonl"
+# Point CLAUDE_PROJECTS at the now-inaccessible parent so encode_claude_dir's
+# target directory lives underneath a mode-000 ancestor (EACCES, not ENOENT).
+chmod 000 "$CPUP/blocked-parent"
+UPO=$UPH/out; UPO_OUT=$UPH/stdout; UPO_ERR=$UPH/stderr
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPUP/blocked-parent" FM_USAGE_NOW=2026-07-18T00:00:00Z \
+  "$USAGE" --target "$UPH" --out "$UPO" --since 2026-07-01 --until 2026-07-31 \
+  >"$UPO_OUT" 2>"$UPO_ERR"
+up_rc=$?
+chmod 755 "$CPUP/blocked-parent"
+[ "$up_rc" -ne 0 ] || fail "QA F5: an unsearchable claude root must exit nonzero, got $up_rc"
+grep -q "failed to list claude session files" "$UPO_ERR" || fail "QA F5: an unsearchable claude root must print the named diagnostic"
+assert_no_grep "usage report:" "$UPO_OUT" "QA F5: an unsearchable claude root must not print a success summary"
+assert_absent "$UPO/latest.json" "QA F5: an unsearchable claude root must not publish a report"
+pass "QA F5: an unsearchable (not missing) Claude root is an operational failure, never silent absence"
+
+# --- 40 (QA F6). fingerprint changes when ONLY Claude token data changes,
+# with model_mix (totals/window) held byte-identical.
+FPH=$(make_home claude-fingerprint)
+CPFP="$FPH/claude-projects"
+append_run "$FPH/state/task-runs.jsonl" fptask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+ENCFP=$(encode_worktree /wt/fptask)
+mkdir -p "$CPFP/$ENCFP"
+claude_event 2026-07-15T12:15:00Z 5 0 0 0 > "$CPFP/$ENCFP/s.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPFP" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$FPH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "fingerprint-baseline run exited non-zero"
+FP1=$(jq -r '.fingerprint' "$FPH/$OUT_SUB/index.jsonl" | tail -1)
+# Same task-runs.jsonl, same window, same model mix - but MORE tokens in the
+# claude session (a second event). The fingerprint must differ.
+claude_event 2026-07-15T12:20:00Z 500 0 0 0 >> "$CPFP/$ENCFP/s.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPFP" FM_USAGE_NOW=2026-07-18T00:00:01Z "$USAGE" \
+  --target "$FPH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "fingerprint-changed run exited non-zero"
+FP2=$(jq -r '.fingerprint' "$FPH/$OUT_SUB/index.jsonl" | tail -1)
+[ "$FP1" != "$FP2" ] || fail "QA F6: the fingerprint must change when only Claude token totals change (got identical $FP1)"
+pass "QA F6: the report fingerprint covers the tokens panel, not just model_mix"
+
+# --- 41 (QA F7). a checked cat-append failure on a new M2 temp file fails
+# loud and nonzero, exactly like the M1 publish-path checks it mirrors.
+CAH=$(make_home claude-catfail)
+append_run "$CAH/state/task-runs.jsonl" catfailtask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+CAB=$(fm_fakebin "$CAH")
+CA_REAL_MKTEMP="$(command -v mktemp)"
+# Shim mktemp: for the claude-task-records temp specifically, create it via
+# the real tool then immediately strip write permission, forcing the FIRST
+# emit_claude_task_record append to fail.
+cat > "$CAB/mktemp" <<'SH'
+#!/usr/bin/env bash
+real="${REAL_MKTEMP:-/usr/bin/mktemp}"
+out="$("$real" "$@")"
+rc=$?
+case "$out" in
+  */fm-usage-claude-task-records.*) chmod 400 "$out" ;;
+esac
+printf '%s\n' "$out"
+exit "$rc"
+SH
+chmod +x "$CAB/mktemp"
+CAO=$CAH/out; CAO_OUT=$CAH/stdout; CAO_ERR=$CAH/stderr
+PATH="$CAB:$PATH" REAL_MKTEMP="$CA_REAL_MKTEMP" FM_USAGE_NOW=2026-07-18T00:00:00Z \
+  "$USAGE" --target "$CAH" --out "$CAO" --since 2026-07-01 --until 2026-07-31 \
+  >"$CAO_OUT" 2>"$CAO_ERR"
+ca_rc=$?
+[ "$ca_rc" -ne 0 ] || fail "QA F7: an unwritable claude task-records temp must exit nonzero, got $ca_rc"
+grep -q "failed to append claude task record" "$CAO_ERR" || fail "QA F7: must print the named append diagnostic"
+assert_no_grep "usage report:" "$CAO_OUT" "QA F7: must not print a success summary"
+assert_absent "$CAO/latest.json" "QA F7: must not publish a report"
+pass "QA F7: a checked cat-append failure on a new M2 temp file fails loud and nonzero"
+
+# --- 42. an OPERATIONAL jq failure on a session file aborts loud (mutation-
+# sensitive counterpart to test 32/33: this must NOT be silently tolerated
+# the way a parse error or a stat mutation is).
 OJH=$(make_home claude-jqfail)
 CP31="$OJH/claude-projects"
 append_run "$OJH/state/task-runs.jsonl" jqfail1 ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
@@ -1030,7 +1312,7 @@ cat > "$OJB/jq" <<'SH'
 real="${REAL_JQ:-/usr/bin/jq}"
 for arg in "$@"; do
   case "$arg" in
-    *'ts_min'*) echo "injected operational jq failure" >&2; exit 66 ;;
+    *'evOK'*) echo "injected operational jq failure" >&2; exit 66 ;;
   esac
 done
 exec "$real" "$@"
@@ -1050,8 +1332,8 @@ assert_absent "$OJO/latest.json" "operational session jq failure must not publis
 [ ! -f "$OJO/index.jsonl" ] || [ "$(wc -l < "$OJO/index.jsonl")" = 0 ] || fail "operational session jq failure must not append an index line"
 pass "an operational (non-parse-error) jq failure on a session file fails loud, unlike a malformed file"
 
-# --- 32. an operational `find` failure listing a claude session directory
-# aborts loud -------------------------------------------------------------
+# --- 43. an operational `find` failure (ENOENT-unrelated) listing a claude
+# session directory aborts loud -------------------------------------------
 FFH=$(make_home claude-findfail)
 CP32="$FFH/claude-projects"
 append_run "$FFH/state/task-runs.jsonl" findfail1 ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
@@ -1076,7 +1358,8 @@ assert_no_grep "usage report:" "$FFO_OUT" "operational find failure must not pri
 assert_absent "$FFO/latest.json" "operational find failure must not publish a report"
 pass "an operational find failure listing a claude session directory fails loud"
 
-# --- 33. non-claude harnesses are tallied as unsupported, never attempted --
+# --- 44. non-claude harnesses are unified into by_task as unsupported, never
+# attempted --------------------------------------------------------------
 NCH=$(make_home claude-nonclaude)
 fm_write_meta "$NCH/state/g1.meta" \
   project=/home/prode/fleet/firstmate harness=grok kind=ship \
@@ -1088,13 +1371,13 @@ FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
   --target "$NCH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
   || fail "non-claude run exited non-zero"
 NCJ=$NCH/$OUT_SUB/latest.json
-[ "$(jq -r '.panels.tokens.claude.tasks_total' "$NCJ")" = 0 ] || fail "no claude tasks in this fixture"
-EXPECT_NC='[["gemini",1],["grok",1]]'
-GOT_NC=$(jq -c '[.panels.tokens.unsupported.by_harness[]|[.harness,.count]]' "$NCJ")
-[ "$GOT_NC" = "$EXPECT_NC" ] || fail "unsupported by_harness: got $GOT_NC want $EXPECT_NC"
-pass "grok/gemini tasks are tallied as unsupported, no join attempted (M3+ scope)"
+EXPECT_NC='[["g1","grok","unsupported"],["g2","gemini","unsupported"]]'
+GOT_NC=$(jq -c '[.panels.tokens.by_task[]|[.task,.harness,.tokens_status]] | sort' "$NCJ")
+[ "$GOT_NC" = "$(jq -c 'sort' <<< "$EXPECT_NC")" ] || fail "unsupported by_task: got $GOT_NC want $EXPECT_NC"
+[ "$(jq -r '.panels.tokens.totals.unsupported' "$NCJ")" = 2 ] || fail "totals.unsupported"
+pass "grok/gemini tasks land in by_task as unsupported, no join attempted (M3+ scope)"
 
-# --- 34. by_model rollup across multiple claude tasks sharing a model ------
+# --- 45. by_harness_model rollup across multiple claude tasks sharing a model
 BMH=$(make_home claude-bymodel)
 CPBM="$BMH/claude-projects"
 append_run "$BMH/state/task-runs.jsonl" bm1 ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
@@ -1106,23 +1389,22 @@ claude_event 2026-07-15T12:15:00Z 10 20 0 0 > "$CPBM/$ENCBM1/sess.jsonl"
 claude_event 2026-07-15T12:15:00Z 30 40 0 0 > "$CPBM/$ENCBM2/sess.jsonl"
 FM_CLAUDE_PROJECTS_OVERRIDE="$CPBM" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
   --target "$BMH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
-  || fail "by_model run exited non-zero"
+  || fail "by_harness_model run exited non-zero"
 BMJ=$BMH/$OUT_SUB/latest.json
-[ "$(jq -r '.panels.tokens.claude.by_model | length' "$BMJ")" = 1 ] || fail "by_model must roll both tasks into one model row"
-GOT_BM=$(jq -c '.panels.tokens.claude.by_model[0] | [.model,.tasks,.tasks_joined,.input_tokens,.output_tokens,.total_tokens]' "$BMJ")
-[ "$GOT_BM" = '["claude-opus-4-8",2,2,40,60,100]' ] || fail "by_model rollup: got $GOT_BM"
-pass "by_model rolls up token sums across multiple claude tasks sharing a model"
+[ "$(jq -r '.panels.tokens.by_harness_model | length' "$BMJ")" = 1 ] || fail "by_harness_model must roll both tasks into one row"
+GOT_BM=$(jq -c '.panels.tokens.by_harness_model[0] | [.harness,.model,.tasks,.tasks_with_data,.input_tokens,.output_tokens,.total_tokens]' "$BMJ")
+[ "$GOT_BM" = '["claude","claude-opus-4-8",2,2,40,60,100]' ] || fail "by_harness_model rollup: got $GOT_BM"
+pass "by_harness_model rolls up token sums across multiple claude tasks sharing a model"
 
-# --- 35. Markdown Panel B renders the claude table, by-model rollup, and the
-# not-yet-joinable harness tally --------------------------------------------
+# --- 46. Markdown Panel B renders the unified by_task table, by_harness_model
+# rollup, and the totals line -----------------------------------------------
 MDOWN=$HP/$OUT_SUB/latest.md
 assert_grep "## Panel B - Tokens (partial)" "$MDOWN" "md Panel B header"
-assert_grep "### Claude (join_method: claude_project_dir)" "$MDOWN" "md claude section header"
-assert_grep "Joined 1/1 claude tasks." "$MDOWN" "md claude coverage line"
-assert_grep "| happy1 | claude-opus-4-8 | ok | high | 300 | 130 | 30 | 13 | 473 |" "$MDOWN" "md claude per-task row"
-assert_grep "#### By model" "$MDOWN" "md by-model header"
-assert_grep "| claude-opus-4-8 | 1 | 1 | 300 | 130 | 30 | 13 | 473 |" "$MDOWN" "md by-model row"
-assert_grep "### Not yet joinable" "$MDOWN" "md not-yet-joinable header"
-pass "Markdown Panel B renders the claude per-task table, by-model rollup, and the unsupported tally"
+assert_grep "### By task" "$MDOWN" "md by-task header"
+assert_grep "| happy1 | claude | claude-opus-4-8 | claude_project_dir | ok | high | 300 | 130 | 30 | 13 | 473 | 1 | 0 | 0 |" "$MDOWN" "md claude per-task row"
+assert_grep "### By harness / model" "$MDOWN" "md by-harness-model header"
+assert_grep "| claude | claude-opus-4-8 | 1 | 1 | 300 | 130 | 30 | 13 | 473 |" "$MDOWN" "md by-harness-model row"
+assert_grep "1 ok, 0 ambiguous_join, 0 partial, 0 absent, 0 unsupported" "$MDOWN" "md totals line"
+pass "Markdown Panel B renders the unified by_task table, by_harness_model rollup, and totals"
 
 echo "ok - fm-usage-report.test.sh"
