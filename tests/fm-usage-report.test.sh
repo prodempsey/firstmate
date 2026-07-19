@@ -23,6 +23,8 @@
 #     never a masked success with a half-published pair (QA r4 f1)
 #   - a sha256sum failure in the fingerprint pipeline fails loud and nonzero
 #     instead of publishing with an empty fingerprint (QA r5 f1)
+#   - ledger jq failures and timestamp converter failures fail loud and nonzero
+#     instead of publishing a silently reduced or mis-windowed report (QA r6 f1/f2)
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -522,5 +524,118 @@ if [ -f "$FHO/index.jsonl" ]; then
   ! grep -q '"fingerprint":""' "$FHO/index.jsonl" || fail "an empty fingerprint must never reach the index"
 fi
 pass "a failed fingerprint hash fails loud and nonzero, never an empty fingerprint"
+
+# --- 18. ledger jq and date failures fail loud, not reduced/undated ----------
+# Round 6 found that the two task-runs.jsonl jq extractions used `|| true`
+# inside command substitutions, so an operational jq failure became an empty
+# task/row and the valid closed-task row was silently dropped. A broken date
+# invocation likewise became an empty timestamp, which let an out-of-window
+# task enter the report as undated. Each probe below injects one operational
+# failure and asserts the run stops before latest/index/success publication.
+
+# 18a. The task-id extraction jq fails.
+JTH=$TMP_ROOT/fail-jq-task
+mkdir -p "$JTH/state"
+append_run "$JTH/state/task-runs.jsonl" jqtask ship /home/prode/fleet/firstmate claude model-jq-task high 2026-07-15T10:00:00Z
+JTO=$JTH/out
+JTB=$(fm_fakebin "$JTH")
+JT_REAL_JQ="$(command -v jq)"
+cat > "$JTB/jq" <<'SH'
+#!/usr/bin/env bash
+real="${REAL_JQ:-/usr/bin/jq}"
+for arg in "$@"; do
+  case "$arg" in
+    *'.task // empty'*) echo "injected task jq failure" >&2; exit 72 ;;
+  esac
+done
+exec "$real" "$@"
+SH
+chmod +x "$JTB/jq"
+JTO_OUT=$JTH/stdout; JTO_ERR=$JTH/stderr
+PATH="$JTB:$PATH" REAL_JQ="$JT_REAL_JQ" FM_USAGE_NOW=2026-07-18T00:00:00Z \
+  "$USAGE" --target "$JTH" --out "$JTO" --since 2026-07-01 --until 2026-07-18 \
+  >"$JTO_OUT" 2>"$JTO_ERR"
+jt_rc=$?
+[ "$jt_rc" -ne 0 ] || fail "ledger task jq failure must exit nonzero, got $jt_rc"
+grep -q "failed to parse task-runs.jsonl task field with jq" "$JTO_ERR" || fail "ledger task jq failure must print a diagnostic to stderr"
+grep -q "injected task jq failure" "$JTO_ERR" || fail "ledger task jq failure must preserve jq stderr"
+assert_no_grep "usage report:" "$JTO_OUT" "ledger task jq failure must not print a success summary"
+assert_absent "$JTO/latest.json" "ledger task jq failure must not publish latest.json"
+[ ! -f "$JTO/index.jsonl" ] || [ "$(wc -l < "$JTO/index.jsonl")" = 0 ] || fail "ledger task jq failure must not append an index line"
+pass "a failed ledger task jq extraction fails loud and nonzero"
+
+# 18b. The full-row extraction jq fails after task-id extraction succeeded.
+JRH=$TMP_ROOT/fail-jq-row
+mkdir -p "$JRH/state"
+append_run "$JRH/state/task-runs.jsonl" jqrow ship /home/prode/fleet/firstmate claude model-jq-row high 2026-07-15T10:00:00Z
+JRO=$JRH/out
+JRB=$(fm_fakebin "$JRH")
+JR_REAL_JQ="$(command -v jq)"
+cat > "$JRB/jq" <<'SH'
+#!/usr/bin/env bash
+real="${REAL_JQ:-/usr/bin/jq}"
+for arg in "$@"; do
+  case "$arg" in
+    *'(.harness // "")'*) echo "injected row jq failure" >&2; exit 71 ;;
+  esac
+done
+exec "$real" "$@"
+SH
+chmod +x "$JRB/jq"
+JRO_OUT=$JRH/stdout; JRO_ERR=$JRH/stderr
+PATH="$JRB:$PATH" REAL_JQ="$JR_REAL_JQ" FM_USAGE_NOW=2026-07-18T00:00:00Z \
+  "$USAGE" --target "$JRH" --out "$JRO" --since 2026-07-01 --until 2026-07-18 \
+  >"$JRO_OUT" 2>"$JRO_ERR"
+jr_rc=$?
+[ "$jr_rc" -ne 0 ] || fail "ledger row jq failure must exit nonzero, got $jr_rc"
+grep -q "failed to parse task-runs.jsonl row fields with jq" "$JRO_ERR" || fail "ledger row jq failure must print a diagnostic to stderr"
+grep -q "injected row jq failure" "$JRO_ERR" || fail "ledger row jq failure must preserve jq stderr"
+assert_no_grep "usage report:" "$JRO_OUT" "ledger row jq failure must not print a success summary"
+assert_absent "$JRO/latest.json" "ledger row jq failure must not publish latest.json"
+[ ! -f "$JRO/index.jsonl" ] || [ "$(wc -l < "$JRO/index.jsonl")" = 0 ] || fail "ledger row jq failure must not append an index line"
+pass "a failed ledger row jq extraction fails loud and nonzero"
+
+# A malformed ledger row is data tolerance, not an operational jq failure.
+MLH=$TMP_ROOT/malformed-ledger
+mkdir -p "$MLH/state"
+append_run "$MLH/state/task-runs.jsonl" goodrow ship /home/prode/fleet/firstmate claude model-good high 2026-07-15T10:00:00Z
+printf '{bad json\n' >> "$MLH/state/task-runs.jsonl"
+FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" --target "$MLH" --since 2026-07-01 --until 2026-07-18 >/dev/null \
+  || fail "malformed ledger row should be skipped, not fatal"
+[ "$(jq -r '.totals.tasks' "$MLH/$OUT_SUB/latest.json")" = 1 ] || fail "malformed ledger row must not drop the valid row"
+pass "malformed ledger rows remain tolerated"
+
+# 18c. A valid out-of-window timestamp hits an operational date failure.
+DFH=$TMP_ROOT/fail-date
+mkdir -p "$DFH/state"
+fm_write_meta "$DFH/state/dateprobe.meta" \
+  project=/home/prode/fleet/firstmate harness=claude kind=ship \
+  model=date-probe effort=high spawned_at=2026-06-01T10:00:00Z
+DFO=$DFH/out
+DFB=$(fm_fakebin "$DFH")
+DF_REAL_DATE="$(command -v date)"
+cat > "$DFB/date" <<'SH'
+#!/usr/bin/env bash
+real="${REAL_DATE:-/bin/date}"
+for arg in "$@"; do
+  case "$arg" in
+    2026-06-01T10:00:00Z) echo "injected date failure" >&2; exit 73 ;;
+  esac
+done
+exec "$real" "$@"
+SH
+chmod +x "$DFB/date"
+DFO_OUT=$DFH/stdout; DFO_ERR=$DFH/stderr
+PATH="$DFB:$PATH" REAL_DATE="$DF_REAL_DATE" FM_USAGE_NOW=2026-07-18T00:00:00Z \
+  "$USAGE" --target "$DFH" --out "$DFO" --since 2026-07-01 --until 2026-07-18 \
+  >"$DFO_OUT" 2>"$DFO_ERR"
+df_rc=$?
+[ "$df_rc" -ne 0 ] || fail "date failure must exit nonzero, got $df_rc"
+grep -q "failed to convert timestamp with date" "$DFO_ERR" || fail "date failure must print a diagnostic to stderr"
+grep -q "injected date failure" "$DFO_ERR" || fail "date failure must preserve date stderr"
+assert_no_grep "usage report:" "$DFO_OUT" "date failure must not print a success summary"
+assert_absent "$DFO/latest.json" "date failure must not publish latest.json"
+[ ! -f "$DFO/index.jsonl" ] || [ "$(wc -l < "$DFO/index.jsonl")" = 0 ] || fail "date failure must not append an index line"
+pass "a failed timestamp conversion fails loud and nonzero"
 
 echo "ok - fm-usage-report.test.sh"

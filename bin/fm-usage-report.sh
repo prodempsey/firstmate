@@ -53,9 +53,8 @@
 # pipefail is ON so a pipeline fails if ANY stage fails, not just the last. Under
 # a bare `set -eu` a broken producer is masked by a succeeding consumer: e.g.
 # `sha256sum | cut` returns cut's status, so a failed hash yields an empty result
-# and exit 0. The only pipelines that may legitimately fail a stage are the
-# ledger row parses, which wrap the whole pipeline in `|| true` to skip a
-# malformed row; pipefail does not change that (the `|| true` still absorbs it).
+# and exit 0. Ledger row parses explicitly classify jq failures: malformed
+# JSON rows are skipped, but operational jq failures abort the report.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -118,11 +117,35 @@ fi
 STATE="${FM_STATE_OVERRIDE:-$TARGET/state}"
 OUT="${OPT_OUT:-$TARGET/data/model-economy/usage}"
 
+CLEANUP_FILES=()
+cleanup_tmp() { rm -f "${CLEANUP_FILES[@]}"; }
+trap cleanup_tmp EXIT
+
+print_tool_error() { [ ! -s "$1" ] || cat "$1" >&2; }
+
 # --- clock and window --------------------------------------------------------
 # Empty input must NOT parse: GNU `date -d ''` silently returns the current time
 # (rc 0), which would misdate every task with a missing timestamp as "now". A
 # genuinely malformed timestamp still fails date's parse and prints nothing.
-to_epoch() { [ -n "${1:-}" ] || return 0; date -u -d "$1" +%s 2>/dev/null || true; }
+DATE_ERR="$(mktemp "${TMPDIR:-/tmp}/fm-usage-date.XXXXXX")" \
+  || { echo "fm-usage-report: cannot create date diagnostic temp file" >&2; exit 2; }
+CLEANUP_FILES+=("$DATE_ERR")
+date_failed_data_parse() { grep -q '^date: invalid date ' "$1"; }
+to_epoch() {
+  local input="${1:-}" out
+  [ -n "$input" ] || return 0
+  : > "$DATE_ERR"
+  if out="$(date -u -d "$input" +%s 2>"$DATE_ERR")"; then
+    printf '%s' "$out"
+    return 0
+  fi
+  if date_failed_data_parse "$DATE_ERR"; then
+    return 0
+  fi
+  print_tool_error "$DATE_ERR"
+  echo "fm-usage-report: failed to convert timestamp with date: $input" >&2
+  return 2
+}
 
 NOW_ISO="${FM_USAGE_NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 NOW_EPOCH="$(to_epoch "$NOW_ISO")"
@@ -144,11 +167,10 @@ UNTIL_EPOCH="$(to_epoch "$UNTIL_ISO")"
 # it from the file (never from argv), so the accumulator cannot hit the argument
 # limit as the fleet grows.
 REC_FILE="$(mktemp "${TMPDIR:-/tmp}/fm-usage-recs.XXXXXX")"
-# Every run-private temp this process creates is tracked here and removed on any
+# Every run-private temp this process creates is tracked and removed on any
 # exit. rm on the array (not a glob) so a sibling concurrent run's temps in the
 # same output dir are never touched.
-CLEANUP_FILES=("$REC_FILE")
-trap 'rm -f "${CLEANUP_FILES[@]}"' EXIT
+CLEANUP_FILES+=("$REC_FILE")
 
 # window_decision <start-epoch-or-empty> <end-epoch-or-empty> -> yes|no|undated
 # A task occupies the interval [start,end]; it belongs in the report when that
@@ -228,9 +250,23 @@ done
 # Historical ledger for closed tasks not currently live.
 LEDGER="$STATE/task-runs.jsonl"
 if [ -f "$LEDGER" ]; then
+  JQ_ERR="$(mktemp "${TMPDIR:-/tmp}/fm-usage-jq.XXXXXX")" \
+    || { echo "fm-usage-report: cannot create jq diagnostic temp file" >&2; exit 2; }
+  CLEANUP_FILES+=("$JQ_ERR")
+  jq_failed_data_parse() { grep -q '^jq: parse error:' "$1"; }
+  fail_ledger_jq() {
+    local context=$1
+    print_tool_error "$JQ_ERR"
+    echo "fm-usage-report: failed to parse task-runs.jsonl $context with jq" >&2
+    exit 2
+  }
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    task="$(printf '%s' "$line" | jq -r '.task // empty' 2>/dev/null || true)"
+    : > "$JQ_ERR"
+    if ! task="$(printf '%s' "$line" | jq -r 'if type == "object" then (.task // empty) else empty end' 2>"$JQ_ERR")"; then
+      jq_failed_data_parse "$JQ_ERR" && continue
+      fail_ledger_jq "task field"
+    fi
     [ -n "$task" ] || continue
     [ -z "${SEEN[$task]:-}" ] || continue
     SEEN["$task"]=1
@@ -238,10 +274,16 @@ if [ -f "$LEDGER" ]; then
     # whitespace character, `read` collapses runs of it and drops empty fields
     # (a null provider would then shift later fields off the end). 0x1f is
     # non-whitespace, so empty fields are preserved positionally.
-    row="$(printf '%s' "$line" | jq -rj '
-      [ (.harness // ""), (.model // ""), (.effort // ""), (.kind // ""),
-        (.project // ""), (.provider // ""),
-        (.spawned_at // ""), (.ended_at // "") ] | join("\u001f")' 2>/dev/null || true)"
+    : > "$JQ_ERR"
+    if ! row="$(printf '%s' "$line" | jq -rj '
+      if type == "object" then
+        [ (.harness // ""), (.model // ""), (.effort // ""), (.kind // ""),
+          (.project // ""), (.provider // ""),
+          (.spawned_at // ""), (.ended_at // "") ] | join("\u001f")
+      else empty end' 2>"$JQ_ERR")"; then
+      jq_failed_data_parse "$JQ_ERR" && continue
+      fail_ledger_jq "row fields"
+    fi
     [ -n "$row" ] || continue
     IFS=$'\x1f' read -r harness model effort kind project provider sp_iso en_iso <<EOF
 $row
