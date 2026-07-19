@@ -4,7 +4,8 @@ import { ControlPlaneError } from '../lib/errors.mjs';
 
 // Thin CLI wrapper over the coordinator. Prints JSON results to stdout; prints a
 // typed error to stderr and exits non-zero on failure. This is the S0 entrypoint
-// skeleton (spec section 6): only init/create-task/task-head are wired.
+// skeleton (spec section 6): only `init` is wired. Later-slice verbs ship in
+// their owning slices and are rejected until then.
 
 async function main() {
   const argv = process.argv.slice(2);

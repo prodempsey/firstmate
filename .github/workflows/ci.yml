@@ -77,18 +77,3 @@ jobs:
             printf '%s\n' "$tracked"
             exit 1
           fi
-
-  control-plane-owner-guard:
-    # Enforces the ORD-228 control-plane owner guard repo-wide: direct
-    # @electric-sql/pglite construction is confined to the sanctioned engine
-    # module. This is a dependency-free filesystem scan (Node stdlib only), so it
-    # stays fast; the package's own `npm test` runs the full store/lock/hosted
-    # suite. See control-plane/scripts/check-no-direct-pglite.mjs.
-    name: Control-plane owner guard
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - run: node control-plane/scripts/check-no-direct-pglite.mjs

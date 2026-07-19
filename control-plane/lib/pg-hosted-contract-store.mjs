@@ -1,6 +1,6 @@
 import { ControlPlaneStore } from './control-plane-store.mjs';
 import { ControlPlaneError } from './errors.mjs';
-import { RUN_EXCLUSIVE } from './internal-symbols.mjs';
+import { registerExclusive } from './internal-runtime.mjs';
 
 // TEST-ONLY, NONPRODUCTION hosted adapter skeleton (spec section 2.1).
 //
@@ -30,6 +30,8 @@ export class PgHostedContractStore extends ControlPlaneStore {
   constructor(pool) {
     super();
     this._pool = pool;
+    // Register the raw exclusive primitive privately (see internal-runtime.mjs).
+    registerExclusive(this, (callback) => this.#exclusive(callback));
   }
 
   static async create({ connString, env = process.env } = {}) {
@@ -48,7 +50,7 @@ export class PgHostedContractStore extends ControlPlaneStore {
     return new PgHostedContractStore(pool);
   }
 
-  async [RUN_EXCLUSIVE](fn) {
+  async #exclusive(callback) {
     const client = await this._pool.connect();
     try {
       await client.query('SELECT pg_advisory_lock($1)', [ADVISORY_LOCK_KEY]);
@@ -59,7 +61,7 @@ export class PgHostedContractStore extends ControlPlaneStore {
       await client.query('BEGIN');
       let result;
       try {
-        result = await fn(conn);
+        result = await callback(conn);
         await client.query('COMMIT');
       } catch (error) {
         try {

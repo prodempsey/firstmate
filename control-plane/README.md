@@ -13,11 +13,15 @@ than restating it.
 ## What S0 owns (and only this)
 
 - **Storage seam** (`lib/control-plane-store.mjs`): an engine-neutral base that
-  owns all domain logic behind one primitive. That primitive is a symbol-keyed
-  method (`internal-symbols.mjs` `RUN_EXCLUSIVE`), NOT a public method, so the
-  raw SQL surface is not part of the public contract (spec §3.1). Public callers
-  see only domain-level methods (`init`, `schemaMeta`, `coordinatorState`,
-  `tableNames`, `contractProbe`).
+  owns all domain logic. The raw exclusive-transaction primitive — the only thing
+  that hands out a connection with unrestricted `query`/`exec` — is **not on the
+  store instance at all**. It lives in a module-private WeakMap
+  (`lib/internal-runtime.mjs`) keyed by the store, so a public caller holding a
+  store object cannot discover it (no property, no symbol, no private field is
+  enumerable to it) or invoke it (spec §3.1). Public callers see only
+  domain-level methods (`init`, `schemaMeta`, `coordinatorState`, `tableNames`,
+  `contractProbe`). See **"Extending the store (S1+)"** below for the sanctioned
+  in-package path.
 - **PGlite production adapter** (`lib/pglite-local-store.mjs`): PGlite persistent
   NodeFS at `FM_HOME/state/control-plane/pgdata`, serialized by real POSIX
   `flock(2)`. First-init and steady-state protocols per spec §2.2. One PGlite
@@ -38,7 +42,11 @@ than restating it.
   (`lib/pglite-engine.mjs`) refuses to open PGlite without a currently-live
   exclusive lock handle; the static half (`scripts/check-no-direct-pglite.mjs`)
   scans the **whole repository** and fails if any shipped module outside the one
-  sanctioned engine file imports or constructs PGlite. It is wired into repo CI.
+  sanctioned engine file imports or constructs PGlite. Run via `npm test` /
+  `npm run lint:owner-guard`. (Wiring this scan into the repository-level CI
+  workflow is proposed separately for explicit approval — see "CI wiring" below —
+  and is deliberately NOT part of this S0 diff, which is confined to
+  `control-plane/`.)
 - **Core schema** (`sql/core-schema.sql`): only `schema_meta` and
   `coordinator_state`, applied idempotently by `cp init`.
 - **Typed errors** (`lib/errors.mjs`): the S0 store/lock/guard errors only.
@@ -56,7 +64,46 @@ alone, satisfying the spec's "contract skeleton runs … without domain tables."
 
 (An earlier candidate applied the full DDL and a minimal `create-task`; round-1
 independent QA — `firstmate-runtime/data/qa-s0-q20/report.md` — correctly
-rejected that as crossing the slice boundary. This is the round-2 recut.)
+rejected that as crossing the slice boundary. This is the round-3 recut, which
+also seals the exclusive-transaction primitive per round-2 QA
+`firstmate-runtime/data/qa-s0r2-q23/report.md`.)
+
+## Extending the store (S1+)
+
+The sanctioned — and only — way for in-package code to run a domain transaction
+is `lib/internal-runtime.mjs`:
+
+```js
+import { runExclusive } from './internal-runtime.mjs';
+await runExclusive(store, async (conn) => {
+  // conn.query(sql, params) / conn.exec(sql), inside the exclusive transaction
+});
+```
+
+An adapter registers its raw primitive once, in its constructor, as a truly
+private method:
+
+```js
+registerExclusive(this, (callback) => this.#exclusive(callback));
+```
+
+`internal-runtime.mjs` is never re-exported from the public entrypoint
+(`bin/cp.mjs`). Reaching the primitive therefore requires deep-importing that
+internal module from **inside** the package — the same trust boundary S1's own
+`lib/` modules live within — and is impossible with only a public store object.
+So S1 can add new `lib/` domain modules (task/run/event verbs) that run
+transactions without reopening a public arbitrary-SQL hole. The guarantee is
+regression-tested in `test/private-primitive.test.mjs` (the round-2 QA
+reproduction now finds no reachable callable and cannot mutate the DB).
+
+## CI wiring (proposed, needs explicit approval)
+
+The static owner guard would ideally run in the repository CI. Wiring it into
+`.github/workflows/ci.yml` is intentionally **out of this S0 diff** so the change
+stays confined to `control-plane/` (round-2 QA finding 2). Proposed follow-up: a
+small, dependency-free CI job running `node control-plane/scripts/check-no-direct-pglite.mjs`
+(the sibling `memory` package's own tests are likewise not in repo CI, so this is
+a new integration to approve on its own, not smuggle into S0).
 
 ## Verb (S0)
 

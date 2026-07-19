@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { RUN_EXCLUSIVE } from './internal-symbols.mjs';
+import { runExclusive } from './internal-runtime.mjs';
 
 const SQL_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'sql');
 const CORE_SCHEMA = fs.readFileSync(path.join(SQL_DIR, 'core-schema.sql'), 'utf8');
@@ -14,39 +14,32 @@ const SCHEMA_VERSION = 's0';
 // S0 owns only the two core tables (schema_meta, coordinator_state), the storage
 // seam, the flock lifecycle, typed errors, and the hosted contract skeleton
 // (spec-amend-s4 section 12, S0 row). Domain tables and their verbs ship in their
-// owning slices (S1+); none of them exist here.
+// owning slices (S1+); none exist here.
 //
-// The whole public surface is expressed through domain-level methods below. The
-// raw exclusive-transaction primitive is a symbol-keyed method (RUN_EXCLUSIVE), so
-// arbitrary SQL is NOT part of the public contract (spec section 3.1). Each
-// adapter implements it with its own exclusivity mechanism: PgliteLocalStore uses
-// flock + a fresh single connection per call; PgHostedContractStore uses a real
-// Postgres connection with serializable/advisory-lock semantics. Because the
-// domain never depends on how exclusivity is achieved, the seam is provably not
-// tied to PGlite's single-connection serialization (spec section 2.1).
+// PUBLIC SURFACE = the domain-level methods below only. The raw
+// exclusive-transaction primitive (which hands out a connection with unrestricted
+// query/exec) is NOT on the instance: it lives in a module-private WeakMap
+// (internal-runtime.mjs) keyed by the store, so a public caller holding a store
+// object cannot discover or invoke it (spec section 3.1; data/qa-s0r2-q23 finding
+// 1). Adapters register their primitive in their constructor; in-package domain
+// code reaches it via `runExclusive(this, fn)`. See internal-runtime.mjs for the
+// sanctioned in-package extension path that S1 uses.
 //
-// Subclasses MUST implement the RUN_EXCLUSIVE method:
-//   async [RUN_EXCLUSIVE](fn) -> acquire exclusive access, open one connection,
-//                                run `await fn(conn)` inside an explicit
-//                                transaction (BEGIN/COMMIT, ROLLBACK+rethrow on
-//                                error), then close the connection and release
-//                                access. `conn` exposes `query(sql, params)` and
-//                                `exec(sql)` and is never handed to public callers.
+// Each adapter registers a primitive `(callback) => Promise` where callback gets
+// the connection { query(sql, params), exec(sql) }; PgliteLocalStore uses flock +
+// a fresh single connection per call, PgHostedContractStore uses a real Postgres
+// connection with serializable/advisory-lock semantics. Because the domain never
+// depends on how exclusivity is achieved, the seam is provably not tied to
+// PGlite's single-connection serialization (spec section 2.1).
 export class ControlPlaneStore {
-  // eslint-disable-next-line no-unused-vars
-  async [RUN_EXCLUSIVE](fn) {
-    throw new Error('RUN_EXCLUSIVE must be implemented by a ControlPlaneStore subclass');
-  }
-
   async close() {
     // Default: nothing long-lived to release.
   }
 
   // Initialize: apply ONLY the S0 core schema (schema_meta, coordinator_state) and
-  // seed home_uuid. Idempotent (spec section 6: `cp init` seeds schema and
-  // home_uuid; idempotent). No domain tables are created here.
+  // seed home_uuid. Idempotent (spec section 6). No domain tables are created here.
   async init({ homeLabel } = {}) {
-    return this[RUN_EXCLUSIVE](async (conn) => {
+    return runExclusive(this, async (conn) => {
       await conn.exec(CORE_SCHEMA);
       await conn.query('INSERT INTO coordinator_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING');
 
@@ -77,7 +70,7 @@ export class ControlPlaneStore {
 
   // Locked read of the seeded identity (home_uuid, schema_version, home_label).
   async schemaMeta() {
-    return this[RUN_EXCLUSIVE](async (conn) => {
+    return runExclusive(this, async (conn) => {
       const r = await conn.query('SELECT key, value FROM schema_meta');
       return Object.fromEntries(r.rows.map((row) => [row.key, row.value]));
     });
@@ -85,7 +78,7 @@ export class ControlPlaneStore {
 
   // Locked read of the coordinator revision counters.
   async coordinatorState() {
-    return this[RUN_EXCLUSIVE](async (conn) => {
+    return runExclusive(this, async (conn) => {
       const r = await conn.query(
         'SELECT domain_revision, projection_revision, commit_sequence FROM coordinator_state WHERE id = 1'
       );
@@ -102,7 +95,7 @@ export class ControlPlaneStore {
   // Locked read of the public table names present (a read-only projection, not a
   // mutation surface). Used to assert "no domain tables" and by the contract.
   async tableNames() {
-    return this[RUN_EXCLUSIVE](async (conn) => {
+    return runExclusive(this, async (conn) => {
       const r = await conn.query(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
       );
@@ -113,10 +106,10 @@ export class ControlPlaneStore {
   // S0 seam contract probe (core tables only). Bumps commit_sequence inside a
   // transaction and reads it back, proving exclusive access, an explicit
   // transaction that commits, and a locked read - identically on every adapter,
-  // without any domain table. This is also the serialized-write used to prove the
-  // lock serializes concurrent writers.
+  // without any domain table. Also the serialized-write used to prove the lock
+  // serializes concurrent writers.
   async contractProbe() {
-    return this[RUN_EXCLUSIVE](async (conn) => {
+    return runExclusive(this, async (conn) => {
       const before = await conn.query('SELECT commit_sequence FROM coordinator_state WHERE id = 1');
       await conn.query('UPDATE coordinator_state SET commit_sequence = commit_sequence + 1 WHERE id = 1');
       const after = await conn.query('SELECT commit_sequence FROM coordinator_state WHERE id = 1');

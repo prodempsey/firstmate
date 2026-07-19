@@ -5,7 +5,7 @@ import { openPglite } from './pglite-engine.mjs';
 import { acquireFlock, withFlock, isFlockHandleLive } from './flock.mjs';
 import { resolveDataPaths } from './paths.mjs';
 import { PathIntegrityError, LockLostError } from './errors.mjs';
-import { RUN_EXCLUSIVE } from './internal-symbols.mjs';
+import { registerExclusive } from './internal-runtime.mjs';
 
 // Production S0 storage adapter: PGlite persistent NodeFS behind the storage
 // seam, serialized by real flock(2). Implements the first-init and steady-state
@@ -18,6 +18,10 @@ export class PgliteLocalStore extends ControlPlaneStore {
     // Pre-canonical layout; canonicalization happens per-open in _resolveCanonical.
     this._layout = resolveDataPaths({ dataDir, fmHome, env });
     this._lockTimeoutMs = Number((env || process.env).CP_LOCK_TIMEOUT_MS || 15000);
+    // Register the raw exclusive primitive in the module-private WeakMap. The
+    // impl is a truly private method, so it is not enumerable/discoverable on the
+    // instance and cannot be invoked by a public caller (see internal-runtime.mjs).
+    registerExclusive(this, (callback) => this.#exclusive(callback));
   }
 
   static create(options = {}) {
@@ -43,7 +47,7 @@ export class PgliteLocalStore extends ControlPlaneStore {
     fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
 
     if (fs.existsSync(pgdata)) {
-      return this._canonicalizeExisting(parent, pgdata);
+      return this.#canonicalizeExisting(parent, pgdata);
     }
 
     // First init: serialize creation with the parent-scoped init lock.
@@ -53,13 +57,13 @@ export class PgliteLocalStore extends ControlPlaneStore {
         if (!fs.existsSync(pgdata)) {
           fs.mkdirSync(pgdata, { mode: 0o700 });
         }
-        return this._canonicalizeExisting(parent, pgdata);
+        return this.#canonicalizeExisting(parent, pgdata);
       },
       { timeoutMs: this._lockTimeoutMs }
     );
   }
 
-  _canonicalizeExisting(parent, pgdata) {
+  #canonicalizeExisting(parent, pgdata) {
     const canonicalParent = fs.realpathSync(parent);
     const canonicalChild = fs.realpathSync(pgdata);
     // The canonical child must sit directly inside the canonical parent; anything
@@ -78,14 +82,14 @@ export class PgliteLocalStore extends ControlPlaneStore {
     return { pgdata: canonicalChild, lock };
   }
 
-  // The one seam primitive (symbol-keyed, not a public method). Acquire exclusive
-  // flock, open exactly one PGlite, run fn inside an explicit transaction, then
-  // close PGlite before releasing the lock (close-before-unlock is mandatory -
-  // spec section 2.2).
+  // The raw exclusive primitive (PRIVATE - registered into the WeakMap, never a
+  // reachable instance property). Acquire exclusive flock, open exactly one
+  // PGlite, run callback inside an explicit transaction, then close PGlite before
+  // releasing the lock (close-before-unlock is mandatory - spec section 2.2).
   //
   // Lock-loss guard: if the flock holder dies mid-section, the handle is no longer
   // live, so we roll back rather than commit under a lock we no longer hold.
-  async [RUN_EXCLUSIVE](fn) {
+  async #exclusive(callback) {
     const { pgdata, lock } = await this._resolveCanonical();
     const handle = await acquireFlock(lock, { exclusive: true, timeoutMs: this._lockTimeoutMs });
     let db;
@@ -95,7 +99,7 @@ export class PgliteLocalStore extends ControlPlaneStore {
       await db.query('BEGIN');
       let result;
       try {
-        result = await fn(conn);
+        result = await callback(conn);
         if (!isFlockHandleLive(handle)) {
           throw new LockLostError('exclusive lock was lost before commit; rolling back', { pgdata });
         }
