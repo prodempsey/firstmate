@@ -767,8 +767,9 @@ install_bug_stub() {  # <dir> <log-path>
 }
 
 install_pausing_tail_stub() {  # <fakebin-dir>
-  local fb=$1 real_tail
+  local fb=$1 real_tail real_flock
   real_tail=$(command -v tail)
+  real_flock=$(command -v flock)
   mkdir -p "$fb"
   cat > "$fb/tail" <<'SH'
 #!/usr/bin/env bash
@@ -789,8 +790,25 @@ if [ "${FM_GUARD_TEST_PAUSE_TAIL:-}" = 1 ] \
 fi
 exec "$FM_GUARD_TEST_REAL_TAIL" "$@"
 SH
+  cat > "$fb/flock" <<'SH'
+#!/usr/bin/env bash
+if [ "${FM_GUARD_TEST_FLOCK_FAIL:-}" = 1 ]; then
+  exit 1
+fi
+if [ -n "${FM_GUARD_TEST_REAL_FLOCK:-}" ] \
+   && [ -n "${FM_GUARD_TEST_TAIL_PAUSED:-}" ] \
+   && [ -n "${FM_GUARD_TEST_TAIL_RELEASE:-}" ] \
+   && [ -n "${FM_GUARD_TEST_FLOCK_CONTENDER:-}" ] \
+   && [ -e "$FM_GUARD_TEST_TAIL_PAUSED" ] \
+   && [ ! -e "$FM_GUARD_TEST_TAIL_RELEASE" ]; then
+  : > "$FM_GUARD_TEST_FLOCK_CONTENDER"
+fi
+exec "${FM_GUARD_TEST_REAL_FLOCK:-flock}" "$@"
+SH
   chmod +x "$fb/tail"
+  chmod +x "$fb/flock"
   printf '%s\n' "$real_tail" > "$fb/real-tail.path"
+  printf '%s\n' "$real_flock" > "$fb/real-flock.path"
 }
 
 # A single transient source failure must be ABSORBED by the bounded retry, not reported as a
@@ -1129,13 +1147,70 @@ test_hook_guard_error_failed_filing_stays_eligible() {
   pass "fm-turnend-guard: a failed bug filing keeps the signal eligible (the window advances only on a confirmed success)"
 }
 
+test_hook_guard_error_flock_failure_uses_loud_fallback() {
+  local dir home pid stub coalesce slug out status tailfb fallback bug_calls
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-flock-fail")
+  home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
+  slug=$(printf '%s' 'fm-nf-attention-lib.sh failed to source' | tr -c 'a-zA-Z0-9' '-')
+  stub=$(install_bug_stub "$dir" "$home/bug-calls.log")
+  install_always_failing_nf_lib "$dir"
+  tailfb="$dir/fakebin"
+  install_pausing_tail_stub "$tailfb"
+  pid=$(start_healthy_watcher "$dir")
+  out=$(printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    PATH="$tailfb:$PATH" FM_GUARD_TEST_FLOCK_FAIL=1 \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$stub" \
+    bash "$dir/bin/fm-turnend-guard.sh" 2>&1)
+  status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "a coalescing lock failure must still fail open, not wedge the primary"
+  assert_contains "$out" "TURN-END GUARD ERROR" "the original guard-error banner must remain loud"
+  assert_contains "$out" "TURN-END GUARD COALESCING LOCK FAILURE" "the coalescing lock failure must be named"
+  assert_contains "$out" "flock acquisition failed" "the fallback must name the failed acquisition"
+  assert_not_contains "$out" "has been raised" "the banner must not overclaim that a durable bug was filed"
+  fallback="$coalesce/$slug.lock-fallback.occurrences"
+  [ -s "$fallback" ] || fail "lock failure fallback did not record an occurrence"
+  [ ! -e "$coalesce/$slug.record" ] || fail "failed flock acquisition should not pretend to update the coalesced summary"
+  bug_calls=$(grep -c 'coalescing lock failure' "$home/bug-calls.log" 2>/dev/null)
+  [ "$bug_calls" -eq 1 ] || fail "lock failure fallback should attempt one bug signal: $(cat "$home/bug-calls.log" 2>/dev/null)"
+  pass "fm-turnend-guard: failed flock acquisition uses a loud fallback occurrence and bug attempt"
+}
+
+test_hook_guard_error_lock_open_failure_reports_loudly() {
+  local dir home pid stub coalesce slug out status bug_calls
+  dir=$(make_primary_dir "$TMP_ROOT/hook-nf-lock-open-fail")
+  home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
+  slug=$(printf '%s' 'fm-nf-attention-lib.sh failed to source' | tr -c 'a-zA-Z0-9' '-')
+  stub=$(install_bug_stub "$dir" "$home/bug-calls.log")
+  install_always_failing_nf_lib "$dir"
+  mkdir -p "$coalesce"
+  chmod 500 "$coalesce"
+  pid=$(start_healthy_watcher "$dir")
+  out=$(printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$stub" \
+    bash "$dir/bin/fm-turnend-guard.sh" 2>&1)
+  status=$?
+  chmod 700 "$coalesce" 2>/dev/null || true
+  stop_watcher "$pid"
+  expect_code 0 "$status" "an unopenable coalescing lock must still fail open, not wedge the primary"
+  assert_contains "$out" "TURN-END GUARD COALESCING LOCK FAILURE" "the lock-open failure must be named"
+  assert_contains "$out" "lock file open failed" "the fallback must name the unopenable lock file"
+  assert_not_contains "$out" "has been raised" "the banner must not overclaim that a durable bug was filed"
+  [ ! -e "$coalesce/$slug.record" ] || fail "failed lock open should not pretend to update the coalesced summary"
+  bug_calls=$(grep -c 'coalescing lock failure' "$home/bug-calls.log" 2>/dev/null)
+  [ "$bug_calls" -eq 1 ] || fail "lock-open fallback should attempt one bug signal: $(cat "$home/bug-calls.log" 2>/dev/null)"
+  pass "fm-turnend-guard: lock-open failure is loud and still attempts a fallback bug signal"
+}
+
 # ROUND 4: compaction and append must share one kernel-owned lock. This fixture preloads the
 # default 1,000-line cap, pauses the first hook after tail has produced its compaction snapshot
 # but before rotation can finish, then starts a second hook. The second hook must wait on flock
 # and append only after rotation; the final exact count must include both new occurrences.
 test_hook_guard_error_compaction_serializes_concurrent_append() {
   local dir home pid stub coalesce slug occ tailfb real_tail paused release once p1 p2 rc1 rc2
-  local count occ_dropped surviving bug_calls
+  local real_flock contender count occ_dropped surviving bug_calls
   dir=$(make_primary_dir "$TMP_ROOT/hook-nf-flock-compact")
   home=$(cd "$dir" && pwd)
   coalesce="$dir/coalesce"
@@ -1150,13 +1225,16 @@ test_hook_guard_error_compaction_serializes_concurrent_append() {
   tailfb="$dir/tailbin"
   install_pausing_tail_stub "$tailfb"
   real_tail=$(cat "$tailfb/real-tail.path")
+  real_flock=$(cat "$tailfb/real-flock.path")
   paused="$dir/tail.paused"
   release="$dir/tail.release"
   once="$dir/tail.once"
+  contender="$dir/flock.contender"
   pid=$(start_healthy_watcher "$dir")
 
   printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
     PATH="$tailfb:$PATH" FM_GUARD_TEST_PAUSE_TAIL=1 FM_GUARD_TEST_REAL_TAIL="$real_tail" \
+    FM_GUARD_TEST_REAL_FLOCK="$real_flock" FM_GUARD_TEST_FLOCK_CONTENDER="$contender" \
     FM_GUARD_TEST_OCC="$occ" FM_GUARD_TEST_TAIL_ONCE="$once" \
     FM_GUARD_TEST_TAIL_PAUSED="$paused" FM_GUARD_TEST_TAIL_RELEASE="$release" \
     FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$stub" \
@@ -1170,12 +1248,23 @@ test_hook_guard_error_compaction_serializes_concurrent_append() {
 
   printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
     PATH="$tailfb:$PATH" FM_GUARD_TEST_PAUSE_TAIL=1 FM_GUARD_TEST_REAL_TAIL="$real_tail" \
+    FM_GUARD_TEST_REAL_FLOCK="$real_flock" FM_GUARD_TEST_FLOCK_CONTENDER="$contender" \
     FM_GUARD_TEST_OCC="$occ" FM_GUARD_TEST_TAIL_ONCE="$once" \
     FM_GUARD_TEST_TAIL_PAUSED="$paused" FM_GUARD_TEST_TAIL_RELEASE="$release" \
     FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$stub" \
     bash "$dir/bin/fm-turnend-guard.sh" > "$dir/second.out" 2>&1 &
   p2=$!
-  sleep 0.2
+  for _ in $(seq 1 100); do
+    [ -e "$contender" ] && break
+    sleep 0.05
+  done
+  if [ ! -e "$contender" ]; then
+    : > "$release"
+    wait "$p1" 2>/dev/null || true
+    wait "$p2" 2>/dev/null || true
+    stop_watcher "$pid"
+    fail "second hook never reached flock acquisition while the first held the compaction lock"
+  fi
   kill -0 "$p2" 2>/dev/null || fail "second hook did not wait for the flock during paused compaction"
   : > "$release"
   wait "$p1"; rc1=$?
@@ -2633,6 +2722,8 @@ test_hook_guard_error_stale_lock_is_reclaimed
 test_hook_guard_error_empty_and_partial_legacy_locks_recover
 test_hook_coalesced_occurrence_still_surfaces
 test_hook_guard_error_failed_filing_stays_eligible
+test_hook_guard_error_flock_failure_uses_loud_fallback
+test_hook_guard_error_lock_open_failure_reports_loudly
 test_hook_guard_error_compaction_serializes_concurrent_append
 test_hook_malformed_ledger_rows_do_not_hide_work
 test_hook_afk_stands_down_without_losing_work

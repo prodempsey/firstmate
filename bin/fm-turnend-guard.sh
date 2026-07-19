@@ -319,6 +319,31 @@ guard_error_clear_legacy_lock_dir() {  # <lock-path> <now-epoch>
   return 0
 }
 
+guard_error_lock_failure_fallback() {  # <slug> <dir> <component> <detail> <reason> <now> <caller> <cli>
+  local slug=$1 dir=$2 component=$3 detail=$4 reason=$5 now=$6 caller=$7 cli=$8 fallback bug_id
+  fallback="$dir/$slug.lock-fallback.occurrences"
+  printf '%s\tpid=%s\tlock_failure=%s\t%s\n' "$now" "$$" "$reason" "$caller" >> "$fallback" 2>/dev/null || true
+  bug_id=''
+  if [ -n "$cli" ] && [ "$cli" != off ] && [ -x "$cli" ]; then
+    bug_id=$("$cli" record "turn-end guard could not record its coalesced guard-error signal ($component): coalescing lock failure: $reason. Original detail: $detail. Caller: $caller. Fallback occurrence path: $fallback. The unattended-work gate is failing open until this is repaired." \
+      --quiet 2>/dev/null) || bug_id=''
+  fi
+  {
+    printf '●%s\n' "$rule"
+    printf '●  TURN-END GUARD COALESCING LOCK FAILURE\n'
+    printf '●  %s\n' "$reason"
+    printf '●  Fallback occurrence path: %s\n' "$fallback"
+    if [ -n "$bug_id" ]; then
+      printf '●  Fallback bug signal: %s\n' "$bug_id"
+    elif [ -n "$cli" ] && [ "$cli" != off ]; then
+      printf '●  Fallback bug signal: attempted but not confirmed.\n'
+    else
+      printf '●  Fallback bug signal: unavailable or disabled.\n'
+    fi
+    printf '●%s\n' "$rule"
+  } >&2
+}
+
 # Raise the durable health signal through the sanctioned bug CLI (the same one the triage
 # enumerator's bugs lane reads; FM_FLEET_TRIAGE_BUG_CLI overrides it, `off` disables).
 #
@@ -348,10 +373,6 @@ signal_guard_error_bug() {  # <component> <detail>
 
   slug=$(printf '%s' "$1" | tr -c 'a-zA-Z0-9' '-')
   dir=$(guard_error_coalesce_dir)
-  mkdir -p "$dir" 2>/dev/null || return 0
-  rec="$dir/$slug.record"
-  lock="$dir/$slug.lock"
-  occ="$dir/$slug.occurrences"
   window=${FM_GUARD_ERROR_COALESCE_WINDOW:-86400}
   case "$window" in *[!0-9]*) window=86400 ;; '') window=86400 ;; esac
   retry=${FM_GUARD_ERROR_BUG_RETRY:-60}
@@ -367,19 +388,43 @@ signal_guard_error_bug() {  # <component> <detail>
     cli=''
   fi
 
-  command -v flock >/dev/null 2>&1 || return 0
-  guard_error_clear_legacy_lock_dir "$lock" "$now" || return 0
+  mkdir -p "$dir" 2>/dev/null || {
+    guard_error_lock_failure_fallback "$slug" "$dir" "$1" "$2" "coalescing directory create failed: $dir" "$now" "$caller" "$cli"
+    return 0
+  }
+  rec="$dir/$slug.record"
+  lock="$dir/$slug.lock"
+  occ="$dir/$slug.occurrences"
+
+  command -v flock >/dev/null 2>&1 || {
+    guard_error_lock_failure_fallback "$slug" "$dir" "$1" "$2" 'flock command not found' "$now" "$caller" "$cli"
+    return 0
+  }
+  guard_error_clear_legacy_lock_dir "$lock" "$now" || {
+    guard_error_lock_failure_fallback "$slug" "$dir" "$1" "$2" "legacy lock migration timed out: $lock" "$now" "$caller" "$cli"
+    return 0
+  }
   flock_wait=${FM_GUARD_ERROR_FLOCK_WAIT:-5}
   case "$flock_wait" in *[!0-9]*) flock_wait=5 ;; '') flock_wait=5 ;; esac
 
-  (
-    trap 'rm -f "$rec.tmp.$$" "$occ.tmp.$$" 2>/dev/null || true; exec 9>&- 2>/dev/null || true' EXIT HUP INT TERM
-    exec 9>"$lock" || exit 0
-    if [ "$flock_wait" -gt 0 ]; then
-      flock -w "$flock_wait" 9 || exit 0
-    else
-      flock -n 9 || exit 0
+  exec 9>"$lock" || {
+    guard_error_lock_failure_fallback "$slug" "$dir" "$1" "$2" "lock file open failed: $lock" "$now" "$caller" "$cli"
+    return 0
+  }
+  if [ "$flock_wait" -gt 0 ]; then
+    if ! flock -w "$flock_wait" 9; then
+      exec 9>&- || true
+      guard_error_lock_failure_fallback "$slug" "$dir" "$1" "$2" "flock acquisition failed for $lock after ${flock_wait}s" "$now" "$caller" "$cli"
+      return 0
     fi
+  elif ! flock -n 9; then
+    exec 9>&- || true
+    guard_error_lock_failure_fallback "$slug" "$dir" "$1" "$2" "flock acquisition failed for $lock without waiting" "$now" "$caller" "$cli"
+    return 0
+  fi
+
+  (
+    trap 'rm -f "$rec.tmp.$$" "$occ.tmp.$$" 2>/dev/null || true; exec 9>&- || true' EXIT HUP INT TERM
 
     count=0
     first=$now
@@ -461,6 +506,7 @@ signal_guard_error_bug() {  # <component> <detail>
       rm -f "$rec.tmp.$$" 2>/dev/null || true
     fi
   )
+  exec 9>&- || true
   return 0
 }
 
@@ -472,7 +518,8 @@ guard_error_banner() {  # <component> <detail>
     printf '●  %s\n' "$2"
     printf '●  The unattended-work gate is FAILING OPEN: this turn end is permitted, but it\n'
     printf '●  is recorded as guard_error, not as a compliant permit. Repair the component;\n'
-    printf '●  a durable bug signal has been raised if the bug CLI is available.\n'
+    printf '●  a durable bug signal will be attempted if the bug CLI is available.\n'
+    printf '●  Any coalescing-lock failure is reported explicitly below.\n'
     printf '●%s\n' "$rule"
   } >&2
 }
