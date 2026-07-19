@@ -36,40 +36,49 @@
 #                            "type":"assistant" and a SCHEMA-VALID "message.usage"
 #                            object contribute (report's Aggregation rule: "Sum
 #                            every assistant message.usage"); schema-valid also
-#                            requires a non-empty, GNU-date-parseable STRING
-#                            timestamp on every such event - a usage-bearing
+#                            requires a non-empty STRING timestamp on every such
+#                            event. SEPARATELY, every one of those timestamps
+#                            (not just a session-wide min/max sample) is
+#                            batch-validated for actual GNU-date parseability in
+#                            one `date -f -` call per session: a usage-bearing
 #                            event this cannot place in time is exactly as
 #                            untrustworthy as one whose token counts are
-#                            unreadable (QA round 2 finding 1: silently
-#                            excluding an untimed session let a small in-window
-#                            sibling publish as a complete ok/high total). A
-#                            session file is included only when its own
-#                            [min,max] event
-#                            timestamp range overlaps the task's
-#                            [spawned_at, window_end + grace] interval (report
-#                            3.4). window_end is ended_at for a closed task
-#                            (task-runs.jsonl), "now" for a still-live task, and
-#                            falls back to spawned_at when no better bound
-#                            exists. A task with no parseable spawned_at cannot
-#                            be time-filtered at all: every top-level session
-#                            under its worktree dir is a candidate instead, and
-#                            the result is labeled tokens_status=ambiguous_join
-#                            (report 3.4, 3.5). A session claimed by MORE THAN
-#                            ONE task (a reused worktree with overlapping
-#                            windows) is excluded from every claiming task's sum
-#                            rather than being double-counted or arbitrarily
-#                            assigned; every affected task is also
-#                            ambiguous_join. A malformed/schema-invalid/
-#                            concurrently-mutated session file is data
-#                            tolerance, like a malformed task-runs.jsonl row,
-#                            but - unlike a merely out-of-window sibling - it
-#                            downgrades its whole task to tokens_status=partial
-#                            (a floor, never a false ok/high); a session file
-#                            that cannot be READ at all (permissions, I/O) is an
+#                            unreadable, whether it is missing, non-string, or
+#                            lexically buried between OTHER valid timestamps
+#                            (QA rounds 2 and 3: a naive extrema-only check let
+#                            a hidden bad timestamp evade validation entirely).
+#                            A session's own time range for window-matching is
+#                            derived SOLELY from its (validated) assistant-event
+#                            timestamps, never from unrelated envelope events,
+#                            and is included only when that range overlaps the
+#                            task's [spawned_at, window_end + grace] interval
+#                            (report 3.4). window_end is ended_at for a closed
+#                            task (task-runs.jsonl), "now" for a still-live
+#                            task, and falls back to spawned_at when no better
+#                            bound exists. A task with no parseable spawned_at
+#                            cannot be time-filtered at all: every top-level
+#                            session under its worktree dir is a candidate
+#                            instead, and the result is labeled
+#                            tokens_status=ambiguous_join (report 3.4, 3.5). A
+#                            session claimed by MORE THAN ONE task (a reused
+#                            worktree with overlapping windows) is excluded
+#                            from every claiming task's sum rather than being
+#                            double-counted or arbitrarily assigned; every
+#                            affected task is also ambiguous_join. A malformed/
+#                            schema-invalid/unparseable-timestamp/concurrently-
+#                            mutated session file is data tolerance, like a
+#                            malformed task-runs.jsonl row, but - unlike a
+#                            merely out-of-window sibling - it downgrades its
+#                            whole task to tokens_status=partial (a floor,
+#                            never a false ok/high); a session file that cannot
+#                            be READ at all (permissions, I/O) is an
 #                            operational failure and aborts the run via
-#                            run_or_die. See the "Claude token join (slice M2
-#                            round 2)" section below for the full per-finding
-#                            rationale (data/qa-m2-q34/report.md).
+#                            run_or_die/run_or_die_to_file. See the "Claude
+#                            token join (slice M2 round 4, class-level)"
+#                            section below for the full per-finding rationale
+#                            (data/qa-m2-q34/report.md,
+#                            data/qa-m2r2-q43/report.md,
+#                            data/qa-m2r3-q47/report.md).
 #                            CLAUDE_PROJECTS defaults to $HOME/.claude/projects;
 #                            override with FM_CLAUDE_PROJECTS_OVERRIDE (same
 #                            override pattern as FM_STATE_OVERRIDE) so tests
@@ -220,6 +229,25 @@ run_or_die() {  # <diagnostic> <allowed-stderr-regex-or-empty> -- <command> [arg
 # vanished, permissions) still aborts loud with a named diagnostic; bash's own
 # raw "No such file" message for this construct bypasses normal fd redirection
 # (verified empirically), so it is suppressed in favor of this one.
+#
+# CALLING CONTRACT (load-bearing - do not violate it): this function's
+# failure path is an `exit 2` INSIDE its own subshell, because it always runs
+# as $(must_read_run_out ...). A command substitution's `exit` only
+# terminates THAT subshell, never the parent script. Empirically verified:
+# the exit status DOES propagate correctly when the substitution is the
+# entire right-hand side of a bare assignment - `var=$(must_read_run_out
+# ...)` - but is SILENTLY DISCARDED when embedded inside another command's
+# arguments, e.g. `printf '%s\n' "$(must_read_run_out ...)"`, because
+# printf's OWN exit status is then what `$?`/`||` observes, and printf
+# happily succeeds on whatever partial/empty string the aborted substitution
+# produced. QA round 3 (data/qa-m2r3-q47/report.md finding 3) caught exactly
+# this: four call sites embedded the substitution and could publish a report
+# with a silently missing Claude token row. EVERY call to this function MUST
+# therefore be a bare assignment on its own line -
+# `content="$(must_read_run_out "...")"` - with any use of $content on a
+# SEPARATE, later statement. The static assertion in
+# tests/fm-usage-report.test.sh enforces this shape for every call site in
+# the join stage.
 must_read_run_out() {
   local diagnostic="$1" content
   if ! content="$(< "$RUN_OUT")" 2>/dev/null; then
@@ -229,21 +257,40 @@ must_read_run_out() {
   printf '%s' "$content"
 }
 
-# save_run_out_to <diagnostic> <dest-path>: binary-safe checked copy of the
-# CURRENT $RUN_OUT content to <dest-path>. Only needed when that content must
-# survive with embedded NUL bytes intact (find -print0 output) - a bash
-# variable cannot hold a NUL byte, so must_read_run_out's round-trip would
-# silently truncate it. cp is the one remaining genuinely-external new call in
-# this class; it cannot be run_or_die itself for the same self-reset reason
-# must_read_run_out documents, so it is its own equivalently frozen checked
-# owner: same named-diagnostic-plus-real-status shape as run_or_die, same
-# captured-stderr-on-failure behavior via the existing print_tool_error.
-save_run_out_to() {
-  local diagnostic="$1" dest="$2" status
-  if cp "$RUN_OUT" "$dest" 2> "$RUN_ERR"; then
-    return 0
+# run_or_die_to_file <diagnostic> <allowed-regex> <dest> -- <command> [args...]
+# Same checked/named-diagnostic/real-status contract as run_or_die, but
+# writes the command's stdout DIRECTLY to <dest> instead of the shared
+# $RUN_OUT. This is the checked owner for find's NUL-delimited -print0
+# output: shell file redirection is always byte-for-byte (unlike a bash
+# variable, which cannot hold an embedded NUL byte), so writing straight to
+# <dest> is NUL-safe with no intermediate copy step at all - there is no
+# separate "preserve $RUN_OUT before the next call resets it" step to get
+# wrong, and so no separate cp call to guard. Mirrors run_or_die's own
+# structure exactly, INCLUDING capturing the real exit status in an explicit
+# `else` branch. That else is load-bearing, not stylistic: `status=$?` placed
+# AFTER an `if cmd; then ...; fi` with NO else is a real bug, not a style
+# nit - POSIX defines a condition-only-false if-statement's own exit status
+# as 0 regardless of the condition's real status (empirically verified), so
+# `$?` immediately after such a block is always 0, never the failed
+# command's actual code. The removed save_run_out_to had exactly this bug
+# (QA round 3 finding 2): it bypassed run_or_die AND silently misreported a
+# real cp failure as "(exit 0)".
+run_or_die_to_file() {
+  local diagnostic=$1 allowed=${2:-} dest=$3 status
+  shift 3
+  [ "${1:-}" = "--" ] && shift
+  if ! : > "$RUN_ERR"; then
+    printf 'fm-usage-report: failed to reset command diagnostic capture %s\n' "$RUN_ERR" >&2
+    exit 2
   fi
-  status=$?
+  if "$@" > "$dest" 2> "$RUN_ERR"; then
+    return 0
+  else
+    status=$?
+  fi
+  if [ -n "$allowed" ] && grep -Eq "$allowed" "$RUN_ERR"; then
+    return 1
+  fi
   print_tool_error "$RUN_ERR"
   printf 'fm-usage-report: %s (exit %s)\n' "$diagnostic" "$status" >&2
   exit 2
@@ -465,56 +512,59 @@ EOF
   done < "$LEDGER"
 fi
 
-# --- Claude token join (slice M2 round 3) -------------------------------------
-# Redesigned twice after independent QA. Round 1: data/qa-m2-q34/report.md.
-# Round 2: data/qa-m2r2-q43/report.md, which found two remaining classes on
-# top of round 2's five closed findings (still referenced below by their
-# original F-number for continuity):
+# --- Claude token join (slice M2 round 4, class-level) ------------------------
+# Redesigned a third time after independent QA (data/qa-m2r3-q47/report.md)
+# found the round-3 point patches did not close their finding classes:
 #
-#   F1 continued (round 3): a session with schema-VALID usage but a missing,
-#      non-string, or unparseable timestamp was not flagged as a problem - it
-#      was simply unclaimable by any dated task, so a task with one such
-#      session plus one small valid sibling reported the sibling's total as
-#      tokens_status=ok/confidence=high, silently dropping the bulk of the
-#      real usage. Every assistant usage-bearing event now REQUIRES a
-#      non-empty STRING timestamp as part of its own schema validity (evOK),
-#      closing the "missing/non-string" half. The "unparseable" half (a
-#      syntactically fine string GNU date still rejects) is closed by a second
-#      check after epoch conversion: if a session's schema passed AND it had
-#      at least one assistant event, but either epoch failed to convert, the
-#      session is retroactively marked invalid - a problem, never silently
-#      unclaimable.
-#   F7 continued (round 3): round 2 checked every new mktemp/cat/cp with a
-#      direct `|| { diagnostic; exit 2; }`, but the requested invariant is
-#      that every external invocation route through run_or_die specifically
-#      (or one equally frozen checked owner for the cases run_or_die cannot
-#      structurally serve). Three call classes needed closing:
-#        - Five mktemp calls now run through run_or_die itself (the actual
-#          external tool), with their printed path read back via
-#          must_read_run_out (a bash builtin read - see that function's own
-#          comment for why it is deliberately not a run_or_die call).
-#        - Every "persist $RUN_OUT before the next run_or_die call resets it"
-#          site (three previously-unguarded `cat` command substitutions the
-#          QA fixture actually broke, plus the previously-guarded-but-still-
-#          external ones) now goes through must_read_run_out (JSON/text
-#          content) or save_run_out_to (find's NUL-delimited output, which a
-#          bash variable cannot hold intact).
-#        - Writing/appending the recovered content to a target file uses only
-#          bash builtins (printf + redirection), so there is no remaining
-#          external `cat`/`cp` to guard in that step at all.
-#      Every one of these sites still fails loud, nonzero, with a named
-#      diagnostic, before any publication step - the requirement was WHICH
-#      checked owner, not whether a check exists.
-#   F3 continued (round 3, non-blocking defect): model_source reported
-#      "routing" even when the resolved model came from the transcript because
-#      a CONCRETE routing model disagreed with it (as opposed to routing being
-#      literally "default"). model_source is now derived from the exact same
-#      branches that pick resolved_model, so any transcript-sourced resolution
-#      - whether routing was "default" or simply wrong - is correctly labeled.
+#   F1 (class-level): round 3 validated that every assistant event's
+#      timestamp is a non-empty STRING, then computed the session's
+#      [min,max] window from ALL events (assistant and non-assistant) and
+#      epoch-converted only those two extrema. An assistant event with a
+#      LEXICALLY INTERIOR but semantically unparseable timestamp (e.g.
+#      "12:30:99") never became an extremum when real envelope events
+#      bracketed it, so it was never epoch-converted and never invalidated -
+#      the exact QA reproduction. The class-level fix: stop deriving the
+#      window from ALL events, and stop checking only two extrema. The
+#      session's window is now derived SOLELY from assistant-event
+#      timestamps (the only ones that can ever contribute tokens), and EVERY
+#      one of them is individually epoch-validated via one batched
+#      `date -u -f -` call per session (feeding the whole timestamp list at
+#      once, not one process per timestamp) - any single unparseable
+#      timestamp fails the whole batch, and the session is invalid. There is
+#      now exactly one timestamp gate for the whole join, and it validates
+#      every timestamp that matters, not two samples of many.
+#   F2 (class-level): round 3 introduced save_run_out_to, a cp call OUTSIDE
+#      run_or_die with a real bug (see run_or_die_to_file's own comment for
+#      why `status=$?` after an if-with-no-else is 0, not the real code) -
+#      so it neither routed through the frozen owner NOR reported the truth
+#      when it failed. The class-level fix removes the need for a copy step
+#      at all: find's NUL-delimited output now goes straight from `find` to
+#      its destination FILE via run_or_die_to_file - shell file redirection
+#      is always byte-for-byte, so there is nothing left to copy, and
+#      nothing left to get wrong. run_or_die_to_file mirrors run_or_die's own
+#      proven-correct structure (explicit else branch) exactly.
+#   F3 (class-level): round 3's "write $RUN_OUT to a file" sites all wrote
+#      `printf '%s\n' "$(must_read_run_out ...)" > dest || { ...; exit 2; }`.
+#      must_read_run_out's own `exit 2` on failure only terminates the
+#      $(...) SUBSHELL it runs in; when that call is embedded inside
+#      printf's arguments, printf still runs (on whatever partial/empty text
+#      the aborted subshell produced), printf still succeeds, and the `||`
+#      guard never fires - four sites could each publish a report with a
+#      silently missing Claude token row. Verified empirically: the failure
+#      DOES propagate under `set -e` when the substitution is instead the
+#      ENTIRE right-hand side of a bare assignment on its own line. The
+#      class-level fix separates every one of the four sites into a bare
+#      assignment followed by a separate use, and must_read_run_out's own
+#      comment now states this as a load-bearing calling contract. The
+#      static assertion below greps for ANY remaining embedded
+#      $(must_read_run_out ...) call, not just the four QA found, so a
+#      future regression at a new call site is caught the same way.
 #
-# Architecture is otherwise unchanged from round 2: bash gathers structured
-# facts (date parsing, guarded external calls); one jq pass at the end does
-# every comparison, validation, and arithmetic sum.
+# Architecture is otherwise unchanged: bash gathers structured facts (date
+# parsing, guarded external calls, now via run_or_die/run_or_die_to_file
+# exclusively - must_read_run_out is a bash builtin, not an external call,
+# so it is deliberately not itself a run_or_die candidate); one jq pass at
+# the end does every comparison, validation, and arithmetic sum.
 
 CLAUDE_TOKEN_MAX_FIELD=1000000000
 
@@ -549,7 +599,8 @@ run_or_die "failed to extract claude task rows with jq" "" -- "$JQ_BIN" -r '
   [ .task, (.worktree // ""), (.model // ""), (.spawned_at // ""), (.window_end // "") ]
   | join("\u001f")
 ' "$REC_FILE"
-printf '%s\n' "$(must_read_run_out "failed to read claude task extraction output")" > "$CLAUDE_TASKS_RAW_FILE" \
+CLAUDE_TASKS_RAW_CONTENT="$(must_read_run_out "failed to read claude task extraction output")"
+printf '%s\n' "$CLAUDE_TASKS_RAW_CONTENT" > "$CLAUDE_TASKS_RAW_FILE" \
   || { echo "fm-usage-report: failed to write claude task extraction temp" >&2; exit 2; }
 
 # emit_claude_task_record <task> <model> <dir> <has_worktree true|false> <dir_found true|false> <sp_epoch-or-empty> <task_hi_epoch-or-empty>
@@ -563,7 +614,8 @@ emit_claude_task_record() {
     { task:$task, model:$model, dir:(if $dir=="" then null else $dir end),
       has_worktree:$has_worktree, dir_found:$dir_found,
       sp_epoch: numOrNull($sp), task_hi_epoch: numOrNull($hi) }'
-  printf '%s\n' "$(must_read_run_out "failed to read claude task record output")" >> "$CLAUDE_TASK_RECORDS_FILE" \
+  CLAUDE_TASK_RECORD_CONTENT="$(must_read_run_out "failed to read claude task record output")"
+  printf '%s\n' "$CLAUDE_TASK_RECORD_CONTENT" >> "$CLAUDE_TASK_RECORDS_FILE" \
     || { echo "fm-usage-report: failed to append claude task record" >&2; exit 2; }
 }
 
@@ -582,7 +634,8 @@ emit_claude_session_record() {
       ts_min_epoch: numOrNull($tsmin), ts_max_epoch: numOrNull($tsmax),
       input_tokens:$input, output_tokens:$output,
       cache_read_tokens:$cr, cache_write_tokens:$cw, models:$models }'
-  printf '%s\n' "$(must_read_run_out "failed to read claude session record output")" >> "$CLAUDE_SESSIONS_FILE" \
+  CLAUDE_SESSION_RECORD_CONTENT="$(must_read_run_out "failed to read claude session record output")"
+  printf '%s\n' "$CLAUDE_SESSION_RECORD_CONTENT" >> "$CLAUDE_SESSIONS_FILE" \
     || { echo "fm-usage-report: failed to append claude session record" >&2; exit 2; }
 }
 
@@ -603,13 +656,12 @@ while IFS=$'\x1f' read -r ctask cworktree cmodel cspawned cwindow_end; do
       cdir="$CLAUDE_PROJECTS/$cdirkey"
       # F5: only a genuinely-missing directory is tolerated as absent; any
       # other find failure (permission denied, I/O) aborts the run loudly.
-      if run_or_die "failed to list claude session files in $cdir with find" 'No such file or directory' \
+      # F2 (round 4): find writes straight to SESSION_LIST_FILE via
+      # run_or_die_to_file - NUL-delimited -print0 output surviving a plain
+      # file redirect intact, no separate copy step to guard.
+      if run_or_die_to_file "failed to list claude session files in $cdir with find" 'No such file or directory' "$SESSION_LIST_FILE" \
           -- find "$cdir" -maxdepth 1 -type f -name '*.jsonl' -print0; then
         CLAUDE_DIR_FOUND["$cdirkey"]="true"
-        # find's -print0 output is NUL-delimited; a bash variable cannot hold
-        # an embedded NUL byte, so this is the one case that needs a genuine
-        # binary-safe file copy (save_run_out_to), not must_read_run_out.
-        save_run_out_to "failed to stage claude session file list" "$SESSION_LIST_FILE"
         while IFS= read -r -d '' sfile; do
           # F1: bracket the read with a stat before and after. A file that
           # vanishes before we can even stat it, or whose size/mtime changes
@@ -622,17 +674,16 @@ while IFS=$'\x1f' read -r ctask cworktree cmodel cspawned cwindow_end; do
           fi
           stat_before="$(must_read_run_out "failed to read claude session pre-read stat output")"
 
-          # F1/F4: schema-validate every assistant usage field (finite,
-          # non-negative, whole, bounded) AND require a non-empty string
-          # timestamp on every usage-bearing event, before trusting any of it.
-          # A missing/null/non-string timestamp fails schema validity here,
-          # same as an invalid token field - report 3.4's join is defined in
-          # terms of a session's [min,max] TIMESTAMP range, so a usage-bearing
-          # event this cannot place in time is exactly as untrustworthy as one
-          # whose token counts are unreadable. Any parse error (truncated/
-          # malformed JSON, e.g. a concurrent writer's torn tail) is tolerated
-          # as data, not an operational failure, but marks this session
-          # invalid rather than silently skipping it.
+          # F1 (round 4, class-level): schema-validate every assistant usage
+          # field AND require a non-empty string timestamp on every such
+          # event (same as round 3), but this program now ALSO emits every
+          # one of those timestamps as its own output line - not just the
+          # two session-wide extrema - so the batched date validation below
+          # sees and checks every one of them, not a sample that a lexically
+          # interior bad timestamp could hide behind. Any parse error
+          # (truncated/malformed JSON, e.g. a concurrent writer's torn tail)
+          # is tolerated as data, not an operational failure, but marks this
+          # session invalid rather than silently skipping it.
           # shellcheck disable=SC2016 # jq variables are expanded by jq, not the shell.
           if ! run_or_die "failed to parse claude session file with jq: $sfile" '^jq: parse error:' \
               -- "$JQ_BIN" -rs --argjson maxv "$CLAUDE_TOKEN_MAX_FIELD" '
@@ -644,28 +695,21 @@ while IFS=$'\x1f' read -r ctask cworktree cmodel cspawned cwindow_end; do
               ((e.message.usage.cache_read_input_tokens==null) or numOK(e.message.usage.cache_read_input_tokens)) and
               ((e.message.usage.cache_creation_input_tokens==null) or numOK(e.message.usage.cache_creation_input_tokens)) and
               (e.timestamp != null) and (e.timestamp|type=="string") and (e.timestamp != "");
-            ( [ .[] | select(type=="object") ] ) as $evs |
-            ( [ $evs[] | select(type=="object" and .type=="assistant") ] ) as $asst |
+            ( [ .[] | select(type=="object" and .type=="assistant") ] ) as $asst |
             ( $asst | all(evOK(.)) ) as $schemaOk |
-            {
-              valid: $schemaOk,
-              has_events: (($asst | length) > 0),
-              ts_min: ([ $evs[] | .timestamp? // empty ] | map(select(type=="string")) | if length>0 then min else null end),
-              ts_max: ([ $evs[] | .timestamp? // empty ] | map(select(type=="string")) | if length>0 then max else null end),
-              input_tokens: (if $schemaOk then ([ $asst[] | (.message.usage.input_tokens? // 0) ] | add // 0) else 0 end),
-              output_tokens: (if $schemaOk then ([ $asst[] | (.message.usage.output_tokens? // 0) ] | add // 0) else 0 end),
-              cache_read_tokens: (if $schemaOk then ([ $asst[] | (.message.usage.cache_read_input_tokens? // 0) ] | add // 0) else 0 end),
-              cache_write_tokens: (if $schemaOk then ([ $asst[] | (.message.usage.cache_creation_input_tokens? // 0) ] | add // 0) else 0 end),
-              models: (if $schemaOk then ([ $asst[] | .message.model? // empty ] | map(select(type=="string")) | unique) else [] end)
-            }
-            | [ (.valid|tostring), (.has_events|tostring), (.ts_min // ""), (.ts_max // ""), (.input_tokens|tostring), (.output_tokens|tostring),
-                (.cache_read_tokens|tostring), (.cache_write_tokens|tostring), (.models|tojson) ]
-            | join("\u001f")' \
+            [ ($schemaOk|tostring), (($asst|length)>0|tostring),
+              ((if $schemaOk then ([ $asst[] | (.message.usage.input_tokens? // 0) ] | add // 0) else 0 end)|tostring),
+              ((if $schemaOk then ([ $asst[] | (.message.usage.output_tokens? // 0) ] | add // 0) else 0 end)|tostring),
+              ((if $schemaOk then ([ $asst[] | (.message.usage.cache_read_input_tokens? // 0) ] | add // 0) else 0 end)|tostring),
+              ((if $schemaOk then ([ $asst[] | (.message.usage.cache_creation_input_tokens? // 0) ] | add // 0) else 0 end)|tostring),
+              ((if $schemaOk then ([ $asst[] | .message.model? // empty ] | map(select(type=="string")) | unique) else [] end)|tojson)
+            ] | join("\u001f"),
+            ( if $schemaOk and ($asst|length)>0 then $asst[].timestamp else empty end )' \
               "$sfile"; then
             emit_claude_session_record "$cdirkey" false "" "" 0 0 0 0 '[]'
             continue
           fi
-          sess_row="$(must_read_run_out "failed to read claude session parse output")"
+          sess_content="$(must_read_run_out "failed to read claude session parse output")"
 
           if ! run_or_die "failed to stat claude session file: $sfile" 'No such file or directory' \
               -- stat -c '%s %Y' "$sfile"; then
@@ -679,21 +723,32 @@ while IFS=$'\x1f' read -r ctask cworktree cmodel cspawned cwindow_end; do
             continue
           fi
 
-          IFS=$'\x1f' read -r v_valid v_has_events v_tsmin v_tsmax v_in v_out v_cr v_cw v_models <<EOF
-$sess_row
-EOF
-          v_tsmin_epoch=""; [ -n "$v_tsmin" ] && v_tsmin_epoch="$(to_epoch "$v_tsmin")"
-          v_tsmax_epoch=""; [ -n "$v_tsmax" ] && v_tsmax_epoch="$(to_epoch "$v_tsmax")"
-          # F1 (round 3): a syntactically-fine timestamp string that GNU date
-          # still cannot parse is the one case the jq schema check cannot
-          # catch on its own (it only proves "non-empty string"). A schema-
-          # valid, usage-bearing session that fails to produce a real epoch
-          # here is retroactively invalid - a problem, never silently
-          # unclaimable. A usage-FREE session (has_events=false) legitimately
-          # has no timestamp to lose and is left alone.
-          if [ "$v_valid" = "true" ] && [ "$v_has_events" = "true" ] \
-              && { [ -z "$v_tsmin_epoch" ] || [ -z "$v_tsmax_epoch" ]; }; then
-            v_valid="false"
+          readarray -t sess_lines <<< "$sess_content"
+          IFS=$'\x1f' read -r v_valid v_has_events v_in v_out v_cr v_cw v_models <<< "${sess_lines[0]}"
+          v_tsmin_epoch=""
+          v_tsmax_epoch=""
+          if [ "$v_valid" = "true" ] && [ "$v_has_events" = "true" ] && [ "${#sess_lines[@]}" -gt 1 ]; then
+            # F1 (round 4): validate EVERY assistant timestamp in ONE batched
+            # `date -f -` call (not one process per timestamp, not just the
+            # extrema). Any single unparseable line fails the whole batch
+            # (GNU date continues past bad lines but exits nonzero and names
+            # each one on stderr, matching the same '^date: invalid date '
+            # text to_epoch already tolerates elsewhere in this script), so
+            # the session is marked invalid rather than silently keeping
+            # whichever lines happened to parse.
+            ts_list="$(printf '%s\n' "${sess_lines[@]:1}")"
+            if run_or_die "failed to validate assistant timestamps in claude session file: $sfile" '^date: invalid date ' \
+                -- "$DATE_BIN" -u -f - +%s <<< "$ts_list"; then
+              epochs_content="$(must_read_run_out "failed to read validated assistant timestamp epochs")"
+              readarray -t epoch_lines <<< "$epochs_content"
+              v_tsmin_epoch="${epoch_lines[0]}"; v_tsmax_epoch="${epoch_lines[0]}"
+              for e in "${epoch_lines[@]}"; do
+                [ "$e" -lt "$v_tsmin_epoch" ] && v_tsmin_epoch="$e"
+                [ "$e" -gt "$v_tsmax_epoch" ] && v_tsmax_epoch="$e"
+              done
+            else
+              v_valid="false"
+            fi
           fi
           emit_claude_session_record "$cdirkey" "$v_valid" "$v_tsmin_epoch" "$v_tsmax_epoch" \
             "$v_in" "$v_out" "$v_cr" "$v_cw" "$v_models"
@@ -790,10 +845,11 @@ run_or_die "failed to aggregate claude token joins with jq" "" -- "$JQ_BIN" -nc 
       model_source: $model_source
     }
   )[]'
-printf '%s\n' "$(must_read_run_out "failed to read claude token join output")" > "$TOKENS_FILE" \
+CLAUDE_TOKEN_JOIN_CONTENT="$(must_read_run_out "failed to read claude token join output")"
+printf '%s\n' "$CLAUDE_TOKEN_JOIN_CONTENT" > "$TOKENS_FILE" \
   || { echo "fm-usage-report: failed to write claude token join output" >&2; exit 2; }
 
-# --- build machine report into a RUN-PRIVATE temp ----------------------------# --- build machine report into a RUN-PRIVATE temp ----------------------------
+# --- build machine report into a RUN-PRIVATE temp ----------------------------
 # Everything below writes to this run's own temp files, never the shared
 # latest.{json,md}. Concurrent same-second runs would otherwise interleave: one
 # process's read/copy of the shared latest could capture another's content, so an

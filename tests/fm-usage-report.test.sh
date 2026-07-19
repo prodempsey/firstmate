@@ -58,12 +58,20 @@
 #     - this is legitimate (no cache activity that turn), not a schema problem
 #   - QA r1 F1 / r2 continued: an assistant event with no usage object, an
 #     invalid/negative/overflowing/fractional/string numeric field, a
-#     malformed (truncated) session file, a session whose stat changes across
-#     the guarded read (a concurrent writer), and - closed in round 3 - a
-#     usage-bearing event with a missing, non-string, or GNU-date-unparseable
-#     timestamp ALL make their task tokens_status=partial/confidence=low - a
-#     floor, NEVER a silently-reduced ok/high. A malformed sibling never hides
-#     a valid session's tokens; it just downgrades the whole task's status.
+#     malformed (truncated) session file, and a session whose stat changes
+#     across the guarded read (a concurrent writer) ALL make their task
+#     tokens_status=partial/confidence=low - a floor, NEVER a
+#     silently-reduced ok/high. A malformed sibling never hides a valid
+#     session's tokens; it just downgrades the whole task's status.
+#   - QA r1 F1 / r2 / r3 (class-level): a usage-bearing assistant event's
+#     timestamp is validated as a whole class, not sampled. Missing,
+#     non-string (numeric/null), and unparseable timestamps are all caught -
+#     including one that is LEXICALLY INTERIOR to valid non-assistant
+#     envelope timestamps, which round 3's extrema-only check missed (round 3
+#     QA's exact reproduction). Every assistant timestamp in a session is
+#     batch-validated in one `date -f -` call; any single failure invalidates
+#     the whole session. An assistant-free session is never penalized (it has
+#     no timestamp to lose).
 #   - QA r1 F2: a session claimed by more than one task sharing a reused
 #     worktree with overlapping windows is excluded from ALL of their sums
 #     (never split, never double counted); a session claimed by only one of
@@ -82,15 +90,19 @@
 #     non-claude tasks are explicit tokens_status=unsupported rows, not an
 #     aggregate-only tally; the report fingerprint changes when only Claude
 #     token totals change, not just when model_mix changes
-#   - QA r1 F7 / r2 F7: every new external call in the join stage - mktemp,
-#     find, jq, stat, and the one binary-safe cp needed for find's NUL-
-#     delimited output - is routed through run_or_die or one of its two
-#     documented equivalents (must_read_run_out, save_run_out_to); a static
-#     assertion greps the join stage for the exact anti-patterns two
-#     independent QA rounds found (a bare `cat "$RUN_OUT"`/`$(cat ...)`, or a
-#     `cp "$RUN_OUT"` outside save_run_out_to's own definition) and asserts
-#     zero matches, plus operational-failure regressions for the mktemp and
-#     cp call classes
+#   - QA r1 F7 / r2 / r3 (class-level): every external call in the join
+#     stage - mktemp, find, jq, stat, and `date -f -` - is routed through
+#     run_or_die or run_or_die_to_file (find's NUL-delimited output now
+#     writes straight to its destination file, so there is no separate copy
+#     step, and no cp to guard at all). must_read_run_out (a bash builtin
+#     read, not itself an external call) is used ONLY as a bare assignment on
+#     its own line - the one shape whose failure actually propagates under
+#     set -e, per round 3's swallowed-substitution finding. A static
+#     assertion greps the join stage for every QA-identified anti-pattern
+#     (bare cat/cp $RUN_OUT, any embedded/non-bare must_read_run_out call,
+#     an unrouted mktemp or find) and asserts zero matches, plus
+#     operational-failure regressions preserving the REAL exit status for
+#     the mktemp and find call classes.
 #   - by_harness_model token rollup across multiple claude tasks sharing a
 #     model, including non-claude rows correctly showing zero tokens
 #   - Markdown Panel B renders the unified by_task table, the by_harness_model
@@ -1545,32 +1557,199 @@ NAEJ=$NAEH/$OUT_SUB/latest.json
 [ "$(row_of "$NAEJ" noassist input_tokens)" = 7 ] || fail "the real session's tokens must still be counted"
 pass "a session with no assistant events at all is not penalized for lacking a timestamp"
 
-# --- 52 (QA r2 F7). Static assertion: the join stage contains none of the two
-# QA-identified anti-patterns - a bare cat/cp reading or writing $RUN_OUT
-# outside the two documented equivalent-checked-owner helpers.
+# ============================================================================
+# Slice M2 round 4, class-level (data/qa-m2r3-q47/report.md): every timestamp
+# gate, not just the two round-3 covered; every external call routed through
+# run_or_die/run_or_die_to_file with zero swallowed-substitution sites.
+# ============================================================================
+
+# --- 52 (QA r3 F1, critical, exact reproduction). An unparseable assistant
+# timestamp that is LEXICALLY INTERIOR to valid non-assistant envelope
+# timestamps must not evade validation just because it never becomes the
+# session's min/max extremum.
+IIH=$(make_home claude-interior-invalid-ts)
+CPII="$IIH/claude-projects"
+append_run "$IIH/state/task-runs.jsonl" interior ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+ENCII=$(encode_worktree /wt/interior)
+mkdir -p "$CPII/$ENCII"
+{
+  non_assistant_event 2026-07-15T12:10:00Z
+  jq -nc --arg ts "2026-07-15T12:30:99Z" '{type:"assistant", timestamp:$ts, message:{model:"claude-opus-4-8", usage:{input_tokens:100, output_tokens:0}}}'
+  non_assistant_event 2026-07-15T12:50:00Z
+} > "$CPII/$ENCII/interior.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPII" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$IIH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "interior-invalid-timestamp run exited non-zero"
+IIJ=$IIH/$OUT_SUB/latest.json
+[ "$(row_of "$IIJ" interior tokens_status)" = partial ] || fail "QA r3 F1: an assistant event with an unparseable timestamp bracketed by valid envelope timestamps must be partial, got $(row_of "$IIJ" interior tokens_status)"
+[ "$(row_of "$IIJ" interior confidence)" = low ] || fail "QA r3 F1: must never be high when a timestamp cannot be placed in time"
+[ "$(row_of "$IIJ" interior sessions_problem)" = 1 ] || fail "QA r3 F1: the session must be counted as a problem"
+[ "$(row_of "$IIJ" interior total_tokens)" = 0 ] || fail "QA r3 F1: the 100 tokens must never be confidently attributed via an unrelated envelope event's timestamp"
+pass "QA r3 F1: an interior invalid assistant timestamp (hidden between valid envelope timestamps) is caught, never confidently attributed"
+
+# --- 53 (QA r3 F1). Multiple assistant events, one interior timestamp
+# unparseable: the WHOLE session is invalid, not just the bad event silently
+# dropped from an otherwise-summed total.
+MIH=$(make_home claude-multi-interior)
+CPMI="$MIH/claude-projects"
+append_run "$MIH/state/task-runs.jsonl" multii ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+ENCMI=$(encode_worktree /wt/multii)
+mkdir -p "$CPMI/$ENCMI"
+{
+  claude_event 2026-07-15T12:05:00Z 10 0 0 0
+  jq -nc --arg ts "2026-07-15T12:15:99Z" '{type:"assistant", timestamp:$ts, message:{model:"claude-opus-4-8", usage:{input_tokens:20, output_tokens:0}}}'
+  claude_event 2026-07-15T12:55:00Z 30 0 0 0
+} > "$CPMI/$ENCMI/multi.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPMI" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$MIH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "multi-event interior-invalid run exited non-zero"
+MIJ=$MIH/$OUT_SUB/latest.json
+[ "$(row_of "$MIJ" multii tokens_status)" = partial ] || fail "QA r3 F1: one bad interior assistant timestamp among several valid ones must still invalidate the whole session"
+[ "$(row_of "$MIJ" multii total_tokens)" = 0 ] || fail "QA r3 F1: must not silently sum only the 10+30 from the valid events, dropping the bad one unlabeled"
+pass "QA r3 F1: one unparseable assistant timestamp among several valid ones invalidates the whole session, not just itself"
+
+# --- 54 (QA r3 F2). run_or_die_to_file preserves the REAL exit status of a
+# failed find, not a fixed/fake code - the exact bug save_run_out_to had
+# (an if-with-no-else zeroed status=$? to 0 regardless of the real failure).
+RSH=$(make_home claude-realstatus)
+CPRS="$RSH/claude-projects"
+append_run "$RSH/state/task-runs.jsonl" realstatustask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+ENCRS=$(encode_worktree /wt/realstatustask)
+mkdir -p "$CPRS/$ENCRS"
+RSB=$(fm_fakebin "$RSH")
+cat > "$RSB/find" <<'SH'
+#!/usr/bin/env bash
+echo "injected find failure with a distinctive code" >&2
+exit 93
+SH
+chmod +x "$RSB/find"
+RSO=$RSH/out; RSO_OUT=$RSH/stdout; RSO_ERR=$RSH/stderr
+PATH="$RSB:$PATH" FM_CLAUDE_PROJECTS_OVERRIDE="$CPRS" FM_USAGE_NOW=2026-07-18T00:00:00Z \
+  "$USAGE" --target "$RSH" --out "$RSO" --since 2026-07-01 --until 2026-07-31 \
+  >"$RSO_OUT" 2>"$RSO_ERR"
+rs_rc=$?
+[ "$rs_rc" -ne 0 ] || fail "QA r3 F2: a failed find must exit nonzero, got $rs_rc"
+grep -q "failed to list claude session files" "$RSO_ERR" || fail "QA r3 F2: must print the named find diagnostic"
+grep -q "(exit 93)" "$RSO_ERR" || fail "QA r3 F2: the diagnostic must report the REAL exit status (93), not a fixed/lost one - the exact save_run_out_to bug"
+grep -q "injected find failure with a distinctive code" "$RSO_ERR" || fail "QA r3 F2: must preserve find's own stderr"
+assert_no_grep "usage report:" "$RSO_OUT" "QA r3 F2: must not print a success summary"
+assert_absent "$RSO/latest.json" "QA r3 F2: must not publish a report"
+pass "QA r3 F2: run_or_die_to_file preserves find's real exit status (not zeroed by an if-with-no-else)"
+
+# --- 55 (QA r3 F2 class check). Isolated proof of the exact bug class: an
+# if-condition that fails with NO else branch resolves the if-STATEMENT's own
+# exit status to 0 per POSIX, not the condition's real status - this is why
+# save_run_out_to silently reported "(exit 0)" for a real cp failure, and
+# exactly why run_or_die_to_file captures status in an explicit else.
+if bash -c '
+  set -eu
+  f() { if false; then :; fi; return $?; }
+  f
+' >/dev/null 2>&1; then
+  : # expected: the if-with-no-else zeroing makes f() return 0, not false's 1
+else
+  fail "QA r3 F2 class check: this bash version does not exhibit the if-with-no-else zeroing bug as expected - re-verify the exploit premise"
+fi
+pass "QA r3 F2: verified the if-with-no-else exit-status-zeroing bug class this round's fix specifically avoids"
+
+# --- 56 (QA r3 F3, critical class check). The exact swallowed-substitution
+# mechanism: a subshell's `exit` inside $(...) is silently discarded when
+# embedded in another command's arguments, but DOES propagate under set -e
+# when it is the entire right-hand side of a bare assignment. This is the
+# load-bearing invariant must_read_run_out's calling contract depends on;
+# reproduced here directly (not via the production script) so a change to
+# bash's own semantics, or a misunderstanding of them, is caught immediately.
+bash -c '
+  set -euo pipefail
+  myfn() { echo "before exit"; exit 2; }
+  printf "%s\n" "$(myfn)" > /dev/null
+  echo "SWALLOWED"
+' >/tmp/swallow_repro.out 2>&1
+swallow_rc=$?
+grep -q "SWALLOWED" /tmp/swallow_repro.out && [ "$swallow_rc" -eq 0 ] \
+  || fail "QA r3 F3 class check: expected the embedded-substitution form to swallow the failure (rc=0, SWALLOWED printed) as the known bash behavior this round's fix works around"
+rm -f /tmp/swallow_repro.out
+bash -c '
+  set -euo pipefail
+  myfn() { echo "before exit"; exit 2; }
+  x="$(myfn)"
+  echo "REACHED: $x"
+' >/tmp/bare_repro.out 2>&1
+bare_rc=$?
+[ "$bare_rc" -eq 2 ] || fail "QA r3 F3 class check: a bare assignment must propagate the subshell's real exit status (2), got $bare_rc"
+assert_no_grep "REACHED" /tmp/bare_repro.out "QA r3 F3 class check: a bare assignment must abort before the following statement runs"
+rm -f /tmp/bare_repro.out
+pass "QA r3 F3: verified the exact swallowed-vs-propagated substitution mechanism must_read_run_out's calling contract relies on"
+
+# --- 57 (QA r3 F3). Static assertion: every call to must_read_run_out in the
+# join stage is a bare assignment on its own line (the ONLY shape that
+# propagates its failure); zero embedded/nested occurrences remain, closing
+# all four QA-cited sites AND any other site the same way. Also: zero
+# remaining cat/cp $RUN_OUT patterns (save_run_out_to and its cp are gone
+# entirely - find now writes straight to its destination via
+# run_or_die_to_file, so there is nothing left to copy).
 JOIN_SECTION_FILE=$(mktemp "$TMP_ROOT/join-section.XXXXXX")
-awk '/^# --- Claude token join \(slice M2 round 3\)/,/^# --- build machine report/' "$USAGE" > "$JOIN_SECTION_FILE"
-# shellcheck disable=SC2016 # these are literal grep patterns, not shell expansions
-assert_no_grep 'cat "$RUN_OUT"' "$JOIN_SECTION_FILE" "QA r2 F7: no direct 'cat \"\$RUN_OUT\"' in the join stage"
+awk '/^# --- Claude token join \(slice M2 round 4, class-level\)/,/^# --- build machine report/' "$USAGE" > "$JOIN_SECTION_FILE"
+[ -s "$JOIN_SECTION_FILE" ] || fail "QA r3 static assertion: the join-stage section marker was not found (anchor text drifted?)"
 # shellcheck disable=SC2016
-assert_no_grep '$(cat "$RUN_OUT")' "$JOIN_SECTION_FILE" "QA r2 F7: no direct '\$(cat \"\$RUN_OUT\")' in the join stage"
-# save_run_out_to's own definition (which legitimately calls cp "$RUN_OUT")
-# lives OUTSIDE this section (up near run_or_die); within the join stage
-# every use is the function CALL "save_run_out_to ...", never a literal cp.
+assert_no_grep 'cat "$RUN_OUT"' "$JOIN_SECTION_FILE" "QA r2/r3 F7: no direct 'cat \"\$RUN_OUT\"' in the join stage"
 # shellcheck disable=SC2016
-assert_no_grep 'cp "$RUN_OUT"' "$JOIN_SECTION_FILE" "QA r2 F7: no direct 'cp \"\$RUN_OUT\"' in the join stage (must go through save_run_out_to)"
-# Every mktemp INVOCATION (not a comment merely mentioning the word) in the
-# join stage must be routed through run_or_die: each such line must also
-# contain the "-- mktemp" run_or_die marker. Exclude comment lines (leading
-# '#' after optional whitespace) so prose discussing mktemp does not skew the
-# count.
+assert_no_grep '$(cat "$RUN_OUT")' "$JOIN_SECTION_FILE" "QA r2/r3 F7: no direct '\$(cat \"\$RUN_OUT\")' in the join stage"
+# shellcheck disable=SC2016
+assert_no_grep 'cp "$RUN_OUT"' "$JOIN_SECTION_FILE" "QA r3 F2: no direct 'cp \"\$RUN_OUT\"' anywhere in the join stage - find now writes straight to its destination"
+# save_run_out_to may still be named in a comment explaining why round 4
+# removed it (documentation, not usage); only an actual CALL - a non-comment
+# line naming it - would mean it survived.
+JOIN_SECTION_NOCOMMENTS=$(mktemp "$TMP_ROOT/join-section-nocomments.XXXXXX")
+grep -v '^[[:space:]]*#' "$JOIN_SECTION_FILE" > "$JOIN_SECTION_NOCOMMENTS"
+assert_no_grep 'save_run_out_to' "$JOIN_SECTION_NOCOMMENTS" \
+  "QA r3 F2: save_run_out_to must be fully removed as a callable, not merely unused"
+# Every mktemp INVOCATION (not a comment merely mentioning the word) must be
+# routed through run_or_die.
 MKTEMP_LINES=$(grep -v '^[[:space:]]*#' "$JOIN_SECTION_FILE" | grep -c 'mktemp')
 MKTEMP_ROUTED=$(grep -v '^[[:space:]]*#' "$JOIN_SECTION_FILE" | grep -c -- '-- mktemp')
 [ "$MKTEMP_LINES" -ge 5 ] || fail "QA r2 F7: expected at least 5 mktemp temp files in the join stage, found $MKTEMP_LINES"
 [ "$MKTEMP_LINES" = "$MKTEMP_ROUTED" ] || fail "QA r2 F7: every mktemp line must be routed through run_or_die (-- mktemp); $MKTEMP_LINES total vs $MKTEMP_ROUTED routed"
-pass "QA r2 F7: the join stage has zero direct cat/cp \$RUN_OUT reads and every mktemp routes through run_or_die"
+# find must be routed through run_or_die_to_file, never called bare: exactly
+# one "-- find" invocation marker (proving it is an argument to a checked
+# owner, not a standalone command), and at least one non-comment call to
+# run_or_die_to_file itself (proving the owner is actually used, not just
+# defined).
+FIND_LINES=$(grep -v '^[[:space:]]*#' "$JOIN_SECTION_FILE" | grep -c -- '-- find ')
+FIND_ROUTED=$(grep -v '^[[:space:]]*#' "$JOIN_SECTION_FILE" | grep -c 'run_or_die_to_file')
+[ "$FIND_LINES" -ge 1 ] || fail "QA r3 F2: expected at least 1 find invocation in the join stage, found $FIND_LINES"
+[ "$FIND_ROUTED" -ge 1 ] || fail "QA r3 F2: expected at least 1 call to run_or_die_to_file, found $FIND_ROUTED"
+# Every occurrence of "$(must_read_run_out" must be the ENTIRE right-hand
+# side of a bare "VAR=" assignment on its own line - the only shape whose
+# failure propagates under set -e (test 56 proves the mechanism). A line
+# where anything precedes "VAR=" (e.g. it is itself an argument to another
+# command such as printf) is exactly QA round 3 finding 3's bug class.
+EMBEDDED_MUST_READ=0
+while IFS= read -r ln; do
+  trimmed="${ln#"${ln%%[![:space:]]*}"}"
+  case "$trimmed" in
+    '#'*) continue ;;  # comment line (e.g. documenting the historical bug) - not code
+  esac
+  # shellcheck disable=SC2016 # these are literal case-pattern text, not shell expansions
+  case "$ln" in
+    *'$(must_read_run_out'*)
+      # shellcheck disable=SC2016
+      case "$trimmed" in
+        [A-Za-z_]*'="$(must_read_run_out'*'")"')
+          : # bare assignment - safe shape
+          ;;
+        *)
+          EMBEDDED_MUST_READ=$((EMBEDDED_MUST_READ + 1))
+          echo "  embedded must_read_run_out: $ln" >&2
+          ;;
+      esac
+      ;;
+  esac
+done < "$JOIN_SECTION_FILE"
+[ "$EMBEDDED_MUST_READ" -eq 0 ] || fail "QA r3 F3: found $EMBEDDED_MUST_READ must_read_run_out call(s) NOT in bare-assignment form (the exact swallowed-substitution bug class)"
+pass "QA r2/r3 F2/F3/F7: the join stage has zero cat/cp \$RUN_OUT reads, zero embedded must_read_run_out calls, find routes through run_or_die_to_file, and every mktemp routes through run_or_die"
 
-# --- 53 (QA r2 F7). Operational mutation: a run_or_die-routed mktemp failure
+# --- 58 (QA r2 F7). Operational mutation: a run_or_die-routed mktemp failure
 # for a new M2 temp file fails loud, nonzero, before any publication.
 MTH=$(make_home claude-mktempfail)
 append_run "$MTH/state/task-runs.jsonl" mtfailtask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
@@ -1599,37 +1778,35 @@ assert_no_grep "usage report:" "$MTO_OUT" "QA r2 F7: must not print a success su
 assert_absent "$MTO/latest.json" "QA r2 F7: must not publish a report"
 pass "QA r2 F7: a run_or_die-routed mktemp failure for a new M2 temp file fails loud and nonzero"
 
-# --- 54 (QA r2 F7). Operational mutation: save_run_out_to's cp failure (the
-# one binary-safe copy needed for find's NUL-delimited output) fails loud.
-CPFH=$(make_home claude-cpfail)
-CPCPF="$CPFH/claude-projects"
-append_run "$CPFH/state/task-runs.jsonl" cpfailtask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
-ENCCPF=$(encode_worktree /wt/cpfailtask)
-mkdir -p "$CPCPF/$ENCCPF"
-claude_event 2026-07-15T12:15:00Z 5 0 0 0 > "$CPCPF/$ENCCPF/s.jsonl"
-CPFB=$(fm_fakebin "$CPFH")
-CPF_REAL_CP="$(command -v cp)"
-cat > "$CPFB/cp" <<'SH'
+# --- 59 (QA r3 F3). Operational mutation: a jq failure feeding one of the
+# now-bare-assignment must_read_run_out reads still aborts loud (proves the
+# fix did not accidentally weaken the existing operational-failure guarantee
+# while restructuring these call sites).
+JFH=$(make_home claude-jqrecordfail)
+append_run "$JFH/state/task-runs.jsonl" jqrecordtask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+JFB=$(fm_fakebin "$JFH")
+JF_REAL_JQ="$(command -v jq)"
+cat > "$JFB/jq" <<'SH'
 #!/usr/bin/env bash
-real="${REAL_CP:-/bin/cp}"
-last="${*: -1}"
-case "$last" in
-  */fm-usage-sessionlist.*) echo "injected cp failure" >&2; exit 72 ;;
-esac
+real="${REAL_JQ:-/usr/bin/jq}"
+for arg in "$@"; do
+  case "$arg" in
+    *'has_worktree:$has_worktree'*) echo "injected task-record jq failure" >&2; exit 74 ;;
+  esac
+done
 exec "$real" "$@"
 SH
-chmod +x "$CPFB/cp"
-CPFO=$CPFH/out; CPFO_OUT=$CPFH/stdout; CPFO_ERR=$CPFH/stderr
-PATH="$CPFB:$PATH" REAL_CP="$CPF_REAL_CP" FM_CLAUDE_PROJECTS_OVERRIDE="$CPCPF" \
-  FM_USAGE_NOW=2026-07-18T00:00:00Z \
-  "$USAGE" --target "$CPFH" --out "$CPFO" --since 2026-07-01 --until 2026-07-31 \
-  >"$CPFO_OUT" 2>"$CPFO_ERR"
-cpf_rc=$?
-[ "$cpf_rc" -ne 0 ] || fail "QA r2 F7: a failed save_run_out_to cp must exit nonzero, got $cpf_rc"
-grep -q "failed to stage claude session file list" "$CPFO_ERR" || fail "QA r2 F7: must print the named cp diagnostic"
-grep -q "injected cp failure" "$CPFO_ERR" || fail "QA r2 F7: must preserve cp's own stderr"
-assert_no_grep "usage report:" "$CPFO_OUT" "QA r2 F7: must not print a success summary"
-assert_absent "$CPFO/latest.json" "QA r2 F7: must not publish a report"
-pass "QA r2 F7: save_run_out_to's cp failure (the binary-safe session-list copy) fails loud and nonzero"
+chmod +x "$JFB/jq"
+JFO=$JFH/out; JFO_OUT=$JFH/stdout; JFO_ERR=$JFH/stderr
+PATH="$JFB:$PATH" REAL_JQ="$JF_REAL_JQ" FM_USAGE_NOW=2026-07-18T00:00:00Z \
+  "$USAGE" --target "$JFH" --out "$JFO" --since 2026-07-01 --until 2026-07-31 \
+  >"$JFO_OUT" 2>"$JFO_ERR"
+jf_rc=$?
+[ "$jf_rc" -ne 0 ] || fail "QA r3 F3: a failed claude-task-record jq must exit nonzero, got $jf_rc"
+grep -q "failed to build claude task record with jq" "$JFO_ERR" || fail "QA r3 F3: must print the named diagnostic"
+grep -q "injected task-record jq failure" "$JFO_ERR" || fail "QA r3 F3: must preserve jq's own stderr"
+assert_no_grep "usage report:" "$JFO_OUT" "QA r3 F3: must not print a success summary"
+assert_absent "$JFO/latest.json" "QA r3 F3: must not publish a report with a silently missing claude token row"
+pass "QA r3 F3: a jq failure feeding a bare-assignment must_read_run_out call still aborts loud, no silently missing row"
 
 echo "ok - fm-usage-report.test.sh"
