@@ -12,7 +12,7 @@
 #   - undated tasks (no timestamp) always included and counted
 #   - routing-profile coverage (live meta only)
 #   - confidence-label scaffolding for the not-yet-built spend/cf panels, and
-#     the M2 tokens panel's partial (claude-only) shape
+#     the M2 tokens panel's partial status with a unified by_task ledger
 #   - fingerprint determinism across a wall-clock change
 #   - empty inputs still produce a valid report
 #   - FM_STATE_OVERRIDE input scoping
@@ -34,7 +34,12 @@
 #   - helper capture-reset failures fail loud, and helper diagnostics preserve
 #     the failed tool's actual exit status (QA r8 f1/f2)
 #
-# Slice M2 (Claude token joiner) coverage:
+# Slice M2 (Claude token joiner) coverage. The joiner has been reworked twice
+# after independent QA found it could publish confidently-wrong numbers
+# (data/qa-m2-q34/report.md, then data/qa-m2r2-q43/report.md); every fixed
+# finding below is annotated with its QA round and finding number, and NONE of
+# them tolerate a reduced-but-unlabeled subtotal - a session this joiner
+# cannot fully trust never contributes to an ok/high row.
 #   - happy path: encode(worktree) join, sum of a matched session's assistant
 #     usage, tokens_status=ok, confidence=high, join_method=claude_project_dir
 #   - session-file-level time filtering: an unrelated session outside the join
@@ -42,26 +47,54 @@
 #     in-window sessions (the worktree-pool-reuse hazard from report 4.3/6.3)
 #   - inclusive lower/upper join-window boundaries (spawned_at and
 #     ended_at+grace), and exclusion one second outside each
-#   - grace-hours configurability via FM_USAGE_CLAUDE_GRACE_HOURS
+#   - grace-hours configurability via FM_USAGE_CLAUDE_GRACE_HOURS, and
+#     FM_USAGE_CLAUDE_GRACE_HOURS rejects a non-numeric value
 #   - undated tasks (no spawned_at) fall back to summing every top-level
 #     session unfiltered, labeled tokens_status=ambiguous_join, confidence=low
 #   - absent cases: no worktree recorded, worktree recorded but no matching
 #     directory, and a directory with zero top-level session files
 #   - subagents/ subdirectories are excluded from the sum by design
 #   - missing usage subfields (no cache_read/cache_creation keys) default to 0
-#   - a malformed session file is skipped (data tolerance), a valid sibling
-#     file in the same directory still contributes
-#   - an OPERATIONAL jq failure on a session file (not a parse error) aborts
-#     the run loudly instead of being silently tolerated (the mutation-
-#     sensitive counterpart to the malformed-file-is-tolerated case above)
-#   - an operational `find` failure listing a claude session directory aborts
-#     the run loudly
-#   - non-claude tasks are tallied under panels.tokens.unsupported, never
-#     attempted as a join (M3+ scope)
-#   - by_model token rollup across multiple claude tasks sharing a model
-#   - Markdown Panel B renders the claude per-task table, by-model rollup, and
-#     the not-yet-joinable harness tally
-#   - FM_USAGE_CLAUDE_GRACE_HOURS rejects a non-numeric value
+#     - this is legitimate (no cache activity that turn), not a schema problem
+#   - QA r1 F1 / r2 continued: an assistant event with no usage object, an
+#     invalid/negative/overflowing/fractional/string numeric field, a
+#     malformed (truncated) session file, a session whose stat changes across
+#     the guarded read (a concurrent writer), and - closed in round 3 - a
+#     usage-bearing event with a missing, non-string, or GNU-date-unparseable
+#     timestamp ALL make their task tokens_status=partial/confidence=low - a
+#     floor, NEVER a silently-reduced ok/high. A malformed sibling never hides
+#     a valid session's tokens; it just downgrades the whole task's status.
+#   - QA r1 F2: a session claimed by more than one task sharing a reused
+#     worktree with overlapping windows is excluded from ALL of their sums
+#     (never split, never double counted); a session claimed by only one of
+#     several tasks sharing a worktree is unaffected for the others
+#   - QA r1 F3 / r2 F3: routing model=default resolves to a single consistent
+#     transcript model with confidence capped to low; a concrete routing model
+#     that disagrees with a single transcript model also resolves to the
+#     transcript (ground truth) with confidence capped to low AND
+#     model_source correctly reported as "transcript" (not "routing") in
+#     both cases; heterogeneous transcript models across sessions cap
+#     confidence without discarding the tokens
+#   - QA r1 F5: an unsearchable (not missing) Claude root - e.g. a mode-000
+#     parent - is an operational failure (loud, nonzero, no publish), never
+#     silent absence
+#   - QA r1 F6: every task (every harness) gets one normalized by_task row;
+#     non-claude tasks are explicit tokens_status=unsupported rows, not an
+#     aggregate-only tally; the report fingerprint changes when only Claude
+#     token totals change, not just when model_mix changes
+#   - QA r1 F7 / r2 F7: every new external call in the join stage - mktemp,
+#     find, jq, stat, and the one binary-safe cp needed for find's NUL-
+#     delimited output - is routed through run_or_die or one of its two
+#     documented equivalents (must_read_run_out, save_run_out_to); a static
+#     assertion greps the join stage for the exact anti-patterns two
+#     independent QA rounds found (a bare `cat "$RUN_OUT"`/`$(cat ...)`, or a
+#     `cp "$RUN_OUT"` outside save_run_out_to's own definition) and asserts
+#     zero matches, plus operational-failure regressions for the mktemp and
+#     cp call classes
+#   - by_harness_model token rollup across multiple claude tasks sharing a
+#     model, including non-claude rows correctly showing zero tokens
+#   - Markdown Panel B renders the unified by_task table, the by_harness_model
+#     rollup, and the totals line
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -1199,7 +1232,8 @@ FM_CLAUDE_PROJECTS_OVERRIDE="$CPMM" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
 MMJ=$MMH/$OUT_SUB/latest.json
 [ "$(row_of "$MMJ" mismatch1 model)" = claude-opus-4-8 ] || fail "QA F3: the transcript's ground truth model should be reported over a disagreeing routing label"
 [ "$(row_of "$MMJ" mismatch1 confidence)" = low ] || fail "QA F3: a routing/transcript model mismatch must cap confidence to low"
-pass "QA F3: a routing/transcript model mismatch resolves to the transcript and caps confidence to low"
+[ "$(row_of "$MMJ" mismatch1 model_source)" = transcript ] || fail "QA r2 F3: model_source must say transcript when a routing mismatch was overridden, not routing"
+pass "QA F3: a routing/transcript model mismatch resolves to the transcript, caps confidence to low, and reports model_source=transcript"
 
 # --- 38 (QA F3). multiple DISTINCT transcript models observed across the
 # uniquely-claimed sessions of one task - heterogeneous, confidence capped.
@@ -1406,5 +1440,196 @@ assert_grep "### By harness / model" "$MDOWN" "md by-harness-model header"
 assert_grep "| claude | claude-opus-4-8 | 1 | 1 | 300 | 130 | 30 | 13 | 473 |" "$MDOWN" "md by-harness-model row"
 assert_grep "1 ok, 0 ambiguous_join, 0 partial, 0 absent, 0 unsupported" "$MDOWN" "md totals line"
 pass "Markdown Panel B renders the unified by_task table, by_harness_model rollup, and totals"
+
+
+# ============================================================================
+# Slice M2 round 3 (data/qa-m2r2-q43/report.md): missing/invalid session
+# timestamps and the full run_or_die invocation-class invariant.
+# ============================================================================
+
+# --- 47 (QA r2 F1, critical). QA's exact reproduction: a usage-bearing
+# session with NO timestamp beside a small valid sibling must NOT silently
+# drop the untimed session's tokens and report the survivor as ok/high.
+NTH=$(make_home claude-notimestamp)
+CPNT="$NTH/claude-projects"
+append_run "$NTH/state/task-runs.jsonl" tstask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+ENCNT=$(encode_worktree /wt/tstask)
+mkdir -p "$CPNT/$ENCNT"
+claude_event 2026-07-15T12:15:00Z 5 0 0 0 > "$CPNT/$ENCNT/small.jsonl"
+jq -nc '{type:"assistant", message:{model:"claude-opus-4-8", usage:{input_tokens:100, output_tokens:0}}}' \
+  > "$CPNT/$ENCNT/notime.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPNT" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$NTH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "missing-timestamp run exited non-zero"
+NTJ=$NTH/$OUT_SUB/latest.json
+[ "$(row_of "$NTJ" tstask tokens_status)" = partial ] || fail "QA r2 F1: a usage-bearing session with no timestamp must make the task partial, got $(row_of "$NTJ" tstask tokens_status)"
+[ "$(row_of "$NTJ" tstask confidence)" = low ] || fail "QA r2 F1: partial confidence must be low, never high"
+[ "$(row_of "$NTJ" tstask sessions_problem)" = 1 ] || fail "QA r2 F1: the untimed session must count as a problem"
+[ "$(row_of "$NTJ" tstask total_tokens)" = 5 ] || fail "QA r2 F1: total must be the valid sibling's honest floor (5), never silently reported as complete"
+pass "QA r2 F1: a usage-bearing session missing its timestamp downgrades the task to partial, never a silent ok/high"
+
+# --- 48 (QA r2 F1). The same missing-timestamp session ALONE (no sibling)
+# must be partial/low with a zero floor, not absent/none.
+NTAH=$(make_home claude-notimestamp-alone)
+CPNTA="$NTAH/claude-projects"
+append_run "$NTAH/state/task-runs.jsonl" alonetask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+ENCNTA=$(encode_worktree /wt/alonetask)
+mkdir -p "$CPNTA/$ENCNTA"
+jq -nc '{type:"assistant", message:{model:"claude-opus-4-8", usage:{input_tokens:100, output_tokens:0}}}' \
+  > "$CPNTA/$ENCNTA/notime.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPNTA" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$NTAH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "missing-timestamp-alone run exited non-zero"
+NTAJ=$NTAH/$OUT_SUB/latest.json
+[ "$(row_of "$NTAJ" alonetask tokens_status)" = partial ] || fail "QA r2 F1: an untimed session alone must be partial, not absent (got $(row_of "$NTAJ" alonetask tokens_status))"
+[ "$(row_of "$NTAJ" alonetask sessions_problem)" = 1 ] || fail "QA r2 F1: the untimed session must be an explicit problem, not silently absent"
+pass "QA r2 F1: a lone usage-bearing session with no timestamp is partial/problem, not absent"
+
+# --- 49 (QA r2 F1). A non-string timestamp (a JSON number, or explicit null)
+# on a usage-bearing event is exactly as invalid as a missing one.
+NSH=$(make_home claude-nonstring-timestamp)
+CPNS="$NSH/claude-projects"
+append_run "$NSH/state/task-runs.jsonl" numts ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+append_run "$NSH/state/task-runs.jsonl" nullts ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+mkdir -p "$CPNS/$(encode_worktree /wt/numts)" "$CPNS/$(encode_worktree /wt/nullts)"
+jq -nc '{type:"assistant", timestamp:1784117700, message:{model:"claude-opus-4-8", usage:{input_tokens:5, output_tokens:0}}}' \
+  > "$CPNS/$(encode_worktree /wt/numts)/s.jsonl"
+jq -nc '{type:"assistant", timestamp:null, message:{model:"claude-opus-4-8", usage:{input_tokens:5, output_tokens:0}}}' \
+  > "$CPNS/$(encode_worktree /wt/nullts)/s.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPNS" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$NSH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "non-string-timestamp run exited non-zero"
+NSJ=$NSH/$OUT_SUB/latest.json
+for t in numts nullts; do
+  [ "$(row_of "$NSJ" "$t" tokens_status)" = partial ] || fail "QA r2 F1: $t (non-string timestamp) must be partial, got $(row_of "$NSJ" "$t" tokens_status)"
+  [ "$(row_of "$NSJ" "$t" total_tokens)" = 0 ] || fail "QA r2 F1: $t must not publish a fabricated total"
+done
+pass "QA r2 F1: a numeric or null timestamp on a usage-bearing event is invalid, same as a missing one"
+
+# --- 50 (QA r2 F1). A syntactically-fine but semantically unparseable
+# timestamp string (passes jq's non-empty-string check, GNU date rejects it)
+# is the residual gap a schema check alone cannot catch - closed via the
+# post-epoch-conversion re-check.
+UPTH=$(make_home claude-unparseable-timestamp)
+CPUPT="$UPTH/claude-projects"
+append_run "$UPTH/state/task-runs.jsonl" badts ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+ENCUPT=$(encode_worktree /wt/badts)
+mkdir -p "$CPUPT/$ENCUPT"
+jq -nc '{type:"assistant", timestamp:"not-a-real-timestamp", message:{model:"claude-opus-4-8", usage:{input_tokens:50, output_tokens:0}}}' \
+  > "$CPUPT/$ENCUPT/s.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPUPT" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$UPTH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "unparseable-timestamp run exited non-zero"
+UPTJ=$UPTH/$OUT_SUB/latest.json
+[ "$(row_of "$UPTJ" badts tokens_status)" = partial ] || fail "QA r2 F1: an unparseable timestamp string must be partial, got $(row_of "$UPTJ" badts tokens_status)"
+[ "$(row_of "$UPTJ" badts sessions_problem)" = 1 ] || fail "QA r2 F1: an unparseable timestamp must count as a problem"
+[ "$(row_of "$UPTJ" badts total_tokens)" = 0 ] || fail "QA r2 F1: an unparseable-timestamp session must never contribute a fabricated total"
+pass "QA r2 F1: a syntactically-valid but GNU-date-unparseable timestamp is caught after epoch conversion, not just at the schema layer"
+
+# --- 51. An assistant-FREE session (no assistant events at all) legitimately
+# has no timestamp to lose and must NOT be penalized - proves the timestamp
+# rule is scoped to usage-bearing events, not every file.
+NAEH=$(make_home claude-no-assistant-events)
+CPNAE="$NAEH/claude-projects"
+append_run "$NAEH/state/task-runs.jsonl" noassist ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+ENCNAE=$(encode_worktree /wt/noassist)
+mkdir -p "$CPNAE/$ENCNAE"
+non_assistant_event 2026-07-15T12:15:00Z > "$CPNAE/$ENCNAE/useronly.jsonl"
+claude_event 2026-07-15T12:20:00Z 7 0 0 0 > "$CPNAE/$ENCNAE/real.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPNAE" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$NAEH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "no-assistant-events run exited non-zero"
+NAEJ=$NAEH/$OUT_SUB/latest.json
+[ "$(row_of "$NAEJ" noassist tokens_status)" = ok ] || fail "an assistant-free sibling must not penalize an otherwise-clean task, got $(row_of "$NAEJ" noassist tokens_status)"
+[ "$(row_of "$NAEJ" noassist sessions_problem)" = 0 ] || fail "an assistant-free session (nothing usage-bearing to time-place) must not count as a problem"
+[ "$(row_of "$NAEJ" noassist input_tokens)" = 7 ] || fail "the real session's tokens must still be counted"
+pass "a session with no assistant events at all is not penalized for lacking a timestamp"
+
+# --- 52 (QA r2 F7). Static assertion: the join stage contains none of the two
+# QA-identified anti-patterns - a bare cat/cp reading or writing $RUN_OUT
+# outside the two documented equivalent-checked-owner helpers.
+JOIN_SECTION_FILE=$(mktemp "$TMP_ROOT/join-section.XXXXXX")
+awk '/^# --- Claude token join \(slice M2 round 3\)/,/^# --- build machine report/' "$USAGE" > "$JOIN_SECTION_FILE"
+# shellcheck disable=SC2016 # these are literal grep patterns, not shell expansions
+assert_no_grep 'cat "$RUN_OUT"' "$JOIN_SECTION_FILE" "QA r2 F7: no direct 'cat \"\$RUN_OUT\"' in the join stage"
+# shellcheck disable=SC2016
+assert_no_grep '$(cat "$RUN_OUT")' "$JOIN_SECTION_FILE" "QA r2 F7: no direct '\$(cat \"\$RUN_OUT\")' in the join stage"
+# save_run_out_to's own definition (which legitimately calls cp "$RUN_OUT")
+# lives OUTSIDE this section (up near run_or_die); within the join stage
+# every use is the function CALL "save_run_out_to ...", never a literal cp.
+# shellcheck disable=SC2016
+assert_no_grep 'cp "$RUN_OUT"' "$JOIN_SECTION_FILE" "QA r2 F7: no direct 'cp \"\$RUN_OUT\"' in the join stage (must go through save_run_out_to)"
+# Every mktemp INVOCATION (not a comment merely mentioning the word) in the
+# join stage must be routed through run_or_die: each such line must also
+# contain the "-- mktemp" run_or_die marker. Exclude comment lines (leading
+# '#' after optional whitespace) so prose discussing mktemp does not skew the
+# count.
+MKTEMP_LINES=$(grep -v '^[[:space:]]*#' "$JOIN_SECTION_FILE" | grep -c 'mktemp')
+MKTEMP_ROUTED=$(grep -v '^[[:space:]]*#' "$JOIN_SECTION_FILE" | grep -c -- '-- mktemp')
+[ "$MKTEMP_LINES" -ge 5 ] || fail "QA r2 F7: expected at least 5 mktemp temp files in the join stage, found $MKTEMP_LINES"
+[ "$MKTEMP_LINES" = "$MKTEMP_ROUTED" ] || fail "QA r2 F7: every mktemp line must be routed through run_or_die (-- mktemp); $MKTEMP_LINES total vs $MKTEMP_ROUTED routed"
+pass "QA r2 F7: the join stage has zero direct cat/cp \$RUN_OUT reads and every mktemp routes through run_or_die"
+
+# --- 53 (QA r2 F7). Operational mutation: a run_or_die-routed mktemp failure
+# for a new M2 temp file fails loud, nonzero, before any publication.
+MTH=$(make_home claude-mktempfail)
+append_run "$MTH/state/task-runs.jsonl" mtfailtask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+MTB=$(fm_fakebin "$MTH")
+MT_REAL_MKTEMP="$(command -v mktemp)"
+cat > "$MTB/mktemp" <<'SH'
+#!/usr/bin/env bash
+real="${REAL_MKTEMP:-/usr/bin/mktemp}"
+for arg in "$@"; do
+  case "$arg" in
+    *fm-usage-tokens.*) echo "injected mktemp failure" >&2; exit 71 ;;
+  esac
+done
+exec "$real" "$@"
+SH
+chmod +x "$MTB/mktemp"
+MTO=$MTH/out; MTO_OUT=$MTH/stdout; MTO_ERR=$MTH/stderr
+PATH="$MTB:$PATH" REAL_MKTEMP="$MT_REAL_MKTEMP" FM_USAGE_NOW=2026-07-18T00:00:00Z \
+  "$USAGE" --target "$MTH" --out "$MTO" --since 2026-07-01 --until 2026-07-31 \
+  >"$MTO_OUT" 2>"$MTO_ERR"
+mt_rc=$?
+[ "$mt_rc" -ne 0 ] || fail "QA r2 F7: a failed claude-tokens mktemp must exit nonzero, got $mt_rc"
+grep -q "cannot create a claude-tokens temp file" "$MTO_ERR" || fail "QA r2 F7: must print the named mktemp diagnostic"
+grep -q "injected mktemp failure" "$MTO_ERR" || fail "QA r2 F7: must preserve mktemp's own stderr"
+assert_no_grep "usage report:" "$MTO_OUT" "QA r2 F7: must not print a success summary"
+assert_absent "$MTO/latest.json" "QA r2 F7: must not publish a report"
+pass "QA r2 F7: a run_or_die-routed mktemp failure for a new M2 temp file fails loud and nonzero"
+
+# --- 54 (QA r2 F7). Operational mutation: save_run_out_to's cp failure (the
+# one binary-safe copy needed for find's NUL-delimited output) fails loud.
+CPFH=$(make_home claude-cpfail)
+CPCPF="$CPFH/claude-projects"
+append_run "$CPFH/state/task-runs.jsonl" cpfailtask ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+ENCCPF=$(encode_worktree /wt/cpfailtask)
+mkdir -p "$CPCPF/$ENCCPF"
+claude_event 2026-07-15T12:15:00Z 5 0 0 0 > "$CPCPF/$ENCCPF/s.jsonl"
+CPFB=$(fm_fakebin "$CPFH")
+CPF_REAL_CP="$(command -v cp)"
+cat > "$CPFB/cp" <<'SH'
+#!/usr/bin/env bash
+real="${REAL_CP:-/bin/cp}"
+last="${*: -1}"
+case "$last" in
+  */fm-usage-sessionlist.*) echo "injected cp failure" >&2; exit 72 ;;
+esac
+exec "$real" "$@"
+SH
+chmod +x "$CPFB/cp"
+CPFO=$CPFH/out; CPFO_OUT=$CPFH/stdout; CPFO_ERR=$CPFH/stderr
+PATH="$CPFB:$PATH" REAL_CP="$CPF_REAL_CP" FM_CLAUDE_PROJECTS_OVERRIDE="$CPCPF" \
+  FM_USAGE_NOW=2026-07-18T00:00:00Z \
+  "$USAGE" --target "$CPFH" --out "$CPFO" --since 2026-07-01 --until 2026-07-31 \
+  >"$CPFO_OUT" 2>"$CPFO_ERR"
+cpf_rc=$?
+[ "$cpf_rc" -ne 0 ] || fail "QA r2 F7: a failed save_run_out_to cp must exit nonzero, got $cpf_rc"
+grep -q "failed to stage claude session file list" "$CPFO_ERR" || fail "QA r2 F7: must print the named cp diagnostic"
+grep -q "injected cp failure" "$CPFO_ERR" || fail "QA r2 F7: must preserve cp's own stderr"
+assert_no_grep "usage report:" "$CPFO_OUT" "QA r2 F7: must not print a success summary"
+assert_absent "$CPFO/latest.json" "QA r2 F7: must not publish a report"
+pass "QA r2 F7: save_run_out_to's cp failure (the binary-safe session-list copy) fails loud and nonzero"
 
 echo "ok - fm-usage-report.test.sh"
