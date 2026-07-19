@@ -69,15 +69,13 @@
 #     including one that is LEXICALLY INTERIOR to valid non-assistant
 #     envelope timestamps, which round 3's extrema-only check missed (round 3
 #     QA's exact reproduction). Every assistant timestamp in a session is
-#     batch-validated in one `date -f -` call; any single failure invalidates
-#     the whole session. An assistant-free session is never penalized (it has
-#     no timestamp to lose). round 4 QA then found the batch's newline-joined
-#     record framing itself was ambiguous: a JSON timestamp value containing
-#     an embedded CR/LF is indistinguishable from two separate records once
-#     joined, so a crafted composite value could split into two individually-
-#     valid dates and evade validation entirely. Fixed by rejecting an
-#     embedded CR/LF at the schema gate, before any batching - a real
-#     ISO-8601 timestamp can never legitimately contain one.
+#     validated inside the same jq pass that reads the original JSON value;
+#     any single failure invalidates the whole session. An assistant-free
+#     session is never penalized (it has no timestamp to lose). Round 4 QA
+#     found newline record framing ambiguity, and round 5 QA found NUL loss in
+#     Bash command substitution. The joiner now emits only a session verdict
+#     and already-computed epoch numbers, never raw timestamp text for Bash to
+#     preserve before validation.
 #   - QA r1 F2: a session claimed by more than one task sharing a reused
 #     worktree with overlapping windows is excluded from ALL of their sums
 #     (never split, never double counted); a session claimed by only one of
@@ -97,8 +95,8 @@
 #     aggregate-only tally; the report fingerprint changes when only Claude
 #     token totals change, not just when model_mix changes
 #   - QA r1 F7 / r2 / r3 (class-level): every external call in the join
-#     stage - mktemp, find, jq, stat, and `date -f -` - is routed through
-#     run_or_die or run_or_die_to_file (find's NUL-delimited output now
+#     stage - mktemp, find, jq, and stat - is routed through run_or_die or
+#     run_or_die_to_file (find's NUL-delimited output now
 #     writes straight to its destination file, so there is no separate copy
 #     step, and no cp to guard at all). must_read_run_out (a bash builtin
 #     read, not itself an external call) is used ONLY as a bare assignment on
@@ -169,6 +167,35 @@ claude_event() {
 # joiner ignores everything except type=assistant events with a usage block.
 non_assistant_event() {
   jq -nc --arg ts "$1" '{type:"user", timestamp:$ts, message:{content:"hi"}}'
+}
+
+required_bad_timestamp_event() {
+  case "$1" in
+    nulbyte)
+      jq -nc '{type:"assistant", timestamp:"2026-07-15T12:30:\u000000Z", message:{model:"claude-opus-4-8", usage:{input_tokens:100, output_tokens:0}}}'
+      ;;
+    newline)
+      jq -nc '{type:"assistant", timestamp:"2026-07-15T12:30:00Z\n2026-07-15T12:31:00Z", message:{model:"claude-opus-4-8", usage:{input_tokens:100, output_tokens:0}}}'
+      ;;
+    cronly)
+      jq -nc '{type:"assistant", timestamp:"2026-07-15T12:30:00Z\r2026-07-15T12:31:00Z", message:{model:"claude-opus-4-8", usage:{input_tokens:100, output_tokens:0}}}'
+      ;;
+    crlf)
+      jq -nc '{type:"assistant", timestamp:"2026-07-15T12:30:00Z\r\n2026-07-15T12:31:00Z", message:{model:"claude-opus-4-8", usage:{input_tokens:100, output_tokens:0}}}'
+      ;;
+    delimiter)
+      jq -nc '{type:"assistant", timestamp:"2026-07-15T12:30:00Z\u001f2026-07-15T12:31:00Z", message:{model:"claude-opus-4-8", usage:{input_tokens:100, output_tokens:0}}}'
+      ;;
+    invalid)
+      jq -nc '{type:"assistant", timestamp:"not-a-real-timestamp", message:{model:"claude-opus-4-8", usage:{input_tokens:100, output_tokens:0}}}'
+      ;;
+    missing)
+      jq -nc '{type:"assistant", message:{model:"claude-opus-4-8", usage:{input_tokens:100, output_tokens:0}}}'
+      ;;
+    *)
+      fail "unknown required bad timestamp fixture $1"
+      ;;
+  esac
 }
 
 OUT_SUB="data/model-economy/usage"
@@ -1661,6 +1688,33 @@ CRJ=$CRH/$OUT_SUB/latest.json
 [ "$(row_of "$CRJ" crts sessions_problem)" = 1 ] || fail "QA r4 F1: the CR-containing session must be counted as a problem"
 pass "QA r4 F1: an embedded carriage return in a timestamp is rejected the same way as an embedded newline"
 
+# --- 53d (QA r5 F1 / round 6 required regressions). The timestamp validator
+# must decide validity while the original JSON string is still inside jq.
+# Bash must never receive a user-controlled timestamp and then ask date to
+# validate the possibly changed string. Each bad timestamp below carries 100
+# tokens that must not be counted; the NUL case is the round-5 exploit that
+# failed on e498e42 because Bash stripped byte 00 and reconstructed a valid
+# timestamp before date saw it.
+R6H=$(make_home claude-required-bad-timestamps)
+CPR6="$R6H/claude-projects"
+for task in nulbyte newline cronly crlf delimiter invalid missing; do
+  append_run "$R6H/state/task-runs.jsonl" "$task" ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+  ENCR6=$(encode_worktree "/wt/$task")
+  mkdir -p "$CPR6/$ENCR6"
+  required_bad_timestamp_event "$task" > "$CPR6/$ENCR6/s.jsonl"
+done
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPR6" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$R6H" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "required-bad-timestamps run exited non-zero"
+R6J=$R6H/$OUT_SUB/latest.json
+for task in nulbyte newline cronly crlf delimiter invalid missing; do
+  [ "$(row_of "$R6J" "$task" tokens_status)" = partial ] || fail "QA r5/r6: $task timestamp must yield partial, got $(row_of "$R6J" "$task" tokens_status)"
+  [ "$(row_of "$R6J" "$task" confidence)" = low ] || fail "QA r5/r6: $task timestamp must yield low confidence"
+  [ "$(row_of "$R6J" "$task" sessions_problem)" -ge 1 ] || fail "QA r5/r6: $task timestamp must count at least one problem session"
+  [ "$(row_of "$R6J" "$task" total_tokens)" = 0 ] || fail "QA r5/r6: $task timestamp must not contribute its 100-token subtotal"
+done
+pass "QA r5/r6: required bad timestamp variants are partial/low problems and never ok/high or silently counted"
+
 # --- 54 (QA r3 F2). run_or_die_to_file preserves the REAL exit status of a
 # failed find, not a fixed/fake code - the exact bug save_run_out_to had
 # (an if-with-no-else zeroed status=$? to 0 regardless of the real failure).
@@ -1742,7 +1796,7 @@ pass "QA r3 F3: verified the exact swallowed-vs-propagated substitution mechanis
 # entirely - find now writes straight to its destination via
 # run_or_die_to_file, so there is nothing left to copy).
 JOIN_SECTION_FILE=$(mktemp "$TMP_ROOT/join-section.XXXXXX")
-awk '/^# --- Claude token join \(slice M2 round 5, record-framing fix\)/,/^# --- build machine report/' "$USAGE" > "$JOIN_SECTION_FILE"
+awk '/^# --- Claude token join \(slice M2 round 6, in-pass timestamp validation\)/,/^# --- build machine report/' "$USAGE" > "$JOIN_SECTION_FILE"
 [ -s "$JOIN_SECTION_FILE" ] || fail "QA r3 static assertion: the join-stage section marker was not found (anchor text drifted?)"
 # shellcheck disable=SC2016
 assert_no_grep 'cat "$RUN_OUT"' "$JOIN_SECTION_FILE" "QA r2/r3 F7: no direct 'cat \"\$RUN_OUT\"' in the join stage"
@@ -1757,6 +1811,13 @@ JOIN_SECTION_NOCOMMENTS=$(mktemp "$TMP_ROOT/join-section-nocomments.XXXXXX")
 grep -v '^[[:space:]]*#' "$JOIN_SECTION_FILE" > "$JOIN_SECTION_NOCOMMENTS"
 assert_no_grep 'save_run_out_to' "$JOIN_SECTION_NOCOMMENTS" \
   "QA r3 F2: save_run_out_to must be fully removed as a callable, not merely unused"
+# shellcheck disable=SC2016
+assert_no_grep '-- "$DATE_BIN" -u -f - +%s' "$JOIN_SECTION_NOCOMMENTS" \
+  "QA r5/r6 F1: assistant timestamps must not be sent through Bash to a date -f batch validator"
+assert_no_grep 'readarray -t sess_lines' "$JOIN_SECTION_NOCOMMENTS" \
+  "QA r5/r6 F1: assistant timestamps must not be recovered from Bash line arrays after jq"
+assert_no_grep 'ts_list=' "$JOIN_SECTION_NOCOMMENTS" \
+  "QA r5/r6 F1: assistant timestamp batches must not be assembled in Bash"
 # Every mktemp INVOCATION (not a comment merely mentioning the word) must be
 # routed through run_or_die.
 MKTEMP_LINES=$(grep -v '^[[:space:]]*#' "$JOIN_SECTION_FILE" | grep -c 'mktemp')

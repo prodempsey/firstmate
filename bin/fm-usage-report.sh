@@ -37,16 +37,15 @@
 #                            object contribute (report's Aggregation rule: "Sum
 #                            every assistant message.usage"); schema-valid also
 #                            requires a non-empty STRING timestamp on every such
-#                            event. SEPARATELY, every one of those timestamps
-#                            (not just a session-wide min/max sample) is
-#                            batch-validated for actual GNU-date parseability in
-#                            one `date -f -` call per session: a usage-bearing
-#                            event this cannot place in time is exactly as
-#                            untrustworthy as one whose token counts are
-#                            unreadable, whether it is missing, non-string, or
-#                            lexically buried between OTHER valid timestamps
-#                            (QA rounds 2 and 3: a naive extrema-only check let
-#                            a hidden bad timestamp evade validation entirely).
+#                            event, and validates that timestamp inside the same
+#                            jq pass that reads the original JSON value. A
+#                            usage-bearing event this cannot place in time is
+#                            exactly as untrustworthy as one whose token counts
+#                            are unreadable, whether it is missing, non-string,
+#                            semantically invalid, or lexically buried between
+#                            OTHER valid timestamps (QA rounds 2 and 3: a naive
+#                            extrema-only check let a hidden bad timestamp evade
+#                            validation entirely).
 #                            A session's own time range for window-matching is
 #                            derived SOLELY from its (validated) assistant-event
 #                            timestamps, never from unrelated envelope events,
@@ -73,17 +72,18 @@
 #                            never a false ok/high); a session file that cannot
 #                            be READ at all (permissions, I/O) is an
 #                            operational failure and aborts the run via
-#                            run_or_die/run_or_die_to_file. Every timestamp is
-#                            also validated as one indivisible unit - an
-#                            embedded CR/LF is rejected at the schema gate
-#                            before any batching, so a JSON string boundary
-#                            can never be lost in the transport to `date`. See
-#                            the "Claude token join (slice M2 round 5,
-#                            record-framing fix)" section below for the full
-#                            per-finding rationale (data/qa-m2-q34/report.md,
+#                            run_or_die/run_or_die_to_file. Assistant
+#                            timestamps never round-trip through a Bash string
+#                            before validation; jq emits only the session
+#                            verdict, token totals, models, and min/max epoch
+#                            numbers. See the "Claude token join (slice M2
+#                            round 6, in-pass timestamp validation)" section
+#                            below for the full per-finding rationale
+#                            (data/qa-m2-q34/report.md,
 #                            data/qa-m2r2-q43/report.md,
 #                            data/qa-m2r3-q47/report.md,
-#                            data/qa-m2r4-q51/report.md).
+#                            data/qa-m2r4-q51/report.md,
+#                            data/qa-m2r5-q52/report.md).
 #                            CLAUDE_PROJECTS defaults to $HOME/.claude/projects;
 #                            override with FM_CLAUDE_PROJECTS_OVERRIDE (same
 #                            override pattern as FM_STATE_OVERRIDE) so tests
@@ -517,7 +517,7 @@ EOF
   done < "$LEDGER"
 fi
 
-# --- Claude token join (slice M2 round 5, record-framing fix) -----------------
+# --- Claude token join (slice M2 round 6, in-pass timestamp validation) -------
 # Redesigned a third time after independent QA (data/qa-m2r3-q47/report.md)
 # found the round-3 point patches did not close their finding classes:
 #
@@ -549,12 +549,21 @@ fi
 #      success and the original (invalid, composite) timestamp value is
 #      never rejected - the record-framing transport lost the JSON string
 #      boundary before validation ever saw it. Fixed at the schema gate,
-#      before any batching: evOK now rejects an assistant event whose
+#      before any batching: evOK rejected an assistant event whose
 #      timestamp contains an embedded CR or LF outright (a real ISO-8601
 #      timestamp can never legitimately contain one), so such a session
 #      never even reaches `date -f -`. This preserves each JSON timestamp as
 #      one indivisible validation unit without needing a more complex
 #      encoding, per the QA report's own "reasonable options".
+#   F1 continued again (round 6, data/qa-m2r5-q52/report.md): CR/LF rejection
+#      still left a lossy jq -> Bash-string -> date transport for legal JSON
+#      strings containing other control bytes. A NUL inside the original JSON
+#      timestamp could be emitted by jq, silently deleted by Bash command
+#      substitution, and converted into a different string before date saw it.
+#      The redesign removes that transport entirely: the jq pass that decodes
+#      the JSON also validates each assistant timestamp, checks calendar
+#      validity, computes per-session min/max epochs, and emits a session JSON
+#      verdict. Bash receives no raw assistant timestamp text.
 #   F2 (class-level): round 3 introduced save_run_out_to, a cp call OUTSIDE
 #      run_or_die with a real bug (see run_or_die_to_file's own comment for
 #      why `status=$?` after an if-with-no-else is 0, not the real code) -
@@ -582,11 +591,11 @@ fi
 #      $(must_read_run_out ...) call, not just the four QA found, so a
 #      future regression at a new call site is caught the same way.
 #
-# Architecture is otherwise unchanged: bash gathers structured facts (date
-# parsing, guarded external calls, now via run_or_die/run_or_die_to_file
-# exclusively - must_read_run_out is a bash builtin, not an external call,
-# so it is deliberately not itself a run_or_die candidate); one jq pass at
-# the end does every comparison, validation, and arithmetic sum.
+# Architecture is otherwise unchanged: bash gathers structured facts (guarded
+# external calls, now via run_or_die/run_or_die_to_file exclusively -
+# must_read_run_out is a bash builtin, not an external call, so it is
+# deliberately not itself a run_or_die candidate); one jq pass at the end does
+# every comparison, validation, and arithmetic sum.
 
 CLAUDE_TOKEN_MAX_FIELD=1000000000
 
@@ -641,16 +650,15 @@ emit_claude_task_record() {
     || { echo "fm-usage-report: failed to append claude task record" >&2; exit 2; }
 }
 
-# emit_claude_session_record <dir> <valid true|false> <ts_min_epoch-or-empty> <ts_max_epoch-or-empty> <input> <output> <cache_read> <cache_write> <models-json-array>
+# emit_claude_session_record <id> <dir> <valid true|false> <ts_min_epoch-or-empty> <ts_max_epoch-or-empty> <input> <output> <cache_read> <cache_write> <models-json-array>
 CLAUDE_SESSION_ID=0
 emit_claude_session_record() {
-  CLAUDE_SESSION_ID=$((CLAUDE_SESSION_ID + 1))
   # shellcheck disable=SC2016 # jq variables are expanded by jq, not the shell.
   run_or_die "failed to build claude session record with jq" "" -- "$JQ_BIN" -n \
-    --argjson id "$CLAUDE_SESSION_ID" --arg dir "$1" --argjson valid "$2" \
-    --arg tsmin "${3:-}" --arg tsmax "${4:-}" \
-    --argjson input "$5" --argjson output "$6" --argjson cr "$7" --argjson cw "$8" \
-    --argjson models "$9" '
+    --argjson id "$1" --arg dir "$2" --argjson valid "$3" \
+    --arg tsmin "${4:-}" --arg tsmax "${5:-}" \
+    --argjson input "$6" --argjson output "$7" --argjson cr "$8" --argjson cw "$9" \
+    --argjson models "${10}" '
     def numOrNull(x): if x == "" then null else (x|tonumber) end;
     { id:$id, dir:$dir, valid:$valid,
       ts_min_epoch: numOrNull($tsmin), ts_max_epoch: numOrNull($tsmax),
@@ -685,51 +693,90 @@ while IFS=$'\x1f' read -r ctask cworktree cmodel cspawned cwindow_end; do
           -- find "$cdir" -maxdepth 1 -type f -name '*.jsonl' -print0; then
         CLAUDE_DIR_FOUND["$cdirkey"]="true"
         while IFS= read -r -d '' sfile; do
+          CLAUDE_SESSION_ID=$((CLAUDE_SESSION_ID + 1))
+          sid="$CLAUDE_SESSION_ID"
           # F1: bracket the read with a stat before and after. A file that
           # vanishes before we can even stat it, or whose size/mtime changes
           # across the read, was being written concurrently - the read cannot
           # be trusted, so the whole file is invalid regardless of what jq saw.
           if ! run_or_die "failed to stat claude session file: $sfile" 'No such file or directory' \
               -- stat -c '%s %Y' "$sfile"; then
-            emit_claude_session_record "$cdirkey" false "" "" 0 0 0 0 '[]'
+            emit_claude_session_record "$sid" "$cdirkey" false "" "" 0 0 0 0 '[]'
             continue
           fi
           stat_before="$(must_read_run_out "failed to read claude session pre-read stat output")"
 
-          # F1 (round 4, class-level): schema-validate every assistant usage
-          # field AND require a non-empty string timestamp on every such
-          # event (same as round 3), but this program now ALSO emits every
-          # one of those timestamps as its own output line - not just the
-          # two session-wide extrema - so the batched date validation below
-          # sees and checks every one of them, not a sample that a lexically
-          # interior bad timestamp could hide behind. Any parse error
-          # (truncated/malformed JSON, e.g. a concurrent writer's torn tail)
-          # is tolerated as data, not an operational failure, but marks this
-          # session invalid rather than silently skipping it.
+          # F1 (round 6, class-level): schema-validate every assistant usage
+          # field, validate every assistant timestamp while it is still the
+          # original jq string, and emit the final per-session record as JSON.
+          # No raw assistant timestamp crosses into Bash, so control bytes
+          # cannot be stripped, split, or re-framed before validation.
+          # Parse errors (truncated/malformed JSON, e.g. a concurrent writer's
+          # torn tail) are tolerated as data, not an operational failure, but
+          # mark this session invalid rather than silently skipping it.
           # shellcheck disable=SC2016 # jq variables are expanded by jq, not the shell.
           if ! run_or_die "failed to parse claude session file with jq: $sfile" '^jq: parse error:' \
-              -- "$JQ_BIN" -rs --argjson maxv "$CLAUDE_TOKEN_MAX_FIELD" '
+              -- "$JQ_BIN" -cs --argjson id "$sid" --arg dir "$cdirkey" --argjson maxv "$CLAUDE_TOKEN_MAX_FIELD" '
             def MAXV: $maxv;
             def numOK(x): (x != null) and (x|type=="number") and ((x|floor)==x) and (x>=0) and (x<=MAXV);
+            def isoEpoch:
+              if type != "string" then null
+              else
+                ([capture("^(?<year>[0-9]{4})-(?<month>[0-9]{2})-(?<day>[0-9]{2})T(?<hour>[0-9]{2}):(?<minute>[0-9]{2}):(?<second>[0-9]{2})(?:\\.[0-9]+)?(?<tz>Z|[+-][0-9]{2}:[0-9]{2})$")?] | .[0] // null) as $m |
+                if $m == null then null
+                else
+                  ($m.year|tonumber) as $year |
+                  ($m.month|tonumber) as $month |
+                  ($m.day|tonumber) as $day |
+                  ($m.hour|tonumber) as $hour |
+                  ($m.minute|tonumber) as $minute |
+                  ($m.second|tonumber) as $second |
+                  ($m.tz) as $tz |
+                  (if $tz == "Z" then 0
+                   else
+                     ($tz[0:1]) as $sign |
+                     ($tz[1:3]|tonumber) as $tzHour |
+                     ($tz[4:6]|tonumber) as $tzMinute |
+                     if ($tzHour > 23) or ($tzMinute > 59) then null
+                     else (($tzHour * 3600 + $tzMinute * 60) * (if $sign == "+" then 1 else -1 end))
+                     end
+                   end) as $offset |
+                  if ($offset == null) or
+                     ($month < 1) or ($month > 12) or
+                     ($day < 1) or ($day > 31) or
+                     ($hour > 23) or ($minute > 59) or ($second > 59)
+                  then null
+                  else
+                    ([ $year, ($month - 1), $day, $hour, $minute, $second, 0, 0 ] | mktime) as $localEpoch |
+                    ($localEpoch | gmtime | .[0:6]) as $roundTrip |
+                    if $roundTrip == [ $year, ($month - 1), $day, $hour, $minute, $second ] then
+                      ($localEpoch - $offset)
+                    else null end
+                  end
+                end
+              end;
             def evOK(e): (e.message.usage? != null) and
               numOK(e.message.usage.input_tokens) and
               numOK(e.message.usage.output_tokens) and
               ((e.message.usage.cache_read_input_tokens==null) or numOK(e.message.usage.cache_read_input_tokens)) and
               ((e.message.usage.cache_creation_input_tokens==null) or numOK(e.message.usage.cache_creation_input_tokens)) and
               (e.timestamp != null) and (e.timestamp|type=="string") and (e.timestamp != "") and
-              (e.timestamp | test("[\r\n]") | not);
-            ( [ .[] | select(type=="object" and .type=="assistant") ] ) as $asst |
+              (e.__ts_epoch != null);
+            ( [ .[] | select(type=="object" and .type=="assistant") |
+                . as $event | ($event.timestamp | isoEpoch) as $epoch |
+                ($event + {__ts_epoch: $epoch}) ] ) as $asst |
             ( $asst | all(evOK(.)) ) as $schemaOk |
-            [ ($schemaOk|tostring), (($asst|length)>0|tostring),
-              ((if $schemaOk then ([ $asst[] | (.message.usage.input_tokens? // 0) ] | add // 0) else 0 end)|tostring),
-              ((if $schemaOk then ([ $asst[] | (.message.usage.output_tokens? // 0) ] | add // 0) else 0 end)|tostring),
-              ((if $schemaOk then ([ $asst[] | (.message.usage.cache_read_input_tokens? // 0) ] | add // 0) else 0 end)|tostring),
-              ((if $schemaOk then ([ $asst[] | (.message.usage.cache_creation_input_tokens? // 0) ] | add // 0) else 0 end)|tostring),
-              ((if $schemaOk then ([ $asst[] | .message.model? // empty ] | map(select(type=="string")) | unique) else [] end)|tojson)
-            ] | join("\u001f"),
-            ( if $schemaOk and ($asst|length)>0 then $asst[].timestamp else empty end )' \
+            ($asst | map(.__ts_epoch)) as $epochs |
+            { id:$id, dir:$dir, valid:$schemaOk,
+              ts_min_epoch:(if $schemaOk and ($epochs|length)>0 then ($epochs|min) else null end),
+              ts_max_epoch:(if $schemaOk and ($epochs|length)>0 then ($epochs|max) else null end),
+              input_tokens:(if $schemaOk then ([ $asst[] | (.message.usage.input_tokens? // 0) ] | add // 0) else 0 end),
+              output_tokens:(if $schemaOk then ([ $asst[] | (.message.usage.output_tokens? // 0) ] | add // 0) else 0 end),
+              cache_read_tokens:(if $schemaOk then ([ $asst[] | (.message.usage.cache_read_input_tokens? // 0) ] | add // 0) else 0 end),
+              cache_write_tokens:(if $schemaOk then ([ $asst[] | (.message.usage.cache_creation_input_tokens? // 0) ] | add // 0) else 0 end),
+              models:(if $schemaOk then ([ $asst[] | .message.model? // empty ] | map(select(type=="string")) | unique) else [] end) }' \
               "$sfile"; then
-            emit_claude_session_record "$cdirkey" false "" "" 0 0 0 0 '[]'
+            emit_claude_session_record "$sid" "$cdirkey" false "" "" 0 0 0 0 '[]'
             continue
           fi
           sess_content="$(must_read_run_out "failed to read claude session parse output")"
@@ -742,39 +789,12 @@ while IFS=$'\x1f' read -r ctask cworktree cmodel cspawned cwindow_end; do
           fi
 
           if [ "$stat_before" != "$stat_after" ]; then
-            emit_claude_session_record "$cdirkey" false "" "" 0 0 0 0 '[]'
+            emit_claude_session_record "$sid" "$cdirkey" false "" "" 0 0 0 0 '[]'
             continue
           fi
 
-          readarray -t sess_lines <<< "$sess_content"
-          IFS=$'\x1f' read -r v_valid v_has_events v_in v_out v_cr v_cw v_models <<< "${sess_lines[0]}"
-          v_tsmin_epoch=""
-          v_tsmax_epoch=""
-          if [ "$v_valid" = "true" ] && [ "$v_has_events" = "true" ] && [ "${#sess_lines[@]}" -gt 1 ]; then
-            # F1 (round 4): validate EVERY assistant timestamp in ONE batched
-            # `date -f -` call (not one process per timestamp, not just the
-            # extrema). Any single unparseable line fails the whole batch
-            # (GNU date continues past bad lines but exits nonzero and names
-            # each one on stderr, matching the same '^date: invalid date '
-            # text to_epoch already tolerates elsewhere in this script), so
-            # the session is marked invalid rather than silently keeping
-            # whichever lines happened to parse.
-            ts_list="$(printf '%s\n' "${sess_lines[@]:1}")"
-            if run_or_die "failed to validate assistant timestamps in claude session file: $sfile" '^date: invalid date ' \
-                -- "$DATE_BIN" -u -f - +%s <<< "$ts_list"; then
-              epochs_content="$(must_read_run_out "failed to read validated assistant timestamp epochs")"
-              readarray -t epoch_lines <<< "$epochs_content"
-              v_tsmin_epoch="${epoch_lines[0]}"; v_tsmax_epoch="${epoch_lines[0]}"
-              for e in "${epoch_lines[@]}"; do
-                [ "$e" -lt "$v_tsmin_epoch" ] && v_tsmin_epoch="$e"
-                [ "$e" -gt "$v_tsmax_epoch" ] && v_tsmax_epoch="$e"
-              done
-            else
-              v_valid="false"
-            fi
-          fi
-          emit_claude_session_record "$cdirkey" "$v_valid" "$v_tsmin_epoch" "$v_tsmax_epoch" \
-            "$v_in" "$v_out" "$v_cr" "$v_cw" "$v_models"
+          printf '%s\n' "$sess_content" >> "$CLAUDE_SESSIONS_FILE" \
+            || { echo "fm-usage-report: failed to append claude session record" >&2; exit 2; }
         done < "$SESSION_LIST_FILE"
       else
         CLAUDE_DIR_FOUND["$cdirkey"]="false"
