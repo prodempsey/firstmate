@@ -328,6 +328,94 @@ while IFS= read -r ln; do
   cp_recompute=$(jq -S '{window, totals, model_mix: .panels.model_mix}' "$CSHARED/$cp_path" | sha256sum | cut -d' ' -f1)
   [ "$cp_fp" = "$cp_recompute" ] || fail "concurrent: fingerprint does not recompute for $cp_path ($cp_fp vs $cp_recompute)"
 done < "$CSHARED/index.jsonl"
+# The published latest pair must itself be a coherent single run: latest.md must
+# state the same totals as latest.json and carry every model row it lists.
+CL_TASKS=$(jq -r '.totals.tasks' "$CSHARED/latest.json")
+grep -q "Total tasks: $CL_TASKS " "$CSHARED/latest.md" || fail "concurrent: latest.json/latest.md disagree on totals"
+while IFS= read -r m; do
+  grep -q "| $m |" "$CSHARED/latest.md" || fail "concurrent: latest.md missing model row $m from latest.json"
+done < <(jq -r '.panels.model_mix.by_harness_model_effort[].model' "$CSHARED/latest.json")
 pass "concurrent same-second runs each yield one correct immutable snapshot"
+
+# --- 15. forced publication interleaving keeps the latest pair coherent -------
+# Round 3 published latest.json and latest.md in two separate renames, so
+# concurrent writers could interleave (A-json, B-json, B-md, A-md) and leave
+# latest.json from one run beside latest.md from another. The fix serializes the
+# whole pair under one output-scoped lock. This regression forces the exact
+# contention: run A is paused by a `mv` shim right AFTER it renames latest.json
+# (the gap round 3 published through) while STILL holding the pair lock; run B
+# then contends. With the lock, B blocks until A finishes both of its renames,
+# so whichever run wins publishes both of ITS files - the pair can never split.
+IHOME=$TMP_ROOT/pairlock
+mkdir -p "$IHOME"
+POUT=$IHOME/out; mkdir -p "$POUT"
+REAL_MV="$(command -v mv)"
+FB=$(fm_fakebin "$IHOME")
+# Shim mv: for the marked slow run only, do the real latest.json rename, signal
+# that A has published its json, then block (still inside A's held lock) until
+# the test releases it. All other renames pass straight through to the real mv.
+cat > "$FB/mv" <<'SH'
+#!/usr/bin/env bash
+real="${REAL_MV:-/bin/mv}"
+if [ "${SLOW_RUN:-0}" = 1 ]; then
+  last="${*: -1}"
+  case "$last" in
+    */latest.json)
+      "$real" "$@"
+      : > "$A_JSON_DONE"
+      tries=0
+      while [ ! -e "$A_RELEASE" ] && [ "$tries" -lt 600 ]; do sleep 0.05; tries=$((tries + 1)); done
+      exit 0
+      ;;
+  esac
+fi
+exec "$real" "$@"
+SH
+chmod +x "$FB/mv"
+
+hA=$IHOME/home-A; mkdir -p "$hA/state"
+hB=$IHOME/home-B; mkdir -p "$hB/state"
+# A: one claude/model-A task. B: two codex/model-B tasks (distinct home, model,
+# and totals, so any split pair is unambiguous).
+append_run "$hA/state/task-runs.jsonl" a1 ship /home/prode/fleet/firstmate claude model-A high 2026-07-15T10:00:00Z
+append_run "$hB/state/task-runs.jsonl" b1 ship /home/prode/fleet/krakenloop codex model-B high 2026-07-15T10:00:00Z
+append_run "$hB/state/task-runs.jsonl" b2 ship /home/prode/fleet/krakenloop codex model-B high 2026-07-15T10:00:00Z
+SIG=$IHOME/a-json-done; REL=$IHOME/a-release
+
+# A runs with the mv shim on PATH and pauses holding the lock after its json rename.
+( PATH="$FB:$PATH" SLOW_RUN=1 REAL_MV="$REAL_MV" A_JSON_DONE="$SIG" A_RELEASE="$REL" \
+    FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" --target "$hA" --out "$POUT" \
+    --since 2026-07-01 --until 2026-07-18 >/dev/null 2>&1 ) &
+apid=$!
+tries=0; while [ ! -e "$SIG" ] && [ "$tries" -lt 400 ]; do sleep 0.05; tries=$((tries + 1)); done
+[ -e "$SIG" ] || { kill "$apid" 2>/dev/null; fail "run A never reached the latest.json publish"; }
+
+# B runs normally (real mv); it writes its archive, then blocks on the pair lock A holds.
+( FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" --target "$hB" --out "$POUT" \
+    --since 2026-07-01 --until 2026-07-18 >/dev/null 2>&1 ) &
+bpid=$!
+# Wait until B has written its archive (proof it reached the publish lock and is
+# contending), so the interleaving window is genuinely open, THEN release A.
+tries=0
+while [ "$(find "$POUT/history" -name 'usage-*.json' 2>/dev/null | wc -l)" -lt 2 ] && [ "$tries" -lt 400 ]; do
+  sleep 0.05; tries=$((tries + 1))
+done
+: > "$REL"
+wait "$apid" || fail "run A exited non-zero"
+wait "$bpid" || fail "run B exited non-zero"
+
+# Whatever won, latest.json and latest.md must be the SAME run: same home, same
+# totals, same model rows. A split pair (round 3's bug) fails at least one.
+PLJ=$POUT/latest.json; PLM=$POUT/latest.md
+pl_home=$(jq -r '.home' "$PLJ")
+pl_tasks=$(jq -r '.totals.tasks' "$PLJ")
+grep -q "Home: $pl_home" "$PLM" || fail "forced-interleave: latest pair disagree on home (json=$pl_home)"
+grep -q "Total tasks: $pl_tasks " "$PLM" || fail "forced-interleave: latest pair disagree on totals (json=$pl_tasks)"
+while IFS= read -r m; do
+  grep -q "| $m |" "$PLM" || fail "forced-interleave: latest.md missing model row $m present in latest.json"
+done < <(jq -r '.panels.model_mix.by_harness_model_effort[].model' "$PLJ")
+# And both immutable archives must still be intact and correct.
+[ "$(find "$POUT/history" -name 'usage-*.json' | wc -l)" = 2 ] || fail "forced-interleave: expected 2 archives"
+pass "forced publication interleaving keeps latest.json/latest.md a coherent pair"
 
 echo "ok - fm-usage-report.test.sh"

@@ -424,15 +424,27 @@ done
 mv -f "$TMP_JSON" "$OUT/history/$BASE.json"
 mv -f "$TMP_MD" "$OUT/history/$BASE.md"
 
-# --- publish latest.{json,md} atomically from this run's archive -------------
-# Copy the finalized archive to a same-dir temp, then rename over latest. Each
-# publish is one complete file swapped in by an atomic rename, so a concurrent
-# reader (or writer) never sees a torn latest; whichever run publishes last wins,
-# which is the correct "most recent" meaning of latest.
+# --- publish latest.{json,md} as one serialized pair -------------------------
+# Each file rename is atomic on its own, but the PAIR is not: two concurrent
+# writers renaming latest.json then latest.md in separate steps can interleave
+# (A-json, B-json, B-md, A-md), leaving latest.json from one run beside
+# latest.md from another - a machine report and human report that disagree.
+# Hold ONE output-scoped exclusive lock across BOTH final renames so the pair is
+# published as a unit; whichever writer wins the lock last publishes both of its
+# own files. A reader that needs a coherent pair should take the same lock. The
+# archive copies happen BEFORE the lock, so only the two renames are serialized.
 PUB_JSON="$(mktemp "$OUT/.usage-latest.XXXXXX")"; CLEANUP_FILES+=("$PUB_JSON")
 PUB_MD="$(mktemp "$OUT/.usage-latest.XXXXXX")"; CLEANUP_FILES+=("$PUB_MD")
-cp "$OUT/history/$BASE.json" "$PUB_JSON"; mv -f "$PUB_JSON" "$OUT/latest.json"
-cp "$OUT/history/$BASE.md" "$PUB_MD"; mv -f "$PUB_MD" "$OUT/latest.md"
+cp "$OUT/history/$BASE.json" "$PUB_JSON"
+cp "$OUT/history/$BASE.md" "$PUB_MD"
+if ! (
+  flock -x 9 || exit 1
+  mv -f "$PUB_JSON" "$OUT/latest.json"
+  mv -f "$PUB_MD" "$OUT/latest.md"
+) 9> "$OUT/.latest.lock"; then
+  echo "fm-usage-report: could not publish latest report pair to $OUT" >&2
+  exit 2
+fi
 
 # --- append one robust JSONL index line --------------------------------------
 # -cn: one COMPACT object per physical line, so index.jsonl is valid JSON Lines
