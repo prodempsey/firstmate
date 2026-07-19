@@ -18,6 +18,9 @@
 #   - same-second archive runs do not overwrite each other (QA finding 3)
 #   - CONCURRENT same-second runs each yield one correct immutable snapshot,
 #     with agreeing json/md pairs and fingerprints that recompute (QA r2 f1)
+#   - forced publication interleaving keeps the latest pair coherent (QA r3 f1)
+#   - publication failures (lock open, first rename) fail loud and nonzero,
+#     never a masked success with a half-published pair (QA r4 f1)
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -417,5 +420,68 @@ done < <(jq -r '.panels.model_mix.by_harness_model_effort[].model' "$PLJ")
 # And both immutable archives must still be intact and correct.
 [ "$(find "$POUT/history" -name 'usage-*.json' | wc -l)" = 2 ] || fail "forced-interleave: expected 2 archives"
 pass "forced publication interleaving keeps latest.json/latest.md a coherent pair"
+
+# --- 16. publication failures fail loud and nonzero (QA round 4, finding 1) ---
+# The round-4 publish ran the renames inside `if ! ( ... ) 9>lock`, where set -e
+# is suppressed and a failed compound-redirect fd-open is skipped, so a lock that
+# could not be opened AND a failed first rename both returned exit 0 with a
+# success summary and an index entry - a masked half-published pair. These two
+# probes force each failure and assert: nonzero exit, a diagnostic on stderr, no
+# success summary on stdout, no index line, and no published latest.json.
+fail_meta() {  # <home>
+  mkdir -p "$1/state"
+  fm_write_meta "$1/state/t.meta" \
+    project=/home/prode/fleet/firstmate harness=claude kind=ship \
+    model=fail-probe effort=high spawned_at=2026-07-15T10:00:00Z
+}
+
+# 16a. Lock descriptor cannot be opened (the lock path is a directory).
+FLH=$TMP_ROOT/fail-lockopen
+fail_meta "$FLH"
+FLO=$FLH/out
+mkdir -p "$FLO/history"
+mkdir -p "$FLO/.latest.lock"   # a directory where the lock file must be opened
+FLO_OUT=$FLH/stdout; FLO_ERR=$FLH/stderr
+FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" --target "$FLH" --out "$FLO" \
+  --since 2026-07-01 --until 2026-07-18 >"$FLO_OUT" 2>"$FLO_ERR"
+flo_rc=$?
+[ "$flo_rc" -ne 0 ] || fail "lock-open failure must exit nonzero, got $flo_rc"
+grep -q "cannot open publication lock" "$FLO_ERR" || fail "lock-open failure must print a diagnostic to stderr"
+assert_absent "$FLO/latest.json" "lock-open failure must not publish latest.json"
+assert_no_grep "usage report:" "$FLO_OUT" "lock-open failure must not print a success summary"
+[ ! -f "$FLO/index.jsonl" ] || [ "$(wc -l < "$FLO/index.jsonl")" = 0 ] || fail "lock-open failure must not append an index line"
+pass "unopenable publication lock fails loud and nonzero, no false success"
+
+# 16b. The first final rename (latest.json) fails.
+FRH=$TMP_ROOT/fail-rename
+fail_meta "$FRH"
+FRO=$FRH/out
+mkdir -p "$FRO/history"
+FRB=$(fm_fakebin "$FRH")
+FR_REAL_MV="$(command -v mv)"
+# mv shim: fail only the latest.json publish rename; pass everything else through
+# (archive renames and the latest.md rename) so the failure is isolated to the
+# first of the two final renames.
+cat > "$FRB/mv" <<'SH'
+#!/usr/bin/env bash
+real="${REAL_MV:-/bin/mv}"
+case "${*: -1}" in
+  */latest.json) echo "injected latest.json rename failure" >&2; exit 74 ;;
+esac
+exec "$real" "$@"
+SH
+chmod +x "$FRB/mv"
+FRO_OUT=$FRH/stdout; FRO_ERR=$FRH/stderr
+PATH="$FRB:$PATH" REAL_MV="$FR_REAL_MV" FM_USAGE_NOW=2026-07-18T00:00:00Z \
+  "$USAGE" --target "$FRH" --out "$FRO" --since 2026-07-01 --until 2026-07-18 \
+  >"$FRO_OUT" 2>"$FRO_ERR"
+fr_rc=$?
+[ "$fr_rc" -ne 0 ] || fail "first-rename failure must exit nonzero, got $fr_rc"
+grep -q "failed to publish latest.json" "$FRO_ERR" || fail "first-rename failure must print a diagnostic to stderr"
+assert_absent "$FRO/latest.json" "first-rename failure must not leave a published latest.json"
+assert_absent "$FRO/latest.md" "first-rename failure must not publish latest.md after the json rename failed"
+assert_no_grep "usage report:" "$FRO_OUT" "first-rename failure must not print a success summary"
+[ ! -f "$FRO/index.jsonl" ] || [ "$(wc -l < "$FRO/index.jsonl")" = 0 ] || fail "first-rename failure must not append an index line"
+pass "a failed first rename fails loud and nonzero, no half-published pair"
 
 echo "ok - fm-usage-report.test.sh"

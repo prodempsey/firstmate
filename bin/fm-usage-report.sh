@@ -263,9 +263,11 @@ fi
 # every run's snapshot its own. The temps live UNDER $OUT (mktemp there) so the
 # later rename into $OUT/history and onto latest is same-filesystem and atomic;
 # a temp in $TMPDIR could be a cross-device move (copy+unlink, not atomic).
-mkdir -p "$OUT/history"
-TMP_JSON="$(mktemp "$OUT/.usage-report.XXXXXX")"; CLEANUP_FILES+=("$TMP_JSON")
-TMP_MD="$(mktemp "$OUT/.usage-report.XXXXXX")"; CLEANUP_FILES+=("$TMP_MD")
+mkdir -p "$OUT/history" || { echo "fm-usage-report: cannot create output dir $OUT/history" >&2; exit 2; }
+TMP_JSON="$(mktemp "$OUT/.usage-report.XXXXXX")" || { echo "fm-usage-report: cannot create a temp file in $OUT" >&2; exit 2; }
+CLEANUP_FILES+=("$TMP_JSON")
+TMP_MD="$(mktemp "$OUT/.usage-report.XXXXXX")" || { echo "fm-usage-report: cannot create a temp file in $OUT" >&2; exit 2; }
+CLEANUP_FILES+=("$TMP_MD")
 
 jq -n \
   --slurpfile recs "$REC_FILE" \
@@ -332,7 +334,7 @@ jq -n \
         note: "Counterfactual savings land in slice M5; not part of this slice."
       }
     }
-  }' > "$TMP_JSON"
+  }' > "$TMP_JSON" || { echo "fm-usage-report: failed to build machine report" >&2; exit 2; }
 
 # --- render human report into the run-private temp ---------------------------
 jq -r '
@@ -387,7 +389,7 @@ jq -r '
   "## Panel D - Counterfactual savings (\(.panels.counterfactual.status), confidence: \(.panels.counterfactual.confidence))",
   "",
   .panels.counterfactual.note
-' "$TMP_JSON" > "$TMP_MD"
+' "$TMP_JSON" > "$TMP_MD" || { echo "fm-usage-report: failed to render human report" >&2; exit 2; }
 
 # --- fingerprint this run's own private JSON ---------------------------------
 # Computed from THIS run's finalized content (which is byte-identical to what
@@ -420,11 +422,12 @@ while [ "$i" -lt 100000 ]; do
 done
 [ -n "$BASE" ] || { echo "fm-usage-report: could not allocate a unique archive name in $OUT/history" >&2; exit 2; }
 # mv (rename) is atomic and replaces the empty reserved .json; the .md shares the
-# exclusively-claimed BASE, so it needs no separate reservation.
-mv -f "$TMP_JSON" "$OUT/history/$BASE.json"
-mv -f "$TMP_MD" "$OUT/history/$BASE.md"
+# exclusively-claimed BASE, so it needs no separate reservation. A failed archive
+# rename is fatal - it would leave the claimed slot empty or half-written.
+mv -f "$TMP_JSON" "$OUT/history/$BASE.json" || { echo "fm-usage-report: failed to write archive $OUT/history/$BASE.json" >&2; exit 2; }
+mv -f "$TMP_MD" "$OUT/history/$BASE.md" || { echo "fm-usage-report: failed to write archive $OUT/history/$BASE.md" >&2; exit 2; }
 
-# --- publish latest.{json,md} as one serialized pair -------------------------
+# --- publish latest.{json,md} as one serialized, fully-checked pair -----------
 # Each file rename is atomic on its own, but the PAIR is not: two concurrent
 # writers renaming latest.json then latest.md in separate steps can interleave
 # (A-json, B-json, B-md, A-md), leaving latest.json from one run beside
@@ -433,29 +436,54 @@ mv -f "$TMP_MD" "$OUT/history/$BASE.md"
 # published as a unit; whichever writer wins the lock last publishes both of its
 # own files. A reader that needs a coherent pair should take the same lock. The
 # archive copies happen BEFORE the lock, so only the two renames are serialized.
-PUB_JSON="$(mktemp "$OUT/.usage-latest.XXXXXX")"; CLEANUP_FILES+=("$PUB_JSON")
-PUB_MD="$(mktemp "$OUT/.usage-latest.XXXXXX")"; CLEANUP_FILES+=("$PUB_MD")
-cp "$OUT/history/$BASE.json" "$PUB_JSON"
-cp "$OUT/history/$BASE.md" "$PUB_MD"
-if ! (
-  flock -x 9 || exit 1
-  mv -f "$PUB_JSON" "$OUT/latest.json"
-  mv -f "$PUB_MD" "$OUT/latest.md"
-) 9> "$OUT/.latest.lock"; then
-  echo "fm-usage-report: could not publish latest report pair to $OUT" >&2
+#
+# EVERY step here is checked and fails loud and nonzero BEFORE the index append
+# or success summary. The round-4 form ran the renames inside `if ! ( ... ) 9>lock`,
+# where set -e is suppressed (condition context) so a failed FIRST rename was
+# masked when the second succeeded, and a failed fd-open on the compound redirect
+# was silently skipped - both returned 0 with a half-published or unpublished
+# pair. The separate checked steps below (fd open, lock acquire, each rename)
+# close both false-success paths. Closing fd 9 releases the flock.
+LOCK="$OUT/.latest.lock"
+PUB_JSON="$(mktemp "$OUT/.usage-latest.XXXXXX")" || { echo "fm-usage-report: cannot create a temp file in $OUT" >&2; exit 2; }
+CLEANUP_FILES+=("$PUB_JSON")
+PUB_MD="$(mktemp "$OUT/.usage-latest.XXXXXX")" || { echo "fm-usage-report: cannot create a temp file in $OUT" >&2; exit 2; }
+CLEANUP_FILES+=("$PUB_MD")
+cp "$OUT/history/$BASE.json" "$PUB_JSON" || { echo "fm-usage-report: failed to stage latest.json in $OUT" >&2; exit 2; }
+cp "$OUT/history/$BASE.md" "$PUB_MD" || { echo "fm-usage-report: failed to stage latest.md in $OUT" >&2; exit 2; }
+if ! exec 9>"$LOCK"; then
+  echo "fm-usage-report: cannot open publication lock $LOCK" >&2
   exit 2
 fi
+if ! flock -x 9; then
+  echo "fm-usage-report: cannot acquire publication lock $LOCK" >&2
+  exec 9>&-
+  exit 2
+fi
+if ! mv -f "$PUB_JSON" "$OUT/latest.json"; then
+  echo "fm-usage-report: failed to publish latest.json to $OUT" >&2
+  exec 9>&-
+  exit 2
+fi
+if ! mv -f "$PUB_MD" "$OUT/latest.md"; then
+  echo "fm-usage-report: failed to publish latest.md to $OUT (latest.json already updated; pair is inconsistent)" >&2
+  exec 9>&-
+  exit 2
+fi
+exec 9>&-
 
 # --- append one robust JSONL index line --------------------------------------
-# -cn: one COMPACT object per physical line, so index.jsonl is valid JSON Lines
-# (section 3.2). Build the whole line first, then append it with a single
-# printf: one bounded (<PIPE_BUF) write to an O_APPEND fd is atomic, so parallel
-# runs never interleave partial lines. `path` names this run's own archive.
+# Only reached after the pair published successfully. -cn: one COMPACT object per
+# physical line, so index.jsonl is valid JSON Lines (section 3.2). Build the whole
+# line first, then append it with a single printf: one bounded (<PIPE_BUF) write
+# to an O_APPEND fd is atomic, so parallel runs never interleave partial lines.
+# `path` names this run's own archive.
 INDEX_LINE="$(jq -cn \
   --arg ts "$NOW_ISO" --arg since "$SINCE_ISO" --arg until "$UNTIL_ISO" \
   --arg path "history/$BASE.json" --arg fingerprint "$FINGERPRINT" \
-  '{ts: $ts, since: $since, until: $until, path: $path, fingerprint: $fingerprint}')"
-printf '%s\n' "$INDEX_LINE" >> "$OUT/index.jsonl"
+  '{ts: $ts, since: $since, until: $until, path: $path, fingerprint: $fingerprint}')" \
+  || { echo "fm-usage-report: failed to build index line" >&2; exit 2; }
+printf '%s\n' "$INDEX_LINE" >> "$OUT/index.jsonl" || { echo "fm-usage-report: failed to append index line to $OUT/index.jsonl" >&2; exit 2; }
 
 # --- caller-facing summary (from THIS run's archive, not the shared latest) ---
 ARCHIVE_JSON="$OUT/history/$BASE.json"
