@@ -49,7 +49,14 @@
 #   fm-usage-report.sh [--target DIR] [--since DATE] [--until DATE]
 #                      [--out DIR] [--json] [-h|--help]
 # Exit: 0 on a written report; 2 on a usage/argument error; 3 if jq is missing.
-set -eu
+#
+# pipefail is ON so a pipeline fails if ANY stage fails, not just the last. Under
+# a bare `set -eu` a broken producer is masked by a succeeding consumer: e.g.
+# `sha256sum | cut` returns cut's status, so a failed hash yields an empty result
+# and exit 0. The only pipelines that may legitimately fail a stage are the
+# ledger row parses, which wrap the whole pipeline in `|| true` to skip a
+# malformed row; pipefail does not change that (the `|| true` still absorbs it).
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
@@ -394,16 +401,21 @@ jq -r '
 # --- fingerprint this run's own private JSON ---------------------------------
 # Computed from THIS run's finalized content (which is byte-identical to what
 # gets renamed into the archive), so the fingerprint always matches its archive.
-# Canonicalize in a checked step first: piping jq straight into sha256sum would,
-# without pipefail, mask a jq failure and record sha256("") - the empty-input
-# digest the concurrent probe caught. The canonical form is bounded (mix only).
+# Canonicalize in a checked step first, so a jq failure is reported on its own.
+# The canonical form is bounded (mix only).
 CANON="$(jq -S '{window, totals, model_mix: .panels.model_mix}' "$TMP_JSON")" \
   || { echo "fm-usage-report: failed to canonicalize report for fingerprint" >&2; exit 2; }
 # printf '%s\n' restores the single trailing newline that $() stripped from jq's
 # output, so this digest is byte-identical to a plain
 #   jq -S '{window,totals,model_mix:.panels.model_mix}' <archive> | sha256sum
 # recompute from the archive - the natural way to re-verify it.
-FINGERPRINT="$(printf '%s\n' "$CANON" | sha256sum | cut -d' ' -f1)"
+# pipefail makes a sha256sum failure fail the whole pipeline (cut no longer masks
+# it into an empty result and exit 0); the explicit guard turns that into a
+# named diagnostic, and the non-empty assertion is a final backstop so an empty
+# fingerprint can never reach the archive index or a success summary.
+FINGERPRINT="$(printf '%s\n' "$CANON" | sha256sum | cut -d' ' -f1)" \
+  || { echo "fm-usage-report: failed to compute report fingerprint" >&2; exit 2; }
+[ -n "$FINGERPRINT" ] || { echo "fm-usage-report: computed an empty report fingerprint" >&2; exit 2; }
 
 # --- claim a unique immutable archive slot, then rename the private pair in ---
 # The archive is an IMMUTABLE per-run snapshot. The stamp has only second

@@ -21,6 +21,8 @@
 #   - forced publication interleaving keeps the latest pair coherent (QA r3 f1)
 #   - publication failures (lock open, first rename) fail loud and nonzero,
 #     never a masked success with a half-published pair (QA r4 f1)
+#   - a sha256sum failure in the fingerprint pipeline fails loud and nonzero
+#     instead of publishing with an empty fingerprint (QA r5 f1)
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -483,5 +485,42 @@ assert_absent "$FRO/latest.md" "first-rename failure must not publish latest.md 
 assert_no_grep "usage report:" "$FRO_OUT" "first-rename failure must not print a success summary"
 [ ! -f "$FRO/index.jsonl" ] || [ "$(wc -l < "$FRO/index.jsonl")" = 0 ] || fail "first-rename failure must not append an index line"
 pass "a failed first rename fails loud and nonzero, no half-published pair"
+
+# --- 17. a failed fingerprint hash fails loud, not empty (QA round 5, f1) -----
+# The fingerprint was computed as `printf ... | sha256sum | cut`. Under a bare
+# set -eu (no pipefail) a sha256sum failure was masked by cut's success, so the
+# assignment took cut's exit 0 and FINGERPRINT became empty; the run then
+# published and indexed the report with an empty fingerprint and printed success.
+# With pipefail plus the explicit guard, a hash failure must abort before the
+# archive rename, the index append, or the success summary.
+FHH=$TMP_ROOT/fail-hash
+mkdir -p "$FHH/state"
+fm_write_meta "$FHH/state/t.meta" \
+  project=/home/prode/fleet/firstmate harness=claude kind=ship \
+  model=hash-probe effort=high spawned_at=2026-07-15T10:00:00Z
+FHO=$FHH/out
+mkdir -p "$FHO/history"
+FHB=$(fm_fakebin "$FHH")
+cat > "$FHB/sha256sum" <<'SH'
+#!/usr/bin/env bash
+echo "injected sha256sum failure" >&2
+exit 76
+SH
+chmod +x "$FHB/sha256sum"
+FHO_OUT=$FHH/stdout; FHO_ERR=$FHH/stderr
+PATH="$FHB:$PATH" FM_USAGE_NOW=2026-07-18T00:00:00Z \
+  "$USAGE" --target "$FHH" --out "$FHO" --since 2026-07-01 --until 2026-07-18 \
+  >"$FHO_OUT" 2>"$FHO_ERR"
+fh_rc=$?
+[ "$fh_rc" -ne 0 ] || fail "sha256sum failure must exit nonzero, got $fh_rc"
+grep -q "failed to compute report fingerprint" "$FHO_ERR" || fail "sha256sum failure must print a diagnostic to stderr"
+assert_no_grep "usage report:" "$FHO_OUT" "sha256sum failure must not print a success summary"
+assert_absent "$FHO/latest.json" "sha256sum failure must not publish latest.json"
+[ ! -f "$FHO/index.jsonl" ] || [ "$(wc -l < "$FHO/index.jsonl")" = 0 ] || fail "sha256sum failure must not append an index line"
+# And no index entry may ever carry an empty fingerprint.
+if [ -f "$FHO/index.jsonl" ]; then
+  ! grep -q '"fingerprint":""' "$FHO/index.jsonl" || fail "an empty fingerprint must never reach the index"
+fi
+pass "a failed fingerprint hash fails loud and nonzero, never an empty fingerprint"
 
 echo "ok - fm-usage-report.test.sh"
