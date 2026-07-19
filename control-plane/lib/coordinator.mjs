@@ -1,5 +1,6 @@
 import { PgliteLocalStore } from './pglite-local-store.mjs';
 import { ValidationError } from './errors.mjs';
+import { runS1Verb, S1_VERBS } from './coordinator-s1.mjs';
 
 // Coordinator entrypoint skeleton (spec section 6). S0 implements exactly one
 // verb, `init`. Every other verb in the spec's command surface (create-task,
@@ -17,6 +18,9 @@ export async function runVerb(argv, { env = process.env } = {}) {
     return { ok: true, result: { help: helpText() }, human: helpText() };
   }
   if (!S0_VERBS.has(verb)) {
+    // S1 verb registration: later slices own their verbs and ship in the slice
+    // that owns them (this file's header). S1's dispatcher lives in its own module.
+    if (S1_VERBS.has(verb)) return runS1Verb(verb, rest, { env });
     throw new ValidationError(
       `unknown or not-yet-implemented verb: ${verb}`,
       { s0Verbs: [...S0_VERBS] }
