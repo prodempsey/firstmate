@@ -216,46 +216,55 @@ land_on_origin_main() {
   rm -rf "$tmp"
 }
 
-# Override GitHub lookups to report PR 7 as merged with the supplied head.
-# The teardown safety chain's merged check queries `pr view --json state,headRefOid`
-# and MUST route it through gh-axi (bughunt-fm-h2 finding 5). So the bare `gh` mock
-# here refuses exactly that query while still serving fm-pr-check.sh's own single-
-# field reads (`--json headRefOid`, `--json state`), which legitimately still use
-# bare gh and are out of finding 5's scope. A teardown that regressed to bare gh for
-# the merged check would hit the refusal, lose the merged signal, and fail these
-# tests - so they double as the finding-5 gh->gh-axi routing regression.
+# Report PR 7 as merged with the supplied head, modelling the REAL gh-axi contract
+# (bughunt-fm-h2 finding 5). gh-axi's `pr view` takes only a number and emits a
+# YAML-ish block (no --json/-q) and exposes NO head OID, so:
+#   - fake gh-axi `pr view` prints the structured `state:`/`merged:` block and
+#     REJECTS the bare-gh --json/-q flags, so a regression that passes them is caught
+#     here instead of masked;
+#   - the PR head OID comes from git's refs/pull/<n>/head, so we publish that ref
+#     into the bare origin exactly as GitHub keeps it after a squash+delete;
+#   - bare `gh` is not used by the teardown chain at all now, so its mock serves only
+#     fm-pr-check.sh's own single-field reads (out of finding 5's scope) and fails
+#     loudly on anything else, catching any regression back to bare gh in teardown.
 add_gh_pr_merged_for_head() {
   local case_dir=$1 head=$2
-  cat > "$case_dir/fakebin/gh-axi" <<SH
+  cat > "$case_dir/fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
-case "\${1:-} \${2:-}" in
+case "${1:-} ${2:-}" in
   "pr list")
-    printf '%s\n' "count: 1 (showing first 1)" "pull_requests[1]{number,state}:" "  7,merged" ; exit 0 ;;
+    printf '%s\n' "count: 1" "pull_requests[1]{number,title,state}:" "  7,merged pr,merged" ; exit 0 ;;
   "pr view")
-    case " \$* " in
-      *"state,headRefOid"*) printf '%s\t%s\n' 'MERGED' '$head' ; exit 0 ;;
-      *"headRefOid"*) printf '%s\n' '$head' ; exit 0 ;;
-      *"state"*) printf '%s\n' 'MERGED' ; exit 0 ;;
-    esac
-    printf '%s\n' "pull_request:" "  number: 7" "  state: merged" '  merged: "2026-06-26T00:00:00Z"' ; exit 0 ;;
+    for a in "$@"; do
+      case "$a" in
+        --json|-q|--jq) echo "error: unknown flag '$a' for gh-axi pr view" >&2 ; exit 2 ;;
+      esac
+    done
+    printf '%s\n' "pull_request:" "  number: 7" "  state: merged" "  merged: yes" ; exit 0 ;;
 esac
 exit 0
 SH
   cat > "$case_dir/fakebin/gh" <<SH
 #!/usr/bin/env bash
+# Only fm-pr-check.sh's own single-field reads (out of finding 5's scope) may use
+# bare gh; the teardown safety chain must not. Anything else fails loudly.
 case "\${1:-} \${2:-}" in
   "pr view")
     case " \$* " in
-      *"state,headRefOid"*) echo "error: teardown merged check must use gh-axi, not bare gh" >&2 ; exit 1 ;;
       *"headRefOid"*) printf '%s\n' '$head' ; exit 0 ;;
       *"state"*) printf '%s\n' 'MERGED' ; exit 0 ;;
     esac
     ;;
 esac
-echo "error: pull request not found" >&2
-exit 1
+echo "error: teardown must not call bare gh (bughunt-fm-h2 finding 5)" >&2
+exit 3
 SH
   chmod +x "$case_dir/fakebin/gh-axi" "$case_dir/fakebin/gh"
+  # Publish the PR head into the bare origin so `git ls-remote origin
+  # refs/pull/7/head` resolves it, exactly like GitHub's kept PR head ref (survives
+  # the squash+delete these tests simulate). The head commit lives in the worktree's
+  # object DB; pushing it by raw SHA uploads the object and creates the ref.
+  git -C "$case_dir/wt" push -q origin "$head:refs/pull/7/head" 2>/dev/null || true
 }
 
 append_pr_meta_for_current_head() {

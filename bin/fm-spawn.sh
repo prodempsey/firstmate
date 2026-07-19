@@ -1092,16 +1092,25 @@ EOF
       ;;
     opencode*)
       mkdir -p "$WT/.opencode/plugins"
-      # The opencode plugin runs `touch <path>` through Bun's `$` shell, so the
-      # path must be shell-escaped in the emitted source - an unquoted $TURNEND
-      # broke turn-end whenever STATE_REAL held a space or shell metacharacter
-      # (claude's equivalent hook already single-quotes its path). shell_quote
-      # produces a POSIX single-quoted literal Bun's shell parses correctly.
-      sq_opencode_turnend=$(shell_quote "$TURNEND")
+      # Touch TURNEND through the filesystem API, NOT a shell template. The former
+      # `await $\`touch <shell-quoted-path>\`` stacked two escaping layers: even a
+      # shell-safe path still had to survive the JavaScript backtick template it was
+      # injected into, so a path with a backtick broke the JS source and ${...} or a
+      # backslash was reinterpreted by the template before Bun's shell ever ran.
+      # Emit the path as a JS STRING literal (json_escape covers the backslash and
+      # double-quote a double-quoted JS string needs; a backtick, ${...}, single
+      # quote, or space is inert inside a double-quoted string) and open+utimes it -
+      # a create-if-missing, bump-mtime `touch` equivalent with no shell at all.
+      js_opencode_turnend=$(json_escape "$TURNEND")
       cat > "$WT/.opencode/plugins/fm-turn-end.js" <<EOF
-export const FmTurnEnd = async ({ \$ }) => ({
+import { open, utimes } from "node:fs/promises"
+export const FmTurnEnd = async () => ({
   event: async ({ event }) => {
-    if (event.type === "session.idle") await \$\`touch $sq_opencode_turnend\`
+    if (event.type !== "session.idle") return
+    const p = "$js_opencode_turnend"
+    await (await open(p, "a")).close()
+    const t = new Date()
+    await utimes(p, t, t)
   },
 })
 EOF

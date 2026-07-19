@@ -1441,7 +1441,12 @@ exit 42
 SH
   chmod +x "$fb/tmux"
 
-  out=$( PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_STATE_OVERRIDE="$state" \
+  # FM_HOME is now required by fm-peek for EVERY target form (bughunt-fm-h2 finding
+  # 6): a colon target is not backend-qualified, so peek must resolve its backend
+  # from THIS home's metadata, never bypass the home check and default to tmux. This
+  # is the non-tmux adversarial proof: the fake tmux exits 42 if peek wrongly routes
+  # a herdr-recorded colon target through tmux.
+  out=$( PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_HOME="$neutral" FM_STATE_OVERRIDE="$state" \
     FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
     "$ROOT/bin/fm-peek.sh" default:w1:p2 5 2>/dev/null )
   [ "$out" = "captured herdr pane" ] || fail "fm-peek did not capture through herdr for an explicit metadata-matched target, got '$out'"

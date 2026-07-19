@@ -384,34 +384,62 @@ test_opencode_threads_model_and_ignores_effort_axis() {
   pass "opencode receives --model and omits the unsupported effort axis"
 }
 
-# bughunt-fm-h2 finding 8: the opencode turn-end plugin runs `touch <path>` through
-# Bun's `$` shell, so the TURNEND path must be shell-quoted in the emitted source.
-# An unquoted path with a space (or shell metacharacter) in the state dir would split
-# into multiple arguments and turn-end would never fire. Force a spaced state path and
-# assert the generated hook single-quotes it (matching the claude template).
-test_opencode_turn_end_hook_shell_quotes_turnend_path() {
-  local rec id spaced_state state_real expected hook
-  id=profile-opencode-quote-q9
-  rec=$(make_spawn_case profile-opencode-quote opencode "$id")
+# bughunt-fm-h2 finding 8: the opencode turn-end plugin must be safe at BOTH the
+# JavaScript source layer and the (now absent) shell layer. The old approach
+# injected a shell-quoted path into a JS backtick template, so a path with a
+# backtick broke the JS source and a ${...} or backslash was reinterpreted by the
+# template before any shell ran. The fix emits the path as a JS STRING literal and
+# touches it through the filesystem API (no shell). This exercises the full
+# metacharacter matrix - space, single quote, backtick, ${...}, backslash - and
+# requires the emitted plugin to be valid JavaScript for every one, with the path
+# faithfully recoverable.
+test_opencode_turn_end_hook_is_js_and_shell_safe() {
+  local rec idx mchar sd id state_real turnend esc hook decoded
+  rec=$(make_spawn_case profile-opencode-meta opencode)
   read_case_record "$rec"
 
-  spaced_state="$CASE_DIR/state with space"
-  mkdir -p "$spaced_state"
-  : > "$LAUNCH_LOG"
-  FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
-    FM_STATE_OVERRIDE="$spaced_state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
-    FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
-    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$WT_DIR" TMUX="fake,1,0" \
-    FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" GROK_HOME="$HOME_DIR/grok-home" PATH="$FAKEBIN_DIR:$PATH" \
-    "$SPAWN" "$id" "$PROJ_DIR" >/dev/null 2>&1
+  idx=0
+  # Each metacharacter is a LITERAL filename part, not a shell expansion.
+  # shellcheck disable=SC2016
+  for mchar in 'state with space' "state'quote" 'state`tick`' 'state${x}y' 'state\back'; do
+    idx=$((idx + 1))
+    id="oc-meta-$idx"
+    mkdir -p "$HOME_DIR/data/$id"; printf 'brief\n' > "$HOME_DIR/data/$id/brief.md"
+    sd="$CASE_DIR/$mchar"
+    mkdir -p "$sd"
+    : > "$LAUNCH_LOG"
+    FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
+      FM_STATE_OVERRIDE="$sd" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+      FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
+      FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$WT_DIR" TMUX="fake,1,0" \
+      FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" GROK_HOME="$HOME_DIR/grok-home" PATH="$FAKEBIN_DIR:$PATH" \
+      "$SPAWN" "$id" "$PROJ_DIR" >/dev/null 2>&1
 
-  state_real=$(cd "$spaced_state" && pwd -P)
-  expected="touch '$state_real/$id.turn-ended'"
-  hook="$WT_DIR/.opencode/plugins/fm-turn-end.js"
-  [ -f "$hook" ] || fail "opencode spawn did not write the turn-end plugin at $hook"
-  assert_contains "$(cat "$hook")" "$expected" \
-    "opencode turn-end hook must shell-quote the (spaced) TURNEND path so Bun's shell keeps it one argument"
-  pass "opencode turn-end hook shell-quotes the TURNEND path (finding 8)"
+    hook="$WT_DIR/.opencode/plugins/fm-turn-end.js"
+    [ -f "$hook" ] || fail "opencode spawn did not write the turn-end plugin for path '$mchar'"
+    # The shell-in-a-JS-template stack is gone entirely.
+    ! grep -q 'await \$`' "$hook" \
+      || fail "opencode hook still shells out via a template literal for '$mchar'"
+    # The path is a double-quoted JS string literal that decodes back to TURNEND.
+    state_real=$(cd "$sd" && pwd -P)
+    turnend="$state_real/$id.turn-ended"
+    esc=$(printf '%s' "$turnend" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    assert_contains "$(cat "$hook")" "const p = \"$esc\"" \
+      "opencode hook must embed the JS-escaped path literal for '$mchar'"
+    # Valid JavaScript module for every metacharacter (the backtick case is exactly
+    # what broke the old shell-quoted-in-a-JS-template approach), and the embedded
+    # literal decodes to the exact TURNEND path.
+    if command -v node >/dev/null 2>&1; then
+      cp "$hook" "$CASE_DIR/check-$idx.mjs"
+      node --check "$CASE_DIR/check-$idx.mjs" 2>"$CASE_DIR/check-$idx.err" \
+        || fail "opencode hook is not valid JS for path '$mchar': $(cat "$CASE_DIR/check-$idx.err")"
+      decoded=$(node -e 'const fs=require("node:fs");const s=fs.readFileSync(process.argv[1],"utf8");const m=s.match(/const p = ("(?:[^"\\]|\\.)*")/);if(!m){process.exit(3)}process.stdout.write(JSON.parse(m[1]))' "$hook" 2>/dev/null) \
+        || fail "could not extract the path literal from the opencode hook for '$mchar'"
+      [ "$decoded" = "$turnend" ] \
+        || fail "opencode hook path literal for '$mchar' decoded to '$decoded', expected '$turnend'"
+    fi
+  done
+  pass "opencode turn-end hook is valid JS and path-safe for spaces, quotes, backticks, \${...}, and backslashes (finding 8)"
 }
 
 test_pi_omits_invalid_max_effort() {
@@ -481,7 +509,7 @@ test_codex_secondmate_launch_omits_codex_home
 test_grok_threads_model_and_reasoning_effort
 test_grok_omits_invalid_max_reasoning_effort
 test_opencode_threads_model_and_ignores_effort_axis
-test_opencode_turn_end_hook_shell_quotes_turnend_path
+test_opencode_turn_end_hook_is_js_and_shell_safe
 test_pi_omits_invalid_max_effort
 test_batch_forwards_shared_profile_flags
 test_active_dispatch_profile_does_not_block_secondmate_launch

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # fm-peek fail-closed home contract (bughunt-fm-h2 finding 6).
 #
-# fm-peek resolves a bare task-id / legacy fm-<id> selector against THIS home's
-# state/<id>.meta, exactly like fm-send. Without an explicit FM_HOME it used to
-# fall back to the script's own repo root and resolve the selector against the
-# WRONG home's state (or the legacy tmux inventory), reading the wrong endpoint,
-# while fm-send refused. These tests pin the mirrored contract: a home-scoped
-# selector requires a non-empty, existing FM_HOME with a state dir, and a fully-
-# qualified explicit backend target (contains ':') stays the escape hatch that
-# needs no home resolution.
+# fm-peek resolves EVERY target form against THIS home's state, exactly like
+# fm-send. Without an explicit FM_HOME it used to fall back to the script's own
+# repo root and resolve the selector against the WRONG home's state, reading the
+# wrong endpoint. A colon target (`session:window`) is NOT backend-qualified - it
+# only names a window - so it must still resolve its backend from this home's
+# metadata and must not bypass the home check (the QA-flagged hole: a no-home colon
+# target defaulted to tmux and could read a non-tmux provider's endpoint). These
+# tests pin the mirrored contract: FM_HOME with an existing state dir is required
+# for ALL forms, colon targets included.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -20,11 +21,14 @@ TMP_ROOT=$(fm_test_tmproot fm-peek-strict)
 make_stubs() {  # <dir> -> echoes fakebin dir
   local dir=$1 fb="$1/fakebin"
   mkdir -p "$fb"
+  # The tmux stub records that it was reached (FM_FAKE_TMUX_MARK), so a test can
+  # prove peek refused BEFORE routing anything through the (possibly wrong) backend.
   cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
 case "${1:-}" in
   capture-pane)
+    [ -n "${FM_FAKE_TMUX_MARK:-}" ] && : > "$FM_FAKE_TMUX_MARK"
     printf 'PANE CONTENT for %s\n' "${FM_FAKE_PEEK_TAG:-x}"
     exit 0 ;;
 esac
@@ -95,21 +99,44 @@ test_task_id_with_home_resolves() {
   pass "fm-peek strict: a task-id resolves through home metadata and captures"
 }
 
-# --- explicit backend target is the escape hatch: no FM_HOME needed -----------
-test_explicit_target_needs_no_fm_home() {
-  local dir fb err rc out
-  dir="$TMP_ROOT/explicit"; mkdir -p "$dir"
-  fb=$(make_stubs "$dir"); err="$dir/peek.err"
+# --- QA repro: a colon target with no FM_HOME must fail closed, not guess a backend
+# Reproduces the QA finding exactly: no FM_HOME, no state dir, and a herdr-SHAPED
+# colon target (`default:w1:p2`). The old escape hatch let this through and defaulted
+# to tmux, reading the wrong provider. It must now refuse BEFORE touching any
+# backend - the tmux stub must never be reached.
+test_explicit_colon_target_still_requires_fm_home() {
+  local dir fb err rc mark
+  dir="$TMP_ROOT/colon-nohome"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); err="$dir/peek.err"; mark="$dir/tmux-was-called"
 
-  out=$( env -u FM_HOME PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$dir" FM_FAKE_PEEK_TAG=direct \
+  env -u FM_HOME PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$dir" FM_FAKE_TMUX_MARK="$mark" \
+    "$PEEK" default:w1:p2 >/dev/null 2>"$err"; rc=$?
+  [ "$rc" -ne 0 ] || fail "a colon target with no FM_HOME must fail closed, not guess a backend"
+  assert_contains "$(cat "$err")" "FM_HOME is not set" "colon-target no-home diagnostic should be explicit"
+  [ ! -e "$mark" ] || fail "peek routed a no-home colon target through tmux instead of refusing (the QA hole)"
+  pass "fm-peek strict: a colon target with no FM_HOME fails closed and never reaches a backend"
+}
+
+# A colon target WITH FM_HOME resolves its backend from this home's metadata (the
+# tmux default only when no meta says otherwise). The non-tmux side - a herdr-
+# recorded colon target routing through herdr and never tmux - is proven in
+# tests/fm-backend-herdr.test.sh (test_scripts_route_explicit_target_through_meta_backend).
+test_colon_target_with_home_resolves_via_meta() {
+  local dir fb err rc home out
+  dir="$TMP_ROOT/colon-home"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); err="$dir/peek.err"; home=$(setup_home colon-home)
+  # No meta for this window -> backend inference defaults to tmux, but only because
+  # FM_HOME/state were present and consulted first.
+  out=$( PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_FAKE_PEEK_TAG=viahome \
     "$PEEK" sess:win 2>"$err" ); rc=$?
-  expect_code 0 "$rc" "a fully-qualified explicit backend target should peek without FM_HOME"
-  assert_contains "$out" "PANE CONTENT for direct" "explicit-target peek should capture directly"
-  pass "fm-peek strict: an explicit backend target (contains ':') peeks without FM_HOME"
+  expect_code 0 "$rc" "a colon target with a valid FM_HOME should resolve and capture"
+  assert_contains "$out" "PANE CONTENT for viahome" "colon-target peek with FM_HOME should capture"
+  pass "fm-peek strict: a colon target resolves through home state when FM_HOME is set"
 }
 
 test_unset_fm_home_with_task_id_fails
 test_missing_fm_home_dir_fails
 test_missing_state_dir_fails
 test_task_id_with_home_resolves
-test_explicit_target_needs_no_fm_home
+test_explicit_colon_target_still_requires_fm_home
+test_colon_target_with_home_resolves_via_meta

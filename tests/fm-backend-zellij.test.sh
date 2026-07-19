@@ -945,7 +945,7 @@ exit 42
 SH
   chmod +x "$fb/tmux"
 
-  out=$( PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_STATE_OVERRIDE="$state" \
+  out=$( PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_HOME="$neutral" FM_STATE_OVERRIDE="$state" \
     FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_SESSION_LIST="firstmate" \
     "$ROOT/bin/fm-peek.sh" firstmate:7 5 2>/dev/null )
   [ "$out" = "captured zellij pane" ] || fail "fm-peek did not capture through zellij for an explicit metadata-matched target, got '$out'"
@@ -978,7 +978,7 @@ test_scripts_verify_label_for_fm_targets() {
   printf 'captured through fm-id\n' > "$dir/responses/3.out"
   fb=$(make_zellij_fakebin "$dir")
 
-  out=$( PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_STATE_OVERRIDE="$state" \
+  out=$( PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral" FM_HOME="$neutral" FM_STATE_OVERRIDE="$state" \
     FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" FM_ZELLIJ_SESSION_LIST="firstmate" \
     "$ROOT/bin/fm-peek.sh" fm-zlabel 5 2>/dev/null )
   [ "$out" = "captured through fm-id" ] || fail "fm-peek did not capture through zellij for an fm-id target with a matching tab label, got '$out'"

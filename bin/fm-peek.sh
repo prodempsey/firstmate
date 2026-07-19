@@ -4,42 +4,36 @@
 #   <target> may be an exact task id, a legacy fm-<id> task label resolved
 #   through this home's state/<id>.meta, or an explicit backend target.
 #
-# Fail-closed home contract (mirrors fm-send.sh): a bare task-id or legacy
-# fm-<id> selector is resolved against THIS home's state/<id>.meta, so without an
-# explicit FM_HOME peek would silently resolve it against a guessed default root
-# (or the wrong home's legacy inventory) and read the WRONG endpoint. A task-id
-# or bare-name selector therefore requires a non-empty, existing FM_HOME with a
-# state dir. A fully-qualified explicit backend target (contains ':') names the
-# endpoint directly, needs no home resolution, and is the standing escape hatch -
-# exactly the ':' form fm_backend_resolve_selector uses as-is.
+# Fail-closed home contract, IDENTICAL to fm-send.sh: EVERY target form is resolved
+# against THIS home's state (a bare selector through its <id>.meta; an explicit
+# session:window target only carries a window, NOT a backend, so its backend is
+# still inferred from this home's metadata and otherwise defaults to tmux). Without
+# an explicit FM_HOME peek would resolve against a guessed default root - or, worse,
+# route a non-tmux endpoint through the wrong provider. So FM_HOME is required for
+# ALL forms; there is no colon escape hatch (a colon target is not backend-qualified
+# and must not bypass the home check).
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
+if [ -z "${FM_HOME+x}" ] || [ -z "${FM_HOME:-}" ]; then
+  echo "error: FM_HOME is not set; fm-peek refuses to resolve targets without an explicit firstmate home" >&2
+  exit 1
+fi
+
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+if [ ! -d "$FM_HOME" ]; then
+  echo "error: FM_HOME '$FM_HOME' is not a directory; fm-peek cannot resolve this home's state" >&2
+  exit 1
+fi
+if [ ! -d "$STATE" ]; then
+  echo "error: state dir '$STATE' is missing; fm-peek cannot resolve targets for FM_HOME '$FM_HOME'" >&2
+  exit 1
+fi
+
 RAW_TARGET=$1
 N=${2:-40}
-
-case "$RAW_TARGET" in
-  *:*) : ;;  # explicit backend target: no home resolution, escape hatch preserved
-  *)
-    if [ -z "${FM_HOME:-}" ]; then
-      echo "error: FM_HOME is not set; fm-peek refuses to resolve a task selector without an explicit firstmate home (pass session:window to target an endpoint outside this home)" >&2
-      exit 1
-    fi
-    if [ ! -d "$FM_HOME" ]; then
-      echo "error: FM_HOME '$FM_HOME' is not a directory; fm-peek cannot resolve this home's state" >&2
-      exit 1
-    fi
-    if [ ! -d "${FM_STATE_OVERRIDE:-$FM_HOME/state}" ]; then
-      echo "error: state dir '${FM_STATE_OVERRIDE:-$FM_HOME/state}' is missing; fm-peek cannot resolve targets for FM_HOME '$FM_HOME'" >&2
-      exit 1
-    fi
-    ;;
-esac
-
-FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
-STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"

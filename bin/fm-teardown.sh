@@ -343,28 +343,47 @@ $unpushed
 EOF
 }
 
+# Does gh-axi's `pr view` output report the PR as merged? gh-axi is NOT a drop-in
+# for `gh --json/-q` - `gh-axi pr view` takes only a number and emits a YAML-ish
+# block (`state:`, `merged:`, ...), with no --json/-q and no head OID. Parse the
+# STRUCTURED merged/state fields at their known indent so quoted body text (on the
+# single `  body:` line) can never be mistaken for the field.
+pr_view_reports_merged() {  # <gh-axi-pr-view-output>
+  printf '%s\n' "$1" | grep -qiE '^[[:space:]]*merged:[[:space:]]*(yes|true|merged)[[:space:]]*$' && return 0
+  printf '%s\n' "$1" | grep -qiE '^[[:space:]]*state:[[:space:]]*merged[[:space:]]*$' && return 0
+  return 1
+}
+
+# The PR head OID - which gh-axi does not expose - read from git's own
+# refs/pull/<n>/head, which GitHub keeps even after a squash merge deletes the head
+# branch. `ls-remote` reads the SHA directly, so there is no gh dependency and no
+# shared FETCH_HEAD to race (unlike the finding-3 hazard fm-review-diff had).
+pr_head_oid_from_remote() {  # <pr-number>
+  local n=$1 sha
+  git -C "$WT" remote get-url origin >/dev/null 2>&1 || return 1
+  sha=$(git -C "$WT" ls-remote origin "refs/pull/$n/head" 2>/dev/null | awk 'NR==1 {print $1}')
+  case "$sha" in ''|*[!0-9a-fA-F]*) return 1 ;; esac
+  printf '%s' "$sha"
+}
+
 # Is the worktree's PR merged for local work contained in that PR? Resolves the
-# PR from the recorded pr= URL first, then from the branch name, and asks GitHub
-# for both the PR state and head. Returns non-zero when the PR is not merged, the
-# current work is not contained in the PR head, no PR is found, or any gh error
-# occurs - the caller then falls back to the content check.
+# PR from the recorded pr= URL first, then from the branch name. Merged-state comes
+# from gh-axi (the fleet GitHub client, via its real `pr view` output contract); the
+# head OID comes from git's refs/pull/<n>/head. Returns non-zero when the PR is not
+# merged, the current work is not contained in the PR head, no PR is found, or any
+# lookup fails - the caller then falls back to the content check.
 pr_is_merged() {
-  local branch=$1 target view state head current
+  local branch=$1 target n view head current
   if [ -n "$PR_URL" ]; then
     target=$PR_URL
   else
     target=$(pr_number_from_branch "$branch") || return 1
   fi
   [ -n "$target" ] || return 1
-  view=$(cd "$WT" && gh-axi pr view "$target" --json state,headRefOid -q '.state + "\t" + .headRefOid' 2>/dev/null) || return 1
-  state=${view%%$'\t'*}
-  head=${view#*$'\t'}
-  [ "$state" != "$view" ] || return 1
-  case "$state" in
-    MERGED|merged) ;;
-    *) return 1 ;;
-  esac
-  [ -n "$head" ] || return 1
+  n=$(pr_number_from_target "$target") || return 1
+  view=$(cd "$WT" && gh-axi pr view "$n" 2>/dev/null) || return 1
+  pr_view_reports_merged "$view" || return 1
+  head=$(pr_head_oid_from_remote "$n") || return 1
   ensure_commit_object "$target" "$head" || return 1
   current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
   git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null && return 0
