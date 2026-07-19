@@ -6,7 +6,7 @@ import { runVerb } from '../lib/coordinator.mjs';
 import { ValidationError } from '../lib/errors.mjs';
 import { IdempotencyConflictError, StateTransitionError } from '../lib/errors-s1.mjs';
 import * as domain from '../lib/domain-store.mjs';
-import { createTask, beginRun, appendEvent } from '../lib/domain-store.mjs';
+import { createTask, beginRun, appendEvent, launchMarkerFor } from '../lib/domain-store.mjs';
 import { mkFixtureHome, cleanupAll } from './helpers.mjs';
 
 // S1 owns the DDL/API negative tests for its tables and API guards (spec-amend-s4
@@ -48,8 +48,15 @@ test('t_generic_append_rejects_terminal_and_lifecycle', async () => {
         taskId: 't1', generation: 1, eventType: type, producer: 'crewmate', seq: 10,
         expectedRevision: rev, commandId: `c-${type}`
       }),
-      (e) => e instanceof StateTransitionError && e.code === 'state_transition',
-      `type ${type} must be rejected via generic append`
+      // Assert the SPECIFIC wrapper guard fired, not merely "some StateTransitionError".
+      // Removing the generic terminal/lifecycle guard makes these types fall through to
+      // the later status-transition rejection, which carries a different message; pinning
+      // the wrapper message keeps this test mutation-sensitive to that guard (QA-s1-q49
+      // finding 5.1).
+      (e) => e instanceof StateTransitionError
+        && e.code === 'state_transition'
+        && /not appendable through generic 'event'|must use its owning wrapper/.test(e.message),
+      `type ${type} must be rejected by the generic-append wrapper guard`
     );
   }
 
@@ -159,8 +166,29 @@ test('t_origin_link_immutable', async () => {
     (e) => e instanceof StateTransitionError
   );
 
-  // The origin_link CHECK backs the guard at the store level: a raw insert with a
-  // bad combination, and a raw update that would break the link, are both rejected.
+  // Immutability is enforced at the store level, not just the combination shape: a
+  // still-VALID rewrite (ORD-1 -> ORD-2) is rejected by the immutability trigger
+  // (QA-s1-q49 finding 3). Before this guard the combination CHECK alone let it commit.
+  await assert.rejects(
+    () => runExclusive(store, async (conn) => {
+      await conn.query("UPDATE tasks SET order_ref = 'ORD-2' WHERE task_id = 'ok1'");
+    }),
+    (e) => e.code === '23514' || /origin_immutable/.test(String(e.message))
+  );
+  // The stored value is untouched by the rejected rewrite.
+  const still = await rows(store, 'SELECT order_ref FROM tasks WHERE task_id = $1', ['ok1']);
+  assert.equal(still[0].order_ref, 'ORD-9', 'order_ref unchanged after rejected rewrite');
+
+  // Flipping task_origin (a valid-to-valid change of the origin axis) is likewise rejected.
+  await assert.rejects(
+    () => runExclusive(store, async (conn) => {
+      await conn.query("UPDATE tasks SET task_origin = 'internal', order_ref = NULL, internal_reason = 'r' WHERE task_id = 'ok1'");
+    }),
+    (e) => e.code === '23514' || /origin_immutable/.test(String(e.message))
+  );
+
+  // The origin_link CHECK still backs the shape at the store level: a raw insert with
+  // a bad combination, and a raw update that would break the link, are both rejected.
   await assert.rejects(
     () => runExclusive(store, async (conn) => {
       await conn.query(
@@ -175,8 +203,30 @@ test('t_origin_link_immutable', async () => {
     () => runExclusive(store, async (conn) => {
       await conn.query("UPDATE tasks SET order_ref = NULL WHERE task_id = 'ok1'");
     }),
-    (e) => e.code === '23514' || /origin_link/.test(String(e.message))
+    // Either guard may fire first (both are 23514); the point is the rewrite is refused.
+    (e) => e.code === '23514' || /origin_immutable|origin_link/.test(String(e.message))
   );
+});
+
+test('t_launch_marker_derivation', async () => {
+  const { store, fmHome } = await freshStore();
+  // Recover the store's home_uuid the same way begin-run does.
+  const meta = await new PgliteLocalStore({ fmHome }).schemaMeta();
+  const homeUuid = meta.home_uuid;
+
+  await createTask(store, { taskId: 't1', kind: 'ship', title: 'x', origin: 'internal', internalReason: 'r', commandId: 'c1' });
+  const begun = await beginRun(store, { taskId: 't1', expectedRevision: 1, commandId: 'c2' });
+
+  // The launch marker is the authoritative sha256(home_uuid || task_id || generation
+  // || bind_nonce), not a random id (QA-s1-q49 finding 4).
+  const expected = launchMarkerFor(homeUuid, 't1', begun.generation, begun.bind_nonce);
+  assert.equal(begun.launch_marker, expected, 'launch_marker is the specified derivation');
+  assert.match(begun.launch_marker, /^[0-9a-f]{64}$/, 'launch_marker is a sha256 hex digest');
+
+  // The stored run row carries the same derived marker.
+  const run = await rows(store, 'SELECT launch_marker, bind_nonce FROM runs WHERE task_id = $1 AND run_generation = $2', ['t1', 1]);
+  assert.equal(run[0].launch_marker, expected);
+  assert.equal(launchMarkerFor(homeUuid, 't1', 1, run[0].bind_nonce), run[0].launch_marker);
 });
 
 test('t_runs_never_terminal_in_s1', async () => {

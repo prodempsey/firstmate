@@ -39,6 +39,29 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (status);
 CREATE INDEX IF NOT EXISTS ix_tasks_order ON tasks (order_ref);
 
+-- task_origin, order_ref, and internal_reason are immutable once a task exists
+-- (spec section 3.1: "task_origin and non-null order_ref are immutable through a
+-- trigger or through an equivalently tested repository guard"). The combination
+-- CHECK above only guards a single row's shape; it does not stop a valid-to-valid
+-- rewrite such as ORD-1 -> ORD-2. This BEFORE UPDATE trigger closes that gap at the
+-- store level (QA-s1-q49 finding 3). CREATE OR REPLACE keeps it idempotent under
+-- the lazy per-transaction schema apply.
+CREATE OR REPLACE FUNCTION cp_tasks_origin_immutable() RETURNS trigger AS $cp$
+BEGIN
+  IF NEW.task_origin IS DISTINCT FROM OLD.task_origin
+     OR NEW.order_ref IS DISTINCT FROM OLD.order_ref
+     OR NEW.internal_reason IS DISTINCT FROM OLD.internal_reason THEN
+    RAISE EXCEPTION 'origin_immutable: task_origin/order_ref/internal_reason are immutable'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$cp$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER trg_tasks_origin_immutable
+  BEFORE UPDATE ON tasks
+  FOR EACH ROW EXECUTE FUNCTION cp_tasks_origin_immutable();
+
 CREATE TABLE IF NOT EXISTS runs (
   task_id            TEXT NOT NULL,
   run_generation     INTEGER NOT NULL CHECK (run_generation >= 1),

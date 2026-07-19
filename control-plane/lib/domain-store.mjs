@@ -81,6 +81,12 @@ function sha256hex(input) {
   return crypto.createHash('sha256').update(input).digest('hex');
 }
 
+// Authoritative launch-marker derivation (spec section 5):
+//   launch_marker = sha256(home_uuid || task_id || generation || bind_nonce)
+export function launchMarkerFor(homeUuid, taskId, generation, bindNonce) {
+  return sha256hex(`${homeUuid}${taskId}${generation}${bindNonce}`);
+}
+
 // Deterministic JSON (recursively key-sorted) for request/payload hashing.
 function canonicalJson(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -206,15 +212,36 @@ async function recordAnomaly(conn, a, now) {
   return fingerprint;
 }
 
+// Internal control-flow signal for an auditable command conflict (idempotency or
+// causal). A `mutate` raises it AFTER attempting whatever domain writes it needs;
+// executeCommand rolls the mutation back to the savepoint, persists the anomaly,
+// and advances the audit counters. It never escapes this module.
+class ConflictSignal extends Error {
+  constructor(kind, anomaly) {
+    super(`command conflict: ${kind}`);
+    this.kind = kind; // 'idempotency' | 'causal'
+    this.anomaly = anomaly;
+  }
+}
+
+// An anomaly audit is itself a canonical domain change: a committed write that
+// advances domain_revision and commit_sequence exactly once, without touching the
+// task revision or projection_revision (spec section 2.3; QA-s1-q49 finding 1).
+async function bumpAuditCounters(conn) {
+  await conn.query(
+    'UPDATE coordinator_state SET domain_revision = domain_revision + 1, commit_sequence = commit_sequence + 1 WHERE id = 1'
+  );
+}
+
 // Shared executor for every mutating S1 command. Enforces: command-id required;
 // idempotent replay by command_id + request_hash; conflict audit through a
 // SAVEPOINT that rolls back the rejected mutation while its anomaly survives to
-// COMMIT (ruling Q2); and the atomic bundle of domain write + counter bumps +
-// command_results in one transaction. `mutate` returns either
-//   { result, committedRevision, domainChanged }              (success)
-//   { conflict: 'causal', anomaly }                           (auditable conflict)
-// or throws a StateTransitionError/ValidationError for a non-audited rejection
-// (which abandons the whole transaction, persisting nothing).
+// COMMIT (ruling Q2); the audit counter contract above; and the atomic bundle of
+// domain write + counter bumps + command_results in one transaction. `mutate`
+// returns { result, committedRevision, domainChanged } on success and raises a
+// ConflictSignal for an auditable conflict; a StateTransitionError/ValidationError
+// is a non-audited rejection that abandons the whole transaction, persisting
+// nothing.
 async function executeCommand(store, { verb, commandId, requestHash, taskId = null, now, mutate, fault }) {
   if (typeof commandId !== 'string' || commandId.length === 0) {
     throw new ValidationError('--command-id is required for every mutating command', { verb });
@@ -225,7 +252,9 @@ async function executeCommand(store, { verb, commandId, requestHash, taskId = nu
     const homeUuid = await readHomeUuid(conn);
 
     // Idempotency pre-check: a stored result for this command_id is either a clean
-    // replay (same request) or an idempotency conflict (different request).
+    // replay (same request) or an idempotency conflict (different request). A replay
+    // is neither a write nor an audit, so it advances no counter; a conflict is an
+    // audited domain write.
     const prior = await conn.query(
       'SELECT verb, request_hash, result_json FROM command_results WHERE command_id = $1',
       [commandId]
@@ -242,25 +271,33 @@ async function executeCommand(store, { verb, commandId, requestHash, taskId = nu
       await recordAnomaly(conn, {
         anomalyClass: 'idempotency_conflict', homeUuid, taskId, terminalFingerprint: commandId, detail
       }, now);
+      await bumpAuditCounters(conn);
       return { status: 'conflict', kind: 'idempotency', detail };
     }
 
-    // Attempt the domain mutation under a savepoint. A thrown error (non-audited
-    // rejection) escapes the callback and the S0 primitive rolls back the whole
-    // transaction; an auditable conflict is returned, not thrown, so the anomaly
-    // it records survives the outer COMMIT.
+    // Attempt the domain mutation under a savepoint. An auditable ConflictSignal is
+    // caught here: the savepoint is rolled back (discarding any partial domain
+    // write the mutation made before detecting the conflict), then the anomaly is
+    // persisted and the audit counters advance, all inside the same outer
+    // transaction. Any other throw (a non-audited StateTransition/Validation
+    // rejection, or a genuine error) escapes the callback so the S0 primitive rolls
+    // the whole transaction back, persisting nothing.
     await conn.query('SAVEPOINT cp_cmd');
-    const m = await mutate(conn, { now, commandId, homeUuid });
-    if (m.conflict) {
+    let m;
+    try {
+      m = await mutate(conn, { now, commandId, homeUuid });
+    } catch (err) {
       await conn.query('ROLLBACK TO SAVEPOINT cp_cmd');
-      await recordAnomaly(conn, { homeUuid, ...m.anomaly }, now);
-      return { status: 'conflict', kind: m.conflict, detail: m.anomaly.detail };
+      if (!(err instanceof ConflictSignal)) throw err;
+      await recordAnomaly(conn, { homeUuid, ...err.anomaly }, now);
+      await bumpAuditCounters(conn);
+      return { status: 'conflict', kind: err.kind, detail: err.anomaly.detail };
     }
     await conn.query('RELEASE SAVEPOINT cp_cmd');
 
     // Test-only crash injection: a writer that exits here has already written the
-    // domain rows but not the counter bump or command_results. Throwing rolls the
-    // whole transaction back, proving the atomic bundle
+    // domain rows but not the counter bump or command_results. Throwing (or a real
+    // process exit) rolls the whole transaction back, proving the atomic bundle
     // (t_recovers_when_writer_exits_before_revision_bump).
     if (typeof fault === 'function') fault();
 
@@ -365,17 +402,17 @@ export async function beginRun(store, params, { now = nowIso(), fault } = {}) {
     mutate: async (conn, ctx) => {
       const task = await readTask(conn, params.taskId);
       if (!task) throw new StateTransitionError(`unknown task: ${params.taskId}`, { task_id: params.taskId });
+      // CAS on the causal token takes precedence over the state guard, so a writer
+      // acting on a stale revision is a causal conflict, not a state-transition
+      // error (ruling Q4).
       if (Number(task.revision) !== params.expectedRevision) {
-        return {
-          conflict: 'causal',
-          anomaly: {
-            anomalyClass: 'causal_ordering_violation', taskId: params.taskId, terminalFingerprint: ctx.commandId,
-            detail: {
-              command_id: ctx.commandId, verb: 'begin-run', reason: 'stale_revision',
-              expected_revision: params.expectedRevision, actual_revision: Number(task.revision)
-            }
+        throw new ConflictSignal('causal', {
+          anomalyClass: 'causal_ordering_violation', taskId: params.taskId, terminalFingerprint: ctx.commandId,
+          detail: {
+            command_id: ctx.commandId, verb: 'begin-run', reason: 'stale_revision',
+            expected_revision: params.expectedRevision, actual_revision: Number(task.revision)
           }
-        };
+        });
       }
       if (!BEGIN_RUN_FROM.has(task.status)) {
         throw new StateTransitionError(`begin-run not allowed from status '${task.status}'`, {
@@ -396,7 +433,11 @@ export async function beginRun(store, params, { now = nowIso(), fault } = {}) {
       }
       const generation = currentGen + 1;
       const bindNonce = crypto.randomBytes(24).toString('hex');
-      const launchMarker = `cpmark_${crypto.randomUUID()}`;
+      // Authoritative launch-marker derivation (spec section 5): the marker binds
+      // the precommitted home/task/generation/nonce identity, so S3 can expose it
+      // from the first observable launch instant. NOT a random id (QA-s1-q49
+      // finding 4).
+      const launchMarker = launchMarkerFor(ctx.homeUuid, params.taskId, generation, bindNonce);
       const launchDir = params.launchDir ?? '';
       const registrationPath = params.registrationPath ?? `${launchMarker}.reg`;
       const backend = params.backend ?? 'tmux';
@@ -462,28 +503,18 @@ export async function appendEvent(store, params, { now = nowIso(), fault } = {})
     throw new ValidationError('event requires an integer --expected-revision');
   }
   const payload = params.payload ?? {};
+  // expected_revision is part of the request identity: a replay that changes the
+  // causal token it acted on is a different request, not an idempotent replay
+  // (QA-s1-q49 finding 2; matches beginRun).
   const requestHash = sha256hex(canonicalJson({
     verb: 'event', task_id: params.taskId, generation: params.generation, type: params.eventType,
-    producer: params.producer, seq: params.seq, payload
+    producer: params.producer, seq: params.seq, expected_revision: params.expectedRevision, payload
   }));
   return executeCommand(store, {
     verb: 'event', commandId: params.commandId, requestHash, taskId: params.taskId, now, fault,
     mutate: async (conn, ctx) => {
       const task = await readTask(conn, params.taskId);
       if (!task) throw new StateTransitionError(`unknown task: ${params.taskId}`, { task_id: params.taskId });
-      if (Number(task.revision) !== params.expectedRevision) {
-        return {
-          conflict: 'causal',
-          anomaly: {
-            anomalyClass: 'causal_ordering_violation', taskId: params.taskId, runGeneration: params.generation,
-            terminalFingerprint: ctx.commandId,
-            detail: {
-              command_id: ctx.commandId, verb: 'event', reason: 'stale_revision',
-              expected_revision: params.expectedRevision, actual_revision: Number(task.revision)
-            }
-          }
-        };
-      }
       const run = await conn.query(
         'SELECT closed_at FROM runs WHERE task_id = $1 AND run_generation = $2',
         [params.taskId, params.generation]
@@ -506,17 +537,14 @@ export async function appendEvent(store, params, { now = nowIso(), fault } = {})
       );
       const lastSeq = hw.rows.length > 0 ? Number(hw.rows[0].last_seq) : 0;
       if (params.seq <= lastSeq) {
-        return {
-          conflict: 'causal',
-          anomaly: {
-            anomalyClass: 'causal_ordering_violation', taskId: params.taskId, runGeneration: params.generation,
-            terminalFingerprint: `${params.producer}:${params.seq}`,
-            detail: {
-              command_id: ctx.commandId, verb: 'event', reason: 'nonmonotonic_producer_seq',
-              producer: params.producer, seq: params.seq, last_seq: lastSeq
-            }
+        throw new ConflictSignal('causal', {
+          anomalyClass: 'causal_ordering_violation', taskId: params.taskId, runGeneration: params.generation,
+          terminalFingerprint: `${params.producer}:${params.seq}`,
+          detail: {
+            command_id: ctx.commandId, verb: 'event', reason: 'nonmonotonic_producer_seq',
+            producer: params.producer, seq: params.seq, last_seq: lastSeq
           }
-        };
+        });
       }
       let newStatus = task.status;
       if (params.eventType !== 'progress') {
@@ -529,6 +557,12 @@ export async function appendEvent(store, params, { now = nowIso(), fault } = {})
         }
         newStatus = match.to;
       }
+      // Write the event and advance the producer high-water, THEN commit the task
+      // revision under a compare-and-set on the expected token. If the CAS matches
+      // no row, the token was stale: raising ConflictSignal here rolls the savepoint
+      // back, discarding the event row and high-water bump just written, while the
+      // anomaly persists in the outer transaction (QA-s1-q49 finding 5.3 - this is
+      // the directly-exercised SAVEPOINT rollback path).
       const eventId = await insertEvent(conn, {
         taskId: params.taskId, eventScope: 'run', runGeneration: params.generation, generationKey: params.generation,
         producer: params.producer, producerSeq: params.seq, eventType: params.eventType, isTerminal: false,
@@ -538,11 +572,21 @@ export async function appendEvent(store, params, { now = nowIso(), fault } = {})
         taskId: params.taskId, runGeneration: params.generation, producer: params.producer, seq: params.seq,
         commandId: ctx.commandId, now: ctx.now
       });
-      const newRevision = Number(task.revision) + 1;
-      await conn.query(
-        'UPDATE tasks SET status = $1, revision = $2, updated_at = $3 WHERE task_id = $4',
-        [newStatus, newRevision, ctx.now, params.taskId]
+      const newRevision = params.expectedRevision + 1;
+      const cas = await conn.query(
+        'UPDATE tasks SET status = $1, revision = $2, updated_at = $3 WHERE task_id = $4 AND revision = $5 RETURNING revision',
+        [newStatus, newRevision, ctx.now, params.taskId, params.expectedRevision]
       );
+      if (cas.rows.length === 0) {
+        throw new ConflictSignal('causal', {
+          anomalyClass: 'causal_ordering_violation', taskId: params.taskId, runGeneration: params.generation,
+          terminalFingerprint: ctx.commandId,
+          detail: {
+            command_id: ctx.commandId, verb: 'event', reason: 'stale_revision',
+            expected_revision: params.expectedRevision, actual_revision: Number(task.revision)
+          }
+        });
+      }
       return {
         result: {
           task_id: params.taskId, generation: params.generation, event_id: eventId,
