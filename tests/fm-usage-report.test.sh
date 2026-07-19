@@ -27,6 +27,8 @@
 #     instead of publishing a silently reduced or mis-windowed report (QA r6 f1/f2)
 #   - default-window date failures fail loud even if the failed date process
 #     emitted plausible output (QA r7 f1)
+#   - helper capture-reset failures fail loud, and helper diagnostics preserve
+#     the failed tool's actual exit status (QA r8 f1/f2)
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -640,7 +642,62 @@ assert_absent "$DFO/latest.json" "date failure must not publish latest.json"
 [ ! -f "$DFO/index.jsonl" ] || [ "$(wc -l < "$DFO/index.jsonl")" = 0 ] || fail "date failure must not append an index line"
 pass "a failed timestamp conversion fails loud and nonzero"
 
-# 18d. The omitted --since default date computation fails after writing plausible
+# 18d. A helper capture reset failure must be fatal even inside a tolerant
+# ledger parse. The old helper relied on errexit while being called in an `if`
+# condition, so a stale allowed parse diagnostic could be reused.
+CRH=$TMP_ROOT/fail-capture-reset
+mkdir -p "$CRH/state" "$CRH/tmp"
+printf '{bad json\n' > "$CRH/state/task-runs.jsonl"
+cr_i=0
+while [ "$cr_i" -lt 20 ]; do
+  append_run "$CRH/state/task-runs.jsonl" "capture-$cr_i" ship /home/prode/fleet/firstmate claude model-capture high 2026-07-15T10:00:00Z
+  cr_i=$((cr_i + 1))
+done
+CRO=$CRH/out
+CRB=$(fm_fakebin "$CRH")
+CR_REAL_JQ="$(command -v jq)"
+CR_REAL_GREP="$(command -v grep)"
+cat > "$CRB/jq" <<'SH'
+#!/usr/bin/env bash
+real="${REAL_JQ:-/usr/bin/jq}"
+input="$(cat)"
+printf '%s\n' "$input" | "$real" "$@"
+SH
+cat > "$CRB/grep" <<'SH'
+#!/usr/bin/env bash
+real="${REAL_GREP:-/bin/grep}"
+"$real" "$@"
+rc=$?
+if [ "$rc" -eq 0 ] && [ ! -e "$CAPTURE_RESET_DONE" ]; then
+  last=
+  for arg in "$@"; do
+    last=$arg
+  done
+  case "$last" in
+    */fm-usage-run-err.*)
+      : > "$CAPTURE_RESET_DONE"
+      chmod 400 "$last" 2>/dev/null || true
+      ( sleep 0.2; chmod 600 "$last" 2>/dev/null || true ) >/dev/null 2>&1 &
+      ;;
+  esac
+fi
+exit "$rc"
+SH
+chmod +x "$CRB/jq" "$CRB/grep"
+CRO_OUT=$CRH/stdout; CRO_ERR=$CRH/stderr
+PATH="$CRB:$PATH" REAL_JQ="$CR_REAL_JQ" REAL_GREP="$CR_REAL_GREP" TMPDIR="$CRH/tmp" \
+  CAPTURE_RESET_DONE="$CRH/reset-done" FM_USAGE_NOW=2026-07-18T00:00:00Z \
+  "$USAGE" --target "$CRH" --out "$CRO" --since 2026-07-01 --until 2026-07-18 \
+  >"$CRO_OUT" 2>"$CRO_ERR"
+cr_rc=$?
+[ "$cr_rc" -ne 0 ] || fail "capture reset failure must exit nonzero, got $cr_rc"
+grep -q "failed to reset command diagnostic capture" "$CRO_ERR" || fail "capture reset failure must print a helper diagnostic"
+assert_no_grep "usage report:" "$CRO_OUT" "capture reset failure must not print a success summary"
+assert_absent "$CRO/latest.json" "capture reset failure must not publish latest.json"
+[ ! -f "$CRO/index.jsonl" ] || [ "$(wc -l < "$CRO/index.jsonl")" = 0 ] || fail "capture reset failure must not append an index line"
+pass "a failed helper capture reset fails loud and nonzero"
+
+# 18e. The omitted --since default date computation fails after writing plausible
 # output. The old nested substitution let norm_since hide that nonzero status and
 # publish a report under the wrong window.
 DSH=$TMP_ROOT/fail-default-since
@@ -673,6 +730,7 @@ PATH="$DSB:$PATH" REAL_DATE="$DS_REAL_DATE" FM_USAGE_NOW=2026-07-18T00:00:00Z \
 ds_rc=$?
 [ "$ds_rc" -ne 0 ] || fail "default-since date failure must exit nonzero, got $ds_rc"
 grep -q "failed to compute default --since with date" "$DSO_ERR" || fail "default-since date failure must print a diagnostic to stderr"
+grep -q "(exit 77)" "$DSO_ERR" || fail "default-since date failure must report the real tool exit code"
 grep -q "injected default-since date failure" "$DSO_ERR" || fail "default-since date failure must preserve date stderr"
 assert_no_grep "usage report:" "$DSO_OUT" "default-since date failure must not print a success summary"
 assert_absent "$DSO/latest.json" "default-since date failure must not publish latest.json"

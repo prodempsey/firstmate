@@ -123,12 +123,19 @@ run_or_die() {  # <diagnostic> <allowed-stderr-regex-or-empty> -- <command> [arg
   local diagnostic=$1 allowed=${2:-} status
   shift 2
   [ "${1:-}" = "--" ] && shift
-  : > "$RUN_OUT"
-  : > "$RUN_ERR"
+  if ! : > "$RUN_OUT"; then
+    printf 'fm-usage-report: failed to reset command output capture %s\n' "$RUN_OUT" >&2
+    exit 2
+  fi
+  if ! : > "$RUN_ERR"; then
+    printf 'fm-usage-report: failed to reset command diagnostic capture %s\n' "$RUN_ERR" >&2
+    exit 2
+  fi
   if "$@" > "$RUN_OUT" 2> "$RUN_ERR"; then
     return 0
+  else
+    status=$?
   fi
-  status=$?
   if [ -n "$allowed" ] && grep -Eq "$allowed" "$RUN_ERR"; then
     return 1
   fi
