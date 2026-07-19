@@ -53,8 +53,8 @@
 # pipefail is ON so a pipeline fails if ANY stage fails, not just the last. Under
 # a bare `set -eu` a broken producer is masked by a succeeding consumer: e.g.
 # `sha256sum | cut` returns cut's status, so a failed hash yields an empty result
-# and exit 0. Ledger row parses explicitly classify jq failures: malformed
-# JSON rows are skipped, but operational jq failures abort the report.
+# and exit 0. All jq/date invocations go through run_or_die so operational
+# failures abort, while declared data-parse failures stay tolerant.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -105,7 +105,37 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-command -v jq >/dev/null 2>&1 || { echo "fm-usage-report: jq is required" >&2; exit 3; }
+CLEANUP_FILES=()
+cleanup_tmp() { rm -f "${CLEANUP_FILES[@]}"; }
+trap cleanup_tmp EXIT
+
+print_tool_error() { [ ! -s "$1" ] || cat "$1" >&2; }
+
+JQ_BIN="$(command -v jq 2>/dev/null)" || { echo "fm-usage-report: jq is required" >&2; exit 3; }
+DATE_BIN="$(command -v date 2>/dev/null)" || { echo "fm-usage-report: date is required" >&2; exit 2; }
+RUN_OUT="$(mktemp "${TMPDIR:-/tmp}/fm-usage-run-out.XXXXXX")" \
+  || { echo "fm-usage-report: cannot create command output temp file" >&2; exit 2; }
+RUN_ERR="$(mktemp "${TMPDIR:-/tmp}/fm-usage-run-err.XXXXXX")" \
+  || { echo "fm-usage-report: cannot create command diagnostic temp file" >&2; exit 2; }
+CLEANUP_FILES+=("$RUN_OUT" "$RUN_ERR")
+
+run_or_die() {  # <diagnostic> <allowed-stderr-regex-or-empty> -- <command> [args...]
+  local diagnostic=$1 allowed=${2:-} status
+  shift 2
+  [ "${1:-}" = "--" ] && shift
+  : > "$RUN_OUT"
+  : > "$RUN_ERR"
+  if "$@" > "$RUN_OUT" 2> "$RUN_ERR"; then
+    return 0
+  fi
+  status=$?
+  if [ -n "$allowed" ] && grep -Eq "$allowed" "$RUN_ERR"; then
+    return 1
+  fi
+  print_tool_error "$RUN_ERR"
+  printf 'fm-usage-report: %s (exit %s)\n' "$diagnostic" "$status" >&2
+  exit 2
+}
 
 # --- resolve home, state, out ------------------------------------------------
 if [ -n "$TARGET" ]; then
@@ -117,37 +147,25 @@ fi
 STATE="${FM_STATE_OVERRIDE:-$TARGET/state}"
 OUT="${OPT_OUT:-$TARGET/data/model-economy/usage}"
 
-CLEANUP_FILES=()
-cleanup_tmp() { rm -f "${CLEANUP_FILES[@]}"; }
-trap cleanup_tmp EXIT
-
-print_tool_error() { [ ! -s "$1" ] || cat "$1" >&2; }
-
 # --- clock and window --------------------------------------------------------
 # Empty input must NOT parse: GNU `date -d ''` silently returns the current time
 # (rc 0), which would misdate every task with a missing timestamp as "now". A
 # genuinely malformed timestamp still fails date's parse and prints nothing.
-DATE_ERR="$(mktemp "${TMPDIR:-/tmp}/fm-usage-date.XXXXXX")" \
-  || { echo "fm-usage-report: cannot create date diagnostic temp file" >&2; exit 2; }
-CLEANUP_FILES+=("$DATE_ERR")
-date_failed_data_parse() { grep -q '^date: invalid date ' "$1"; }
 to_epoch() {
-  local input="${1:-}" out
+  local input="${1:-}"
   [ -n "$input" ] || return 0
-  : > "$DATE_ERR"
-  if out="$(date -u -d "$input" +%s 2>"$DATE_ERR")"; then
-    printf '%s' "$out"
-    return 0
+  if run_or_die "failed to convert timestamp with date: $input" '^date: invalid date ' \
+    -- "$DATE_BIN" -u -d "$input" +%s; then
+    cat "$RUN_OUT"
   fi
-  if date_failed_data_parse "$DATE_ERR"; then
-    return 0
-  fi
-  print_tool_error "$DATE_ERR"
-  echo "fm-usage-report: failed to convert timestamp with date: $input" >&2
-  return 2
 }
 
-NOW_ISO="${FM_USAGE_NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+if [ -n "${FM_USAGE_NOW:-}" ]; then
+  NOW_ISO="$FM_USAGE_NOW"
+else
+  run_or_die "failed to read current time with date" "" -- "$DATE_BIN" -u +%Y-%m-%dT%H:%M:%SZ
+  NOW_ISO="$(cat "$RUN_OUT")"
+fi
 NOW_EPOCH="$(to_epoch "$NOW_ISO")"
 [ -n "$NOW_EPOCH" ] || { echo "fm-usage-report: unparseable FM_USAGE_NOW '$NOW_ISO'" >&2; exit 2; }
 
@@ -155,7 +173,13 @@ NOW_EPOCH="$(to_epoch "$NOW_ISO")"
 norm_since() { case "$1" in ????-??-??) printf '%sT00:00:00Z' "$1" ;; *) printf '%s' "$1" ;; esac; }
 norm_until() { case "$1" in ????-??-??) printf '%sT23:59:59Z' "$1" ;; *) printf '%s' "$1" ;; esac; }
 
-SINCE_ISO="$(norm_since "${OPT_SINCE:-$(date -u -d "$NOW_ISO - 7 days" +%Y-%m-%dT%H:%M:%SZ)}")"
+if [ -n "$OPT_SINCE" ]; then
+  SINCE_ISO="$(norm_since "$OPT_SINCE")"
+else
+  run_or_die "failed to compute default --since with date" "" \
+    -- "$DATE_BIN" -u -d "$NOW_ISO - 7 days" +%Y-%m-%dT%H:%M:%SZ
+  SINCE_ISO="$(norm_since "$(cat "$RUN_OUT")")"
+fi
 UNTIL_ISO="$(norm_until "${OPT_UNTIL:-$NOW_ISO}")"
 SINCE_EPOCH="$(to_epoch "$SINCE_ISO")"
 UNTIL_EPOCH="$(to_epoch "$UNTIL_ISO")"
@@ -189,7 +213,8 @@ window_decision() {
 }
 
 emit_record() {  # <task> <source> <live-bool> <harness> <model> <effort> <kind> <repo> <profile> <class> <provider> <dated-bool>
-  jq -n \
+  # shellcheck disable=SC2016 # jq variables are expanded by jq, not the shell.
+  run_or_die "failed to build task record with jq" "" -- "$JQ_BIN" -n \
     --arg task "$1" --arg source "$2" --argjson live "$3" \
     --arg harness "${4:-}" --arg model "${5:-}" --arg effort "${6:-}" \
     --arg kind "${7:-}" --arg repo "${8:-}" \
@@ -204,7 +229,8 @@ emit_record() {  # <task> <source> <live-bool> <harness> <model> <effort> <kind>
       repo: (if $repo == "" then "unknown" else $repo end),
       profile: blank($profile), class: blank($class), provider: blank($provider),
       dated: $dated
-    }' >> "$REC_FILE"
+    }'
+  cat "$RUN_OUT" >> "$REC_FILE" || { echo "fm-usage-report: failed to append task record" >&2; exit 2; }
 }
 
 # Live metas first, and remember their task ids so a still-live task is not
@@ -250,23 +276,13 @@ done
 # Historical ledger for closed tasks not currently live.
 LEDGER="$STATE/task-runs.jsonl"
 if [ -f "$LEDGER" ]; then
-  JQ_ERR="$(mktemp "${TMPDIR:-/tmp}/fm-usage-jq.XXXXXX")" \
-    || { echo "fm-usage-report: cannot create jq diagnostic temp file" >&2; exit 2; }
-  CLEANUP_FILES+=("$JQ_ERR")
-  jq_failed_data_parse() { grep -q '^jq: parse error:' "$1"; }
-  fail_ledger_jq() {
-    local context=$1
-    print_tool_error "$JQ_ERR"
-    echo "fm-usage-report: failed to parse task-runs.jsonl $context with jq" >&2
-    exit 2
-  }
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    : > "$JQ_ERR"
-    if ! task="$(printf '%s' "$line" | jq -r 'if type == "object" then (.task // empty) else empty end' 2>"$JQ_ERR")"; then
-      jq_failed_data_parse "$JQ_ERR" && continue
-      fail_ledger_jq "task field"
+    if ! run_or_die "failed to parse task-runs.jsonl task field with jq" '^jq: parse error:' \
+      -- "$JQ_BIN" -r 'if type == "object" then (.task // empty) else empty end' <<< "$line"; then
+      continue
     fi
+    task="$(cat "$RUN_OUT")"
     [ -n "$task" ] || continue
     [ -z "${SEEN[$task]:-}" ] || continue
     SEEN["$task"]=1
@@ -274,16 +290,16 @@ if [ -f "$LEDGER" ]; then
     # whitespace character, `read` collapses runs of it and drops empty fields
     # (a null provider would then shift later fields off the end). 0x1f is
     # non-whitespace, so empty fields are preserved positionally.
-    : > "$JQ_ERR"
-    if ! row="$(printf '%s' "$line" | jq -rj '
+    if ! run_or_die "failed to parse task-runs.jsonl row fields with jq" '^jq: parse error:' \
+      -- "$JQ_BIN" -rj '
       if type == "object" then
         [ (.harness // ""), (.model // ""), (.effort // ""), (.kind // ""),
           (.project // ""), (.provider // ""),
           (.spawned_at // ""), (.ended_at // "") ] | join("\u001f")
-      else empty end' 2>"$JQ_ERR")"; then
-      jq_failed_data_parse "$JQ_ERR" && continue
-      fail_ledger_jq "row fields"
+      else empty end' <<< "$line"; then
+      continue
     fi
+    row="$(cat "$RUN_OUT")"
     [ -n "$row" ] || continue
     IFS=$'\x1f' read -r harness model effort kind project provider sp_iso en_iso <<EOF
 $row
@@ -318,7 +334,8 @@ CLEANUP_FILES+=("$TMP_JSON")
 TMP_MD="$(mktemp "$OUT/.usage-report.XXXXXX")" || { echo "fm-usage-report: cannot create a temp file in $OUT" >&2; exit 2; }
 CLEANUP_FILES+=("$TMP_MD")
 
-jq -n \
+# shellcheck disable=SC2016 # jq variables are expanded by jq, not the shell.
+run_or_die "failed to build machine report with jq" "" -- "$JQ_BIN" -n \
   --slurpfile recs "$REC_FILE" \
   --arg generated_at "$NOW_ISO" \
   --arg since "$SINCE_ISO" \
@@ -383,10 +400,11 @@ jq -n \
         note: "Counterfactual savings land in slice M5; not part of this slice."
       }
     }
-  }' > "$TMP_JSON" || { echo "fm-usage-report: failed to build machine report" >&2; exit 2; }
+  }'
+cat "$RUN_OUT" > "$TMP_JSON" || { echo "fm-usage-report: failed to write machine report temp" >&2; exit 2; }
 
 # --- render human report into the run-private temp ---------------------------
-jq -r '
+run_or_die "failed to render human report with jq" "" -- "$JQ_BIN" -r '
   "# Model economy - usage report (slice \(.slice))",
   "",
   "Generated: \(.generated_at)",
@@ -438,15 +456,17 @@ jq -r '
   "## Panel D - Counterfactual savings (\(.panels.counterfactual.status), confidence: \(.panels.counterfactual.confidence))",
   "",
   .panels.counterfactual.note
-' "$TMP_JSON" > "$TMP_MD" || { echo "fm-usage-report: failed to render human report" >&2; exit 2; }
+' "$TMP_JSON"
+cat "$RUN_OUT" > "$TMP_MD" || { echo "fm-usage-report: failed to write human report temp" >&2; exit 2; }
 
 # --- fingerprint this run's own private JSON ---------------------------------
 # Computed from THIS run's finalized content (which is byte-identical to what
 # gets renamed into the archive), so the fingerprint always matches its archive.
 # Canonicalize in a checked step first, so a jq failure is reported on its own.
 # The canonical form is bounded (mix only).
-CANON="$(jq -S '{window, totals, model_mix: .panels.model_mix}' "$TMP_JSON")" \
-  || { echo "fm-usage-report: failed to canonicalize report for fingerprint" >&2; exit 2; }
+run_or_die "failed to canonicalize report for fingerprint with jq" "" \
+  -- "$JQ_BIN" -S '{window, totals, model_mix: .panels.model_mix}' "$TMP_JSON"
+CANON="$(cat "$RUN_OUT")"
 # printf '%s\n' restores the single trailing newline that $() stripped from jq's
 # output, so this digest is byte-identical to a plain
 #   jq -S '{window,totals,model_mix:.panels.model_mix}' <archive> | sha256sum
@@ -466,7 +486,8 @@ FINGERPRINT="$(printf '%s\n' "$CANON" | sha256sum | cut -d' ' -f1)" \
 # no-clobber create (O_EXCL): the first run at a second gets usage-<STAMP>, the
 # next usage-<STAMP>-1, and so on. Because the name is claimed exclusively, the
 # rename of this run's private files into it cannot capture another run's content.
-STAMP="$(date -u -d "$NOW_ISO" +%Y%m%dT%H%M%SZ)"
+run_or_die "failed to compute archive timestamp with date" "" -- "$DATE_BIN" -u -d "$NOW_ISO" +%Y%m%dT%H%M%SZ
+STAMP="$(cat "$RUN_OUT")"
 BASE=""
 i=0
 while [ "$i" -lt 100000 ]; do
@@ -532,11 +553,12 @@ exec 9>&-
 # line first, then append it with a single printf: one bounded (<PIPE_BUF) write
 # to an O_APPEND fd is atomic, so parallel runs never interleave partial lines.
 # `path` names this run's own archive.
-INDEX_LINE="$(jq -cn \
+# shellcheck disable=SC2016 # jq variables are expanded by jq, not the shell.
+run_or_die "failed to build index line with jq" "" -- "$JQ_BIN" -cn \
   --arg ts "$NOW_ISO" --arg since "$SINCE_ISO" --arg until "$UNTIL_ISO" \
   --arg path "history/$BASE.json" --arg fingerprint "$FINGERPRINT" \
-  '{ts: $ts, since: $since, until: $until, path: $path, fingerprint: $fingerprint}')" \
-  || { echo "fm-usage-report: failed to build index line" >&2; exit 2; }
+  '{ts: $ts, since: $since, until: $until, path: $path, fingerprint: $fingerprint}'
+INDEX_LINE="$(cat "$RUN_OUT")"
 printf '%s\n' "$INDEX_LINE" >> "$OUT/index.jsonl" || { echo "fm-usage-report: failed to append index line to $OUT/index.jsonl" >&2; exit 2; }
 
 # --- caller-facing summary (from THIS run's archive, not the shared latest) ---
@@ -544,9 +566,12 @@ ARCHIVE_JSON="$OUT/history/$BASE.json"
 if [ "$EMIT_JSON" -eq 1 ]; then
   cat "$ARCHIVE_JSON"
 else
-  total="$(jq -r '.totals.tasks' "$ARCHIVE_JSON")"
-  mix="$(jq -r '.panels.model_mix.by_harness_model_effort
-    | map("\(.harness)/\(.model)/\(.effort)=\(.count)") | join(" ")' "$ARCHIVE_JSON")"
+  run_or_die "failed to read total from archive with jq" "" -- "$JQ_BIN" -r '.totals.tasks' "$ARCHIVE_JSON"
+  total="$(cat "$RUN_OUT")"
+  run_or_die "failed to read model mix from archive with jq" "" -- "$JQ_BIN" -r \
+    '.panels.model_mix.by_harness_model_effort
+    | map("\(.harness)/\(.model)/\(.effort)=\(.count)") | join(" ")' "$ARCHIVE_JSON"
+  mix="$(cat "$RUN_OUT")"
   printf 'usage report: %s tasks in window %s..%s\n' "$total" "$SINCE_ISO" "$UNTIL_ISO"
   [ -n "$mix" ] && printf 'mix: %s\n' "$mix"
   printf 'report: %s\n' "$OUT/history/$BASE.md"

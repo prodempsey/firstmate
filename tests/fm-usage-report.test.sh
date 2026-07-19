@@ -25,6 +25,8 @@
 #     instead of publishing with an empty fingerprint (QA r5 f1)
 #   - ledger jq failures and timestamp converter failures fail loud and nonzero
 #     instead of publishing a silently reduced or mis-windowed report (QA r6 f1/f2)
+#   - default-window date failures fail loud even if the failed date process
+#     emitted plausible output (QA r7 f1)
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -637,5 +639,44 @@ assert_no_grep "usage report:" "$DFO_OUT" "date failure must not print a success
 assert_absent "$DFO/latest.json" "date failure must not publish latest.json"
 [ ! -f "$DFO/index.jsonl" ] || [ "$(wc -l < "$DFO/index.jsonl")" = 0 ] || fail "date failure must not append an index line"
 pass "a failed timestamp conversion fails loud and nonzero"
+
+# 18d. The omitted --since default date computation fails after writing plausible
+# output. The old nested substitution let norm_since hide that nonzero status and
+# publish a report under the wrong window.
+DSH=$TMP_ROOT/fail-default-since
+mkdir -p "$DSH/state"
+fm_write_meta "$DSH/state/defaultsince.meta" \
+  project=/home/prode/fleet/firstmate harness=claude kind=ship \
+  model=default-since-probe effort=high spawned_at=2026-07-15T10:00:00Z
+DSO=$DSH/out
+DSB=$(fm_fakebin "$DSH")
+DS_REAL_DATE="$(command -v date)"
+cat > "$DSB/date" <<'SH'
+#!/usr/bin/env bash
+real="${REAL_DATE:-/bin/date}"
+for arg in "$@"; do
+  case "$arg" in
+    "2026-07-18T00:00:00Z - 7 days")
+      printf '%s\n' "2020-01-01T00:00:00Z"
+      echo "injected default-since date failure" >&2
+      exit 77
+      ;;
+  esac
+done
+exec "$real" "$@"
+SH
+chmod +x "$DSB/date"
+DSO_OUT=$DSH/stdout; DSO_ERR=$DSH/stderr
+PATH="$DSB:$PATH" REAL_DATE="$DS_REAL_DATE" FM_USAGE_NOW=2026-07-18T00:00:00Z \
+  "$USAGE" --target "$DSH" --out "$DSO" --until 2026-07-18 \
+  >"$DSO_OUT" 2>"$DSO_ERR"
+ds_rc=$?
+[ "$ds_rc" -ne 0 ] || fail "default-since date failure must exit nonzero, got $ds_rc"
+grep -q "failed to compute default --since with date" "$DSO_ERR" || fail "default-since date failure must print a diagnostic to stderr"
+grep -q "injected default-since date failure" "$DSO_ERR" || fail "default-since date failure must preserve date stderr"
+assert_no_grep "usage report:" "$DSO_OUT" "default-since date failure must not print a success summary"
+assert_absent "$DSO/latest.json" "default-since date failure must not publish latest.json"
+[ ! -f "$DSO/index.jsonl" ] || [ "$(wc -l < "$DSO/index.jsonl")" = 0 ] || fail "default-since date failure must not append an index line"
+pass "a failed default-since date computation fails loud and nonzero"
 
 echo "ok - fm-usage-report.test.sh"
