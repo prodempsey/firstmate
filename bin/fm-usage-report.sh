@@ -73,12 +73,17 @@
 #                            never a false ok/high); a session file that cannot
 #                            be READ at all (permissions, I/O) is an
 #                            operational failure and aborts the run via
-#                            run_or_die/run_or_die_to_file. See the "Claude
-#                            token join (slice M2 round 4, class-level)"
-#                            section below for the full per-finding rationale
-#                            (data/qa-m2-q34/report.md,
+#                            run_or_die/run_or_die_to_file. Every timestamp is
+#                            also validated as one indivisible unit - an
+#                            embedded CR/LF is rejected at the schema gate
+#                            before any batching, so a JSON string boundary
+#                            can never be lost in the transport to `date`. See
+#                            the "Claude token join (slice M2 round 5,
+#                            record-framing fix)" section below for the full
+#                            per-finding rationale (data/qa-m2-q34/report.md,
 #                            data/qa-m2r2-q43/report.md,
-#                            data/qa-m2r3-q47/report.md).
+#                            data/qa-m2r3-q47/report.md,
+#                            data/qa-m2r4-q51/report.md).
 #                            CLAUDE_PROJECTS defaults to $HOME/.claude/projects;
 #                            override with FM_CLAUDE_PROJECTS_OVERRIDE (same
 #                            override pattern as FM_STATE_OVERRIDE) so tests
@@ -512,11 +517,11 @@ EOF
   done < "$LEDGER"
 fi
 
-# --- Claude token join (slice M2 round 4, class-level) ------------------------
+# --- Claude token join (slice M2 round 5, record-framing fix) -----------------
 # Redesigned a third time after independent QA (data/qa-m2r3-q47/report.md)
 # found the round-3 point patches did not close their finding classes:
 #
-#   F1 (class-level): round 3 validated that every assistant event's
+#   F1 (class-level, round 4): round 3 validated that every assistant event's
 #      timestamp is a non-empty STRING, then computed the session's
 #      [min,max] window from ALL events (assistant and non-assistant) and
 #      epoch-converted only those two extrema. An assistant event with a
@@ -533,6 +538,23 @@ fi
 #      timestamp fails the whole batch, and the session is invalid. There is
 #      now exactly one timestamp gate for the whole join, and it validates
 #      every timestamp that matters, not two samples of many.
+#   F1 continued (round 5, data/qa-m2r4-q51/report.md): the round-4 batch
+#      validator joins every assistant timestamp with a newline and feeds the
+#      whole list to `date -u -f -` in one call - one line per timestamp.
+#      A JSON string may legally CONTAIN an escaped newline ("\n"), which
+#      `jq -r` materializes as a literal newline byte; a single crafted
+#      timestamp value like "2026-...T12:30:00Z\n2026-...T12:31:00Z" then
+#      splits into TWO separate `date -f` input records. If both halves
+#      happen to be individually valid dates, the whole batch reports
+#      success and the original (invalid, composite) timestamp value is
+#      never rejected - the record-framing transport lost the JSON string
+#      boundary before validation ever saw it. Fixed at the schema gate,
+#      before any batching: evOK now rejects an assistant event whose
+#      timestamp contains an embedded CR or LF outright (a real ISO-8601
+#      timestamp can never legitimately contain one), so such a session
+#      never even reaches `date -f -`. This preserves each JSON timestamp as
+#      one indivisible validation unit without needing a more complex
+#      encoding, per the QA report's own "reasonable options".
 #   F2 (class-level): round 3 introduced save_run_out_to, a cp call OUTSIDE
 #      run_or_die with a real bug (see run_or_die_to_file's own comment for
 #      why `status=$?` after an if-with-no-else is 0, not the real code) -
@@ -694,7 +716,8 @@ while IFS=$'\x1f' read -r ctask cworktree cmodel cspawned cwindow_end; do
               numOK(e.message.usage.output_tokens) and
               ((e.message.usage.cache_read_input_tokens==null) or numOK(e.message.usage.cache_read_input_tokens)) and
               ((e.message.usage.cache_creation_input_tokens==null) or numOK(e.message.usage.cache_creation_input_tokens)) and
-              (e.timestamp != null) and (e.timestamp|type=="string") and (e.timestamp != "");
+              (e.timestamp != null) and (e.timestamp|type=="string") and (e.timestamp != "") and
+              (e.timestamp | test("[\r\n]") | not);
             ( [ .[] | select(type=="object" and .type=="assistant") ] ) as $asst |
             ( $asst | all(evOK(.)) ) as $schemaOk |
             [ ($schemaOk|tostring), (($asst|length)>0|tostring),

@@ -63,7 +63,7 @@
 #     tokens_status=partial/confidence=low - a floor, NEVER a
 #     silently-reduced ok/high. A malformed sibling never hides a valid
 #     session's tokens; it just downgrades the whole task's status.
-#   - QA r1 F1 / r2 / r3 (class-level): a usage-bearing assistant event's
+#   - QA r1 F1 / r2 / r3 / r4 (class-level): a usage-bearing assistant event's
 #     timestamp is validated as a whole class, not sampled. Missing,
 #     non-string (numeric/null), and unparseable timestamps are all caught -
 #     including one that is LEXICALLY INTERIOR to valid non-assistant
@@ -71,7 +71,13 @@
 #     QA's exact reproduction). Every assistant timestamp in a session is
 #     batch-validated in one `date -f -` call; any single failure invalidates
 #     the whole session. An assistant-free session is never penalized (it has
-#     no timestamp to lose).
+#     no timestamp to lose). round 4 QA then found the batch's newline-joined
+#     record framing itself was ambiguous: a JSON timestamp value containing
+#     an embedded CR/LF is indistinguishable from two separate records once
+#     joined, so a crafted composite value could split into two individually-
+#     valid dates and evade validation entirely. Fixed by rejecting an
+#     embedded CR/LF at the schema gate, before any batching - a real
+#     ISO-8601 timestamp can never legitimately contain one.
 #   - QA r1 F2: a session claimed by more than one task sharing a reused
 #     worktree with overlapping windows is excluded from ALL of their sums
 #     (never split, never double counted); a session claimed by only one of
@@ -1608,6 +1614,53 @@ MIJ=$MIH/$OUT_SUB/latest.json
 [ "$(row_of "$MIJ" multii total_tokens)" = 0 ] || fail "QA r3 F1: must not silently sum only the 10+30 from the valid events, dropping the bad one unlabeled"
 pass "QA r3 F1: one unparseable assistant timestamp among several valid ones invalidates the whole session, not just itself"
 
+# --- 53b (QA r4 F1, critical, exact reproduction). Record-framing defect: the
+# batch validator joins assistant timestamps with newlines before feeding GNU
+# `date -f -`. A single JSON timestamp value containing an EMBEDDED newline
+# (a JSON string may legally contain "\n" - jq -r materializes it as a real
+# newline byte) is therefore split into two separate `date -f` input records.
+# If both halves happen to be individually valid dates, the whole batch
+# reports success and the ORIGINAL invalid/composite timestamp is never
+# rejected - QA round 4's exact reproduction. The fix rejects any embedded
+# CR/LF as part of schema validation itself (a real ISO-8601 timestamp can
+# never legitimately contain one), so this session never even reaches the
+# date -f - batch call.
+NLH=$(make_home claude-newline-timestamp)
+CPNL="$NLH/claude-projects"
+append_run "$NLH/state/task-runs.jsonl" newlinets ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+ENCNL=$(encode_worktree /wt/newlinets)
+mkdir -p "$CPNL/$ENCNL"
+jq -nc --arg ts "$(printf '2026-07-15T12:30:00Z\n2026-07-15T12:31:00Z')" \
+  '{type:"assistant", timestamp:$ts, message:{model:"claude-opus-4-8", usage:{input_tokens:100, output_tokens:0}}}' \
+  > "$CPNL/$ENCNL/s.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPNL" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$NLH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "embedded-newline-timestamp run exited non-zero"
+NLJ=$NLH/$OUT_SUB/latest.json
+[ "$(row_of "$NLJ" newlinets tokens_status)" = partial ] || fail "QA r4 F1: a timestamp containing an embedded newline (two individually-valid dates once split) must be partial, got $(row_of "$NLJ" newlinets tokens_status)"
+[ "$(row_of "$NLJ" newlinets confidence)" = low ] || fail "QA r4 F1: must never be high - the composite value was never a single valid timestamp"
+[ "$(row_of "$NLJ" newlinets sessions_problem)" = 1 ] || fail "QA r4 F1: the session must be counted as a problem"
+[ "$(row_of "$NLJ" newlinets total_tokens)" = 0 ] || fail "QA r4 F1: the 100 tokens must never be confidently attributed via a record-framing artifact"
+pass "QA r4 F1: an assistant timestamp with an embedded newline (record-framing ambiguity) is rejected at the schema gate, never ok/high"
+
+# --- 53c (QA r4 F1). An embedded carriage return alone (no LF) is rejected
+# the same way - the fix covers CR/LF as a class, not just \n.
+CRH=$(make_home claude-cr-timestamp)
+CPCR="$CRH/claude-projects"
+append_run "$CRH/state/task-runs.jsonl" crts ship /home/prode/fleet/firstmate claude claude-opus-4-8 high 2026-07-15T12:00:00Z
+ENCCR=$(encode_worktree /wt/crts)
+mkdir -p "$CPCR/$ENCCR"
+jq -nc --arg ts "$(printf '2026-07-15T12:30:00Z\r2026-07-15T12:31:00Z')" \
+  '{type:"assistant", timestamp:$ts, message:{model:"claude-opus-4-8", usage:{input_tokens:50, output_tokens:0}}}' \
+  > "$CPCR/$ENCCR/s.jsonl"
+FM_CLAUDE_PROJECTS_OVERRIDE="$CPCR" FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+  --target "$CRH" --since 2026-07-01 --until 2026-07-31 >/dev/null \
+  || fail "embedded-CR-timestamp run exited non-zero"
+CRJ=$CRH/$OUT_SUB/latest.json
+[ "$(row_of "$CRJ" crts tokens_status)" = partial ] || fail "QA r4 F1: an embedded carriage return must also be rejected, got $(row_of "$CRJ" crts tokens_status)"
+[ "$(row_of "$CRJ" crts sessions_problem)" = 1 ] || fail "QA r4 F1: the CR-containing session must be counted as a problem"
+pass "QA r4 F1: an embedded carriage return in a timestamp is rejected the same way as an embedded newline"
+
 # --- 54 (QA r3 F2). run_or_die_to_file preserves the REAL exit status of a
 # failed find, not a fixed/fake code - the exact bug save_run_out_to had
 # (an if-with-no-else zeroed status=$? to 0 regardless of the real failure).
@@ -1689,7 +1742,7 @@ pass "QA r3 F3: verified the exact swallowed-vs-propagated substitution mechanis
 # entirely - find now writes straight to its destination via
 # run_or_die_to_file, so there is nothing left to copy).
 JOIN_SECTION_FILE=$(mktemp "$TMP_ROOT/join-section.XXXXXX")
-awk '/^# --- Claude token join \(slice M2 round 4, class-level\)/,/^# --- build machine report/' "$USAGE" > "$JOIN_SECTION_FILE"
+awk '/^# --- Claude token join \(slice M2 round 5, record-framing fix\)/,/^# --- build machine report/' "$USAGE" > "$JOIN_SECTION_FILE"
 [ -s "$JOIN_SECTION_FILE" ] || fail "QA r3 static assertion: the join-stage section marker was not found (anchor text drifted?)"
 # shellcheck disable=SC2016
 assert_no_grep 'cat "$RUN_OUT"' "$JOIN_SECTION_FILE" "QA r2/r3 F7: no direct 'cat \"\$RUN_OUT\"' in the join stage"
