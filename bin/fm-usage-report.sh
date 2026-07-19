@@ -137,7 +137,11 @@ UNTIL_EPOCH="$(to_epoch "$UNTIL_ISO")"
 # it from the file (never from argv), so the accumulator cannot hit the argument
 # limit as the fleet grows.
 REC_FILE="$(mktemp "${TMPDIR:-/tmp}/fm-usage-recs.XXXXXX")"
-trap 'rm -f "$REC_FILE"' EXIT
+# Every run-private temp this process creates is tracked here and removed on any
+# exit. rm on the array (not a glob) so a sibling concurrent run's temps in the
+# same output dir are never touched.
+CLEANUP_FILES=("$REC_FILE")
+trap 'rm -f "${CLEANUP_FILES[@]}"' EXIT
 
 # window_decision <start-epoch-or-empty> <end-epoch-or-empty> -> yes|no|undated
 # A task occupies the interval [start,end]; it belongs in the report when that
@@ -250,10 +254,18 @@ EOF
   done < "$LEDGER"
 fi
 
-# --- build machine report (latest.json) --------------------------------------
+# --- build machine report into a RUN-PRIVATE temp ----------------------------
+# Everything below writes to this run's own temp files, never the shared
+# latest.{json,md}. Concurrent same-second runs would otherwise interleave: one
+# process's read/copy of the shared latest could capture another's content, so an
+# archive would hold the wrong report and its recorded fingerprint would not
+# match. Writing private, then renaming into the uniquely-claimed archive, keeps
+# every run's snapshot its own. The temps live UNDER $OUT (mktemp there) so the
+# later rename into $OUT/history and onto latest is same-filesystem and atomic;
+# a temp in $TMPDIR could be a cross-device move (copy+unlink, not atomic).
 mkdir -p "$OUT/history"
-LATEST_JSON="$OUT/latest.json"
-LATEST_MD="$OUT/latest.md"
+TMP_JSON="$(mktemp "$OUT/.usage-report.XXXXXX")"; CLEANUP_FILES+=("$TMP_JSON")
+TMP_MD="$(mktemp "$OUT/.usage-report.XXXXXX")"; CLEANUP_FILES+=("$TMP_MD")
 
 jq -n \
   --slurpfile recs "$REC_FILE" \
@@ -320,9 +332,9 @@ jq -n \
         note: "Counterfactual savings land in slice M5; not part of this slice."
       }
     }
-  }' > "$LATEST_JSON"
+  }' > "$TMP_JSON"
 
-# --- render human report (latest.md) -----------------------------------------
+# --- render human report into the run-private temp ---------------------------
 jq -r '
   "# Model economy - usage report (slice \(.slice))",
   "",
@@ -375,14 +387,29 @@ jq -r '
   "## Panel D - Counterfactual savings (\(.panels.counterfactual.status), confidence: \(.panels.counterfactual.confidence))",
   "",
   .panels.counterfactual.note
-' "$LATEST_JSON" > "$LATEST_MD"
+' "$TMP_JSON" > "$TMP_MD"
 
-# --- dated archive copy + run index ------------------------------------------
-# The archive is an IMMUTABLE per-run snapshot, but the stamp has only second
+# --- fingerprint this run's own private JSON ---------------------------------
+# Computed from THIS run's finalized content (which is byte-identical to what
+# gets renamed into the archive), so the fingerprint always matches its archive.
+# Canonicalize in a checked step first: piping jq straight into sha256sum would,
+# without pipefail, mask a jq failure and record sha256("") - the empty-input
+# digest the concurrent probe caught. The canonical form is bounded (mix only).
+CANON="$(jq -S '{window, totals, model_mix: .panels.model_mix}' "$TMP_JSON")" \
+  || { echo "fm-usage-report: failed to canonicalize report for fingerprint" >&2; exit 2; }
+# printf '%s\n' restores the single trailing newline that $() stripped from jq's
+# output, so this digest is byte-identical to a plain
+#   jq -S '{window,totals,model_mix:.panels.model_mix}' <archive> | sha256sum
+# recompute from the archive - the natural way to re-verify it.
+FINGERPRINT="$(printf '%s\n' "$CANON" | sha256sum | cut -d' ' -f1)"
+
+# --- claim a unique immutable archive slot, then rename the private pair in ---
+# The archive is an IMMUTABLE per-run snapshot. The stamp has only second
 # precision, so two runs in the same second (a pinned test clock, or genuinely
-# concurrent/repeated invocations) would collide. Claim a unique slot with an
-# atomic no-clobber create (O_EXCL): the first run at a second gets usage-<STAMP>,
-# the next usage-<STAMP>-1, and so on, so no prior snapshot is ever overwritten.
+# concurrent invocations) would collide. Claim a unique name with an atomic
+# no-clobber create (O_EXCL): the first run at a second gets usage-<STAMP>, the
+# next usage-<STAMP>-1, and so on. Because the name is claimed exclusively, the
+# rename of this run's private files into it cannot capture another run's content.
 STAMP="$(date -u -d "$NOW_ISO" +%Y%m%dT%H%M%SZ)"
 BASE=""
 i=0
@@ -392,30 +419,41 @@ while [ "$i" -lt 100000 ]; do
   i=$((i + 1))
 done
 [ -n "$BASE" ] || { echo "fm-usage-report: could not allocate a unique archive name in $OUT/history" >&2; exit 2; }
-cp "$LATEST_JSON" "$OUT/history/$BASE.json"
-cp "$LATEST_MD" "$OUT/history/$BASE.md"
+# mv (rename) is atomic and replaces the empty reserved .json; the .md shares the
+# exclusively-claimed BASE, so it needs no separate reservation.
+mv -f "$TMP_JSON" "$OUT/history/$BASE.json"
+mv -f "$TMP_MD" "$OUT/history/$BASE.md"
 
-# Fingerprint the mix content only (window + totals + model_mix), never the wall
-# clock, so identical inputs over the same window fingerprint identically.
-FINGERPRINT="$(jq -S '{window, totals, model_mix: .panels.model_mix}' "$LATEST_JSON" \
-  | sha256sum | cut -d' ' -f1)"
-# -cn: one COMPACT JSON object per physical line, so index.jsonl is valid JSON
-# Lines (section 3.2); a pretty-printed object would span several lines and break
-# any line-oriented reader.
-jq -cn \
+# --- publish latest.{json,md} atomically from this run's archive -------------
+# Copy the finalized archive to a same-dir temp, then rename over latest. Each
+# publish is one complete file swapped in by an atomic rename, so a concurrent
+# reader (or writer) never sees a torn latest; whichever run publishes last wins,
+# which is the correct "most recent" meaning of latest.
+PUB_JSON="$(mktemp "$OUT/.usage-latest.XXXXXX")"; CLEANUP_FILES+=("$PUB_JSON")
+PUB_MD="$(mktemp "$OUT/.usage-latest.XXXXXX")"; CLEANUP_FILES+=("$PUB_MD")
+cp "$OUT/history/$BASE.json" "$PUB_JSON"; mv -f "$PUB_JSON" "$OUT/latest.json"
+cp "$OUT/history/$BASE.md" "$PUB_MD"; mv -f "$PUB_MD" "$OUT/latest.md"
+
+# --- append one robust JSONL index line --------------------------------------
+# -cn: one COMPACT object per physical line, so index.jsonl is valid JSON Lines
+# (section 3.2). Build the whole line first, then append it with a single
+# printf: one bounded (<PIPE_BUF) write to an O_APPEND fd is atomic, so parallel
+# runs never interleave partial lines. `path` names this run's own archive.
+INDEX_LINE="$(jq -cn \
   --arg ts "$NOW_ISO" --arg since "$SINCE_ISO" --arg until "$UNTIL_ISO" \
   --arg path "history/$BASE.json" --arg fingerprint "$FINGERPRINT" \
-  '{ts: $ts, since: $since, until: $until, path: $path, fingerprint: $fingerprint}' \
-  >> "$OUT/index.jsonl"
+  '{ts: $ts, since: $since, until: $until, path: $path, fingerprint: $fingerprint}')"
+printf '%s\n' "$INDEX_LINE" >> "$OUT/index.jsonl"
 
-# --- caller-facing summary ---------------------------------------------------
+# --- caller-facing summary (from THIS run's archive, not the shared latest) ---
+ARCHIVE_JSON="$OUT/history/$BASE.json"
 if [ "$EMIT_JSON" -eq 1 ]; then
-  cat "$LATEST_JSON"
+  cat "$ARCHIVE_JSON"
 else
-  total="$(jq -r '.totals.tasks' "$LATEST_JSON")"
+  total="$(jq -r '.totals.tasks' "$ARCHIVE_JSON")"
   mix="$(jq -r '.panels.model_mix.by_harness_model_effort
-    | map("\(.harness)/\(.model)/\(.effort)=\(.count)") | join(" ")' "$LATEST_JSON")"
+    | map("\(.harness)/\(.model)/\(.effort)=\(.count)") | join(" ")' "$ARCHIVE_JSON")"
   printf 'usage report: %s tasks in window %s..%s\n' "$total" "$SINCE_ISO" "$UNTIL_ISO"
   [ -n "$mix" ] && printf 'mix: %s\n' "$mix"
-  printf 'report: %s\n' "$LATEST_MD"
+  printf 'report: %s\n' "$OUT/history/$BASE.md"
 fi

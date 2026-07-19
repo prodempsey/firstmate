@@ -16,6 +16,8 @@
 #   - interval overlap: a task spanning the whole window is kept (QA finding 1)
 #   - index.jsonl is physical JSON Lines, one object per line (QA finding 2)
 #   - same-second archive runs do not overwrite each other (QA finding 3)
+#   - CONCURRENT same-second runs each yield one correct immutable snapshot,
+#     with agreeing json/md pairs and fingerprints that recompute (QA r2 f1)
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -268,5 +270,64 @@ CHIST=$CH/$OUT_SUB/history
 COUNTS=$(find "$CHIST" -name 'usage-*.json' -exec jq -r '.totals.tasks' {} \; | sort | tr '\n' ' ')
 [ "$COUNTS" = "1 2 " ] || fail "archives must preserve both distinct reports, got '$COUNTS'"
 pass "index.jsonl is real JSONL and same-second archives never overwrite"
+
+# --- 14. concurrent same-second runs stay run-private (QA round 2, finding 1) --
+# Four processes with distinct per-run model markers and isolated input homes,
+# all writing ONE shared --out at the IDENTICAL pinned second. Each must land its
+# own correct immutable snapshot; none may capture another run's content. Asserts
+# exactly what the QA report requires: every run appears exactly once, each
+# json/md pair agrees, every indexed path exists, and every fingerprint
+# recomputes from its referenced archive.
+NPROC=4
+CSHARED=$TMP_ROOT/cc-shared-out
+mkdir -p "$CSHARED"
+cpids=()
+k=1
+while [ "$k" -le "$NPROC" ]; do
+  chome=$TMP_ROOT/cc-home-$k
+  mkdir -p "$chome/state"
+  # A distinct model marker per run, three rows so content is nontrivial.
+  t=1
+  while [ "$t" -le 3 ]; do
+    append_run "$chome/state/task-runs.jsonl" "r$k-t$t" ship \
+      /home/prode/fleet/firstmate claude "model-$k" high 2026-07-15T10:00:00Z
+    t=$((t + 1))
+  done
+  FM_USAGE_NOW=2026-07-18T00:00:00Z "$USAGE" \
+    --target "$chome" --out "$CSHARED" --since 2026-07-01 --until 2026-07-18 \
+    >/dev/null 2>&1 &
+  cpids+=("$!")
+  k=$((k + 1))
+done
+crc=0
+for p in "${cpids[@]}"; do wait "$p" || crc=1; done
+[ "$crc" = 0 ] || fail "a concurrent run exited non-zero"
+
+# One line and one json/md archive pair per run - nothing lost, nothing merged.
+[ "$(wc -l < "$CSHARED/index.jsonl")" = "$NPROC" ] || fail "concurrent: expected $NPROC index lines, got $(wc -l < "$CSHARED/index.jsonl")"
+[ "$(find "$CSHARED/history" -name 'usage-*.json' | wc -l)" = "$NPROC" ] || fail "concurrent: expected $NPROC json archives"
+[ "$(find "$CSHARED/history" -name 'usage-*.md' | wc -l)" = "$NPROC" ] || fail "concurrent: expected $NPROC md archives"
+
+# Every expected model appears exactly once across the archives (no run's report
+# was overwritten by another's shared latest).
+CMODELS=$(find "$CSHARED/history" -name 'usage-*.json' -exec jq -r '.panels.model_mix.by_harness_model_effort[].model' {} \; | sort | tr '\n' ' ')
+CEXPECT=""
+k=1; while [ "$k" -le "$NPROC" ]; do CEXPECT="$CEXPECT model-$k"; k=$((k + 1)); done
+CEXPECT="$(printf '%s' "$CEXPECT" | tr ' ' '\n' | grep -v '^$' | sort | tr '\n' ' ')"
+[ "$CMODELS" = "$CEXPECT" ] || fail "concurrent: each model must appear exactly once; got [$CMODELS] want [$CEXPECT]"
+
+# Each indexed run: path exists, json/md pair agrees, fingerprint recomputes.
+while IFS= read -r ln; do
+  cp_path=$(printf '%s' "$ln" | jq -r '.path')
+  cp_fp=$(printf '%s' "$ln" | jq -r '.fingerprint')
+  [ -f "$CSHARED/$cp_path" ] || fail "concurrent: indexed archive missing: $cp_path"
+  cp_md="${cp_path%.json}.md"
+  [ -f "$CSHARED/$cp_md" ] || fail "concurrent: md pair missing for $cp_path"
+  cp_tasks=$(jq -r '.totals.tasks' "$CSHARED/$cp_path")
+  grep -q "Total tasks: $cp_tasks " "$CSHARED/$cp_md" || fail "concurrent: json/md pair disagree for $cp_path"
+  cp_recompute=$(jq -S '{window, totals, model_mix: .panels.model_mix}' "$CSHARED/$cp_path" | sha256sum | cut -d' ' -f1)
+  [ "$cp_fp" = "$cp_recompute" ] || fail "concurrent: fingerprint does not recompute for $cp_path ($cp_fp vs $cp_recompute)"
+done < "$CSHARED/index.jsonl"
+pass "concurrent same-second runs each yield one correct immutable snapshot"
 
 echo "ok - fm-usage-report.test.sh"
