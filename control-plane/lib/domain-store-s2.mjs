@@ -48,12 +48,13 @@ const S2_CONFLICT_ERRORS = {
 const COMPLETE_FROM = new Set(['running', 'waiting_firstmate']);
 const FAIL_FROM = new Set(['spawning', 'running', 'blocked', 'waiting_firstmate', 'needs_human']);
 
-// Allowed outcomes per terminal verb. `complete` admits exactly 'success' (the
-// DDL's outcome_tied CHECK ties a completed event to it); requiring the caller to
-// SAY so - rather than defaulting it - is what makes `complete --outcome failure`
-// a loud rejection instead of a silent success (qa-s2-q54 finding 2).
+// Allowed outcomes for `complete`: exactly 'success' (the DDL's outcome_tied CHECK
+// ties a completed event to it); requiring the caller to SAY so - rather than
+// defaulting it - is what makes `complete --outcome failure` a loud rejection
+// instead of a silent success (qa-s2-q54 finding 2). `fail` has no outcome set at
+// all: its outcome is hard-coded 'failure' (the DDL's 'superseded' failed outcome
+// is reserved for internal reconciler use in a later slice, never caller-selected).
 const COMPLETE_OUTCOMES = new Set(['success']);
-const FAIL_OUTCOMES = new Set(['failure', 'superseded']);
 
 // Mirrors the task_events.producer_id CHECK vocabulary in domain-schema-s1.sql.
 // Defined locally rather than exported from S1 so the sanctioned domain-store.mjs
@@ -394,14 +395,17 @@ export async function failRun(store, params, opts = {}) {
     runStatus: 'failed',
     taskStatus: 'failed',
     fromStates: FAIL_FROM,
+    // A failed run's outcome is 'failure', full stop (spec section 6 gives fail no
+    // --outcome). The dispatcher already rejects the flag; this guard keeps the
+    // domain seam equally closed so no in-package caller can author a
+    // caller-selected failed outcome either (qa-s2r2-q55).
     resolveOutcome: (p) => {
-      const o = p.outcome ?? 'failure';
-      if (!FAIL_OUTCOMES.has(o)) {
+      if (p.outcome !== undefined) {
         throw new ValidationError(
-          `fail --outcome must be one of ${[...FAIL_OUTCOMES].join(', ')}`, { outcome: p.outcome ?? null }
+          "fail records outcome 'failure'; an outcome is not part of its surface", { outcome: p.outcome }
         );
       }
-      return o;
+      return 'failure';
     },
     // --reason is REQUIRED and persisted in the failed event's payload; --artifacts-file
     // is the spec's one optional terminal input and rides along when supplied.

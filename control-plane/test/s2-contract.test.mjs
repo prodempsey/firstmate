@@ -498,6 +498,18 @@ test('t_terminal_inputs_validated_loudly', async () => {
     (e) => e instanceof ValidationError && /--artifacts-file could not be read/.test(e.message),
     'a supplied-but-missing --artifacts-file must reject loudly, never silently drop'
   );
+  // fail has NO --outcome (spec section 6): a failed run's outcome is 'failure',
+  // full stop. Both the redundant and the reserved-internal value are rejected
+  // identically - honoring '--outcome superseded' here changed durable terminal
+  // truth and the delivered outbox event (qa-s2r2-q55).
+  for (const outcome of ['failure', 'superseded']) {
+    await assert.rejects(
+      () => runVerb(['fail', ...base, '--reason', 'r', '--producer', 'crewmate', '--seq', '1',
+        '--outcome', outcome, '--command-id', `c-fail-outcome-${outcome}`], { env }),
+      (e) => e instanceof ValidationError && /has no --outcome/.test(e.message),
+      `fail --outcome ${outcome} must reject loudly`
+    );
+  }
   await assert.rejects(
     () => runVerb(['cancel', 't1', '--expected-revision', String(rev), '--command-id', 'c-cancel-noreason'], { env }),
     (e) => e instanceof ValidationError && /requires --reason/.test(e.message),

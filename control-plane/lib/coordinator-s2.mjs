@@ -65,11 +65,19 @@ async function dispatch(verb, flags, positionals, store) {
         commandId: flags['command-id']
       });
     case 'fail':
+      // The spec gives fail NO --outcome (section 6: a failed run's outcome is
+      // 'failure', full stop). Accepting-and-honoring it changed durable terminal
+      // truth (qa-s2r2-q55), so like the other non-spec flags it rejects loudly.
+      if ('outcome' in flags) {
+        throw new ValidationError(
+          "'fail' has no --outcome; a failed run's outcome is always 'failure' (spec section 6)",
+          { verb }
+        );
+      }
       return failRun(store, {
         taskId: positionals[0],
         generation: parseIntFlag(flags, 'generation'),
         expectedRevision: parseIntFlag(flags, 'expected-revision'),
-        outcome: typeof flags.outcome === 'string' ? flags.outcome : undefined,
         reason: requireStringFlag(verb, flags, 'reason'),
         producer: requireStringFlag(verb, flags, 'producer'),
         seq: parseIntFlag(flags, 'seq'),

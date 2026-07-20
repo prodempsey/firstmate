@@ -256,7 +256,7 @@ test('t_complete_after_fail_conflicts', async () => {
   const rev = await runningTask(store, 't1');
 
   await failRun(store, {
-    taskId: 't1', generation: 1, expectedRevision: rev, outcome: 'failure', ...FAIL_INPUTS, commandId: 'c-fail'
+    taskId: 't1', generation: 1, expectedRevision: rev, ...FAIL_INPUTS, commandId: 'c-fail'
   });
   const afterFail = await counters(store);
   const ev = await rows(
@@ -338,7 +338,7 @@ test('t_complete_fail_race', async () => {
   // generation's outcome; the other must be refused rather than overwrite it.
   const settled = await Promise.allSettled([
     completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-complete' }),
-    failRun(other, { taskId: 't1', generation: 1, expectedRevision: rev, outcome: 'failure', ...FAIL_INPUTS, commandId: 'c-fail' })
+    failRun(other, { taskId: 't1', generation: 1, expectedRevision: rev, ...FAIL_INPUTS, commandId: 'c-fail' })
   ]);
   const fulfilled = settled.filter((s) => s.status === 'fulfilled');
   const rejected = settled.filter((s) => s.status === 'rejected');
