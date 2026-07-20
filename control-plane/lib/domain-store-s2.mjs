@@ -48,10 +48,43 @@ const S2_CONFLICT_ERRORS = {
 const COMPLETE_FROM = new Set(['running', 'waiting_firstmate']);
 const FAIL_FROM = new Set(['spawning', 'running', 'blocked', 'waiting_firstmate', 'needs_human']);
 
+// Allowed outcomes per terminal verb. `complete` admits exactly 'success' (the
+// DDL's outcome_tied CHECK ties a completed event to it); requiring the caller to
+// SAY so - rather than defaulting it - is what makes `complete --outcome failure`
+// a loud rejection instead of a silent success (qa-s2-q54 finding 2).
+const COMPLETE_OUTCOMES = new Set(['success']);
 const FAIL_OUTCOMES = new Set(['failure', 'superseded']);
+
+// Mirrors the task_events.producer_id CHECK vocabulary in domain-schema-s1.sql.
+// Defined locally rather than exported from S1 so the sanctioned domain-store.mjs
+// diff stays exactly the ruling RISK#1 export edit.
+const TERMINAL_PRODUCERS = new Set(['coordinator', 'adapter', 'crewmate', 'firstmate', 'reconciler']);
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+// Terminal provenance is caller-supplied and REQUIRED (spec section 6: complete and
+// fail both take --producer/--seq). It is validated here and then stored verbatim as
+// the event's provenance - never rewritten to a coordinator-derived sequence, which
+// would falsify the audit trail (qa-s2-q54 finding 2).
+function validateTerminalProvenance(verb, params) {
+  if (!TERMINAL_PRODUCERS.has(params.producer)) {
+    throw new ValidationError(
+      `${verb} --producer must be one of ${[...TERMINAL_PRODUCERS].join(', ')}`,
+      { producer: params.producer ?? null }
+    );
+  }
+  if (!Number.isInteger(params.seq) || params.seq < 1) {
+    throw new ValidationError(`${verb} requires an integer --seq >= 1`);
+  }
+}
+
+function requireReason(verb, reason) {
+  if (typeof reason !== 'string' || reason.length === 0) {
+    throw new ValidationError(`${verb} requires a non-empty --reason`, { reason: reason ?? null });
+  }
+  return reason;
 }
 
 // Apply the S2 schema idempotently at the start of an S2 domain mutation. S2 applies
@@ -69,8 +102,9 @@ async function applyS2Schema(conn) {
 
 // The next strictly-advancing producer sequence for a producer within a generation
 // namespace (run_generation = -1 is the task-scope namespace, mirroring
-// ux_event_producer_seq). Derived rather than assumed so a terminal never collides
-// with the seq begin-run already spent on the same generation.
+// ux_event_producer_seq). Used only by `cancel`, whose two events are
+// coordinator-generated (spec section 6 gives cancel no --producer/--seq); the
+// terminal verbs store the caller's validated provenance instead.
 async function nextProducerSeq(conn, taskId, generationNamespace, producer) {
   const hw = await conn.query(
     'SELECT last_seq FROM producer_highwater WHERE task_id = $1 AND run_generation = $2 AND producer_id = $3',
@@ -145,14 +179,18 @@ async function commitTerminal(store, params, { now = nowIso(), fault, faultBefor
   if (!Number.isInteger(params.expectedRevision)) {
     throw new ValidationError(`${spec.verb} requires an integer --expected-revision`);
   }
+  validateTerminalProvenance(spec.verb, params);
   const outcome = spec.resolveOutcome(params);
-  const payload = params.payload ?? {};
+  const payload = spec.buildPayload(params);
   // expected_revision is part of the request identity, matching S1's begin-run/event:
   // a replay that changes the causal token it acted on is a DIFFERENT request, not an
-  // idempotent replay.
+  // idempotent replay. Producer and seq are part of it too: a retry that claims
+  // different provenance is a DIFFERENT request and must surface as an idempotency
+  // conflict, never silently replay the stored result (qa-s2-q54 finding 2).
   const requestHash = sha256hex(canonicalJson({
     verb: spec.verb, task_id: params.taskId, generation: params.generation,
-    expected_revision: params.expectedRevision, outcome, payload
+    expected_revision: params.expectedRevision, outcome,
+    producer: params.producer, seq: params.seq, payload
   }));
 
   return executeCommand(store, {
@@ -220,12 +258,33 @@ async function commitTerminal(store, params, { now = nowIso(), fault, faultBefor
         );
       }
 
+      // The caller's producer sequence must strictly advance its own high-water
+      // within the generation, exactly as generic `event` enforces (ruling Q5:
+      // reject seq <= last_seq; gaps tolerated). This is what makes the supplied
+      // --seq a CHECKED causal claim rather than decoration.
+      const hw = await conn.query(
+        'SELECT last_seq FROM producer_highwater WHERE task_id = $1 AND run_generation = $2 AND producer_id = $3',
+        [params.taskId, params.generation, params.producer]
+      );
+      const lastSeq = hw.rows.length > 0 ? Number(hw.rows[0].last_seq) : 0;
+      if (params.seq <= lastSeq) {
+        throw new ConflictSignal('causal', {
+          anomalyClass: 'causal_ordering_violation', taskId: params.taskId,
+          runGeneration: params.generation, terminalFingerprint: `${params.producer}:${params.seq}`,
+          detail: {
+            ...conflictDetail, reason: 'nonmonotonic_producer_seq',
+            producer: params.producer, seq: params.seq, last_seq: lastSeq
+          }
+        });
+      }
+
       // ---- the atomic bundle: event + run closure + outbox, one commit ----
-      const producerSeq = await nextProducerSeq(conn, params.taskId, params.generation, 'coordinator');
+      // The event's provenance is the CALLER's, stored verbatim (qa-s2-q54
+      // finding 2): the producer that observed the outcome owns the terminal claim.
       const payloadHash = sha256hex(canonicalJson(payload));
       const eventId = await insertTerminalEvent(conn, {
         taskId: params.taskId, eventScope: 'run', runGeneration: params.generation,
-        generationKey: params.generation, producer: 'coordinator', producerSeq,
+        generationKey: params.generation, producer: params.producer, producerSeq: params.seq,
         eventType: spec.eventType, isTerminal: true, outcome, payload, now: ctx.now
       }, conflictDetail);
 
@@ -253,8 +312,8 @@ async function commitTerminal(store, params, { now = nowIso(), fault, faultBefor
       });
 
       await upsertHighwater(conn, {
-        taskId: params.taskId, runGeneration: params.generation, producer: 'coordinator',
-        seq: producerSeq, commandId: ctx.commandId, now: ctx.now
+        taskId: params.taskId, runGeneration: params.generation, producer: params.producer,
+        seq: params.seq, commandId: ctx.commandId, now: ctx.now
       });
 
       // Authoritative commit guard. The leading comparison above rejects a stale token
@@ -298,14 +357,30 @@ export async function completeRun(store, params, opts = {}) {
     runStatus: 'completed',
     taskStatus: 'completed',
     fromStates: COMPLETE_FROM,
-    // outcome_tied CHECK: a completed event's outcome is always 'success'. It is not
-    // caller-selectable, so an explicit conflicting --outcome is a validation error
-    // rather than a silently ignored flag.
+    // --outcome is REQUIRED and validated against the allowed set (exactly
+    // 'success', per the outcome_tied CHECK). A caller asserting any other outcome
+    // through `complete` is using the wrong verb and is rejected loudly rather than
+    // silently converted (qa-s2-q54 finding 2).
     resolveOutcome: (p) => {
-      if (p.outcome !== undefined && p.outcome !== 'success') {
-        throw new ValidationError("complete always records outcome 'success'", { outcome: p.outcome });
+      if (p.outcome === undefined) {
+        throw new ValidationError(
+          `complete requires --outcome (allowed: ${[...COMPLETE_OUTCOMES].join(', ')})`
+        );
       }
-      return 'success';
+      if (!COMPLETE_OUTCOMES.has(p.outcome)) {
+        throw new ValidationError(
+          `complete --outcome must be one of ${[...COMPLETE_OUTCOMES].join(', ')}`, { outcome: p.outcome }
+        );
+      }
+      return p.outcome;
+    },
+    // The evidence named by --evidence-file is REQUIRED and rides durably in the
+    // owned terminal event's payload; losing it silently was finding 2's harm.
+    buildPayload: (p) => {
+      if (p.evidence === undefined) {
+        throw new ValidationError('complete requires --evidence-file');
+      }
+      return { evidence: p.evidence };
     }
   });
 }
@@ -327,6 +402,12 @@ export async function failRun(store, params, opts = {}) {
         );
       }
       return o;
+    },
+    // --reason is REQUIRED and persisted in the failed event's payload; --artifacts-file
+    // is the spec's one optional terminal input and rides along when supplied.
+    buildPayload: (p) => {
+      const reason = requireReason('fail', p.reason);
+      return p.artifacts === undefined ? { reason } : { reason, artifacts: p.artifacts };
     }
   });
 }
@@ -342,10 +423,14 @@ export async function cancelTask(store, params, { now = nowIso(), fault } = {}) 
   if (!Number.isInteger(params.expectedRevision)) {
     throw new ValidationError('cancel requires an integer --expected-revision');
   }
-  const payload = params.payload ?? {};
+  // --reason is REQUIRED (spec section 6) and is the cancelled event's durable
+  // payload: queued work must never disappear without a recorded why (qa-s2-q54
+  // finding 2).
+  const reason = requireReason('cancel', params.reason);
+  const payload = { reason };
   const requestHash = sha256hex(canonicalJson({
     verb: 'cancel', task_id: params.taskId,
-    expected_revision: params.expectedRevision, reason: params.reason ?? null, payload
+    expected_revision: params.expectedRevision, reason
   }));
 
   return executeCommand(store, {

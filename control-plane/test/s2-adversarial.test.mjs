@@ -63,6 +63,13 @@ async function runningTask(store, taskId = 't1') {
   return promoteToRunning(store, taskId, 1, 2);
 }
 
+// Minimal valid required terminal inputs (spec section 6) for tests whose subject is
+// crash/race/conflict behavior rather than the input contract (which s2-contract
+// pins). Conflicting attempts use seq 2 so only the conflict itself is under test.
+const COMPLETE_INPUTS = { outcome: 'success', producer: 'crewmate', seq: 1, evidence: {} };
+const COMPLETE_RETRY_INPUTS = { outcome: 'success', producer: 'crewmate', seq: 2, evidence: {} };
+const FAIL_INPUTS = { reason: 'it broke', producer: 'crewmate', seq: 1 };
+
 // The full terminal bundle as observable state, so a test can assert all-or-nothing
 // in one comparison instead of three that could each pass while the set is torn.
 async function terminalState(store, taskId) {
@@ -101,7 +108,7 @@ test('t_terminal_atomic_under_crash_between_writes', async () => {
   // command_results insert.
   await assert.rejects(
     () => completeRun(store, {
-      taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-crash-a'
+      taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-crash-a'
     }, { fault: () => { throw new Error('simulated crash after terminal bundle'); } }),
     /simulated crash after terminal bundle/
   );
@@ -113,7 +120,7 @@ test('t_terminal_atomic_under_crash_between_writes', async () => {
   // never learn about.
   await assert.rejects(
     () => completeRun(store, {
-      taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-crash-b'
+      taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-crash-b'
     }, { faultBeforeDelivery: () => { throw new Error('simulated crash before delivery'); } }),
     /simulated crash before delivery/
   );
@@ -131,7 +138,7 @@ test('t_terminal_atomic_under_crash_between_writes', async () => {
 
   // A clean retry after both crashes commits the full bundle exactly once.
   const ok = await completeRun(store, {
-    taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-retry'
+    taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-retry'
   });
   assert.equal(ok.revision, rev + 1);
   assert.deepEqual(
@@ -184,7 +191,7 @@ test('t_recovers_when_terminal_writer_exits_before_outbox', async () => {
 
   // The same command retried after the crash commits exactly once, delivery included.
   const retry = await completeRun(reopened, {
-    taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-crash-child'
+    taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-crash-child'
   });
   assert.equal(retry.revision, rev + 1);
   assert.deepEqual(
@@ -200,13 +207,13 @@ test('t_recovers_when_terminal_writer_exits_before_outbox', async () => {
 test('t_double_complete_replays_and_conflicts', async () => {
   const { store } = await freshStore();
   const rev = await runningTask(store, 't1');
-  await completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-done' });
+  await completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-done' });
   const afterFirst = await counters(store);
 
   // Same command-id, same request: an idempotent REPLAY. No write, no audit, no
   // counter movement, stored result returned.
   const replay = await completeRun(store, {
-    taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-done'
+    taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-done'
   });
   assert.equal(replay.revision, rev + 1, 'the replay returns the stored result');
   assert.deepEqual(await counters(store), afterFirst, 'a replay advances nothing');
@@ -218,7 +225,7 @@ test('t_double_complete_replays_and_conflicts', async () => {
   // A DIFFERENT command-id against the now-closed generation is a terminal conflict,
   // not a replay and not a stale-revision causal error.
   await assert.rejects(
-    () => completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev + 1, commandId: 'c-again' }),
+    () => completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev + 1, ...COMPLETE_RETRY_INPUTS, commandId: 'c-again' }),
     (e) => e instanceof TerminalConflictError
       && e.code === 'terminal_conflict'
       && e.detail.reason === 'generation_already_closed',
@@ -249,7 +256,7 @@ test('t_complete_after_fail_conflicts', async () => {
   const rev = await runningTask(store, 't1');
 
   await failRun(store, {
-    taskId: 't1', generation: 1, expectedRevision: rev, outcome: 'failure', commandId: 'c-fail'
+    taskId: 't1', generation: 1, expectedRevision: rev, outcome: 'failure', ...FAIL_INPUTS, commandId: 'c-fail'
   });
   const afterFail = await counters(store);
   const ev = await rows(
@@ -260,7 +267,7 @@ test('t_complete_after_fail_conflicts', async () => {
   // A generation that failed cannot then complete: the outcome of a generation is
   // decided once.
   await assert.rejects(
-    () => completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev + 1, commandId: 'c-complete' }),
+    () => completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev + 1, ...COMPLETE_RETRY_INPUTS, commandId: 'c-complete' }),
     (e) => e instanceof TerminalConflictError
       && e.detail.existing_run_status === 'failed'
       && e.detail.attempted_status === 'completed',
@@ -278,9 +285,9 @@ test('t_complete_after_fail_conflicts', async () => {
 
   // The reverse direction is symmetric.
   const rev2 = await runningTask(store, 't2');
-  await completeRun(store, { taskId: 't2', generation: 1, expectedRevision: rev2, commandId: 'c-done-2' });
+  await completeRun(store, { taskId: 't2', generation: 1, expectedRevision: rev2, ...COMPLETE_INPUTS, commandId: 'c-done-2' });
   await assert.rejects(
-    () => failRun(store, { taskId: 't2', generation: 1, expectedRevision: rev2 + 1, commandId: 'c-fail-2' }),
+    () => failRun(store, { taskId: 't2', generation: 1, expectedRevision: rev2 + 1, reason: 'it broke', producer: 'crewmate', seq: 2, commandId: 'c-fail-2' }),
     (e) => e instanceof TerminalConflictError && e.detail.existing_run_status === 'completed',
     'fail after complete is equally a terminal conflict'
   );
@@ -294,8 +301,8 @@ test('t_concurrent_complete_serializes', async () => {
   // Two complete commands race on the same open generation with the same causal
   // token, through two independent store instances contending on the real flock.
   const settled = await Promise.allSettled([
-    completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-a' }),
-    completeRun(other, { taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-b' })
+    completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-a' }),
+    completeRun(other, { taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-b' })
   ]);
   const fulfilled = settled.filter((s) => s.status === 'fulfilled');
   const rejected = settled.filter((s) => s.status === 'rejected');
@@ -330,8 +337,8 @@ test('t_complete_fail_race', async () => {
   // complete and fail race for the SAME generation. Whichever lands first decides the
   // generation's outcome; the other must be refused rather than overwrite it.
   const settled = await Promise.allSettled([
-    completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-complete' }),
-    failRun(other, { taskId: 't1', generation: 1, expectedRevision: rev, outcome: 'failure', commandId: 'c-fail' })
+    completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-complete' }),
+    failRun(other, { taskId: 't1', generation: 1, expectedRevision: rev, outcome: 'failure', ...FAIL_INPUTS, commandId: 'c-fail' })
   ]);
   const fulfilled = settled.filter((s) => s.status === 'fulfilled');
   const rejected = settled.filter((s) => s.status === 'rejected');
@@ -361,13 +368,13 @@ test('t_complete_fail_race', async () => {
 test('t_conflicting_terminal_audits_and_persists', async () => {
   const { store } = await freshStore();
   const rev = await runningTask(store, 't1');
-  await completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-done' });
+  await completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-done' });
   const base = await counters(store);
 
   // Three distinct conflicting terminals against the closed generation.
   for (const id of ['c-x1', 'c-x2', 'c-x3']) {
     await assert.rejects(
-      () => completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev + 1, commandId: id }),
+      () => completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev + 1, ...COMPLETE_RETRY_INPUTS, commandId: id }),
       (e) => e instanceof TerminalConflictError
     );
   }
@@ -405,12 +412,12 @@ test('t_conflicting_terminal_audits_and_persists', async () => {
   // FAILED task (begin-run correctly refuses to respawn a completed one), so this uses
   // the retry path: gen 1 fails, gen 2 is begun, completed, then conflicted.
   const rev2 = await runningTask(store, 't2');
-  await failRun(store, { taskId: 't2', generation: 1, expectedRevision: rev2, commandId: 'c-t2-fail' });
+  await failRun(store, { taskId: 't2', generation: 1, expectedRevision: rev2, ...FAIL_INPUTS, commandId: 'c-t2-fail' });
   await beginRun(store, { taskId: 't2', expectedRevision: rev2 + 1, commandId: 'c-t2-begin-2' });
   const rev2b = await promoteToRunning(store, 't2', 2, rev2 + 1);
-  await completeRun(store, { taskId: 't2', generation: 2, expectedRevision: rev2b, commandId: 'c-t2-done-2' });
+  await completeRun(store, { taskId: 't2', generation: 2, expectedRevision: rev2b, ...COMPLETE_INPUTS, commandId: 'c-t2-done-2' });
   await assert.rejects(
-    () => completeRun(store, { taskId: 't2', generation: 2, expectedRevision: rev2b + 1, commandId: 'c-t2-again' }),
+    () => completeRun(store, { taskId: 't2', generation: 2, expectedRevision: rev2b + 1, ...COMPLETE_RETRY_INPUTS, commandId: 'c-t2-again' }),
     (e) => e instanceof TerminalConflictError
   );
   const anom2 = await rows(
@@ -428,7 +435,7 @@ test('t_terminal_replay_is_not_double_delivery', async () => {
   const { store } = await freshStore();
   const rev = await runningTask(store, 't1');
   const first = await completeRun(store, {
-    taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-done'
+    taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-done'
   });
   const original = await rows(
     store, "SELECT outbox_id, event_id, task_seq, delivery_attempts, acked_at FROM outbox WHERE task_id = 't1'"
@@ -441,7 +448,7 @@ test('t_terminal_replay_is_not_double_delivery', async () => {
   // would become a duplicate side effect there.
   for (let i = 0; i < 5; i += 1) {
     const replay = await completeRun(store, {
-      taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-done'
+      taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-done'
     });
     assert.deepEqual(replay, first, 'every replay returns the identical stored result');
   }
@@ -459,9 +466,9 @@ test('t_terminal_replay_is_not_double_delivery', async () => {
   await createTask(store, {
     taskId: 't2', kind: 'ship', title: 'y', origin: 'internal', internalReason: 'r', commandId: 'c-create-2'
   });
-  const cancelled = await cancelTask(store, { taskId: 't2', expectedRevision: 1, commandId: 'c-cancel' });
+  const cancelled = await cancelTask(store, { taskId: 't2', expectedRevision: 1, reason: 'captain withdrew', commandId: 'c-cancel' });
   const beforeCancelReplay = await counters(store);
-  const cancelReplay = await cancelTask(store, { taskId: 't2', expectedRevision: 1, commandId: 'c-cancel' });
+  const cancelReplay = await cancelTask(store, { taskId: 't2', expectedRevision: 1, reason: 'captain withdrew', commandId: 'c-cancel' });
   assert.deepEqual(cancelReplay, cancelled, 'the cancel replay returns the stored result');
   const cancelOb = await rows(store, "SELECT count(*)::int AS n FROM outbox WHERE task_id = 't2'");
   assert.equal(cancelOb[0].n, 1, 'the cancel replay produced no second delivery');

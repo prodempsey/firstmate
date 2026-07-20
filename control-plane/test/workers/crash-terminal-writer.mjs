@@ -20,6 +20,7 @@ await completeRun(
     taskId: process.env.CP_TASK_ID,
     generation: Number(process.env.CP_GENERATION),
     expectedRevision: Number(process.env.CP_EXPECTED_REVISION),
+    outcome: 'success', producer: 'crewmate', seq: 1, evidence: {},
     commandId: process.env.CP_COMMAND_ID
   },
   { faultBeforeDelivery: () => process.exit(41) }

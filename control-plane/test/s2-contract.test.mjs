@@ -7,7 +7,7 @@ import { PgliteLocalStore } from '../lib/pglite-local-store.mjs';
 import { runExclusive } from '../lib/internal-runtime.mjs';
 import { runVerb } from '../lib/coordinator.mjs';
 import { ValidationError } from '../lib/errors.mjs';
-import { StateTransitionError } from '../lib/errors-s1.mjs';
+import { IdempotencyConflictError, CausalOrderingError, StateTransitionError } from '../lib/errors-s1.mjs';
 import { createTask, beginRun, appendEvent } from '../lib/domain-store.mjs';
 import { completeRun, failRun, cancelTask } from '../lib/domain-store-s2.mjs';
 import {
@@ -99,13 +99,18 @@ async function queuedTask(store, taskId = 't1') {
   return 1;
 }
 
+// Minimal valid required terminal inputs (spec section 6) for tests whose subject is
+// something other than the input contract itself; that contract has its own tests
+// below.
+const COMPLETE_INPUTS = { outcome: 'success', producer: 'crewmate', seq: 1, evidence: {} };
+
 test('t_terminal_run_event_outbox_atomic', async () => {
   const { store } = await freshStore();
   const rev = await runningTask(store, 't1', { endpointId: 'ep-1' });
   const before = await counters(store);
 
   const res = await completeRun(store, {
-    taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-complete'
+    taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-complete'
   });
   assert.equal(res.status, 'completed');
   assert.equal(res.revision, rev + 1);
@@ -163,14 +168,14 @@ test('t_outbox_exactly_once_per_terminal_event', async () => {
   const rev = await runningTask(store, 't1');
 
   await completeRun(store, {
-    taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-complete'
+    taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-complete'
   });
   const afterFirst = await counters(store);
 
   // An identical replay is a replay: the stored result comes back, and it neither
   // writes a second outbox row nor advances any counter.
   const replay = await completeRun(store, {
-    taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-complete'
+    taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-complete'
   });
   assert.equal(replay.revision, rev + 1, 'the stored result is returned verbatim');
 
@@ -318,7 +323,7 @@ test('t_cancel_queued_only', async () => {
   await beginRun(store, { taskId: 't1', expectedRevision: 1, commandId: 'c-begin' });
   const beforeSpawning = await counters(store);
   await assert.rejects(
-    () => cancelTask(store, { taskId: 't1', expectedRevision: 2, commandId: 'c-cancel-spawning' }),
+    () => cancelTask(store, { taskId: 't1', expectedRevision: 2, reason: 'x', commandId: 'c-cancel-spawning' }),
     (e) => e instanceof StateTransitionError
       && e.code === 'state_transition'
       && /allowed only while a task is still queued/.test(e.message),
@@ -334,9 +339,9 @@ test('t_cancel_queued_only', async () => {
 
   // Terminal states are equally uncancellable.
   const rev = await promoteToRunning(store, 't1', 1, 2);
-  await completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-complete' });
+  await completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-complete' });
   await assert.rejects(
-    () => cancelTask(store, { taskId: 't1', expectedRevision: rev + 1, commandId: 'c-cancel-completed' }),
+    () => cancelTask(store, { taskId: 't1', expectedRevision: rev + 1, reason: 'x', commandId: 'c-cancel-completed' }),
     (e) => e instanceof StateTransitionError && /allowed only while a task is still queued/.test(e.message),
     'cancel is refused on a completed task'
   );
@@ -346,7 +351,7 @@ test('t_cancel_queued_only', async () => {
   await createTask(store, {
     taskId: 't2', kind: 'ship', title: 'y', origin: 'internal', internalReason: 'r', commandId: 'c-create-2'
   });
-  const ok = await cancelTask(store, { taskId: 't2', expectedRevision: 1, commandId: 'c-cancel-ok' });
+  const ok = await cancelTask(store, { taskId: 't2', expectedRevision: 1, reason: 'x', commandId: 'c-cancel-ok' });
   assert.equal(ok.status, 'archived');
 });
 
@@ -381,7 +386,7 @@ test('t_run_terminal_only_through_complete_fail', async () => {
   await createTask(store, {
     taskId: 't2', kind: 'ship', title: 'y', origin: 'internal', internalReason: 'r', commandId: 'c-create-2'
   });
-  await cancelTask(store, { taskId: 't2', expectedRevision: 1, commandId: 'c-cancel-2' });
+  await cancelTask(store, { taskId: 't2', expectedRevision: 1, reason: 'x', commandId: 'c-cancel-2' });
   assert.equal((await rows(store, "SELECT 1 FROM runs WHERE task_id = 't2'")).length, 0);
 
   // The DDL's own invariant: a terminal run status without closed_at is impossible,
@@ -397,7 +402,7 @@ test('t_run_terminal_only_through_complete_fail', async () => {
   // And `complete` DOES close it, proving the guards above are not simply blocking
   // every path.
   const done = await completeRun(store, {
-    taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-complete'
+    taskId: 't1', generation: 1, expectedRevision: rev, ...COMPLETE_INPUTS, commandId: 'c-complete'
   });
   assert.equal(done.run_status, 'completed');
   assert.equal((await deliveries(store, 't1')).length, 1, 'complete is the path that does deliver');
@@ -434,4 +439,209 @@ test('t_no_caller_deliver_switch_terminal', async () => {
   const run = await rows(reopened, "SELECT status FROM runs WHERE task_id = 't1'");
   assert.equal(run[0].status, 'open');
   await reopened.close();
+});
+
+// ---- terminal command surface: provenance, evidence, and reason (qa-s2-q54
+// finding 2). These run through the PUBLIC runVerb seam - the exact surface the QA
+// probes used - so the dispatcher's flag contract and the domain's storage contract
+// are pinned together.
+
+const asJson = (v) => (typeof v === 'string' ? JSON.parse(v) : v);
+
+test('t_terminal_inputs_validated_loudly', async () => {
+  const { store, fmHome } = await freshStore();
+  const rev = await runningTask(store, 't1');
+  const before = await counters(store);
+  const env = { FM_HOME: fmHome };
+  const evidencePath = path.join(fmHome, 'evidence.json');
+  fs.writeFileSync(evidencePath, JSON.stringify({ note: 'ok' }));
+
+  const base = ['t1', '--generation', '1', '--expected-revision', String(rev)];
+  const good = [
+    ...base, '--outcome', 'success', '--producer', 'crewmate', '--seq', '1',
+    '--evidence-file', evidencePath
+  ];
+  const cases = [
+    ['no-outcome', [...base, '--producer', 'crewmate', '--seq', '1', '--evidence-file', evidencePath],
+      /requires --outcome/],
+    ['bad-outcome', [...base, '--outcome', 'failure', '--producer', 'crewmate', '--seq', '1', '--evidence-file', evidencePath],
+      /--outcome must be one of success/],
+    ['no-producer', [...base, '--outcome', 'success', '--seq', '1', '--evidence-file', evidencePath],
+      /requires --producer/],
+    ['bad-producer', [...base, '--outcome', 'success', '--producer', 'ghost', '--seq', '1', '--evidence-file', evidencePath],
+      /--producer must be one of/],
+    ['no-seq', [...base, '--outcome', 'success', '--producer', 'crewmate', '--evidence-file', evidencePath],
+      /--seq is required/],
+    ['no-evidence', [...base, '--outcome', 'success', '--producer', 'crewmate', '--seq', '1'],
+      /requires --evidence-file/],
+    ['missing-evidence-file', [...base, '--outcome', 'success', '--producer', 'crewmate', '--seq', '1', '--evidence-file', path.join(fmHome, 'definitely-missing.json')],
+      /--evidence-file could not be read/],
+    ['generic-payload-file', [...good, '--payload-file', evidencePath],
+      /has no --payload-file/]
+  ];
+  for (const [label, args, pattern] of cases) {
+    await assert.rejects(
+      () => runVerb(['complete', ...args, '--command-id', `c-${label}`], { env }),
+      (e) => e instanceof ValidationError && pattern.test(e.message),
+      `complete ${label} must reject loudly`
+    );
+  }
+
+  await assert.rejects(
+    () => runVerb(['fail', ...base, '--producer', 'crewmate', '--seq', '1', '--command-id', 'c-fail-noreason'], { env }),
+    (e) => e instanceof ValidationError && /requires --reason/.test(e.message),
+    'fail without --reason must reject loudly'
+  );
+  await assert.rejects(
+    () => runVerb(['fail', ...base, '--reason', 'r', '--producer', 'crewmate', '--seq', '1',
+      '--artifacts-file', path.join(fmHome, 'no-artifacts.json'), '--command-id', 'c-fail-badart'], { env }),
+    (e) => e instanceof ValidationError && /--artifacts-file could not be read/.test(e.message),
+    'a supplied-but-missing --artifacts-file must reject loudly, never silently drop'
+  );
+  await assert.rejects(
+    () => runVerb(['cancel', 't1', '--expected-revision', String(rev), '--command-id', 'c-cancel-noreason'], { env }),
+    (e) => e instanceof ValidationError && /requires --reason/.test(e.message),
+    'cancel without --reason must reject loudly'
+  );
+
+  // Every rejection fired before any store mutation: run still open, no terminal
+  // event, no delivery, no counter movement, no command_results ghost.
+  assert.deepEqual(await counters(store), before, 'the rejected commands wrote nothing');
+  const run = await rows(store, "SELECT status, closed_at FROM runs WHERE task_id = 't1'");
+  assert.equal(run[0].status, 'open');
+  assert.equal(run[0].closed_at, null, 'the generation stayed open through every rejection');
+  assert.equal((await rows(store, "SELECT 1 FROM task_events WHERE task_id = 't1' AND is_terminal")).length, 0);
+  assert.deepEqual(await deliveries(store, 't1'), [], 'nothing was delivered');
+  assert.equal(
+    (await rows(
+      store,
+      "SELECT 1 FROM command_results WHERE command_id NOT IN ('c-create-t1', 'c-begin-t1')"
+    )).length, 0,
+    'no rejected command was recorded as if it had run'
+  );
+});
+
+test('t_terminal_provenance_stored_and_checked', async () => {
+  const { store, fmHome } = await freshStore();
+  const rev = await runningTask(store, 't1');
+  const env = { FM_HOME: fmHome };
+  const evidencePath = path.join(fmHome, 'evidence.json');
+  const evidence = { result: 'green', log: 'all suites passed' };
+  fs.writeFileSync(evidencePath, JSON.stringify(evidence));
+
+  // The crewmate has already spoken at seq 7 in this generation.
+  await appendEvent(store, {
+    taskId: 't1', generation: 1, eventType: 'progress', producer: 'crewmate', seq: 7,
+    expectedRevision: rev, commandId: 'c-progress'
+  });
+  const rev2 = rev + 1;
+  const argsFor = (seq, commandId) => [
+    'complete', 't1', '--generation', '1', '--expected-revision', String(rev2),
+    '--outcome', 'success', '--producer', 'crewmate', '--seq', String(seq),
+    '--evidence-file', evidencePath, '--command-id', commandId
+  ];
+
+  // A terminal claiming a non-advancing seq is a CHECKED causal conflict against the
+  // caller's own high-water, exactly as generic `event` enforces - not accepted
+  // decoration (qa-s2-q54 finding 2).
+  await assert.rejects(
+    () => runVerb(argsFor(7, 'c-stale-seq'), { env }),
+    (e) => e instanceof CausalOrderingError && e.detail.reason === 'nonmonotonic_producer_seq',
+    'a non-advancing --seq is rejected against the producer high-water'
+  );
+  const run = await rows(store, "SELECT closed_at FROM runs WHERE task_id = 't1'");
+  assert.equal(run[0].closed_at, null, 'the rejected terminal left the generation open');
+
+  const done = await runVerb(argsFor(8, 'c-done'), { env });
+  assert.equal(done.result.revision, rev2 + 1);
+
+  // The stored provenance is the CALLER's, verbatim - never rewritten to a
+  // coordinator-derived sequence.
+  const ev = await rows(
+    store,
+    `SELECT producer_id, producer_seq, outcome, payload_json
+       FROM task_events WHERE task_id = 't1' AND is_terminal`
+  );
+  assert.equal(ev.length, 1);
+  assert.equal(ev[0].producer_id, 'crewmate', 'the terminal event carries the supplied producer');
+  assert.equal(Number(ev[0].producer_seq), 8, 'the terminal event carries the supplied seq');
+  assert.equal(ev[0].outcome, 'success');
+  assert.deepEqual(
+    asJson(ev[0].payload_json), { evidence },
+    'the evidence file content rides durably in the terminal payload'
+  );
+
+  const hw = await rows(
+    store,
+    `SELECT last_seq FROM producer_highwater
+       WHERE task_id = 't1' AND run_generation = 1 AND producer_id = 'crewmate'`
+  );
+  assert.equal(Number(hw[0].last_seq), 8, "the caller's high-water advanced to the supplied seq");
+
+  // An identical retry is an idempotent replay of the stored result...
+  const replay = await runVerb(argsFor(8, 'c-done'), { env });
+  assert.deepEqual(replay.result, done.result, 'the identical retry replays the stored result');
+
+  // ...but the same command-id claiming DIFFERENT provenance is a different request:
+  // producer/seq are part of the request identity, so it conflicts rather than
+  // silently replaying under false provenance.
+  await assert.rejects(
+    () => runVerb(argsFor(9, 'c-done'), { env }),
+    (e) => e instanceof IdempotencyConflictError,
+    'changed provenance under a reused command-id is an idempotency conflict'
+  );
+  assert.equal((await rows(store, "SELECT 1 FROM task_events WHERE task_id = 't1' AND is_terminal")).length, 1);
+  assert.equal((await deliveries(store, 't1')).length, 1, 'the conflict enqueued no second delivery');
+});
+
+test('t_cancel_and_fail_reason_persisted', async () => {
+  const { store, fmHome } = await freshStore();
+  const env = { FM_HOME: fmHome };
+  await queuedTask(store, 't1');
+
+  const cancelled = await runVerb(
+    ['cancel', 't1', '--expected-revision', '1', '--reason', 'captain withdrew the order', '--command-id', 'c-cancel'],
+    { env }
+  );
+  assert.equal(cancelled.result.status, 'archived');
+  const ev = await rows(
+    store,
+    "SELECT payload_json, payload_hash FROM task_events WHERE task_id = 't1' AND event_type = 'cancelled'"
+  );
+  assert.equal(ev.length, 1);
+  assert.deepEqual(
+    asJson(ev[0].payload_json), { reason: 'captain withdrew the order' },
+    'the required cancel reason IS the cancelled event payload'
+  );
+  // The delivered copy hashes the same payload, so the consumer-side event carries
+  // the reason too.
+  const ob = await rows(
+    store, "SELECT payload_hash FROM outbox WHERE task_id = 't1' AND event_type = 'cancelled'"
+  );
+  assert.equal(ob[0].payload_hash, ev[0].payload_hash);
+
+  // fail: the required reason and the optional artifacts are equally durable, under
+  // the caller's provenance.
+  const rev = await runningTask(store, 't2');
+  const artifactsPath = path.join(fmHome, 'artifacts.json');
+  fs.writeFileSync(artifactsPath, JSON.stringify({ logs: ['a.log'] }));
+  await runVerb(
+    ['fail', 't2', '--generation', '1', '--expected-revision', String(rev),
+      '--reason', 'suite red', '--producer', 'firstmate', '--seq', '1',
+      '--artifacts-file', artifactsPath, '--command-id', 'c-fail'],
+    { env }
+  );
+  const fev = await rows(
+    store,
+    `SELECT producer_id, producer_seq, outcome, payload_json
+       FROM task_events WHERE task_id = 't2' AND is_terminal`
+  );
+  assert.equal(fev.length, 1);
+  assert.equal(fev[0].producer_id, 'firstmate');
+  assert.equal(Number(fev[0].producer_seq), 1);
+  assert.equal(fev[0].outcome, 'failure');
+  assert.deepEqual(
+    asJson(fev[0].payload_json), { reason: 'suite red', artifacts: { logs: ['a.log'] } },
+    'the fail reason and artifacts ride durably in the failed event payload'
+  );
 });

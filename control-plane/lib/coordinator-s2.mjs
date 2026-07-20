@@ -36,15 +36,32 @@ function rejectDeliverSwitch(verb, flags) {
   }
 }
 
+// The terminal verbs take exactly the spec's named inputs (--evidence-file,
+// --artifacts-file, --reason); a generic --payload-file is not part of their
+// surface, and accepting-but-ignoring it would be the same silent-discard defect
+// finding 2 repaired, so it is rejected loudly.
+function rejectPayloadFile(verb, flags) {
+  if ('payload-file' in flags) {
+    throw new ValidationError(
+      `'${verb}' has no --payload-file; its payload is built from the spec's named inputs (spec section 6)`,
+      { verb }
+    );
+  }
+}
+
 async function dispatch(verb, flags, positionals, store) {
   rejectDeliverSwitch(verb, flags);
+  rejectPayloadFile(verb, flags);
   switch (verb) {
     case 'complete':
       return completeRun(store, {
         taskId: positionals[0],
         generation: parseIntFlag(flags, 'generation'),
         expectedRevision: parseIntFlag(flags, 'expected-revision'),
-        payload: readPayloadFlag(flags),
+        outcome: requireStringFlag(verb, flags, 'outcome'),
+        producer: requireStringFlag(verb, flags, 'producer'),
+        seq: parseIntFlag(flags, 'seq'),
+        evidence: readJsonFileFlag(verb, flags, 'evidence-file', { required: true }),
         commandId: flags['command-id']
       });
     case 'fail':
@@ -53,15 +70,17 @@ async function dispatch(verb, flags, positionals, store) {
         generation: parseIntFlag(flags, 'generation'),
         expectedRevision: parseIntFlag(flags, 'expected-revision'),
         outcome: typeof flags.outcome === 'string' ? flags.outcome : undefined,
-        payload: readPayloadFlag(flags),
+        reason: requireStringFlag(verb, flags, 'reason'),
+        producer: requireStringFlag(verb, flags, 'producer'),
+        seq: parseIntFlag(flags, 'seq'),
+        artifacts: readJsonFileFlag(verb, flags, 'artifacts-file', { required: false }),
         commandId: flags['command-id']
       });
     case 'cancel':
       return cancelTask(store, {
         taskId: positionals[0],
         expectedRevision: parseIntFlag(flags, 'expected-revision'),
-        reason: typeof flags.reason === 'string' ? flags.reason : undefined,
-        payload: readPayloadFlag(flags),
+        reason: requireStringFlag(verb, flags, 'reason'),
         commandId: flags['command-id']
       });
     default:
@@ -81,18 +100,37 @@ function parseIntFlag(flags, name) {
   return n;
 }
 
-function readPayloadFlag(flags) {
-  const p = flags['payload-file'];
-  if (!p || p === true) return {};
+function requireStringFlag(verb, flags, name) {
+  const v = flags[name];
+  if (typeof v !== 'string' || v.length === 0) {
+    throw new ValidationError(`'${verb}' requires --${name}`, { verb, flag: name });
+  }
+  return v;
+}
+
+// Read a JSON file named by a flag. A REQUIRED input that is missing, unreadable
+// (including a nonexistent path), or malformed rejects loudly BEFORE any store work:
+// evidence and artifacts must be durably captured, never silently dropped
+// (qa-s2-q54 finding 2). An optional input that was not supplied returns undefined;
+// once supplied it is held to the same standard.
+function readJsonFileFlag(verb, flags, name, { required }) {
+  const p = flags[name];
+  if (p === undefined) {
+    if (required) throw new ValidationError(`'${verb}' requires --${name}`, { verb, flag: name });
+    return undefined;
+  }
+  if (p === true) {
+    throw new ValidationError(`--${name} requires a file path`, { verb, flag: name });
+  }
   let text;
   try {
     text = fs.readFileSync(p, 'utf8');
   } catch (err) {
-    throw new ValidationError('--payload-file could not be read', { path: p, cause: err.message });
+    throw new ValidationError(`--${name} could not be read`, { verb, flag: name, path: p, cause: err.message });
   }
   try {
     return JSON.parse(text);
   } catch {
-    throw new ValidationError('--payload-file is not valid JSON', { path: p });
+    throw new ValidationError(`--${name} is not valid JSON`, { verb, flag: name, path: p });
   }
 }
