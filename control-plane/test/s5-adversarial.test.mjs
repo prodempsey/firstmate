@@ -6,8 +6,9 @@ import { PgliteLocalStore } from '../lib/pglite-local-store.mjs';
 import { runExclusive } from '../lib/internal-runtime.mjs';
 import { createTask, beginRun } from '../lib/domain-store.mjs';
 import { completeRun } from '../lib/domain-store-s2.mjs';
-import { recordSpawn, commitRunning } from '../lib/domain-store-s3.mjs';
+import { recordSpawn, commitRunning, cleanupIntent, cleanupFinish } from '../lib/domain-store-s3.mjs';
 import { resolveAnomaly } from '../lib/domain-store-s5.mjs';
+import { AnomalyResolutionError } from '../lib/errors-s5.mjs';
 import { reconcilePass } from '../lib/reconciler.mjs';
 import { mkFixtureHome, cleanupAll } from './helpers.mjs';
 
@@ -126,28 +127,38 @@ test('t_concurrent_reconcile_flock_serializes', async () => {
   const { revision } = await spawnedTask(store, 't1', '@1', '%1'); // one promotable spawning generation
   const before = await counters(store);
 
-  // Two full reconcile passes with DIFFERENT nonces race through two store instances on the
-  // real flock. They serialize; exactly one promotes t1, the other finds it already running
-  // and its promote attempt resolves against it (skipped) - never a double promotion.
-  const settled = await Promise.allSettled([
-    reconcilePass(store, { nonce: 'race-a', probeIdentity: probeMatch }),
-    reconcilePass(other, { nonce: 'race-b', probeIdentity: probeMatch })
-  ]);
-  assert.equal(settled.every((s) => s.status === 'fulfilled'), true, 'neither pass throws; a race is a benign skip');
+  // BARRIER PROBE (finding 2, spec 792 "the flock makes passes non-overlapping"). The
+  // pass-level flock must hold from snapshot through every commit, so a second pass cannot
+  // enter its probe/decide phase until the first fully exits. Each pass, on reaching its
+  // decide phase, increments a shared counter, records the peak, holds briefly, then
+  // decrements. If passes overlapped, the peak would reach 2; whole-pass serialization
+  // pins it at 1.
+  let active = 0;
+  let maxActive = 0;
+  const onPhase = async (phase) => {
+    if (phase !== 'decide') return;
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((r) => setTimeout(r, 120)); // a real window for the other pass to overlap if unlocked
+    active -= 1;
+  };
 
-  // The strong, interleaving-independent invariant: EXACTLY ONE promotion. The loser
-  // either found the run already running (no action) or attempted on a stale token and was
-  // audited as a causal conflict - both leave a single promotion and a single revision bump.
+  const settled = await Promise.allSettled([
+    reconcilePass(store, { nonce: 'race-a', probeIdentity: probeMatch, onPhase }),
+    reconcilePass(other, { nonce: 'race-b', probeIdentity: probeMatch, onPhase })
+  ]);
+  assert.equal(settled.every((s) => s.status === 'fulfilled'), true, 'neither pass throws');
+
+  assert.equal(maxActive, 1, 'whole passes never overlap: the pass-level flock serializes them (spec 792)');
+
+  // And the outcome is still exactly one promotion - never two.
   assert.equal((await taskRow(store, 't1')).status, 'running');
   assert.equal(Number((await taskRow(store, 't1')).revision), revision + 1, 'exactly one revision bump - no double promotion');
-  assert.equal(await eventCount(store, 't1', 'running_verified'), 1, 'exactly one running_verified survived the concurrent passes');
-  // The winner's promotion is one domain change; a losing stale-token attempt adds at most
-  // one causal-conflict audit, so the delta is 1 (loser saw the promotion) or 2 (loser
-  // raced it). Never more: there is only ever one promotion.
+  assert.equal(await eventCount(store, 't1', 'running_verified'), 1, 'exactly one running_verified survived the serialized passes');
+  // With true serialization the second pass sees the promotion already done and commits
+  // nothing (no losing causal-conflict audit): exactly one domain change.
   const delta = await counters(store);
-  assert.ok(delta.domain - before.domain >= 1 && delta.domain - before.domain <= 2, `promotion + at most one causal audit (got +${delta.domain - before.domain})`);
-  assert.equal(delta.commit - before.commit, delta.domain - before.domain, 'domain and commit move together');
-  assert.equal(delta.projection, 0);
+  assert.deepEqual(delta, { domain: before.domain + 1, projection: 0, commit: before.commit + 1 }, 'serialized passes yield exactly one promotion and no conflict noise');
   await other.close();
 });
 
@@ -223,26 +234,30 @@ test('t_pid_reuse_suspected_detected', async () => {
 
   // The probe finds the recorded pid LIVE but with DIFFERENT start ticks: the pid was
   // reused by a new process. That is a definitive loss - the reconciler audits a
-  // pid_reuse_suspected anomaly (the actionable "why") and marks the binding lost.
+  // pid_reuse_suspected anomaly (the actionable "why") plus binding_lost_under_active, then
+  // emits identity_lost and terminally fails the provably-dead generation in the SAME pass.
   const r = await reconcilePass(store, { nonce: 'pr', probeIdentity: probePidReuse });
-  assert.deepEqual(r.committed.map((c) => c.kind), ['pid_reuse_suspected', 'mark_lost']);
+  assert.deepEqual(r.committed.map((c) => c.kind), ['pid_reuse_suspected', 'binding_lost_under_active', 'fail_lost']);
 
   const pidReuse = await anomalyRows(store, 'pid_reuse_suspected');
   assert.equal(pidReuse.length, 1, 'exactly one pid_reuse_suspected anomaly persisted');
   assert.equal(pidReuse[0].status, 'active');
-  assert.equal((await runRow(store, 't1')).binding_state, 'lost', 'the reused-pid binding is marked lost');
+  assert.equal((await runRow(store, 't1')).status, 'failed', 'the reused-pid generation is terminally failed');
+  assert.equal((await taskRow(store, 't1')).status, 'failed');
   assert.equal(await eventCount(store, 't1', 'identity_lost'), 1);
-  assert.equal(Number((await taskRow(store, 't1')).revision), rev + 1);
-  assert.deepEqual(await counters(store), { domain: before.domain + 2, projection: 0, commit: before.commit + 2 });
+  assert.equal(await eventCount(store, 't1', 'failed'), 1);
+  assert.equal(Number((await taskRow(store, 't1')).revision), rev + 2, 'identity_lost then terminal fail');
+  // pid_reuse audit + binding_lost_under_active audit + identity_lost + terminal fail = +4.
+  assert.deepEqual(await counters(store), { domain: before.domain + 4, projection: 0, commit: before.commit + 4 });
 });
 
 test('t_terminal_without_cleanup_anomaly_then_resolution', async () => {
   const { store } = await freshStore();
   const rev = await runningTask(store, 't1');
-  await completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev, outcome: 'success', producer: 'crewmate', seq: 1, evidence: {}, commandId: 'c-done' });
+  const done = await completeRun(store, { taskId: 't1', generation: 1, expectedRevision: rev, outcome: 'success', producer: 'crewmate', seq: 1, evidence: {}, commandId: 'c-done' });
   // The generation is now terminal but still binding cleanup_pending with cleanup never
   // started. A pass with a tiny grace window flags terminal_without_cleanup; the stored
-  // cleanup target still MATCHES (probeMatch-equivalent), so no kill, no identity_mismatch.
+  // cleanup target still MATCHES, so no kill, no identity_mismatch.
   const before = await counters(store);
   const r = await reconcilePass(store, {
     nonce: 'tw', terminalCleanupGraceMs: 0,
@@ -257,21 +272,25 @@ test('t_terminal_without_cleanup_anomaly_then_resolution', async () => {
   assert.equal(await eventCount(store, 't1', 'cleaned'), 0);
   assert.deepEqual(await counters(store), { domain: before.domain + 1, projection: 0, commit: before.commit + 1 });
 
-  // Resolve it (agent-level; not an orphan). The row is preserved, status flips.
-  const resolved = await resolveAnomaly(store, { fingerprint: anom[0].fingerprint, reason: 'cleanup completed out of band', resolutionKind: 'agent_verified', commandId: 'res-tw' });
+  // PREDICATE ENFORCEMENT (finding 3, spec 836): the anomaly may NOT be resolved while
+  // cleanup is unfinished, no matter what free-text reason is asserted. The refusal writes
+  // nothing - the row stays active.
+  await assert.rejects(
+    () => resolveAnomaly(store, { fingerprint: anom[0].fingerprint, reason: 'cleanup completed out of band', resolutionKind: 'agent_verified', commandId: 'res-tw-bad' }),
+    (e) => e instanceof AnomalyResolutionError && /cleanup is unfinished/.test(e.message),
+    'terminal_without_cleanup cannot be resolved while cleanup_pending / not cleaned'
+  );
+  assert.equal((await anomalyRows(store, 'terminal_without_cleanup'))[0].status, 'active', 'the refused resolution left the row active');
+
+  // Now actually finish cleanup through the S3 saga (confirmed absent), so the predicate holds.
+  const intent = await cleanupIntent(store, { taskId: 't1', generation: 1, expectedRevision: done.revision, commandId: 'c-intent' });
+  await cleanupFinish(store, { taskId: 't1', generation: 1, expectedRevision: intent.revision, effectResult: { killed: true, confirmed_absent: true }, commandId: 'c-finish' });
+  assert.equal((await runRow(store, 't1')).binding_state, 'closed', 'cleanup is now finished');
+
+  // With the predicate satisfied, the anomaly resolves; the row is preserved.
+  const resolved = await resolveAnomaly(store, { fingerprint: anom[0].fingerprint, reason: 'cleanup-finish committed', resolutionKind: 'agent_verified', commandId: 'res-tw-ok' });
   assert.equal(resolved.status, 'resolved');
   const after = await anomalyRows(store, 'terminal_without_cleanup');
-  assert.equal(after.length, 1, 'the resolved anomaly is preserved');
+  assert.equal(after.length, 1, 'the resolved anomaly is preserved, never deleted');
   assert.equal(after[0].status, 'resolved');
-
-  // A subsequent pass re-observes the still-pending terminal and RE-OPENS nothing: the
-  // resolved row coalesces (occurrence_count climbs) but stays resolved is NOT required;
-  // what matters is no duplicate row and no kill. (Reobservation reactivates via upsert
-  // detail only; status is not downgraded here.)
-  const r2 = await reconcilePass(store, {
-    nonce: 'tw2', terminalCleanupGraceMs: 0,
-    cleanupProbe: () => ({ present: true, matches: true, reason: 'exact_match' })
-  });
-  assert.equal(r2.committed.map((c) => c.kind).filter((k) => k === 'terminal_without_cleanup').length, 1, 're-observed once');
-  assert.equal((await anomalyRows(store, 'terminal_without_cleanup')).length, 1, 'still exactly one row - coalesced, not duplicated');
 });

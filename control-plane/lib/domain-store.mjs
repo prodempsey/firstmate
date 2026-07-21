@@ -109,7 +109,14 @@ function anomalyFingerprint(f) {
     f.homeUuid, f.anomalyClass, f.taskId, f.runGeneration, f.endpointId,
     f.paneId, f.agentPid, f.agentStartTicks, f.terminalFingerprint
   ];
-  return sha256hex(parts.map((p) => (p === null || p === undefined ? '' : String(p))).join('\u0000'));
+  // Spec-amend-s4 lines 819-825 fingerprint formula: direct field concatenation with NO
+  // delimiter, the same convention launchMarkerFor uses (spec section 5); a null/undefined
+  // field contributes the empty string. (S5 QA qa-s5-q64 finding 7: the earlier
+  // NUL-delimited join diverged from the ratified formula. Corrected so every slice -
+  // S1/S2/S3/S5 - fingerprints identically and S5's cleanup-mismatch coalesces onto S3's
+  // identity_mismatch row. No existing test pinned a digest; test/s5-contract.test.mjs now
+  // pins a fixed vector.)
+  return sha256hex(parts.map((p) => (p === null || p === undefined ? '' : String(p))).join(''));
 }
 
 export async function ensureInitialized(conn) {

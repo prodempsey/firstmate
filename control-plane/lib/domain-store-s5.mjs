@@ -45,7 +45,6 @@ const RECONCILER = 'reconciler';
 const RESOLUTION_KINDS = new Set([
   'human_approved', 'agent_verified', 'auto_recovered', 'duplicate', 'benign'
 ]);
-const HUMAN_ONLY_ANOMALY_CLASSES = new Set(['orphan_pane']);
 
 function defaultSocket() {
   return process.env.CP_TMUX_SOCKET || 'cp-default';
@@ -385,12 +384,14 @@ export async function reconcileMarkUnverified(store, params, { now = nowIso(), f
   });
 }
 
-// reconcileReverify: an open, bound_unverified generation whose probe now matches ->
-// back to 'bound_verified', emitting an audit-only `running_verified` under producer
-// `reconciler`. The recovery half of the transient-demotion ladder: a transient blip
-// must not permanently strand a live run at bound_unverified. Re-probes the STORED
-// identity at commit time - the same anti-ghost gate as promote - so a run is only
-// re-verified against a genuine live match. Requires an open bound_unverified run.
+// reconcileReverify: an open, non-verified generation (bound_unverified OR lost) whose
+// probe now matches -> back to 'bound_verified', emitting an audit-only `running_verified`
+// under producer `reconciler`. The recovery half of the ladder: a transient blip must not
+// permanently strand a live run at bound_unverified, and a binding that momentarily read
+// 'lost' (e.g. a transient failure misclassified, or an interrupted loss pass) must be able
+// to recover if the EXACT stored identity reappears (qa-s5-q64 finding 6 - no unhandled
+// open/lost stable state). Re-probes the STORED identity at commit time - the same
+// anti-ghost gate as promote - so a run is only re-verified against a genuine live match.
 export async function reconcileReverify(store, params, { now = nowIso(), fault, probeIdentity = defaultProbeIdentity } = {}) {
   requireStr('reconcile-reverify', params.taskId, 'task_id');
   requireIntFlag('reconcile-reverify', params.generation, 'generation', { min: 1 });
@@ -424,9 +425,10 @@ export async function reconcileReverify(store, params, { now = nowIso(), fault, 
       if (Number(task.revision) !== params.expectedRevision) {
         throw new ConflictSignal('causal', causalAnomaly(ctx.commandId, 'reconcile-reverify', params, Number(task.revision)));
       }
-      if (run.status !== 'open' || run.closed_at !== null || run.binding_state !== 'bound_unverified') {
+      if (run.status !== 'open' || run.closed_at !== null
+          || (run.binding_state !== 'bound_unverified' && run.binding_state !== 'lost')) {
         throw new StateTransitionError(
-          `reconcile-reverify requires an open bound_unverified generation (run '${run.status}', binding '${run.binding_state}')`,
+          `reconcile-reverify requires an open bound_unverified or lost generation (run '${run.status}', binding '${run.binding_state}')`,
           { task_id: params.taskId, generation: params.generation, run_status: run.status, binding_state: run.binding_state }
         );
       }
@@ -523,12 +525,110 @@ export async function recordReconcilerAnomaly(store, params, { now = nowIso(), f
   });
 }
 
+// Classes whose resolution predicate depends on a canonical surface this slice does NOT
+// own (S4 consumer/ack/lease, S6 projections). S5 cannot verify their spec-830-840
+// predicate, so it refuses to resolve them rather than falsely blessing them; the owning
+// slice's resolver handles them.
+const OUT_OF_SLICE_ANOMALY_CLASSES = new Set([
+  'stale_projection', 'duplicate_projection', 'sink_idempotency_unknown', 'consumer_lease_conflict'
+]);
+
+// The spec-830-840 resolution predicate dispatcher (qa-s5-q64 finding 3). Given the FULL
+// anomaly row and the requested resolution, it verifies - in the SAME transaction, against
+// the canonical rows - that the class-specific precondition actually holds before the row
+// may be marked resolved. Returns { ok } or { ok:false, message, detail }. It never
+// mutates; resolveAnomaly performs the update only when ok. A class with no spec predicate
+// (the reconciler's own remediable observations: missing_pane, identity_mismatch,
+// pid_reuse_suspected, binding_lost_under_active, running_without_verification,
+// launch_marker_*, datadir_size_tripwire) resolves on agent authority with a reason.
+async function resolutionPredicate(conn, anomaly, params) {
+  const cls = anomaly.anomaly_class;
+
+  if (cls === 'orphan_pane') {
+    // spec 834/835. terminal_fingerprint holds the pane's marker (null == markerless).
+    if (anomaly.terminal_fingerprint === null || anomaly.terminal_fingerprint === undefined) {
+      // markerless/ambiguous orphan: captain-routed, human-approved ONLY (ruling Q4). This
+      // slice never kills it.
+      if (params.resolutionKind !== 'human_approved') {
+        return { ok: false, message: "markerless/ambiguous orphan_pane is captain-routed; resolve only with resolution-kind 'human_approved'", detail: { resolution_kind: params.resolutionKind } };
+      }
+      return { ok: true };
+    }
+    // marker-bearing orphan: resolved by safe adoption into the matching run OR by exact
+    // cleanup after terminal failure. Verify the run that owns this marker reached one of
+    // those states.
+    const r = await conn.query(
+      'SELECT status, binding_state, cleanup_state, endpoint_id FROM runs WHERE launch_marker = $1',
+      [anomaly.terminal_fingerprint]
+    );
+    if (r.rows.length === 0) {
+      return { ok: false, message: 'marker-bearing orphan_pane has no matching run to adopt or clean; not safely resolvable in this slice', detail: { marker: anomaly.terminal_fingerprint } };
+    }
+    const run = r.rows[0];
+    const adopted = (run.binding_state === 'bound_verified' || run.binding_state === 'bound_unverified')
+      && run.endpoint_id !== null && run.endpoint_id === anomaly.endpoint_id;
+    const exactlyCleaned = (run.status === 'failed' || run.status === 'completed') && run.cleanup_state === 'cleaned';
+    if (!adopted && !exactlyCleaned) {
+      return { ok: false, message: 'marker-bearing orphan_pane is neither adopted into its run nor exactly cleaned after terminal failure', detail: { run_status: run.status, binding_state: run.binding_state, cleanup_state: run.cleanup_state } };
+    }
+    return { ok: true };
+  }
+
+  if (cls === 'terminal_without_cleanup') {
+    // spec 836: resolved by cleanup-finish OR confirmed already-absent under a committed
+    // cleanup intent. Verify the run reached a cleaned/closed state; a run still
+    // cleanup_pending with cleanup not finished is NOT resolvable.
+    const r = await conn.query(
+      'SELECT binding_state, cleanup_state FROM runs WHERE task_id = $1 AND run_generation = $2',
+      [anomaly.task_id, anomaly.run_generation]
+    );
+    if (r.rows.length === 0) {
+      return { ok: false, message: 'terminal_without_cleanup names no such run', detail: { task_id: anomaly.task_id, generation: anomaly.run_generation } };
+    }
+    const run = r.rows[0];
+    const cleaned = run.cleanup_state === 'cleaned' || run.binding_state === 'closed';
+    if (!cleaned) {
+      return { ok: false, message: 'terminal_without_cleanup cannot be resolved while cleanup is unfinished (require cleanup-finish or confirmed-absent under a committed intent)', detail: { binding_state: run.binding_state, cleanup_state: run.cleanup_state } };
+    }
+    return { ok: true };
+  }
+
+  if (cls === 'terminal_conflict') {
+    // spec 832: one canonical terminal chain. Verify exactly one terminal event exists for
+    // the generation (ux_terminal_per_gen guarantees at most one; require it to be present).
+    const r = await conn.query(
+      'SELECT count(*)::int AS n FROM task_events WHERE task_id = $1 AND run_generation = $2 AND is_terminal',
+      [anomaly.task_id, anomaly.run_generation]
+    );
+    if (Number(r.rows[0].n) !== 1) {
+      return { ok: false, message: 'terminal_conflict requires exactly one canonical terminal event for the generation', detail: { terminal_events: Number(r.rows[0].n) } };
+    }
+    return { ok: true };
+  }
+
+  if (cls === 'idempotency_conflict' || cls === 'causal_ordering_violation') {
+    // spec 833: resolvable only when the offending command left no domain mutation and
+    // rejects deterministically. The envelope GUARANTEES this by construction - an audited
+    // conflict rolls its mutation back to the savepoint and re-raises the same typed error
+    // on replay - so the predicate holds structurally for any persisted conflict row.
+    return { ok: true };
+  }
+
+  if (OUT_OF_SLICE_ANOMALY_CLASSES.has(cls)) {
+    return { ok: false, message: `anomaly class '${cls}' has a resolution predicate owned by another slice (S4 consumer/ack/lease or S6 projections); not resolvable in S5`, detail: { anomaly_class: cls } };
+  }
+
+  // A reconciler observation class with no spec-830-840 predicate: agent-level resolution
+  // (a valid resolution-kind and a reason) suffices - the operator explains/remediates it.
+  return { ok: true };
+}
+
 // resolveAnomaly: flip an active anomaly to 'resolved' in place (spec 597/828 - the row
 // is preserved, never deleted). An ordinary audited mutation (+1 domain/commit, no task
-// revision) guarded by the spec-830-840 resolution predicates. Ruling Q4 is encoded as a
-// hard predicate: a markerless/ambiguous-orphan (`orphan_pane`) anomaly is captain-routed
-// and may be resolved ONLY with resolution-kind `human_approved`. Every refusal is a
-// non-audited AnomalyResolutionError that persists nothing.
+// revision) guarded by the class-specific spec-830-840 resolution predicates
+// (resolutionPredicate). The markerless/ambiguous-orphan human_approved gate (ruling Q4)
+// is ONE of those predicates, applied ONLY to markerless orphans, never to every class.
+// Every refusal is a non-audited AnomalyResolutionError that persists nothing.
 export async function resolveAnomaly(store, params, { now = nowIso(), fault } = {}) {
   requireStr('resolve-anomaly', params.fingerprint, 'fingerprint');
   requireStr('resolve-anomaly', params.reason, 'reason');
@@ -549,7 +649,10 @@ export async function resolveAnomaly(store, params, { now = nowIso(), fault } = 
     verb: 'resolve-anomaly', commandId: params.commandId, requestHash, taskId: null, now, fault,
     mutate: async (conn, ctx) => {
       const q = await conn.query(
-        'SELECT anomaly_class, status FROM anomalies WHERE fingerprint = $1', [params.fingerprint]
+        `SELECT anomaly_class, status, task_id, run_generation, endpoint_id, pane_id,
+                terminal_fingerprint, detail_json
+           FROM anomalies WHERE fingerprint = $1`,
+        [params.fingerprint]
       );
       if (q.rows.length === 0) {
         throw new AnomalyResolutionError(
@@ -563,13 +666,13 @@ export async function resolveAnomaly(store, params, { now = nowIso(), fault } = 
           { fingerprint: params.fingerprint, anomaly_class: anomaly.anomaly_class }
         );
       }
-      // Ruling Q4 / spec 835: a markerless/ambiguous-orphan is captain-routed and only
-      // a human_approved resolution disposes of it.
-      if (HUMAN_ONLY_ANOMALY_CLASSES.has(anomaly.anomaly_class) && params.resolutionKind !== 'human_approved') {
-        throw new AnomalyResolutionError(
-          `anomaly class '${anomaly.anomaly_class}' is captain-routed; it may be resolved only with resolution-kind 'human_approved'`,
-          { fingerprint: params.fingerprint, anomaly_class: anomaly.anomaly_class, resolution_kind: params.resolutionKind }
-        );
+      // Class-specific spec-830-840 predicate: the canonical precondition must actually
+      // hold before the row may be resolved.
+      const verdict = await resolutionPredicate(conn, anomaly, params);
+      if (!verdict.ok) {
+        throw new AnomalyResolutionError(verdict.message, {
+          fingerprint: params.fingerprint, anomaly_class: anomaly.anomaly_class, ...verdict.detail
+        });
       }
 
       await conn.query(
@@ -617,4 +720,4 @@ export async function listAnomalies(store, { activeOnly = false } = {}) {
   });
 }
 
-export { RECONCILER, RESOLUTION_KINDS, HUMAN_ONLY_ANOMALY_CLASSES };
+export { RECONCILER, RESOLUTION_KINDS };

@@ -1,12 +1,15 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { runExclusive } from './internal-runtime.mjs';
+import { withFlock } from './flock.mjs';
 import { ValidationError } from './errors.mjs';
 import { CausalOrderingError, StateTransitionError } from './errors-s1.mjs';
 import { TerminalConflictError } from './errors-s2.mjs';
 import { IdentityMismatchError } from './errors-s3.mjs';
 import { ensureInitialized } from './domain-store.mjs';
 import { failRun } from './domain-store-s2.mjs';
-import { probeIdentity as realProbeIdentity, cleanupTargetMatches as realCleanupTargetMatches } from './tmux-adapter.mjs';
+import { cleanupTargetMatches as realCleanupTargetMatches } from './tmux-adapter.mjs';
+import { scanIsolatedSocket, probeIdentityTransientAware } from './backend-scan-s5.mjs';
 import {
   reconcilePromote, reconcileMarkLost, reconcileMarkUnverified, reconcileReverify,
   recordReconcilerAnomaly, RECONCILER
@@ -61,21 +64,27 @@ function probeRun(run) {
 function defaultSocket() {
   return process.env.CP_TMUX_SOCKET || 'cp-default';
 }
+// The production identity probe is transient-AWARE (qa-s5-q64 finding 4): it reports a
+// transient/backend-unverified result when the isolated tmux server is unreachable,
+// distinct from a definitive absence the server proves. That distinction is what lets the
+// reconciler demote to bound_unverified rather than declaring a live binding lost.
 function defaultProbeIdentity(arg) {
-  return realProbeIdentity({ ...arg, socket: defaultSocket() });
+  return probeIdentityTransientAware({ ...arg, socket: defaultSocket() });
 }
 function defaultCleanupProbe(arg) {
   return realCleanupTargetMatches({ ...arg, socket: defaultSocket() });
 }
-// The real marker scan of the isolated cp socket is exercised only in the tmux-guarded
-// smoke. The default returns null - "no scan available" - which is DELIBERATELY distinct
-// from an empty array ("scanned, found zero panes"): a null scan skips marker
-// reconciliation entirely, so a host without the cp tmux namespace never mistakes an
-// un-performed scan for "every known run's marker has vanished" and never flags a
-// spurious launch_marker_missing. A caller/test that supplies a real (possibly empty)
-// array opts into full marker reconciliation.
+// The PRODUCTION marker scan reads the isolated cp tmux socket for marker-bearing launch
+// endpoints (qa-s5-q64 finding 1; spec 795), reading each pane leader's CP_LAUNCH_MARKER
+// live from /proc environ. It returns null when the backend is unreachable - "no scan
+// available" - DELIBERATELY distinct from an empty array ("scanned, found zero panes"): a
+// null scan skips marker reconciliation entirely, so an unreachable socket never mistakes
+// an un-performed scan for "every known run's marker has vanished" and never flags a
+// spurious launch_marker_missing. A markerless or unknown-marker pane a reachable server
+// DOES list becomes a real orphan. The real scan is exercised end to end in the
+// tmux-guarded s5 smoke; domain tests inject deterministic arrays.
 function defaultScanMarkers() {
-  return null;
+  return scanIsolatedSocket(defaultSocket());
 }
 function defaultDatadirSize(store) {
   try {
@@ -116,9 +125,12 @@ function isRaceConflict(err) {
 // a foreign identity, a reused pid) is a provable loss -> lost + identity_lost.
 function openDisposition(probe) {
   if (probe && probe.matches === true) return { disp: 'alive' };
-  if (probe && probe.transient === true) return { disp: 'transient', anomalyClass: probe.anomalyClass ?? 'running_without_verification' };
+  if (probe && probe.transient === true) {
+    return { disp: 'transient', anomalyClass: 'running_without_verification', failingClause: probe.failingClause || 'backend_unreachable' };
+  }
   if (probe && probe.anomalyClass === 'running_without_verification') {
-    return { disp: 'transient', anomalyClass: 'running_without_verification' };
+    // An incomplete stored binding cannot be proven dead: treat it as transient/unverified.
+    return { disp: 'transient', anomalyClass: 'running_without_verification', failingClause: probe.failingClause || 'incomplete_binding' };
   }
   return {
     disp: 'gone',
@@ -187,13 +199,29 @@ export async function reconcilePass(store, {
   datadirSize = defaultDatadirSize,
   datadirLimitBytes = DEFAULT_DATADIR_LIMIT_BYTES,
   terminalCleanupGraceMs = DEFAULT_TERMINAL_CLEANUP_GRACE_MS,
+  passLockPath = null,
+  passLockTimeoutMs = 30000,
+  onPhase = null,
   faultAfterCommit = null
 } = {}) {
   if (typeof nonce !== 'string' || nonce.length === 0) {
     throw new ValidationError('reconcile pass requires a non-empty nonce (its deterministic per-pass command-id root)');
   }
   const fleetWide = !taskId;
+  // WHOLE-PASS SERIALIZATION (qa-s5-q64 finding 2; spec 792 "the flock makes passes
+  // non-overlapping"). A dedicated pass-level flock is held from snapshot through the last
+  // commit, so two reconcile passes can never run their probe/decide phases concurrently.
+  // It is a SEPARATE lock file from the per-command store flock (`<pgdata>.lock`), so the
+  // per-item transactions inside the pass acquire the store lock without deadlocking on
+  // this one, and coordinator commands - which take only the store lock - still interleave
+  // per-operation. Two passes contend on THIS lock and serialize as whole passes.
+  const passLock = passLockPath || path.join(path.dirname(store.dataDir), 'cp-reconcile-pass.lock');
+  return withFlock(passLock, () => runPassBody(), { timeoutMs: passLockTimeoutMs, exclusive: true });
+
+  async function runPassBody() {
+  if (typeof onPhase === 'function') await onPhase('snapshot');
   const snapshot = await snapshotCandidates(store, taskId);
+  if (typeof onPhase === 'function') await onPhase('decide');
 
   // ---- DECIDE (probe live identity OUTSIDE any lock) ----
   const actions = [];
@@ -220,32 +248,38 @@ export async function reconcilePass(store, {
       const probe = await probeIdentity({ run: probeRun(run), now });
       const { disp, anomalyClass, failingClause } = openDisposition(probe);
       if (disp === 'alive') {
-        if (run.binding_state === 'bound_unverified') {
+        // A live match RE-VERIFIES a binding that is not currently verified - recovering
+        // both a transiently-demoted binding AND a stranded 'lost' one back to
+        // bound_verified, so open/lost is never a permanent stable state (finding 6).
+        if (run.binding_state === 'bound_unverified' || run.binding_state === 'lost') {
           actions.push(reverifyAction(run, `${nonce}:${tag}:reverify`, probeIdentity));
         }
-        // bound_verified + alive, or lost + alive: nothing to commit.
+        // bound_verified + alive: nothing to commit.
       } else if (disp === 'transient') {
+        // A transient probe failure demotes a live binding to bound_unverified AND authors
+        // a running_without_verification anomaly explaining why the live binding became
+        // unverified (finding 5). Anomaly first, then the transition.
         if (run.binding_state === 'bound_verified') {
+          actions.push(anomalyAction(run, `${nonce}:${tag}:unverified-anomaly`, {
+            anomalyClass: 'running_without_verification', failingClause
+          }));
           actions.push(unverifyAction(run, `${nonce}:${tag}:unverify`));
         }
-        // already bound_unverified / lost: no-op.
-      } else { // gone
+        // already bound_unverified / lost: no-op (a transient failure cannot prove death).
+      } else { // gone: a provably dead open generation
+        // The reconciler audits the specific identity failure AND the binding_lost_under_active
+        // alert, then - in the SAME pass - emits identity_lost (binding -> lost) and terminally
+        // fails the generation through the sanctioned S2 fail path, never leaving it open/lost
+        // (finding 6, spec 491). A binding already lost from an interrupted prior pass just needs
+        // the terminal escalation (its identity_lost already committed).
+        actions.push(anomalyAction(run, `${nonce}:${tag}:loss-observed`, { anomalyClass, failingClause }));
+        actions.push(anomalyAction(run, `${nonce}:${tag}:lost-under-active`, {
+          anomalyClass: 'binding_lost_under_active', failingClause, probeClass: anomalyClass
+        }));
         if (run.binding_state === 'lost') {
-          // A binding that was already lost on a prior pass and is STILL provably gone is
-          // a provably-dead open generation still held under an active task: audit
-          // `binding_lost_under_active`, then escalate to a terminal fail via the S2 path
-          // (spec 491). Anomaly first, so a crash-cut resumes cleanly.
-          actions.push(anomalyAction(run, `${nonce}:${tag}:lost-under-active`, {
-            anomalyClass: 'binding_lost_under_active', failingClause, probeClass: anomalyClass
-          }));
-          actions.push(failAction(run, `${nonce}:${tag}:escalate-terminal`, `provably_dead:${failingClause}`));
+          actions.push(failAction(run, `${nonce}:${tag}:terminal`, `provably_dead:${failingClause}`, run.reconciler_seq + 1));
         } else {
-          // First provable loss of a live binding: audit the SPECIFIC identity failure
-          // (missing_pane / identity_mismatch / pid_reuse_suspected - the actionable
-          // "why"), then mark the binding lost + emit identity_lost. Two atomic actions,
-          // observation first.
-          actions.push(anomalyAction(run, `${nonce}:${tag}:loss-observed`, { anomalyClass, failingClause }));
-          actions.push(markLostAction(run, `${nonce}:${tag}:mark-lost`, failingClause, anomalyClass));
+          actions.push(failLostAction(run, `${nonce}:${tag}:lost-fail`, failingClause, anomalyClass));
         }
       }
       continue;
@@ -306,6 +340,7 @@ export async function reconcilePass(store, {
   }
 
   return { nonce, task_id: taskId, candidates: snapshot.length, committed, skipped };
+  }
 
   // ---- action builders (closures over the pass's stores/probes) ----
   function promoteAction(run, key, probe) {
@@ -316,22 +351,38 @@ export async function reconcilePass(store, {
       }, { now, probeIdentity: probe })
     };
   }
-  function failAction(run, key, reason) {
+  function failAction(run, key, reason, seq = run.reconciler_seq + 1) {
     return {
       key, kind: 'fail', taskId: run.task_id, generation: run.run_generation,
       run: (commandId) => failRun(store, {
         taskId: run.task_id, generation: run.run_generation, expectedRevision: run.task_revision,
-        reason: `reconciler: ${reason}`, producer: RECONCILER, seq: run.reconciler_seq + 1, commandId
+        reason: `reconciler: ${reason}`, producer: RECONCILER, seq, commandId
       }, { now })
     };
   }
-  function markLostAction(run, key, failingClause, anomalyClass) {
+  // Compound one-pass loss-and-terminal (finding 6, spec 491): emit identity_lost (binding
+  // -> lost, revision R -> R+1), then terminally fail the provably-dead generation through
+  // the S2 fail path (R+1 -> R+2) with the reconciler's next two producer seqs. The two
+  // sub-commands carry distinct deterministic command-ids so a crash between them replays
+  // cleanly; and if a crash lands after the identity_lost but before the terminal, the next
+  // pass sees binding 'lost' + still-gone and escalates via failAction. The failRun's
+  // expected-revision is threaded from the mark-lost result, so a coordinator that raced in
+  // between makes the terminal a benign skip that the next pass reconciles.
+  function failLostAction(run, key, failingClause, anomalyClass) {
     return {
-      key, kind: 'mark_lost', taskId: run.task_id, generation: run.run_generation,
-      run: (commandId) => reconcileMarkLost(store, {
-        taskId: run.task_id, generation: run.run_generation, expectedRevision: run.task_revision,
-        failingClause, anomalyClass, commandId
-      }, { now })
+      key, kind: 'fail_lost', taskId: run.task_id, generation: run.run_generation,
+      run: async (commandId) => {
+        const lost = await reconcileMarkLost(store, {
+          taskId: run.task_id, generation: run.run_generation, expectedRevision: run.task_revision,
+          failingClause, anomalyClass, commandId: `${commandId}:lost`
+        }, { now });
+        const failed = await failRun(store, {
+          taskId: run.task_id, generation: run.run_generation, expectedRevision: lost.revision,
+          reason: `reconciler: provably_dead:${failingClause}`, producer: RECONCILER,
+          seq: run.reconciler_seq + 2, commandId: `${commandId}:fail`
+        }, { now });
+        return { lost, failed };
+      }
     };
   }
   function unverifyAction(run, key) {

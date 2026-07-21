@@ -5,9 +5,11 @@ import { runExclusive } from '../lib/internal-runtime.mjs';
 import { createTask, beginRun } from '../lib/domain-store.mjs';
 import { completeRun } from '../lib/domain-store-s2.mjs';
 import { recordSpawn, commitRunning } from '../lib/domain-store-s3.mjs';
-import { resolveAnomaly, listAnomalies } from '../lib/domain-store-s5.mjs';
+import { sha256hex } from '../lib/domain-store.mjs';
+import { resolveAnomaly, listAnomalies, recordReconcilerAnomaly } from '../lib/domain-store-s5.mjs';
 import { AnomalyResolutionError } from '../lib/errors-s5.mjs';
 import { reconcilePass } from '../lib/reconciler.mjs';
+import { backendReachable, scanIsolatedSocket, probeIdentityTransientAware } from '../lib/backend-scan-s5.mjs';
 import { mkFixtureHome, cleanupAll } from './helpers.mjs';
 
 // S5 owns the reconciler pass, anomaly authorship + resolve-anomaly, and the S3-deferred
@@ -193,14 +195,17 @@ test('t_reconcile_marks_bound_unverified_on_transient', async () => {
   const before = await counters(store);
 
   const r = await reconcilePass(store, { nonce: 'p1', probeIdentity: probeTransient });
-  assert.equal(r.committed.length, 1);
-  assert.equal(r.committed[0].kind, 'mark_unverified');
+  // A transient demotion authors running_without_verification (the "why") AND demotes the
+  // binding - finding 5. Two commits, anomaly first.
+  assert.deepEqual(r.committed.map((c) => c.kind), ['running_without_verification', 'mark_unverified']);
   const run = await runRow(store, 't1');
   assert.equal(run.binding_state, 'bound_unverified', 'a transient probe failure demotes the binding, not loses it');
   assert.equal(run.status, 'open', 'the run stays open on a transient demotion');
   assert.equal(await eventCount(store, 't1', 'identity_lost'), 0, 'a transient demotion emits no identity_lost');
+  assert.equal((await anomalyRows(store, 'running_without_verification')).length, 1, 'the transient demotion is explained by a running_without_verification anomaly');
   assert.equal(Number((await taskRow(store, 't1')).revision), rev + 1);
-  assert.deepEqual(await counters(store), { domain: before.domain + 1, projection: 0, commit: before.commit + 1 });
+  // Anomaly audit (+1) + binding demotion (+1) = +2 domain/commit, +1 task revision.
+  assert.deepEqual(await counters(store), { domain: before.domain + 2, projection: 0, commit: before.commit + 2 });
 
   // Re-running while it is already bound_unverified is a no-op: no counter noise.
   const afterDemote = await counters(store);
@@ -223,31 +228,78 @@ test('t_reconcile_marks_lost_and_emits_identity_lost', async () => {
 
   const r = await reconcilePass(store, { nonce: 'p1', probeIdentity: probeGone('agent_pid', 'missing_pane') });
   const kinds = r.committed.map((c) => c.kind);
-  assert.deepEqual(kinds, ['missing_pane', 'mark_lost'], 'a provable loss audits the specific identity failure then marks the binding lost');
+  // A provably-dead open generation is handled in ONE pass (finding 6, spec 491): audit the
+  // specific identity failure, audit binding_lost_under_active, then emit identity_lost
+  // (binding -> lost) AND terminally fail through the S2 path - never left open/lost.
+  assert.deepEqual(kinds, ['missing_pane', 'binding_lost_under_active', 'fail_lost']);
 
   const run = await runRow(store, 't1');
-  assert.equal(run.binding_state, 'lost', 'the binding is marked lost');
-  assert.equal(run.status, 'open', 'losing the binding is not a terminal outcome; the run stays open');
-  assert.equal(await eventCount(store, 't1', 'identity_lost'), 1, 'exactly one identity_lost event');
+  assert.equal(run.status, 'failed', 'the provably-dead generation is terminally failed in the same pass');
+  assert.notEqual(run.closed_at, null, 'the failed generation is closed');
+  assert.equal(await eventCount(store, 't1', 'identity_lost'), 1, 'exactly one identity_lost event (the loss audit) precedes the terminal');
   const il = await rows(store, "SELECT producer_id, payload_json FROM task_events WHERE task_id = 't1' AND event_type = 'identity_lost'");
   assert.equal(il[0].producer_id, 'reconciler');
   const payload = typeof il[0].payload_json === 'string' ? JSON.parse(il[0].payload_json) : il[0].payload_json;
   assert.equal(payload.failing_clause, 'agent_pid');
-
-  // The specific-failure anomaly is durable; the transition bumps one task revision.
-  assert.equal((await anomalyRows(store, 'missing_pane')).length, 1);
-  assert.equal(Number((await taskRow(store, 't1')).revision), rev + 1, 'the loss transition bumps exactly one task revision');
-  // Observation audit (+1) + lost transition (+1) = +2 domain/commit, +1 task revision.
-  assert.deepEqual(await counters(store), { domain: before.domain + 2, projection: 0, commit: before.commit + 2 });
-
-  // A later pass on the still-gone, already-lost generation audits binding_lost_under_active
-  // and escalates to a terminal fail via the S2 path (provably dead open generation, spec 491).
-  const r2 = await reconcilePass(store, { nonce: 'p2', probeIdentity: probeGone('agent_pid', 'missing_pane') });
-  const r2kinds = r2.committed.map((c) => c.kind);
-  assert.equal(r2kinds.includes('binding_lost_under_active'), true, 'the escalation audits binding_lost_under_active');
-  assert.equal(r2kinds.includes('fail'), true, 'a still-lost generation escalates to terminal');
-  assert.equal((await runRow(store, 't1')).status, 'failed');
+  // The failed terminal is authored by the reconciler with outcome 'failure'.
+  const failed = await rows(store, "SELECT producer_id, outcome FROM task_events WHERE task_id = 't1' AND event_type = 'failed'");
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].producer_id, 'reconciler');
+  assert.equal(failed[0].outcome, 'failure');
   assert.equal((await taskRow(store, 't1')).status, 'failed');
+
+  assert.equal((await anomalyRows(store, 'missing_pane')).length, 1);
+  assert.equal((await anomalyRows(store, 'binding_lost_under_active')).length, 1);
+  // missing_pane audit (+1) + binding_lost_under_active audit (+1) + identity_lost transition
+  // (+1) + terminal fail (+1) = +4 domain/commit; the task revision advances twice (lost, fail).
+  assert.deepEqual(await counters(store), { domain: before.domain + 4, projection: 0, commit: before.commit + 4 });
+  assert.equal(Number((await taskRow(store, 't1')).revision), rev + 2, 'identity_lost then terminal fail advance the revision twice');
+
+  // The generation is now terminal, so a rerun finds nothing to do - no duplicate terminal.
+  const r2 = await reconcilePass(store, { nonce: 'p2', probeIdentity: probeGone('agent_pid', 'missing_pane') });
+  assert.equal(r2.committed.length, 0, 'a rerun over the settled terminal does nothing');
+  assert.equal(await eventCount(store, 't1', 'failed'), 1, 'still exactly one terminal - no duplicate');
+});
+
+test('t_reconcile_recovers_stranded_lost_binding_on_live_match', async () => {
+  const { store } = await freshStore();
+  const rev = await runningTask(store, 't1'); // open, bound_verified
+  // Simulate a binding that momentarily read 'lost' (e.g. an interrupted loss pass or a
+  // transient failure misclassified). Force the run to open/lost directly.
+  await runExclusive(store, (conn) => conn.query("UPDATE runs SET binding_state = 'lost' WHERE task_id = 't1' AND run_generation = 1"));
+  const before = await counters(store);
+
+  // The EXACT stored identity reappears live: the reconciler re-verifies the stranded lost
+  // binding back to bound_verified rather than leaving open/lost as a stable state (finding 6).
+  const r = await reconcilePass(store, { nonce: 'rec', probeIdentity: probeMatch });
+  assert.deepEqual(r.committed.map((c) => c.kind), ['reverify']);
+  const run = await runRow(store, 't1');
+  assert.equal(run.binding_state, 'bound_verified', 'a live match recovers a stranded lost binding');
+  assert.equal(run.status, 'open');
+  const rv = await rows(store, "SELECT producer_id FROM task_events WHERE task_id = 't1' AND event_type = 'running_verified' ORDER BY created_at");
+  assert.equal(rv[rv.length - 1].producer_id, 'reconciler');
+  assert.deepEqual(await counters(store), { domain: before.domain + 1, projection: 0, commit: before.commit + 1 });
+  assert.equal(Number((await taskRow(store, 't1')).revision), rev + 1);
+});
+
+test('t_anomaly_fingerprint_matches_spec_concatenation', async () => {
+  // Finding 7: the persisted fingerprint MUST equal the ratified spec-819-825 formula -
+  // sha256 of the DIRECT concatenation (no delimiter) of the nine positional fields, a
+  // null field contributing the empty string - matching launchMarkerFor's convention.
+  const { store } = await freshStore();
+  await runningTask(store, 't1');
+  await reconcilePass(store, {
+    nonce: 'fp', datadirSize: () => 9_999_999, datadirLimitBytes: 1
+  });
+  const homeUuid = (await rows(store, "SELECT value FROM schema_meta WHERE key = 'home_uuid'"))[0].value;
+  const row = (await rows(store, "SELECT fingerprint, anomaly_class, terminal_fingerprint FROM anomalies WHERE anomaly_class = 'datadir_size_tripwire'"))[0];
+  // datadir_size_tripwire carries only home_uuid, class, and terminal_fingerprint='datadir';
+  // every other positional field is null -> empty string.
+  const expected = sha256hex(`${homeUuid}${'datadir_size_tripwire'}${''}${''}${''}${''}${''}${''}${'datadir'}`);
+  assert.equal(row.fingerprint, expected, 'the datadir tripwire fingerprint is the exact spec-819-825 direct concatenation');
+  // Prove sensitivity: a NUL-delimited join (the pre-fix formula) would differ.
+  const nulJoined = sha256hex([homeUuid, 'datadir_size_tripwire', '', '', '', '', '', '', 'datadir'].join('\u0000'));
+  assert.notEqual(row.fingerprint, nulJoined, 'and is NOT the old NUL-delimited digest');
 });
 
 test('t_reconcile_never_kills_or_adopts_markerless', async () => {
@@ -398,4 +450,88 @@ test('t_resolve_anomaly_predicates_enforced_row_preserved', async () => {
   assert.equal(active.anomalies.some((a) => a.fingerprint === orphanFp || a.fingerprint === datadirFp), false, 'resolved anomalies drop out of the active list');
   const all = await listAnomalies(store, {});
   assert.equal(all.anomalies.some((a) => a.fingerprint === orphanFp), true, 'but remain in the full ledger');
+});
+
+test('t_resolve_anomaly_class_predicates', async () => {
+  // Finding 3: resolve-anomaly enforces the class-specific spec-830-840 predicates against
+  // the canonical rows, positive AND negative, and the human_approved gate applies ONLY to
+  // markerless orphans - a marker-bearing orphan is gated on the adoption/exact-cleanup
+  // predicate instead, not on human approval.
+  const { store } = await freshStore();
+  // A running run whose marker + endpoint a marker-bearing orphan can be "adopted" into.
+  await runningTask(store, 't1');
+  const t1 = (await rows(store, "SELECT launch_marker, endpoint_id FROM runs WHERE task_id = 't1'"))[0];
+
+  // --- marker-bearing orphan: NEGATIVE (marker matches a run but endpoint not adopted) ---
+  const orphanBadFp = await recordReconcilerAnomaly(store, {
+    anomalyClass: 'orphan_pane', endpointId: '@nope', paneId: '%9', terminalFingerprint: t1.launch_marker,
+    detail: { reason: 'unknown_marker' }, commandId: 'a-orphan-bad'
+  });
+  await assert.rejects(
+    () => resolveAnomaly(store, { fingerprint: orphanBadFp.fingerprint, reason: 'x', resolutionKind: 'agent_verified', commandId: 'r-orphan-bad' }),
+    (e) => e instanceof AnomalyResolutionError && /neither adopted.*nor exactly cleaned/.test(e.message),
+    'a marker-bearing orphan not adopted/cleaned cannot be resolved'
+  );
+  // A marker-bearing orphan is NOT captain-routed: human_approved does not bypass the predicate.
+  await assert.rejects(
+    () => resolveAnomaly(store, { fingerprint: orphanBadFp.fingerprint, reason: 'x', resolutionKind: 'human_approved', commandId: 'r-orphan-bad2' }),
+    (e) => e instanceof AnomalyResolutionError,
+    'human approval does not substitute for the marker-bearing orphan predicate'
+  );
+
+  // --- marker-bearing orphan: POSITIVE (adopted - marker + endpoint match the live run) ---
+  const orphanOkFp = await recordReconcilerAnomaly(store, {
+    anomalyClass: 'orphan_pane', endpointId: t1.endpoint_id, paneId: '%0', terminalFingerprint: t1.launch_marker,
+    detail: { reason: 'unknown_marker' }, commandId: 'a-orphan-ok'
+  });
+  const okRes = await resolveAnomaly(store, { fingerprint: orphanOkFp.fingerprint, reason: 'adopted into its run', resolutionKind: 'agent_verified', commandId: 'r-orphan-ok' });
+  assert.equal(okRes.status, 'resolved', 'a marker-bearing orphan adopted into its run resolves on agent authority');
+
+  // --- terminal_conflict: POSITIVE (a canonical terminal exists) vs NEGATIVE (none) ---
+  const rev2 = await runningTask(store, 't2');
+  await completeRun(store, { taskId: 't2', generation: 1, expectedRevision: rev2, outcome: 'success', producer: 'crewmate', seq: 1, evidence: {}, commandId: 'c-done-t2' });
+  const tcOk = await recordReconcilerAnomaly(store, { anomalyClass: 'terminal_conflict', taskId: 't2', generation: 1, terminalFingerprint: 't2:1', detail: {}, commandId: 'a-tc-ok' });
+  const tcRes = await resolveAnomaly(store, { fingerprint: tcOk.fingerprint, reason: 'one canonical terminal', resolutionKind: 'agent_verified', commandId: 'r-tc-ok' });
+  assert.equal(tcRes.status, 'resolved', 'terminal_conflict resolves when exactly one canonical terminal exists');
+
+  await runningTask(store, 't3'); // open, no terminal
+  const tcBad = await recordReconcilerAnomaly(store, { anomalyClass: 'terminal_conflict', taskId: 't3', generation: 1, terminalFingerprint: 't3:1', detail: {}, commandId: 'a-tc-bad' });
+  await assert.rejects(
+    () => resolveAnomaly(store, { fingerprint: tcBad.fingerprint, reason: 'x', resolutionKind: 'agent_verified', commandId: 'r-tc-bad' }),
+    (e) => e instanceof AnomalyResolutionError && /exactly one canonical terminal/.test(e.message),
+    'terminal_conflict without a canonical terminal is not resolvable'
+  );
+
+  // --- out-of-slice class: rejected (S4/S6 owns the predicate) ---
+  const spFp = await recordReconcilerAnomaly(store, { anomalyClass: 'stale_projection', terminalFingerprint: 'proj-1', detail: {}, commandId: 'a-sp' });
+  await assert.rejects(
+    () => resolveAnomaly(store, { fingerprint: spFp.fingerprint, reason: 'x', resolutionKind: 'agent_verified', commandId: 'r-sp' }),
+    (e) => e instanceof AnomalyResolutionError && /owned by another slice/.test(e.message),
+    'a projection/consumer class is not resolvable in S5'
+  );
+
+  // --- idempotency/causal: structurally satisfiable; a reconciler observation: agent-level ---
+  const causalFp = await recordReconcilerAnomaly(store, { anomalyClass: 'causal_ordering_violation', terminalFingerprint: 'cmd-x', detail: {}, commandId: 'a-causal' });
+  assert.equal((await resolveAnomaly(store, { fingerprint: causalFp.fingerprint, reason: 'rejected deterministically, no mutation', resolutionKind: 'agent_verified', commandId: 'r-causal' })).status, 'resolved');
+  const mpFp = await recordReconcilerAnomaly(store, { anomalyClass: 'missing_pane', taskId: 't3', generation: 1, terminalFingerprint: 'mk', detail: {}, commandId: 'a-mp' });
+  assert.equal((await resolveAnomaly(store, { fingerprint: mpFp.fingerprint, reason: 'operator remediated', resolutionKind: 'agent_verified', commandId: 'r-mp' })).status, 'resolved', 'a reconciler observation class resolves on agent authority');
+});
+
+test('t_production_probe_reports_transient_on_unreachable_backend', async () => {
+  // Finding 4: the production probe seam distinguishes a TRANSIENT/backend-unverified
+  // failure (the isolated tmux server could not be reached) from a definitive absence. An
+  // isolated socket with no server is unreachable, so the probe reports transient - NOT a
+  // proof of death - and the marker scan returns null (no scan performed), not [].
+  const socket = `cp-s5-unreachable-${process.pid}`;
+  const reachable = backendReachable(socket);
+  // On a host without a server on this socket (and even without tmux at all), unreachable.
+  if (reachable) return; // extraordinarily unlikely; skip rather than assert a live server
+  const probe = probeIdentityTransientAware({
+    run: { endpoint_id: '@0', pane_id: '%0', boot_id: 'b', pane_leader_pid: 1, pane_start_ticks: 1, agent_pid: 1, agent_start_ticks: 1, agent_exe: '/x', agent_argv_hash: 'h', agent_ppid: 1, agent_pty: 'p' },
+    socket
+  });
+  assert.equal(probe.matches, false);
+  assert.equal(probe.transient, true, 'an unreachable backend is a transient failure, not proof of death');
+  assert.equal(probe.anomalyClass, 'running_without_verification');
+  assert.equal(scanIsolatedSocket(socket), null, 'an unreachable socket yields a null scan (not an empty array)');
 });
