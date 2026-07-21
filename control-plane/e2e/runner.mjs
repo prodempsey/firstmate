@@ -113,6 +113,38 @@ export class Harness {
   markAgentDead(pid) { for (const a of this.agents) if (a.pid === pid) a.alive = false; }
   liveAgentMarkers() { return new Set(this.agents.filter((a) => a.alive).map((a) => a.marker)); }
 
+  // Fail-CLOSED kill authority (ratified ruling Q3): a kill target must be proven
+  // fixture-recorded IMMEDIATELY before the signal, in the kill primitive itself - never a
+  // raw integer PID trusted by a caller. A future wiring error that passed an unrecorded PID
+  // would throw here rather than signalling a stranger's process.
+  killRecordedAgent(pid) {
+    if (!this.agents.some((a) => a.pid === pid)) throw new Error(`refusing to kill unrecorded agent PID ${pid} (not in the fixture registry)`);
+    killExactPid(pid);
+    this.markAgentDead(pid);
+  }
+  killRecordedChild(pid) {
+    if (!this.children.some((c) => c.pid === pid) && !this.keepalives.some((k) => k.pid === pid)) {
+      throw new Error(`refusing to kill unrecorded child PID ${pid} (not in the fixture registry)`);
+    }
+    killExactPid(pid);
+  }
+
+  // Abruptly CRASH a spawned driver child by its exact recorded PID and reap it. A child of
+  // this test process becomes a zombie (still "alive" to kill(pid,0)) until reaped, so a
+  // clean death is proven by awaiting its own `exit` event rather than by isAlive polling.
+  // Fail-closed on the registry membership exactly like the other kill primitives (Q3).
+  async crashRecordedChild(pid, child) {
+    if (!this.children.some((c) => c.pid === pid)) {
+      throw new Error(`refusing to crash unrecorded child PID ${pid} (not in the fixture registry)`);
+    }
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise((resolve) => child.once('exit', resolve));
+      child.kill('SIGKILL');
+      await exited;
+    }
+    return { exitCode: child.exitCode, signalCode: child.signalCode };
+  }
+
   // ---- store helpers --------------------------------------------------------------
 
   async read(sql, params) { return runExclusive(this.#store, async (conn) => (await conn.query(sql, params)).rows); }
@@ -147,6 +179,19 @@ export class Harness {
     let json = null;
     try { json = JSON.parse((res.stdout || '').trim()); } catch { /* not JSON (e.g. help) */ }
     return { status: res.status, stdout: res.stdout, stderr: res.stderr, json };
+  }
+
+  // Spawn a fixture DRIVER child process (a real coordinator/adapter/store/consumer driver
+  // that reaches a state and then either hangs to be killed or waits for a release signal).
+  // Returns the live ChildProcess. The caller records its PID and kills it via the fail-closed
+  // killRecordedChild. Carries the fixture home/socket/dataDir so the child drives the same
+  // isolated store.
+  spawnDriver(scriptPath, extraEnv = {}) {
+    const env = {
+      ...process.env, FM_HOME: this._fmHome, CP_FM_HOME: this._fmHome, CP_SINK_DIR: this._sinkDir,
+      CP_TMUX_SOCKET: this._socket, TMUX_TMPDIR: this._tmuxTmpDir, CP_DATA_DIR: this._dataDir, ...extraEnv
+    };
+    return spawn('node', [scriptPath], { env });
   }
 
   // Async variant of cp() for genuinely CONCURRENT invocations (wf9 serialization): several

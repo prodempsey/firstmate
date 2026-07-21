@@ -50,6 +50,12 @@ export function waitFor(predicate, { tries = 400, stepMs = 25 } = {}) {
   return predicate();
 }
 
+// Wait (bounded) for a file to exist - the readiness handshake a driver child writes when it
+// has reached its cutpoint/hold state, so the parent kills it at a DETERMINISTIC point.
+export function waitForFile(path) {
+  return waitFor(() => fs.existsSync(path));
+}
+
 // Send SIGKILL to an exact pid and wait until it is confirmed gone. Returns true when the
 // pid is dead (or already was). NEVER used with a pattern - the caller passes one exact,
 // fixture-recorded integer pid.

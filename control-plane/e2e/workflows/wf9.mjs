@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { waitForFile } from '../fixtures/proc.mjs';
 
 // Workflow 9 - PGlite durability / lock / reopen (spec matrix row 868): concurrent `cp`
 // invocations serialize on the store flock; a process killed mid-transaction leaves NO
@@ -11,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 export const meta = { tmuxRequired: false };
 
 const CRASH_WRITER = fileURLToPath(new URL('../fixtures/crash-writer.mjs', import.meta.url));
+const FLOCK_HOLDER = fileURLToPath(new URL('../fixtures/flock-holder.mjs', import.meta.url));
 
 export async function run(h) {
   // (a) Concurrent cp invocations serialize. Launch many writers AND a reader at once; the
@@ -40,9 +42,28 @@ export async function run(h) {
   assert.equal(Number(countersAfter.domain_revision), Number(countersBefore.domain_revision), 'domain_revision did not move for the rolled-back transaction');
   assert.equal(Number(countersAfter.commit_sequence), Number(countersBefore.commit_sequence), 'commit_sequence did not move for the rolled-back transaction');
 
-  // (c) A read verb takes the lock too and returns a consistent view after the crash.
-  const head = h.cp(['task-head', 't-conc-0']);
-  assert.equal(head.json.status, 'queued', 'a locked read returns the committed state');
+  // (c) Reads also lock - and CONTEND. A holder child grabs the exclusive store lock and
+  // holds it; a concurrent `cp task-head` READ must BLOCK for the whole hold and only complete
+  // once the lock is released. If reads bypassed the exclusive lock this would not block, so
+  // the assertion is mutation-sensitive to the read-also-locks property.
+  const holderReady = path.join(h.fmHome, 'lock-ready');
+  const releaseFile = path.join(h.fmHome, 'lock-release');
+  const holder = h.spawnDriver(FLOCK_HOLDER, { CP_MODE: 'release', CP_READY_FILE: holderReady, CP_RELEASE_FILE: releaseFile });
+  h.recordChild(holder.pid, 'lock-holder');
+  const holderExit = new Promise((res) => holder.once('exit', res));
+  assert.equal(waitForFile(holderReady), true, 'the holder acquired the exclusive store lock');
+
+  let readerResolved = false;
+  const readerPromise = h.cpAsync(['task-head', 't-conc-0']).then((r) => { readerResolved = true; return r; });
+  await new Promise((r) => setTimeout(r, 700)); // let the reader try to acquire while the lock is held
+  assert.equal(readerResolved, false, 'the read is BLOCKED while the exclusive lock is held (reads also lock)');
+
+  fs.writeFileSync(releaseFile, 'go'); // release the lock; the reader can now acquire it
+  const readerRes = await readerPromise;
+  assert.equal(readerResolved, true, 'the read completes once the lock is released');
+  assert.equal(readerRes.status, 0, 'the previously-blocked read succeeds after release');
+  assert.equal(JSON.parse(readerRes.stdout.trim()).status, 'queued', 'the unblocked read returns committed state');
+  await holderExit; // reap the cleanly-exited holder so it is not a lingering zombie
 
   // (d) First-init missing-dataDir path: point cp init at a dataDir that does NOT exist; it
   // must create it (owner-only) and initialize cleanly.

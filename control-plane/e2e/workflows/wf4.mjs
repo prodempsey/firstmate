@@ -6,7 +6,7 @@ import { projectHelm } from '../../lib/projections.mjs';
 import { probeIdentityTransientAware } from '../../lib/backend-scan-s5.mjs';
 import { launchAgentPane, launchMarkerlessPane } from '../fixtures/agent.mjs';
 import { makeSink, drainToIdle } from '../fixtures/consumer.mjs';
-import { killExactPid, waitFor } from '../fixtures/proc.mjs';
+import { waitFor } from '../fixtures/proc.mjs';
 import { tmuxListPane } from '../../lib/tmux-adapter.mjs';
 
 // Workflow 4 - Unexpected death (spec matrix row 863): kill the EXACT recorded agent PID
@@ -34,8 +34,10 @@ async function toRunning(h, taskId, seed) {
 // assert the generation is failed+lost, then resolve the (explained) death anomalies with
 // agent authority so only genuinely-unremediable residue remains.
 async function killAndReconcile(h, taskId, agentPid, endpointId, paneId) {
-  killExactPid(agentPid);
-  h.markAgentDead(agentPid);
+  // Fail-CLOSED at the kill boundary (Q3): killRecordedAgent asserts this PID is
+  // fixture-recorded in the harness registry IMMEDIATELY before it signals, then kills and
+  // marks it dead. An unrecorded PID would throw here rather than being signalled.
+  h.killRecordedAgent(agentPid);
   assert.equal(waitFor(() => !tmuxListPane(h.socket, endpointId, paneId).listed), true, `${taskId}: the exact pane is gone after the kill`);
 
   const out = h.cp(['reconcile', '--task', taskId]);
