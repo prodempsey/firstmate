@@ -3,6 +3,7 @@ import { ValidationError } from './errors.mjs';
 import { runS1Verb, S1_VERBS } from './coordinator-s1.mjs';
 import { runS2Verb, S2_VERBS } from './coordinator-s2.mjs';
 import { runS3Verb, S3_VERBS } from './coordinator-s3.mjs';
+import { runS4Verb, S4_VERBS } from './coordinator-s4.mjs';
 import { runS5Verb, S5_VERBS } from './coordinator-s5.mjs';
 
 // Coordinator entrypoint skeleton (spec section 6). S0 implements exactly one
@@ -26,6 +27,7 @@ export async function runVerb(argv, { env = process.env } = {}) {
     if (S1_VERBS.has(verb)) return runS1Verb(verb, rest, { env });
     if (S2_VERBS.has(verb)) return runS2Verb(verb, rest, { env });
     if (S3_VERBS.has(verb)) return runS3Verb(verb, rest, { env });
+    if (S4_VERBS.has(verb)) return runS4Verb(verb, rest, { env });
     if (S5_VERBS.has(verb)) return runS5Verb(verb, rest, { env });
     throw new ValidationError(
       `unknown or not-yet-implemented verb: ${verb}`,
