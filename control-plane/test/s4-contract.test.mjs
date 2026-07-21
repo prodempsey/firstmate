@@ -70,10 +70,11 @@ async function claim(store, opts = {}) {
 }
 
 // Verb-level apply+ack with a direct sink result (no sink adapter under test here).
-async function applyAndAck(store, token, row, prefix) {
-  await claimDelivery(store, { outboxId: row.outbox_id, ownerToken: token, sinkKind: 'disposition', commandId: `${prefix}-cd` });
-  await markApplied(store, { eventId: row.event_id, ownerToken: token, sinkResult: { ok: true, event_id: row.event_id }, commandId: `${prefix}-ma` });
-  return ack(store, { outboxId: row.outbox_id, ownerToken: token, commandId: `${prefix}-ak` });
+// Carries the full (owner_token, owner_epoch) fencing tuple on every verb.
+async function applyAndAck(store, token, epoch, row, prefix) {
+  await claimDelivery(store, { outboxId: row.outbox_id, ownerToken: token, ownerEpoch: epoch, sinkKind: 'disposition', commandId: `${prefix}-cd` });
+  await markApplied(store, { eventId: row.event_id, ownerToken: token, ownerEpoch: epoch, sinkResult: { ok: true, event_id: row.event_id }, commandId: `${prefix}-ma` });
+  return ack(store, { outboxId: row.outbox_id, ownerToken: token, ownerEpoch: epoch, commandId: `${prefix}-ak` });
 }
 
 async function initHome() {
@@ -110,14 +111,14 @@ test('t_next_returns_minimum_unacked_only', async () => {
   assert.ok(d2.outbox_id > d1.outbox_id);
   const c = await claim(store, { commandId: 'cc' });
 
-  const head = await next(store, { ownerToken: c.owner_token });
+  const head = await next(store, { ownerToken: c.owner_token, ownerEpoch: c.owner_epoch });
   assert.equal(head.row.outbox_id, d1.outbox_id, 'next returns the single minimum unacked row');
   assert.equal(head.row.event_id, d1.event_id);
   // The shape is one row (or null), never a batch.
   assert.ok(!Array.isArray(head.row) && head.row.task_id === 't1');
 
-  await applyAndAck(store, c.owner_token, head.row, 'm1');
-  const head2 = await next(store, { ownerToken: c.owner_token });
+  await applyAndAck(store, c.owner_token, c.owner_epoch, head.row, 'm1');
+  const head2 = await next(store, { ownerToken: c.owner_token, ownerEpoch: c.owner_epoch });
   assert.equal(head2.row.outbox_id, d2.outbox_id, 'after ack, the next minimum is returned');
 });
 
@@ -139,10 +140,10 @@ test('t_next_skips_gapped_outbox_id', async () => {
   assert.ok(!ids.includes(d1.outbox_id + 1), 'the burned id is not a committed row');
 
   const c = await claim(store, { commandId: 'cc' });
-  const first = await next(store, { ownerToken: c.owner_token });
+  const first = await next(store, { ownerToken: c.owner_token, ownerEpoch: c.owner_epoch });
   assert.equal(first.row.outbox_id, d1.outbox_id, 'next returns the true MIN, not cursor+1');
-  await applyAndAck(store, c.owner_token, first.row, 'g1');
-  const second = await next(store, { ownerToken: c.owner_token });
+  await applyAndAck(store, c.owner_token, c.owner_epoch, first.row, 'g1');
+  const second = await next(store, { ownerToken: c.owner_token, ownerEpoch: c.owner_epoch });
   assert.equal(second.row.outbox_id, d2.outbox_id, 'next skips the burned id and returns the next committed row');
 });
 
@@ -151,7 +152,7 @@ test('t_claim_delivery_creates_claimed_receipt_no_effect', async () => {
   const d = await deliverable(store, 't1');
   const c = await claim(store, { commandId: 'cc' });
 
-  const res = await claimDelivery(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, sinkKind: 'disposition', commandId: 'cd1' });
+  const res = await claimDelivery(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, ownerEpoch: c.owner_epoch, sinkKind: 'disposition', commandId: 'cd1' });
   assert.equal(res.state, 'claimed');
   assert.equal(res.sink_idempotency_key, d.event_id, 'the sink idempotency key is the event_id');
   assert.equal(res.delivery_attempts, 1, 'claim-delivery records one delivery attempt');
@@ -169,9 +170,9 @@ test('t_mark_applied_transitions_claimed_to_applied', async () => {
   const { store } = await freshStore();
   const d = await deliverable(store, 't1');
   const c = await claim(store, { commandId: 'cc' });
-  await claimDelivery(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, sinkKind: 'disposition', commandId: 'cd1' });
+  await claimDelivery(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, ownerEpoch: c.owner_epoch, sinkKind: 'disposition', commandId: 'cd1' });
 
-  const res = await markApplied(store, { eventId: d.event_id, ownerToken: c.owner_token, sinkResult: { applied: true, event_id: d.event_id }, commandId: 'ma1' });
+  const res = await markApplied(store, { eventId: d.event_id, ownerToken: c.owner_token, ownerEpoch: c.owner_epoch, sinkResult: { applied: true, event_id: d.event_id }, commandId: 'ma1' });
   assert.equal(res.state, 'applied');
   assert.ok(typeof res.sink_result_hash === 'string' && res.sink_result_hash.length === 64);
 
@@ -188,10 +189,10 @@ test('t_ack_advances_cursor_and_marks_outbox', async () => {
   const { store } = await freshStore();
   const d = await deliverable(store, 't1');
   const c = await claim(store, { commandId: 'cc' });
-  await claimDelivery(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, sinkKind: 'disposition', commandId: 'cd1' });
-  await markApplied(store, { eventId: d.event_id, ownerToken: c.owner_token, sinkResult: { ok: true }, commandId: 'ma1' });
+  await claimDelivery(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, ownerEpoch: c.owner_epoch, sinkKind: 'disposition', commandId: 'cd1' });
+  await markApplied(store, { eventId: d.event_id, ownerToken: c.owner_token, ownerEpoch: c.owner_epoch, sinkResult: { ok: true }, commandId: 'ma1' });
 
-  const res = await ack(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, commandId: 'ak1' });
+  const res = await ack(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, ownerEpoch: c.owner_epoch, commandId: 'ak1' });
   assert.equal(res.acked, true);
   assert.equal(res.cursor, d.outbox_id);
 
@@ -219,7 +220,7 @@ test('t_consumer_drains_outbox_in_order', async () => {
   assert.deepEqual(summary.handled.map((h) => h.outbox_id), ordered, 'rows drained in ascending outbox_id order');
   const cursor = await readCursor(store);
   assert.equal(cursor.last_acked_outbox_id, d3.outbox_id, 'the cursor ends at the last row');
-  const head = await next(store, { ownerToken: consumer.ownerToken });
+  const head = await next(store, { ownerToken: consumer.ownerToken, ownerEpoch: consumer.ownerEpoch });
   assert.equal(head.row, null, 'nothing left unacked');
 });
 
@@ -237,13 +238,13 @@ test('t_counter_deltas_per_s4_verb', async () => {
     assert.equal(a.projection, 0, `${label}: projection_revision never moves`);
   };
 
-  // claim-consumer renew -> commit only (rotates the token we then use).
-  let token;
-  await step('claim-consumer', async () => { token = (await claim(store, { commandId: 'cc2' })).owner_token; }, 1, 0);
-  await step('next', async () => { await next(store, { ownerToken: token }); }, 0, 0);
-  await step('claim-delivery', async () => { await claimDelivery(store, { outboxId: d.outbox_id, ownerToken: token, sinkKind: 'disposition', commandId: 'cd1' }); }, 1, 0);
-  await step('mark-applied', async () => { await markApplied(store, { eventId: d.event_id, ownerToken: token, sinkResult: { ok: true }, commandId: 'ma1' }); }, 1, 0);
-  await step('ack', async () => { await ack(store, { outboxId: d.outbox_id, ownerToken: token, commandId: 'ak1' }); }, 1, 1);
+  // claim-consumer renew -> commit only (rotates the token/epoch we then use).
+  let token; let epoch;
+  await step('claim-consumer', async () => { const r = await claim(store, { commandId: 'cc2' }); token = r.owner_token; epoch = r.owner_epoch; }, 1, 0);
+  await step('next', async () => { await next(store, { ownerToken: token, ownerEpoch: epoch }); }, 0, 0);
+  await step('claim-delivery', async () => { await claimDelivery(store, { outboxId: d.outbox_id, ownerToken: token, ownerEpoch: epoch, sinkKind: 'disposition', commandId: 'cd1' }); }, 1, 0);
+  await step('mark-applied', async () => { await markApplied(store, { eventId: d.event_id, ownerToken: token, ownerEpoch: epoch, sinkResult: { ok: true }, commandId: 'ma1' }); }, 1, 0);
+  await step('ack', async () => { await ack(store, { outboxId: d.outbox_id, ownerToken: token, ownerEpoch: epoch, commandId: 'ak1' }); }, 1, 1);
 });
 
 test('t_no_caller_deliver_switch_s4', async () => {

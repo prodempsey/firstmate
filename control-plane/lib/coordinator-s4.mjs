@@ -70,16 +70,19 @@ async function dispatch(verb, flags, positionals, store) {
       });
     }
     case 'next':
-      // Locked read: no command-id, no revision, no bump (spec section 6/8).
+      // Locked read: no command-id, no revision, no bump (spec section 6/8). Carries
+      // the full (owner_token, owner_epoch) fencing tuple (spec section 8.1).
       return next(store, {
         consumerId,
-        ownerToken: requireStringFlag(verb, flags, 'owner-token')
+        ownerToken: requireStringFlag(verb, flags, 'owner-token'),
+        ownerEpoch: parseIntFlag(flags, 'owner-epoch')
       });
     case 'claim-delivery':
       return claimDelivery(store, {
         consumerId,
         outboxId: parseIntFlag(flags, 'outbox-id'),
         ownerToken: requireStringFlag(verb, flags, 'owner-token'),
+        ownerEpoch: parseIntFlag(flags, 'owner-epoch'),
         sinkKind: requireStringFlag(verb, flags, 'sink-kind'),
         commandId: flags['command-id']
       });
@@ -88,6 +91,7 @@ async function dispatch(verb, flags, positionals, store) {
         consumerId,
         eventId: requireStringFlag(verb, flags, 'event-id'),
         ownerToken: requireStringFlag(verb, flags, 'owner-token'),
+        ownerEpoch: parseIntFlag(flags, 'owner-epoch'),
         sinkResult: readJsonFileFlag(verb, flags, 'sink-result-file', { required: true }),
         commandId: flags['command-id']
       });
@@ -96,6 +100,7 @@ async function dispatch(verb, flags, positionals, store) {
         consumerId,
         outboxId: parseIntFlag(flags, 'outbox-id'),
         ownerToken: requireStringFlag(verb, flags, 'owner-token'),
+        ownerEpoch: parseIntFlag(flags, 'owner-epoch'),
         commandId: flags['command-id']
       });
     default:

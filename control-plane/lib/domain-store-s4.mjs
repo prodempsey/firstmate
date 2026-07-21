@@ -127,35 +127,44 @@ async function readLease(conn, consumerId) {
   return r.rows[0] || null;
 }
 
-// Classify a presented owner_token against the current lease:
-//   'holder' - a live lease whose owner_token matches (the caller holds it);
-//   'fenced' - a live lease held by a DIFFERENT owner_token (a genuine contention);
+// Classify a presented (owner_token, owner_epoch) FENCING TUPLE against the current
+// lease (spec section 8.1: "every consumer command carries both"):
+//   'holder' - a live lease whose owner_token AND owner_epoch both match;
+//   'fenced' - a live lease whose fencing tuple does NOT match (a different owner, OR
+//              the same token presented with a stale epoch - either way the caller is
+//              acting on superseded lease knowledge and must be fenced);
 //   'lapsed' - no lease, or the lease has expired (the caller's own lease lapsed).
-// The distinction is what decides audited (fenced) vs un-audited (lapsed) rejection.
-function classifyLease(lease, ownerToken, nowMs) {
+// The token and epoch rotate together on every grant/renew/takeover, so a valid token
+// always pairs with exactly one epoch; validating both closes the gap where a stale
+// epoch rode through on a still-recognized token (qa-s4-q67 finding 1). The distinction
+// decides audited (fenced) vs un-audited (lapsed) rejection.
+function classifyLease(lease, ownerToken, ownerEpoch, nowMs) {
   if (!lease) return 'lapsed';
   const live = new Date(lease.lease_expires_at).getTime() > nowMs;
   if (!live) return 'lapsed';
-  return lease.owner_token === ownerToken ? 'holder' : 'fenced';
+  const matches = lease.owner_token === ownerToken && Number(lease.owner_epoch) === ownerEpoch;
+  return matches ? 'holder' : 'fenced';
 }
 
 // Fencing check for a MUTATING verb. Returns the live lease when the caller holds it.
-// A fenced token raises the AUDITED consumer_lease_conflict through the sanctioned
-// audit path (ConflictSignal -> savepoint rollback -> anomaly persisted). A lapsed
-// lease raises LeaseConflictError DIRECTLY (un-audited): the caller's own lease simply
-// expired and it must re-acquire; there is no competing owner to record a contention
-// against.
-async function requireLeaseHolderForMutation(conn, consumerId, ownerToken, nowMs, verb, commandId) {
+// A fenced tuple (wrong token OR stale epoch) raises the AUDITED consumer_lease_conflict
+// through the sanctioned audit path (ConflictSignal -> savepoint rollback -> anomaly
+// persisted). A lapsed lease raises LeaseConflictError DIRECTLY (un-audited): the
+// caller's own lease simply expired and it must re-acquire; there is no competing owner
+// to record a contention against.
+async function requireLeaseHolderForMutation(conn, consumerId, ownerToken, ownerEpoch, nowMs, verb, commandId) {
   const lease = await readLease(conn, consumerId);
-  const cls = classifyLease(lease, ownerToken, nowMs);
+  const cls = classifyLease(lease, ownerToken, ownerEpoch, nowMs);
   if (cls === 'holder') return lease;
   if (cls === 'fenced') {
     throw new ConflictSignal('lease', {
       anomalyClass: 'consumer_lease_conflict', taskId: null,
-      terminalFingerprint: `${consumerId}:fenced:${ownerToken}`,
+      terminalFingerprint: `${consumerId}:fenced:${ownerToken}:${ownerEpoch}`,
       detail: {
-        command_id: commandId, verb, reason: 'fenced_by_live_other_owner',
-        consumer_id: consumerId, holder_boot_id: lease.owner_boot_id, holder_pid: Number(lease.owner_pid)
+        command_id: commandId, verb, reason: 'fenced_by_live_lease',
+        consumer_id: consumerId,
+        holder_epoch: Number(lease.owner_epoch), presented_epoch: ownerEpoch,
+        holder_boot_id: lease.owner_boot_id, holder_pid: Number(lease.owner_pid)
       }
     });
   }
@@ -267,13 +276,14 @@ export async function next(store, params, { now = nowIso() } = {}) {
   const consumerId = params.consumerId ?? CONSUMER_ID;
   requireConsumer('next', consumerId);
   const ownerToken = requireStr('next', params.ownerToken, 'owner-token');
+  const ownerEpoch = requireInt('next', params.ownerEpoch, 'owner-epoch', { min: 1 });
   return runExclusive(store, async (conn) => {
     await ensureInitialized(conn);
     const nowMs = new Date(now).getTime();
     const lease = await readLease(conn, consumerId);
-    if (classifyLease(lease, ownerToken, nowMs) !== 'holder') {
+    if (classifyLease(lease, ownerToken, ownerEpoch, nowMs) !== 'holder') {
       throw new LeaseConflictError(
-        'owner_token does not hold the live consumer lease; re-acquire with claim-consumer',
+        'owner_token/owner_epoch does not hold the live consumer lease; re-acquire with claim-consumer',
         { consumer_id: consumerId }
       );
     }
@@ -313,11 +323,12 @@ export async function claimDelivery(store, params, { now = nowIso(), fault } = {
   requireConsumer('claim-delivery', consumerId);
   requireInt('claim-delivery', params.outboxId, 'outbox-id', { min: 1 });
   const ownerToken = requireStr('claim-delivery', params.ownerToken, 'owner-token');
+  const ownerEpoch = requireInt('claim-delivery', params.ownerEpoch, 'owner-epoch', { min: 1 });
   const sinkKind = requireStr('claim-delivery', params.sinkKind, 'sink-kind');
   const claimTtlMs = params.claimTtlMs ?? DEFAULT_CLAIM_TTL_MS;
   const requestHash = sha256hex(canonicalJson({
     verb: 'claim-delivery', consumer_id: consumerId, outbox_id: params.outboxId,
-    owner_token: ownerToken, sink_kind: sinkKind
+    owner_token: ownerToken, owner_epoch: ownerEpoch, sink_kind: sinkKind
   }));
   return executeCommand(store, {
     verb: 'claim-delivery', commandId: params.commandId, requestHash, taskId: null, now, fault,
@@ -325,7 +336,7 @@ export async function claimDelivery(store, params, { now = nowIso(), fault } = {
     mutate: async (conn, ctx) => {
       await applyS4Schema(conn);
       const nowMs = new Date(ctx.now).getTime();
-      const lease = await requireLeaseHolderForMutation(conn, consumerId, ownerToken, nowMs, 'claim-delivery', ctx.commandId);
+      const lease = await requireLeaseHolderForMutation(conn, consumerId, ownerToken, ownerEpoch, nowMs, 'claim-delivery', ctx.commandId);
       const ob = await requireOutboxRow(conn, params.outboxId);
       if (ob.acked_at !== null) {
         throw new StateTransitionError('claim-delivery rejected: outbox row is already acked', {
@@ -384,13 +395,14 @@ export async function markApplied(store, params, { now = nowIso(), fault } = {})
   requireConsumer('mark-applied', consumerId);
   const eventId = requireStr('mark-applied', params.eventId, 'event-id');
   const ownerToken = requireStr('mark-applied', params.ownerToken, 'owner-token');
+  const ownerEpoch = requireInt('mark-applied', params.ownerEpoch, 'owner-epoch', { min: 1 });
   if (params.sinkResult === undefined) {
     throw new ValidationError('mark-applied requires --sink-result-file', { verb: 'mark-applied' });
   }
   const sinkResultHash = sha256hex(canonicalJson(params.sinkResult));
   const requestHash = sha256hex(canonicalJson({
     verb: 'mark-applied', consumer_id: consumerId, event_id: eventId,
-    owner_token: ownerToken, sink_result_hash: sinkResultHash
+    owner_token: ownerToken, owner_epoch: ownerEpoch, sink_result_hash: sinkResultHash
   }));
   return executeCommand(store, {
     verb: 'mark-applied', commandId: params.commandId, requestHash, taskId: null, now, fault,
@@ -398,7 +410,7 @@ export async function markApplied(store, params, { now = nowIso(), fault } = {})
     mutate: async (conn, ctx) => {
       await applyS4Schema(conn);
       const nowMs = new Date(ctx.now).getTime();
-      await requireLeaseHolderForMutation(conn, consumerId, ownerToken, nowMs, 'mark-applied', ctx.commandId);
+      await requireLeaseHolderForMutation(conn, consumerId, ownerToken, ownerEpoch, nowMs, 'mark-applied', ctx.commandId);
       const receipt = await readReceiptRow(conn, consumerId, eventId);
       if (!receipt) {
         throw new StateTransitionError(
@@ -451,8 +463,10 @@ export async function ack(store, params, { now = nowIso(), fault } = {}) {
   requireConsumer('ack', consumerId);
   requireInt('ack', params.outboxId, 'outbox-id', { min: 1 });
   const ownerToken = requireStr('ack', params.ownerToken, 'owner-token');
+  const ownerEpoch = requireInt('ack', params.ownerEpoch, 'owner-epoch', { min: 1 });
   const requestHash = sha256hex(canonicalJson({
-    verb: 'ack', consumer_id: consumerId, outbox_id: params.outboxId, owner_token: ownerToken
+    verb: 'ack', consumer_id: consumerId, outbox_id: params.outboxId,
+    owner_token: ownerToken, owner_epoch: ownerEpoch
   }));
   return executeCommand(store, {
     verb: 'ack', commandId: params.commandId, requestHash, taskId: null, now, fault,
@@ -460,7 +474,7 @@ export async function ack(store, params, { now = nowIso(), fault } = {}) {
     mutate: async (conn, ctx) => {
       await applyS4Schema(conn);
       const nowMs = new Date(ctx.now).getTime();
-      await requireLeaseHolderForMutation(conn, consumerId, ownerToken, nowMs, 'ack', ctx.commandId);
+      await requireLeaseHolderForMutation(conn, consumerId, ownerToken, ownerEpoch, nowMs, 'ack', ctx.commandId);
       if (!(await consumerTablePresent(conn, 'outbox'))) {
         throw new ValidationError(
           'outbox table is absent; no deliverable events have ever been produced (S2 precondition unmet)',

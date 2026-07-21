@@ -79,7 +79,8 @@ export class FirstMateConsumer {
   // sink cannot confirm by event_id; delivery must stop there rather than lie.
   async drainOne({ now } = {}) {
     const nowOpts = now === undefined ? {} : { now };
-    const head = await next(this.store, { consumerId: this.consumerId, ownerToken: this.ownerToken }, nowOpts);
+    const fencing = { consumerId: this.consumerId, ownerToken: this.ownerToken, ownerEpoch: this.ownerEpoch };
+    const head = await next(this.store, { ...fencing }, nowOpts);
     if (head.row === null) return { idle: true };
     const row = head.row;
     const { outbox_id: outboxId, event_id: eventId } = row;
@@ -88,18 +89,14 @@ export class FirstMateConsumer {
 
     // Recovery: an `applied` receipt with no ack only needs the ack.
     if (receipt && receipt.state === 'applied') {
-      await ack(this.store, {
-        consumerId: this.consumerId, outboxId, ownerToken: this.ownerToken, commandId: this.genCommandId()
-      }, nowOpts);
+      await ack(this.store, { ...fencing, outboxId, commandId: this.genCommandId() }, nowOpts);
       return { outbox_id: outboxId, event_id: eventId, recovered: 'applied_without_ack', acked: true };
     }
 
     // Recovery: no receipt -> claim then call the sink; a `claimed` receipt with no
     // applied_at -> re-claim (renew, idempotent) then re-drive the sink by event_id.
     const sinkKind = receipt ? receipt.sink_kind : this.resolveSinkKind(row);
-    await claimDelivery(this.store, {
-      consumerId: this.consumerId, outboxId, ownerToken: this.ownerToken, sinkKind, commandId: this.genCommandId()
-    }, nowOpts);
+    await claimDelivery(this.store, { ...fencing, outboxId, sinkKind, commandId: this.genCommandId() }, nowOpts);
 
     // Call the sink with event_id as the idempotency key. The sink durably applies, or
     // returns the already-applied result for that same event_id (dedup across a crash).
@@ -122,12 +119,9 @@ export class FirstMateConsumer {
     }
 
     await markApplied(this.store, {
-      consumerId: this.consumerId, eventId, ownerToken: this.ownerToken,
-      sinkResult: sinkResult.result, commandId: this.genCommandId()
+      ...fencing, eventId, sinkResult: sinkResult.result, commandId: this.genCommandId()
     }, nowOpts);
-    await ack(this.store, {
-      consumerId: this.consumerId, outboxId, ownerToken: this.ownerToken, commandId: this.genCommandId()
-    }, nowOpts);
+    await ack(this.store, { ...fencing, outboxId, commandId: this.genCommandId() }, nowOpts);
     return {
       outbox_id: outboxId, event_id: eventId, applied: true, acked: true,
       already_applied: sinkResult.alreadyApplied === true

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,9 +18,10 @@ import { mkFixtureHome, mkTempDir, cleanupAll } from './helpers.mjs';
 // Adversarial S4: at-least-once delivery with idempotent-by-event_id apply must survive
 // every crash cut between claim, sink effect, mark-applied, and ack; two owners
 // contending for the single lease must resolve to exactly one winner with an audited
-// conflict; a fenced/stale token must be rejected; the cursor must never regress; a
-// duplicate delivery must not duplicate the effect; and a sink that cannot confirm
-// idempotency must record an anomaly and STOP rather than lie about apply.
+// conflict; a fenced/stale token OR a stale owner_epoch must be rejected; the cursor
+// must never regress; a duplicate delivery (sequential OR concurrent) must not duplicate
+// the effect; and a sink that cannot confirm idempotency must record an anomaly and STOP
+// rather than lie about apply.
 after(cleanupAll);
 
 async function freshStore() {
@@ -75,10 +76,12 @@ async function claim(store, opts = {}) {
   }, opts.now === undefined ? {} : { now: opts.now });
 }
 
-async function applyAndAck(store, token, row, prefix) {
-  await claimDelivery(store, { outboxId: row.outbox_id, ownerToken: token, sinkKind: 'disposition', commandId: `${prefix}-cd` });
-  await markApplied(store, { eventId: row.event_id, ownerToken: token, sinkResult: { ok: true, event_id: row.event_id }, commandId: `${prefix}-ma` });
-  return ack(store, { outboxId: row.outbox_id, ownerToken: token, commandId: `${prefix}-ak` });
+// Verb-level apply+ack with a direct sink result, carrying the full fencing tuple.
+async function applyAndAck(store, lease, row, prefix) {
+  const f = { ownerToken: lease.owner_token, ownerEpoch: lease.owner_epoch };
+  await claimDelivery(store, { ...f, outboxId: row.outbox_id, sinkKind: 'disposition', commandId: `${prefix}-cd` });
+  await markApplied(store, { ...f, eventId: row.event_id, sinkResult: { ok: true, event_id: row.event_id }, commandId: `${prefix}-ma` });
+  return ack(store, { ...f, outboxId: row.outbox_id, commandId: `${prefix}-ak` });
 }
 
 function ledgerCount(dir, sinkKind) {
@@ -87,7 +90,16 @@ function ledgerCount(dir, sinkKind) {
   return fs.readdirSync(d).filter((f) => f.endsWith('.json')).length;
 }
 
+async function waitForFile(p, timeoutMs) {
+  const start = Date.now();
+  while (!fs.existsSync(p)) {
+    if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${p}`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
 const WORKER = fileURLToPath(new URL('./workers/crash-consumer-writer.mjs', import.meta.url));
+const RACE_WORKER = fileURLToPath(new URL('./workers/sink-race-writer.mjs', import.meta.url));
 
 async function setupForCrash(taskId = 't1') {
   const { store, fmHome } = await freshStore();
@@ -95,84 +107,89 @@ async function setupForCrash(taskId = 't1') {
   const c = await claim(store, { commandId: 'cc' });
   const sinkDir = mkTempDir('cp-s4-sink-');
   await store.close(); // release the flock so the child process can open the store
-  return { fmHome, d, token: c.owner_token, sinkDir };
+  return { fmHome, d, token: c.owner_token, epoch: c.owner_epoch, sinkDir };
 }
 
-function runCrashChild({ fmHome, token, d, sinkDir, cut, prefix = 'x' }) {
+function runCrashChild({ fmHome, token, epoch, d, sinkDir, cut, prefix = 'x' }) {
   return spawnSync(process.execPath, [WORKER], {
     env: {
-      ...process.env, CP_FM_HOME: fmHome, CP_OWNER_TOKEN: token, CP_OUTBOX_ID: String(d.outbox_id),
-      CP_EVENT_ID: d.event_id, CP_SINK_KIND: 'disposition', CP_SINK_DIR: sinkDir, CP_CRASH_CUT: cut, CP_CMD_PREFIX: prefix
+      ...process.env, CP_FM_HOME: fmHome, CP_OWNER_TOKEN: token, CP_OWNER_EPOCH: String(epoch),
+      CP_OUTBOX_ID: String(d.outbox_id), CP_EVENT_ID: d.event_id, CP_SINK_KIND: 'disposition',
+      CP_SINK_DIR: sinkDir, CP_CRASH_CUT: cut, CP_CMD_PREFIX: prefix
     },
     encoding: 'utf8', timeout: 60000
   });
 }
 
+function recoveryConsumer(store, { token, epoch, sinkDir }) {
+  return new FirstMateConsumer(store, { ownerToken: token, ownerEpoch: epoch, sink: new FileLedgerSink({ dir: sinkDir }) });
+}
+
 test('t_crash_after_claim_before_effect', async () => {
-  const { fmHome, d, token, sinkDir } = await setupForCrash();
-  const child = runCrashChild({ fmHome, token, d, sinkDir, cut: 'after_claim_before_sink' });
+  const s = await setupForCrash();
+  const child = runCrashChild({ ...s, cut: 'after_claim_before_sink' });
   assert.equal(child.status, 51, `worker must hard-exit after claim before effect (stderr: ${child.stderr})`);
 
-  const store = new PgliteLocalStore({ fmHome });
-  assert.equal((await readReceipt(store, { eventId: d.event_id })).state, 'claimed', 'the claimed receipt survived');
-  assert.equal(ledgerCount(sinkDir, 'disposition'), 0, 'no sink effect happened before the crash');
+  const store = new PgliteLocalStore({ fmHome: s.fmHome });
+  assert.equal((await readReceipt(store, { eventId: s.d.event_id })).state, 'claimed', 'the claimed receipt survived');
+  assert.equal(ledgerCount(s.sinkDir, 'disposition'), 0, 'no sink effect happened before the crash');
 
-  const consumer = new FirstMateConsumer(store, { ownerToken: token, sink: new FileLedgerSink({ dir: sinkDir }) });
+  const consumer = recoveryConsumer(store, s);
   const out = await consumer.drainOne();
   assert.equal(out.acked, true);
-  assert.equal(ledgerCount(sinkDir, 'disposition'), 1, 'recovery applies the effect exactly once');
-  assert.equal((await readCursor(store)).last_acked_outbox_id, d.outbox_id);
-  assert.equal((await next(store, { ownerToken: token })).row, null, 'nothing left unacked');
+  assert.equal(ledgerCount(s.sinkDir, 'disposition'), 1, 'recovery applies the effect exactly once');
+  assert.equal((await readCursor(store)).last_acked_outbox_id, s.d.outbox_id);
+  assert.equal((await next(store, { ownerToken: s.token, ownerEpoch: s.epoch })).row, null, 'nothing left unacked');
 });
 
 test('t_crash_during_effect', async () => {
-  const { fmHome, d, token, sinkDir } = await setupForCrash();
-  const child = runCrashChild({ fmHome, token, d, sinkDir, cut: 'during_sink' });
+  const s = await setupForCrash();
+  const child = runCrashChild({ ...s, cut: 'during_sink' });
   assert.equal(child.status, 54, `worker must hard-exit during the sink effect (stderr: ${child.stderr})`);
 
-  const store = new PgliteLocalStore({ fmHome });
-  assert.equal((await readReceipt(store, { eventId: d.event_id })).state, 'claimed');
-  assert.equal(ledgerCount(sinkDir, 'disposition'), 0, 'the atomic sink left no committed effect (temp only)');
+  const store = new PgliteLocalStore({ fmHome: s.fmHome });
+  assert.equal((await readReceipt(store, { eventId: s.d.event_id })).state, 'claimed');
+  assert.equal(ledgerCount(s.sinkDir, 'disposition'), 0, 'the atomic sink left no committed effect (temp only)');
 
-  const consumer = new FirstMateConsumer(store, { ownerToken: token, sink: new FileLedgerSink({ dir: sinkDir }) });
+  const consumer = recoveryConsumer(store, s);
   await consumer.drainOne();
-  assert.equal(ledgerCount(sinkDir, 'disposition'), 1, 'recovery re-drives the sink to exactly one durable effect');
-  assert.equal((await readCursor(store)).last_acked_outbox_id, d.outbox_id);
+  assert.equal(ledgerCount(s.sinkDir, 'disposition'), 1, 'recovery re-drives the sink to exactly one durable effect');
+  assert.equal((await readCursor(store)).last_acked_outbox_id, s.d.outbox_id);
 });
 
 test('t_at_least_once_crash_between_apply_and_ack', async () => {
-  const { fmHome, d, token, sinkDir } = await setupForCrash();
-  const child = runCrashChild({ fmHome, token, d, sinkDir, cut: 'after_sink_before_mark' });
+  const s = await setupForCrash();
+  const child = runCrashChild({ ...s, cut: 'after_sink_before_mark' });
   assert.equal(child.status, 52, `worker must hard-exit after the sink effect before mark (stderr: ${child.stderr})`);
 
-  const store = new PgliteLocalStore({ fmHome });
-  assert.equal((await readReceipt(store, { eventId: d.event_id })).state, 'claimed', 'receipt still claimed - apply not yet marked');
-  assert.equal(ledgerCount(sinkDir, 'disposition'), 1, 'the sink effect committed once before the crash');
+  const store = new PgliteLocalStore({ fmHome: s.fmHome });
+  assert.equal((await readReceipt(store, { eventId: s.d.event_id })).state, 'claimed', 'receipt still claimed - apply not yet marked');
+  assert.equal(ledgerCount(s.sinkDir, 'disposition'), 1, 'the sink effect committed once before the crash');
 
-  const consumer = new FirstMateConsumer(store, { ownerToken: token, sink: new FileLedgerSink({ dir: sinkDir }) });
+  const consumer = recoveryConsumer(store, s);
   const out = await consumer.drainOne();
   assert.equal(out.acked, true);
   assert.equal(out.already_applied, true, 'recovery re-drove the sink, which deduped by event_id');
-  assert.equal(ledgerCount(sinkDir, 'disposition'), 1, 'still exactly one effect after recovery - at-least-once, applied once');
-  assert.equal((await readReceipt(store, { eventId: d.event_id })).state, 'applied');
-  assert.equal((await readCursor(store)).last_acked_outbox_id, d.outbox_id);
+  assert.equal(ledgerCount(s.sinkDir, 'disposition'), 1, 'still exactly one effect after recovery - at-least-once, applied once');
+  assert.equal((await readReceipt(store, { eventId: s.d.event_id })).state, 'applied');
+  assert.equal((await readCursor(store)).last_acked_outbox_id, s.d.outbox_id);
 });
 
 test('t_crash_after_mark_applied_before_ack', async () => {
-  const { fmHome, d, token, sinkDir } = await setupForCrash();
-  const child = runCrashChild({ fmHome, token, d, sinkDir, cut: 'after_mark_before_ack' });
+  const s = await setupForCrash();
+  const child = runCrashChild({ ...s, cut: 'after_mark_before_ack' });
   assert.equal(child.status, 53, `worker must hard-exit after mark before ack (stderr: ${child.stderr})`);
 
-  const store = new PgliteLocalStore({ fmHome });
-  assert.equal((await readReceipt(store, { eventId: d.event_id })).state, 'applied', 'the receipt is applied but not acked');
-  const obBefore = await rows(store, 'SELECT delivered_at, acked_at FROM outbox WHERE outbox_id=$1', [d.outbox_id]);
+  const store = new PgliteLocalStore({ fmHome: s.fmHome });
+  assert.equal((await readReceipt(store, { eventId: s.d.event_id })).state, 'applied', 'the receipt is applied but not acked');
+  const obBefore = await rows(store, 'SELECT delivered_at, acked_at FROM outbox WHERE outbox_id=$1', [s.d.outbox_id]);
   assert.ok(obBefore[0].delivered_at !== null && obBefore[0].acked_at === null);
 
-  const consumer = new FirstMateConsumer(store, { ownerToken: token, sink: new FileLedgerSink({ dir: sinkDir }) });
+  const consumer = recoveryConsumer(store, s);
   const out = await consumer.drainOne();
   assert.equal(out.recovered, 'applied_without_ack', 'recovery only needs the ack; no second sink call');
-  assert.equal(ledgerCount(sinkDir, 'disposition'), 1, 'the effect is never re-applied');
-  assert.equal((await readCursor(store)).last_acked_outbox_id, d.outbox_id);
+  assert.equal(ledgerCount(s.sinkDir, 'disposition'), 1, 'the effect is never re-applied');
+  assert.equal((await readCursor(store)).last_acked_outbox_id, s.d.outbox_id);
 });
 
 test('t_two_consumers_contend_one_lease', async () => {
@@ -205,16 +222,15 @@ test('t_stale_token_rejected_on_mutating_and_read', async () => {
   const tLater = '2026-07-21T00:00:05.000Z'; // A has expired
   const b = await claim(store, { bootId: 'B', pid: 2, ttlMs: 90000, commandId: 'cb', now: tLater }); // takeover; B now live
 
-  // READ with the fenced token A -> LeaseConflictError, and NO anomaly (a read has no
-  // transaction that may write one).
+  // READ with the fenced token A -> LeaseConflictError, and NO anomaly.
   const anomBefore = await anomalyCount(store, 'consumer_lease_conflict');
-  await assert.rejects(() => next(store, { ownerToken: a.owner_token }, { now: tLater }), (e) => e.code === 'consumer_lease_conflict');
+  await assert.rejects(() => next(store, { ownerToken: a.owner_token, ownerEpoch: a.owner_epoch }, { now: tLater }), (e) => e.code === 'consumer_lease_conflict');
   assert.equal(await anomalyCount(store, 'consumer_lease_conflict'), anomBefore, 'the read raised no anomaly');
 
   // MUTATING with the fenced token A -> audited consumer_lease_conflict.
   const before = await counters(store);
   await assert.rejects(
-    () => claimDelivery(store, { outboxId: d.outbox_id, ownerToken: a.owner_token, sinkKind: 'disposition', commandId: 'cdA' }, { now: tLater }),
+    () => claimDelivery(store, { outboxId: d.outbox_id, ownerToken: a.owner_token, ownerEpoch: a.owner_epoch, sinkKind: 'disposition', commandId: 'cdA' }, { now: tLater }),
     (e) => e.code === 'consumer_lease_conflict'
   );
   const afterC = await counters(store);
@@ -222,7 +238,38 @@ test('t_stale_token_rejected_on_mutating_and_read', async () => {
   assert.equal(await anomalyCount(store, 'consumer_lease_conflict') - anomBefore, 1, 'and records the anomaly');
 
   // The true holder (B) still works.
-  const ok = await claimDelivery(store, { outboxId: d.outbox_id, ownerToken: b.owner_token, sinkKind: 'disposition', commandId: 'cdB' }, { now: tLater });
+  const ok = await claimDelivery(store, { outboxId: d.outbox_id, ownerToken: b.owner_token, ownerEpoch: b.owner_epoch, sinkKind: 'disposition', commandId: 'cdB' }, { now: tLater });
+  assert.equal(ok.state, 'claimed');
+});
+
+test('t_stale_epoch_fenced_on_mutating_and_read', async () => {
+  const { store } = await freshStore();
+  const d = await deliverable(store, 't1');
+  const c = await claim(store, { commandId: 'cc' }); // valid token, owner_epoch = 1
+  const staleEpoch = c.owner_epoch + 999;
+
+  // READ with the CORRECT token but a stale/mismatched epoch -> LeaseConflictError, no anomaly.
+  const anomBefore = await anomalyCount(store, 'consumer_lease_conflict');
+  await assert.rejects(
+    () => next(store, { ownerToken: c.owner_token, ownerEpoch: staleEpoch }),
+    (e) => e.code === 'consumer_lease_conflict',
+    'a valid token with a wrong epoch is rejected on the read path'
+  );
+  assert.equal(await anomalyCount(store, 'consumer_lease_conflict'), anomBefore, 'the read raised no anomaly');
+
+  // MUTATING with the CORRECT token but a stale epoch -> audited consumer_lease_conflict.
+  const before = await counters(store);
+  await assert.rejects(
+    () => claimDelivery(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, ownerEpoch: staleEpoch, sinkKind: 'disposition', commandId: 'cdStale' }),
+    (e) => e.code === 'consumer_lease_conflict',
+    'and rejected on the mutating path'
+  );
+  const afterC = await counters(store);
+  assert.equal(afterC.domain - before.domain, 1, 'the stale-epoch mutating verb audits +1 domain');
+  assert.equal(await anomalyCount(store, 'consumer_lease_conflict') - anomBefore, 1, 'and records the consumer_lease_conflict anomaly');
+
+  // The correct (token, epoch) tuple still works.
+  const ok = await claimDelivery(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, ownerEpoch: c.owner_epoch, sinkKind: 'disposition', commandId: 'cdOK' });
   assert.equal(ok.state, 'claimed');
 });
 
@@ -231,18 +278,19 @@ test('t_cursor_never_goes_backward', async () => {
   const d1 = await deliverable(store, 't1');
   const d2 = await deliverable(store, 't2');
   const c = await claim(store, { commandId: 'cc' });
+  const f = { ownerToken: c.owner_token, ownerEpoch: c.owner_epoch };
 
-  await applyAndAck(store, c.owner_token, (await next(store, { ownerToken: c.owner_token })).row, 'a');
+  await applyAndAck(store, c, (await next(store, { ...f })).row, 'a');
   assert.equal((await readCursor(store)).last_acked_outbox_id, d1.outbox_id);
-  await applyAndAck(store, c.owner_token, (await next(store, { ownerToken: c.owner_token })).row, 'b');
+  await applyAndAck(store, c, (await next(store, { ...f })).row, 'b');
   assert.equal((await readCursor(store)).last_acked_outbox_id, d2.outbox_id);
 
   // A replayed ack of the earlier row (same command-id) never regresses the cursor.
-  await ack(store, { outboxId: d1.outbox_id, ownerToken: c.owner_token, commandId: 'a-ak' });
+  await ack(store, { ...f, outboxId: d1.outbox_id, commandId: 'a-ak' });
   assert.equal((await readCursor(store)).last_acked_outbox_id, d2.outbox_id, 'a replayed ack does not move the cursor backward');
 
   // A fresh-command ack of an already-acked row is a gap (nothing unacked) and rejected.
-  await assert.rejects(() => ack(store, { outboxId: d1.outbox_id, ownerToken: c.owner_token, commandId: 'fresh-ak' }), (e) => e.code === 'state_transition');
+  await assert.rejects(() => ack(store, { ...f, outboxId: d1.outbox_id, commandId: 'fresh-ak' }), (e) => e.code === 'state_transition');
   assert.equal((await readCursor(store)).last_acked_outbox_id, d2.outbox_id, 'and the cursor is unchanged');
 });
 
@@ -250,9 +298,10 @@ test('t_receipt_dedup_duplicate_delivery', async () => {
   const { store } = await freshStore();
   const d = await deliverable(store, 't1');
   const c = await claim(store, { commandId: 'cc' });
+  const f = { ownerToken: c.owner_token, ownerEpoch: c.owner_epoch };
 
-  await claimDelivery(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, sinkKind: 'disposition', commandId: 'cd1' });
-  const r2 = await claimDelivery(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, sinkKind: 'disposition', commandId: 'cd2' });
+  await claimDelivery(store, { ...f, outboxId: d.outbox_id, sinkKind: 'disposition', commandId: 'cd1' });
+  const r2 = await claimDelivery(store, { ...f, outboxId: d.outbox_id, sinkKind: 'disposition', commandId: 'cd2' });
   assert.equal(r2.delivery_attempts, 2, 'two delivery attempts are recorded');
   const rc = await rows(store, 'SELECT count(*)::int AS n FROM consumer_receipts WHERE event_id=$1', [d.event_id]);
   assert.equal(rc[0].n, 1, 'but exactly one receipt row (deduped by (consumer_id,event_id))');
@@ -266,22 +315,64 @@ test('t_receipt_dedup_duplicate_delivery', async () => {
   assert.deepEqual(a2.result, a1.result, 'and returns the previous result');
   assert.equal(ledgerCount(sinkDir, 'disposition'), 1, 'exactly one durable effect for the event_id');
 
-  await markApplied(store, { eventId: d.event_id, ownerToken: c.owner_token, sinkResult: a1.result, commandId: 'ma1' });
-  await ack(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, commandId: 'ak1' });
+  await markApplied(store, { ...f, eventId: d.event_id, sinkResult: a1.result, commandId: 'ma1' });
+  await ack(store, { ...f, outboxId: d.outbox_id, commandId: 'ak1' });
   const rc2 = await rows(store, 'SELECT count(*)::int AS n FROM consumer_receipts WHERE event_id=$1', [d.event_id]);
   assert.equal(rc2[0].n, 1, 'still one receipt after apply+ack');
+});
+
+test('t_sink_concurrent_redelivery_one_result', async () => {
+  // The lease-expiry safety case: token fencing cannot stop an old sink effect already
+  // in flight, so two callers may concurrently apply the SAME event_id. The sink must be
+  // first-writer-wins: exactly one fresh apply, and the loser returns the winner result.
+  const eventId = 'concurrent-event';
+  const sinkKind = 'wake';
+  const sinkDir = mkTempDir('cp-s4-sinkrace-');
+  const coordDir = mkTempDir('cp-s4-coord-');
+  const pauseFile = path.join(coordDir, 'paused');
+  const releaseFile = path.join(coordDir, 'release');
+
+  // Caller A runs in a child and pauses AFTER its temp+fsync, BEFORE the atomic link.
+  const child = spawn(process.execPath, [RACE_WORKER], {
+    env: { ...process.env, CP_SINK_DIR: sinkDir, CP_EVENT_ID: eventId, CP_SINK_KIND: sinkKind, CP_PAUSE_FILE: pauseFile, CP_RELEASE_FILE: releaseFile },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  let childOut = ''; let childErr = '';
+  child.stdout.on('data', (d) => { childOut += d; });
+  child.stderr.on('data', (d) => { childErr += d; });
+  const childExit = new Promise((res) => child.on('close', (code) => res(code)));
+
+  await waitForFile(pauseFile, 15000); // A is paused pre-link
+
+  // Caller B applies the same event_id and wins the link race while A is paused.
+  const sink = new FileLedgerSink({ dir: sinkDir });
+  const b = await sink.apply(sinkKind, eventId, { caller: 'B' });
+  assert.equal(b.alreadyApplied, false, 'B is the first writer');
+
+  fs.writeFileSync(releaseFile, 'go'); // release A
+  const code = await childExit;
+  assert.equal(code, 0, `race worker exited cleanly (stderr: ${childErr})`);
+  const a = JSON.parse(childOut.trim());
+
+  // A lost the race: it MUST return B's canonical result, never overwrite it.
+  assert.equal(a.alreadyApplied, true, 'A observes the record already committed and does not re-apply');
+  assert.deepEqual(a.result, b.result, 'A returns the winner (B) result');
+  assert.equal(ledgerCount(sinkDir, sinkKind), 1, 'exactly one durable effect for the event_id');
+  const stored = JSON.parse(fs.readFileSync(path.join(sinkDir, sinkKind, `${encodeURIComponent(eventId)}.json`), 'utf8'));
+  assert.equal(stored.payload.caller, 'B', 'the committed record is the first writer (B), never clobbered by the loser');
 });
 
 test('t_ack_already_acked_is_idempotent_via_command_id', async () => {
   const { store } = await freshStore();
   const d = await deliverable(store, 't1');
   const c = await claim(store, { commandId: 'cc' });
-  await claimDelivery(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, sinkKind: 'disposition', commandId: 'cd1' });
-  await markApplied(store, { eventId: d.event_id, ownerToken: c.owner_token, sinkResult: { ok: true }, commandId: 'ma1' });
-  const first = await ack(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, commandId: 'ak1' });
+  const f = { ownerToken: c.owner_token, ownerEpoch: c.owner_epoch };
+  await claimDelivery(store, { ...f, outboxId: d.outbox_id, sinkKind: 'disposition', commandId: 'cd1' });
+  await markApplied(store, { ...f, eventId: d.event_id, sinkResult: { ok: true }, commandId: 'ma1' });
+  const first = await ack(store, { ...f, outboxId: d.outbox_id, commandId: 'ak1' });
 
   const before = await counters(store);
-  const replay = await ack(store, { outboxId: d.outbox_id, ownerToken: c.owner_token, commandId: 'ak1' });
+  const replay = await ack(store, { ...f, outboxId: d.outbox_id, commandId: 'ak1' });
   assert.deepEqual(replay, first, 'the same command-id replays the stored result');
   assert.deepEqual(await counters(store), before, 'a replayed ack moves no counter');
   assert.equal((await readCursor(store)).last_acked_outbox_id, d.outbox_id, 'and the cursor is unchanged');
@@ -293,14 +384,15 @@ test('t_ack_gap_rejected', async () => {
   const d1 = await deliver(store, 't1', rev1); // outbox_id 1 (min unacked)
   const d2 = await deliverable(store, 't2');    // outbox_id 2
   const c = await claim(store, { commandId: 'cc' });
+  const f = { ownerToken: c.owner_token, ownerEpoch: c.owner_epoch };
 
   await assert.rejects(
-    () => ack(store, { outboxId: d2.outbox_id, ownerToken: c.owner_token, commandId: 'gap1' }),
+    () => ack(store, { ...f, outboxId: d2.outbox_id, commandId: 'gap1' }),
     (e) => e.code === 'state_transition' && /minimum unacked/.test(e.message),
     'acking past the minimum unacked is a gap ack'
   );
   await assert.rejects(
-    () => ack(store, { outboxId: 9999, ownerToken: c.owner_token, commandId: 'gap2' }),
+    () => ack(store, { ...f, outboxId: 9999, commandId: 'gap2' }),
     (e) => e.code === 'state_transition',
     'acking a nonexistent id is likewise not the minimum'
   );
@@ -330,7 +422,7 @@ test('t_sink_idempotency_unknown_raises_anomaly_and_stops', async () => {
   assert.equal(ob[0].delivered_at, null, 'nor delivered');
 
   // The loop form also halts cleanly with a stopped summary rather than throwing.
-  const looped = new FirstMateConsumer(store, { ownerToken: consumer.ownerToken, sink: timeoutSink });
+  const looped = new FirstMateConsumer(store, { ownerToken: consumer.ownerToken, ownerEpoch: consumer.ownerEpoch, sink: timeoutSink });
   const summary = await looped.drainUntilIdle();
   assert.equal(summary.stopped, true);
   assert.equal(summary.reason, 'sink_idempotency_unknown');

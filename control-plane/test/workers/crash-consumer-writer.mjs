@@ -24,6 +24,7 @@ import { FileLedgerSink } from '../../lib/sinks.mjs';
 
 const store = new PgliteLocalStore({ fmHome: process.env.CP_FM_HOME });
 const ownerToken = process.env.CP_OWNER_TOKEN;
+const ownerEpoch = Number(process.env.CP_OWNER_EPOCH);
 const outboxId = Number(process.env.CP_OUTBOX_ID);
 const eventId = process.env.CP_EVENT_ID;
 const sinkKind = process.env.CP_SINK_KIND;
@@ -32,12 +33,12 @@ const prefix = process.env.CP_CMD_PREFIX || 'crash';
 const sink = new FileLedgerSink({ dir: process.env.CP_SINK_DIR });
 const payload = { event_id: eventId };
 
-await claimDelivery(store, { outboxId, ownerToken, sinkKind, commandId: `${prefix}-cd` });
+await claimDelivery(store, { outboxId, ownerToken, ownerEpoch, sinkKind, commandId: `${prefix}-cd` });
 if (cut === 'after_claim_before_sink') process.exit(51);
 
 if (cut === 'during_sink') {
-  // Durable temp write + fsync, then exit before the atomic rename: proves the sink
-  // leaves NO half-applied effect, so recovery re-applies idempotently.
+  // Durable temp write + fsync, then exit before the atomic link commit: proves the
+  // sink leaves NO half-applied effect, so recovery re-applies idempotently.
   await sink.apply(sinkKind, eventId, payload, { faultBeforeCommit: () => process.exit(54) });
   process.exit(99); // unreachable: faultBeforeCommit exits first
 }
@@ -45,8 +46,8 @@ if (cut === 'during_sink') {
 const sinkResult = await sink.apply(sinkKind, eventId, payload);
 if (cut === 'after_sink_before_mark') process.exit(52);
 
-await markApplied(store, { eventId, ownerToken, sinkResult: sinkResult.result, commandId: `${prefix}-ma` });
+await markApplied(store, { eventId, ownerToken, ownerEpoch, sinkResult: sinkResult.result, commandId: `${prefix}-ma` });
 if (cut === 'after_mark_before_ack') process.exit(53);
 
-await ack(store, { outboxId, ownerToken, commandId: `${prefix}-ak` });
+await ack(store, { outboxId, ownerToken, ownerEpoch, commandId: `${prefix}-ak` });
 process.exit(0);

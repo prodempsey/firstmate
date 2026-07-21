@@ -92,15 +92,24 @@ export class FileLedgerSink {
     return path.join(this.dir, sinkKind, `${encodeURIComponent(eventId)}.json`);
   }
 
-  // Durably idempotent apply, keyed by event_id. `faultBeforeCommit`, when supplied, is
-  // a TEST-ONLY hook fired AFTER the durable temp write + fsync but BEFORE the atomic
-  // rename - the exact "crash during the effect" cut. It mirrors the domain layer's
-  // `fault` convention and is never passed by any production caller.
+  // Durably idempotent apply, keyed by event_id, safe under CONCURRENT redelivery of the
+  // same event_id (qa-s4-q67 finding 2). The final event-id record is committed with an
+  // atomic FIRST-WRITER-WINS primitive - link(2), which fails EEXIST if the record
+  // already exists rather than overwriting it (unlike rename, whose overwrite let a late
+  // caller clobber a prior committed result). The temp file is fully written and fsync'd
+  // BEFORE the link, so the moment the record becomes visible its content is complete; a
+  // loser that hits EEXIST reads and returns the WINNER's durable prior result. The
+  // containing directory is fsync'd after the link so the new directory entry is durable.
+  //
+  // `faultBeforeCommit`, when supplied, is a TEST-ONLY hook fired AFTER the durable temp
+  // write + fsync but BEFORE the atomic link - the exact "crash during the effect" cut.
+  // It mirrors the domain layer's `fault` convention and is never passed by production.
   _applyIdempotent(sinkKind, eventId, payload, { faultBeforeCommit } = {}) {
     const file = this._pathFor(sinkKind, eventId);
+    // Fast path only; the link EEXIST below is the authoritative race arbiter, so a
+    // caller that sees the record absent here still cannot clobber a concurrent winner.
     if (fs.existsSync(file)) {
-      const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
-      return { result: stored.result, alreadyApplied: true };
+      return { result: JSON.parse(fs.readFileSync(file, 'utf8')).result, alreadyApplied: true };
     }
     const result = {
       sink_kind: sinkKind,
@@ -119,8 +128,40 @@ export class FileLedgerSink {
       fs.closeSync(fd);
     }
     if (typeof faultBeforeCommit === 'function') faultBeforeCommit();
-    fs.renameSync(tmp, file);
+    try {
+      fs.linkSync(tmp, file); // atomic first-writer-wins: throws EEXIST if already committed
+    } catch (err) {
+      this._unlinkQuietly(tmp);
+      if (err && err.code === 'EEXIST') {
+        // Lost the race: return the winner's durable prior result, never our own.
+        return { result: JSON.parse(fs.readFileSync(file, 'utf8')).result, alreadyApplied: true };
+      }
+      throw err;
+    }
+    this._fsyncDir(path.dirname(file));
+    this._unlinkQuietly(tmp); // the inode persists via `file`; drop the temp name
     return { result, alreadyApplied: false };
+  }
+
+  _unlinkQuietly(p) {
+    try { fs.unlinkSync(p); } catch { /* best effort */ }
+  }
+
+  // Fsync the containing directory so the new directory entry survives a crash. Some
+  // filesystems disallow directory fsync; treat that as best-effort rather than failing
+  // an otherwise-committed effect.
+  _fsyncDir(dir) {
+    let dfd;
+    try {
+      dfd = fs.openSync(dir, 'r');
+      fs.fsyncSync(dfd);
+    } catch {
+      /* best effort */
+    } finally {
+      if (dfd !== undefined) {
+        try { fs.closeSync(dfd); } catch { /* ignore */ }
+      }
+    }
   }
 
   async upsertCardDisposition(eventId, payload, opts) {
