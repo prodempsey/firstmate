@@ -292,29 +292,71 @@ test('t_orphan_inspector_only_for_mismatched', async () => {
   const { store } = await freshStore();
   // A bound_verified pane (must NOT appear in the orphan inspector).
   await runningTask(store, 't-ok');
-  // An identity-mismatched pane: a running run whose binding the reconciler marked 'lost'
-  // while it still holds a recorded endpoint.
-  const rev = await runningTask(store, 't-lost');
+  // A DEFINITIVELY GONE endpoint: a running run the reconciler marked 'lost' (missing
+  // pane). A gone endpoint is NOT an orphan (finding-3): it must NOT appear in the
+  // inspector even though it still carries a historical endpoint id.
+  const goneRev = await runningTask(store, 't-gone');
   await reconcileMarkLost(store, {
-    taskId: 't-lost', generation: 1, expectedRevision: rev, failingClause: 'agent_pid',
-    commandId: 'c-lost-t-lost'
+    taskId: 't-gone', generation: 1, expectedRevision: goneRev, failingClause: 'agent_pid',
+    anomalyClass: 'missing_pane', commandId: 'c-lost-t-gone'
   });
-  // A shell-only / markerless orphan pane observed by the reconciler (an anomaly, no run).
+  // A PRESENT shell-only / markerless orphan pane the reconciler scanned (an anomaly).
   await recordReconcilerAnomaly(store, {
     anomalyClass: 'orphan_pane', endpointId: '@99', paneId: '%99',
     detail: { note: 'markerless shell' }, commandId: 'c-orphan-anom'
+  });
+  // A PRESENT pane whose live identity did not match the expected one (a squatter).
+  await recordReconcilerAnomaly(store, {
+    anomalyClass: 'identity_mismatch', taskId: 't-ok', generation: 1, endpointId: '@50', paneId: '%50',
+    detail: { note: 'different process at expected pane' }, commandId: 'c-idmm-anom'
+  });
+  // A definitively GONE pane observed as a missing_pane anomaly - NOT an orphan.
+  await recordReconcilerAnomaly(store, {
+    anomalyClass: 'missing_pane', endpointId: '@dead', paneId: '%dead',
+    detail: { note: 'expected pane vanished' }, commandId: 'c-missing-anom'
   });
 
   await createSnapshot(store, { orderSourcePath: fixtureInbox([]) });
   const helm = projectHelm(await getSnapshot(store, {}));
 
-  const orphanTaskIds = helm.orphan_inspector.filter((o) => o.source === 'run').map((o) => o.task_id);
-  assert.deepEqual(orphanTaskIds, ['t-lost'], 'only the identity-mismatched (lost) pane is a run-orphan');
-  assert.ok(helm.orphan_inspector.some((o) => o.source === 'anomaly' && o.reason === 'shell_only_or_markerless'),
-    'the markerless orphan_pane anomaly is a shell-only orphan');
+  // The inspector is derived SOLELY from present-pane anomalies - never from a run's
+  // binding_state.
+  assert.ok(helm.orphan_inspector.every((o) => o.source === 'anomaly'),
+    'no orphan entry is inferred from a run/binding_state (finding-3)');
+  assert.ok(!helm.orphan_inspector.some((o) => o.task_id === 't-gone'),
+    'a definitively gone (lost) run is NOT an orphan pane');
+  assert.ok(helm.orphan_inspector.some((o) => o.reason === 'shell_only_or_markerless'),
+    'the present markerless orphan_pane anomaly is a shell-only orphan');
+  assert.ok(helm.orphan_inspector.some((o) => o.reason === 'identity_mismatch' && o.endpoint_id === '@50'),
+    'the present identity_mismatch anomaly is an orphan');
+  assert.ok(!helm.orphan_inspector.some((o) => o.endpoint_id === '@dead'),
+    'a missing_pane (gone) anomaly is NOT an orphan');
   // The bound_verified pane is live and never an orphan.
   assert.ok(helm.live.some((p) => p.task_id === 't-ok'));
-  assert.ok(!helm.orphan_inspector.some((o) => o.task_id === 't-ok'), 'a bound_verified pane never appears in the orphan inspector');
+  assert.ok(!helm.orphan_inspector.some((o) => o.source === 'run'), 'a bound_verified pane never appears in the orphan inspector');
+});
+
+test('t_helm_gone_endpoint_is_not_an_orphan', async () => {
+  // Finding-3 direct probe: a failed run with binding_state=lost and a historical endpoint
+  // id, and NO active present-pane anomaly, yields an EMPTY orphan inspector. A stored
+  // endpoint id is historical metadata, never proof a pane still exists.
+  const { store } = await freshStore();
+  const rev = await runningTask(store, 'dead');
+  await reconcileMarkLost(store, {
+    taskId: 'dead', generation: 1, expectedRevision: rev, failingClause: 'agent_pid',
+    anomalyClass: 'missing_pane', commandId: 'c-lost-dead'
+  });
+  // Drive the lost run to terminal failure so it is status=failed, binding=lost, with the
+  // endpoint id still on record.
+  await createSnapshot(store, { orderSourcePath: fixtureInbox([]) });
+  const helm = projectHelm(await getSnapshot(store, {}));
+
+  const deadRun = (await rows(store, 'SELECT binding_state, endpoint_id FROM runs WHERE task_id = $1', ['dead']))[0];
+  assert.equal(deadRun.binding_state, 'lost');
+  assert.notEqual(deadRun.endpoint_id, null, 'the gone run still carries a historical endpoint id');
+  assert.equal(helm.orphan_inspector.length, 0, 'a gone endpoint produces NO orphan pane');
+  assert.ok(!helm.live.some((p) => p.task_id === 'dead'), 'a gone run is not live either');
+  assert.ok(!helm.retained.some((p) => p.task_id === 'dead'), 'a gone (lost) run is not retained');
 });
 
 test('t_project_reads_snapshots_only', async () => {

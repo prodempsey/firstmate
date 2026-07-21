@@ -208,13 +208,21 @@ export async function createSnapshot(store, {
   fault,
   faultAfterCommit
 } = {}) {
-  // Step 1-8 of the order-prefix protocol (external file I/O; no DB lock needed). Tests
-  // may inject a pre-captured prefix to drive exact byte boundaries deterministically.
-  const prefix = orderPrefix || await acquireStableOrderPrefix(orderSourcePath, orderPrefixOptions);
-
   const outcome = await runExclusive(store, async (conn) => {
     await ensureInitialized(conn);
     await applyS6Schema(conn);
+
+    // FINDING-1 FIX (qa-s6-q72): capture the stable order prefix INSIDE the exclusive
+    // transaction, under the same per-home flock that guards the insert. Previously the
+    // prefix was captured BEFORE runExclusive, which let two callers serialize in the
+    // OPPOSITE order from their prefix captures: a caller that read a one-order prefix and
+    // paused could commit a NEWER projection_revision carrying an OLDER prefix than a later
+    // capture that had already committed. With capture under the lock, capture order ==
+    // commit order == projection_revision order, so under an append-only source
+    // order_source_bytes is monotonically non-decreasing with projection_revision and a
+    // later revision can never forget an append an earlier revision already folded (spec
+    // 753). Tests may still inject a pre-captured `orderPrefix` for exact byte boundaries.
+    const prefix = orderPrefix || await acquireStableOrderPrefix(orderSourcePath, orderPrefixOptions);
 
     const cs = await conn.query('SELECT domain_revision FROM coordinator_state WHERE id = 1');
     const domainRevision = Number(cs.rows[0].domain_revision);

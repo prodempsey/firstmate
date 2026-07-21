@@ -52,21 +52,25 @@ export function projectBridge(snapshot) {
   };
 }
 
-// Helm projection (spec 780-784) plus the ORPHAN INSPECTOR section (spec 784, from the
-// Helm projection's excluded panes).
+// Helm projection (spec 780-784) plus the ORPHAN INSPECTOR section (spec 784).
 //
-// Classification is purely on the captured binding_state (and, for shell-only panes,
-// the active orphan_pane anomalies):
 //   * LIVE  iff binding_state === 'bound_verified' at snapshot build. A task in
 //     blocked/waiting/needs_human whose process is bound_verified is RETAINED-LIVE, not
 //     orphan (spec 783) - task status never demotes a verified pane out of `live`.
-//   * ORPHAN INSPECTOR holds ONLY shell-only or identity-mismatched panes (spec 784):
-//     a run still holding a recorded endpoint whose binding went 'lost' (identity gone/
-//     mismatched), and active orphan_pane anomalies (the reconciler's shell-only /
-//     markerless pane observations). A bound_verified pane NEVER appears here.
-//   * RETAINED surfaces endpoint-bearing panes that are neither verified nor proven-lost
-//     (bound_unverified / spawning-with-endpoint / cleanup_pending): transitional, not
-//     yet live and not yet orphan. It exists so no captured pane is silently dropped.
+//   * ORPHAN INSPECTOR holds ONLY shell-only or identity-mismatched PRESENT panes (spec
+//     784). FINDING-3 FIX (qa-s6-q72): the inspector is derived SOLELY from captured
+//     anomalies whose class denotes a PRESENT pane the reconciler actually observed -
+//     `orphan_pane` (a scanned markerless / unknown-marker shell pane) and
+//     `identity_mismatch` (a scanned pane whose live identity did not match the expected
+//     one). It is NEVER inferred from a run's binding_state plus a historical endpoint id.
+//     A stored endpoint id is metadata, not proof a pane still exists: `binding_state ===
+//     'lost'` is set for a DEFINITIVELY GONE endpoint too (the reconciler's missing-pane
+//     path), and a gone endpoint is not an orphan. `missing_pane` and every other "gone"
+//     anomaly class are excluded for the same reason.
+//   * RETAINED surfaces endpoint-bearing runs that are transitional - not yet verified and
+//     not proven gone (bound_unverified / spawning-with-endpoint / cleanup_pending). It is
+//     an informational "binding not yet settled" bucket, NOT a presence or orphan claim;
+//     a 'lost' (gone) or 'closed' (cleaned) run contributes no pane at all.
 export function projectHelm(snapshot) {
   const taskStatus = new Map(snapshot.payload.tasks.map((t) => [t.task_id, t.status]));
 
@@ -87,19 +91,34 @@ export function projectHelm(snapshot) {
     };
     if (run.binding_state === 'bound_verified') {
       live.push(pane);
-    } else if (run.binding_state === 'lost' && run.endpoint_id !== null) {
-      orphanInspector.push({ source: 'run', reason: 'identity_mismatch', ...pane });
-    } else if (run.endpoint_id !== null && run.binding_state !== 'closed') {
+    } else if (run.endpoint_id !== null && run.binding_state !== 'closed' && run.binding_state !== 'lost') {
+      // Transitional: endpoint recorded but the binding is not yet verified and not proven
+      // gone. NOT a presence claim and NOT an orphan (finding-3). 'lost' (gone) and
+      // 'closed' (cleaned) runs fall through to no pane.
       retained.push(pane);
     }
-    // endpoint-less or 'closed' panes have no live endpoint to project; omitted.
   }
 
+  // The orphan inspector: ONLY captured anomalies that PROVE a present pane (finding-3).
   for (const a of snapshot.payload.anomalies.active) {
     if (a.anomaly_class === 'orphan_pane') {
+      // A pane the reconciler scanned on the isolated socket that is markerless or carries
+      // an unknown marker - a real present shell-only / orphan pane (spec 553-562).
       orphanInspector.push({
         source: 'anomaly',
-        reason: a.terminal_fingerprint === null ? 'shell_only_or_markerless' : 'marker_bearing_orphan',
+        reason: a.terminal_fingerprint === null ? 'shell_only_or_markerless' : 'unknown_marker_present_pane',
+        fingerprint: a.fingerprint,
+        task_id: a.task_id ?? null,
+        endpoint_id: a.endpoint_id ?? null,
+        pane_id: a.pane_id ?? null,
+        occurrence_count: a.occurrence_count
+      });
+    } else if (a.anomaly_class === 'identity_mismatch') {
+      // A pane that IS present but whose live identity did not match the expected one - a
+      // different process squatting the expected pane (spec 803, S3 cleanup-mismatch).
+      orphanInspector.push({
+        source: 'anomaly',
+        reason: 'identity_mismatch',
         fingerprint: a.fingerprint,
         task_id: a.task_id ?? null,
         endpoint_id: a.endpoint_id ?? null,
@@ -107,6 +126,8 @@ export function projectHelm(snapshot) {
         occurrence_count: a.occurrence_count
       });
     }
+    // Every "gone" class (missing_pane, launch_marker_missing, ...) is deliberately NOT an
+    // orphan: a vanished endpoint is not a present pane.
   }
 
   return {
