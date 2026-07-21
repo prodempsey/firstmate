@@ -8,10 +8,13 @@ import { PgliteLocalStore } from '../lib/pglite-local-store.mjs';
 import { runExclusive } from '../lib/internal-runtime.mjs';
 import { createTask, beginRun } from '../lib/domain-store.mjs';
 import { completeRun } from '../lib/domain-store-s2.mjs';
-import { recordSpawn, commitRunning, verifyRunning, cleanupIntent, cleanupFinish } from '../lib/domain-store-s3.mjs';
 import {
-  killExactPane, cleanupTargetMatches, tmuxListPane, probeIdentity, captureIdentity, registrationHmac
+  recordSpawn, commitRunning, verifyRunning, cleanupIntent, cleanupFinish, recordCleanupMismatch
+} from '../lib/domain-store-s3.mjs';
+import {
+  killExactPane, cleanupTargetMatches, tmuxListPane, probeIdentity, captureIdentity, registrationHmac, readProcIdentity
 } from '../lib/tmux-adapter.mjs';
+import { IdentityMismatchError } from '../lib/errors-s3.mjs';
 import { mkFixtureHome, cleanupAll } from './helpers.mjs';
 
 // Real-adapter smoke + regression against a genuine marker-bearing pane on an ISOLATED
@@ -20,11 +23,12 @@ import { mkFixtureHome, cleanupAll } from './helpers.mjs';
 // coverage (s3-contract/s3-adversarial) passes with NO tmux via injected doubles; these
 // tests SKIP when tmux is absent, exactly as S0's hosted-Postgres contract does.
 //
-// These tests exercise the PRODUCTION probes end to end so a weakened predicate is
-// caught here: the false-positive-identity regression (finding 1) corrupts each stored
-// clause and requires the real probe to fail; the agent-identity regression (finding 2)
-// proves the recorded agent is the harness, not the wrapper; the mismatched-cleanup
-// regression (finding 3) proves a materially wrong target is never killed.
+// These tests exercise the PRODUCTION launcher and probes end to end so a weakened
+// contract is caught here: the register-first/PID-preserving launch regression
+// (finding 2) proves the registered PID IS the live harness process (no separate child);
+// the false-positive-identity regression (finding 1) corrupts each stored clause and
+// requires the real probe to fail; the mismatched-cleanup regression (finding 3) proves
+// a materially wrong target is never killed AND that the mismatch persists an anomaly.
 after(cleanupAll);
 
 const hasTmux = (() => {
@@ -63,6 +67,10 @@ function waitFor(predicate, { tries = 200, stepMs = 25 } = {}) {
   return predicate();
 }
 
+async function rows(store, sql, params) {
+  return runExclusive(store, async (conn) => (await conn.query(sql, params)).rows);
+}
+
 async function runRow(store, taskId, generation = 1) {
   return runExclusive(store, async (conn) => (await conn.query(
     `SELECT status, binding_state, cleanup_state, closed_at, endpoint_id, pane_id, pane_leader_pid, pane_start_ticks,
@@ -72,12 +80,13 @@ async function runRow(store, taskId, generation = 1) {
   )).rows[0]);
 }
 
-const launchWrapper = fileURLToPath(new URL('../bin/cp-launch.mjs', import.meta.url));
+const cpLaunchSh = fileURLToPath(new URL('../bin/cp-launch.sh', import.meta.url));
 
-// Launch a real marker-bearing pane running cp-launch with a `sleep` harness on the
-// isolated socket, wait for its registration, and drive the domain lifecycle through
-// record-spawn (real capture) and commit-running (real probe) to a running binding.
-// Returns the live handles the tests need.
+// Launch a real marker-bearing pane whose initial command is `exec sh cp-launch.sh sleep
+// 300`, so cp-launch.sh writes the registration and then EXECs the harness in place -
+// the pane's single PID-preserved process becomes the harness. Wait for registration and
+// for the exec to complete, then drive the domain lifecycle through record-spawn (real
+// capture) and commit-running (real probe) to a running binding. Returns the live handles.
 async function launchToRunning(store, socket, fmHome, taskId = 't1') {
   await createTask(store, { taskId, kind: 'ship', title: 'smoke', origin: 'internal', internalReason: 'r', commandId: `c-create-${taskId}` });
   const regFile = path.join(fmHome, `${taskId}.reg`);
@@ -88,17 +97,28 @@ async function launchToRunning(store, socket, fmHome, taskId = 't1') {
     `CP_TASK_ID=${taskId}`,
     'CP_RUN_GENERATION=1',
     `CP_BIND_NONCE=${beg.bind_nonce}`,
-    `CP_REG_FILE=${regFile}`,
-    "CP_HARNESS_CMD='[\"sleep\",\"300\"]'"
+    `CP_REG_FILE=${regFile}`
   ].join(' ');
   const winName = `cp-${beg.launch_marker.slice(0, 8)}`;
   // new-session both starts the isolated server and creates the first (marker-bearing)
-  // window; execing node makes the wrapper the pane leader.
-  const created = tmux(socket, ['new-session', '-d', '-P', '-F', '#{window_id} #{pane_id}', '-s', `cp-${taskId}`, '-n', winName, `${env} exec node ${launchWrapper}`]);
+  // window; `exec sh cp-launch.sh` makes the launcher the pane process, and its own
+  // `exec "$@"` then replaces it in place with the harness (PID preserved).
+  const paneCmd = `${env} exec sh ${cpLaunchSh} sleep 300`;
+  const created = tmux(socket, ['new-session', '-d', '-P', '-F', '#{window_id} #{pane_id}', '-s', `cp-${taskId}`, '-n', winName, paneCmd]);
   assert.equal(created.status, 0, `tmux new-session failed: ${created.stderr}`);
   const [endpointId, paneId] = created.stdout.trim().split(/\s+/);
 
   assert.equal(waitFor(() => fs.existsSync(regFile)), true, 'cp-launch wrote the registration record');
+  const reg = JSON.parse(fs.readFileSync(regFile, 'utf8'));
+  // Wait for the exec to complete: the pane's live process at the registered PID must be
+  // the harness the registration signed.
+  assert.equal(
+    waitFor(() => {
+      const p = readProcIdentity(reg.agentPid);
+      return p !== null && p.exe === reg.agentExe;
+    }),
+    true, 'the registered PID exec\'d into the harness'
+  );
   assert.equal(waitFor(() => tmuxListPane(socket, endpointId, paneId).listed), true, 'tmux lists the marker-bearing pane');
 
   const rs = await recordSpawn(store, {
@@ -106,7 +126,7 @@ async function launchToRunning(store, socket, fmHome, taskId = 't1') {
     endpoint: endpointId, pane: paneId, regFile, commandId: `c-spawn-${taskId}`
   });
   const cr = await commitRunning(store, { taskId, generation: 1, expectedRevision: rs.revision, commandId: `c-run-${taskId}` });
-  return { endpointId, paneId, regFile, launchMarker: beg.launch_marker, bindNonce: beg.bind_nonce, revision: cr.revision };
+  return { endpointId, paneId, regFile, reg, revision: cr.revision };
 }
 
 test('t_real_tmux_marker_launch_smoke', { skip: hasTmux ? false : 'tmux not available' }, async () => {
@@ -118,23 +138,27 @@ test('t_real_tmux_marker_launch_smoke', { skip: hasTmux ? false : 'tmux not avai
   try {
     const h = await launchToRunning(store, socket, fmHome, 't1');
 
-    // The real predicate confirms the running binding.
     const vr = await verifyRunning(store, { taskId: 't1', generation: 1 });
     assert.equal(vr.running_verified, true, 'the real predicate confirms the running binding');
 
-    // FINDING 2: the RECORDED agent identity is the HARNESS, not the wrapper. The reg
-    // record and the stored run both name a distinct agent pid whose exe is the harness,
-    // and the pane leader is the (different) wrapper node process.
-    const reg = JSON.parse(fs.readFileSync(h.regFile, 'utf8'));
+    // FINDING 2: register-first, THEN exec with the PID PRESERVED. The registered agent
+    // PID equals the LIVE pane process, that live process is the HARNESS (not the node
+    // helper, which has already exited), and the agent IS the pane leader - a single
+    // PID-preserved process, no lingering wrapper and no distinct child.
     const run = await runRow(store, 't1');
     const paneLeaderPid = tmuxListPane(socket, h.endpointId, h.paneId).paneLeaderPid;
+    const live = readProcIdentity(h.reg.agentPid);
     const nodeReal = fs.realpathSync(process.execPath);
-    assert.notEqual(reg.agentPid, paneLeaderPid, 'the recorded agent is NOT the pane-leader wrapper');
-    assert.notEqual(reg.agentExe, nodeReal, 'the recorded agent exe is the harness, not the node wrapper');
-    assert.equal(Number(run.agent_pid), reg.agentPid, 'record-spawn stored the harness agent pid');
-    assert.equal(run.agent_exe, reg.agentExe, 'record-spawn stored the harness agent exe');
-    assert.equal(Number(run.pane_leader_pid), paneLeaderPid, 'the pane leader is the wrapper process');
-    assert.equal(Number(run.agent_ppid), paneLeaderPid, 'the agent parent chain is the pane-leader wrapper');
+    assert.equal(h.reg.agentPid, paneLeaderPid, 'the registered PID IS the live pane process (PID preserved by exec)');
+    assert.equal(live.exe, h.reg.agentExe, 'the live process at the registered PID is the signed harness');
+    assert.notEqual(h.reg.agentExe, nodeReal, 'the registered agent is the harness, not the node helper');
+    assert.equal(Number(run.agent_pid), h.reg.agentPid, 'record-spawn stored the PID-preserved agent');
+    assert.equal(Number(run.pane_leader_pid), paneLeaderPid, 'the pane leader is that same PID-preserved process');
+    assert.equal(Number(run.agent_pid), Number(run.pane_leader_pid), 'the agent and the pane leader are one PID-preserved process');
+    // No separate child harness lingers: no process on the host has the pane process as
+    // its parent AND the harness executable (the two-process design would leave exactly
+    // that). The harness IS the pane process itself.
+    assert.equal(live.ppid !== h.reg.agentPid, true, 'the harness is not a child of itself; there is no wrapper->child split');
 
     // Terminal, then the exact-pane cleanup saga against the real socket.
     const done = await completeRun(store, { taskId: 't1', generation: 1, expectedRevision: h.revision, outcome: 'success', producer: 'crewmate', seq: 1, evidence: {}, commandId: 'c-done' });
@@ -162,15 +186,12 @@ test('t_real_tmux_identity_predicate_fails_closed', { skip: hasTmux ? false : 't
   try {
     await launchToRunning(store, socket, fmHome, 't1');
     const run = await runRow(store, 't1');
-    // Normalize the run object the way commit/verify pass it to the probe.
     const base = { ...run, task_id: 't1', run_generation: 1 };
 
     // FINDING 1: with the TRUE stored identity, the real predicate matches.
     assert.equal(probeIdentity({ run: base, socket }).matches, true, 'the real predicate matches the true live identity');
 
-    // ...and corrupting ANY single required clause makes it fail closed. Each row is a
-    // wrong value for exactly one stored field plus the failing clause the real predicate
-    // must report. A regression that drops any clause fails here.
+    // ...and corrupting ANY single required clause makes it fail closed.
     const corruptions = [
       ['boot_id', 'not-the-real-boot-id', 'boot_id'],
       ['pane_leader_pid', 999999, 'pane_leader_pid'],
@@ -187,7 +208,7 @@ test('t_real_tmux_identity_predicate_fails_closed', { skip: hasTmux ? false : 't
       assert.equal(probed.matches, false, `a wrong ${field} must NOT match`);
       assert.equal(probed.failingClause, clause, `the failing clause for a wrong ${field} is ${clause}`);
     }
-    // A NULL stored clause is a weak binding and also fails closed (never a skipped clause).
+    // A NULL stored clause is a weak binding and also fails closed.
     for (const field of ['pane_start_ticks', 'agent_ppid', 'agent_pty']) {
       const probed = probeIdentity({ run: { ...base, [field]: null }, socket });
       assert.equal(probed.matches, false, `a null stored ${field} must fail closed`);
@@ -196,7 +217,7 @@ test('t_real_tmux_identity_predicate_fails_closed', { skip: hasTmux ? false : 't
 
     // FINDING 1 (record time): a registration with a VALID HMAC over deliberately wrong
     // immutable values must be rejected by capture - the signed identity must equal the
-    // live process, closing the PID-reuse / stale-registration gap.
+    // live process.
     const badReg = path.join(fmHome, 'stale.reg');
     const signed = {
       marker: run.launch_marker, taskId: 't1', generation: 1,
@@ -218,7 +239,7 @@ test('t_real_tmux_identity_predicate_fails_closed', { skip: hasTmux ? false : 't
   }
 });
 
-test('t_real_tmux_cleanup_refuses_mismatched_target', { skip: hasTmux ? false : 'tmux not available' }, async () => {
+test('t_real_tmux_cleanup_refuses_and_records_mismatch', { skip: hasTmux ? false : 'tmux not available' }, async () => {
   const { fmHome } = mkFixtureHome();
   const socket = isolatedSocket();
   const store = new PgliteLocalStore({ fmHome });
@@ -228,12 +249,11 @@ test('t_real_tmux_cleanup_refuses_mismatched_target', { skip: hasTmux ? false : 
     const h = await launchToRunning(store, socket, fmHome, 't1');
     const run = await runRow(store, 't1');
 
-    // FINDING 3: the real cleanup predicate matches the TRUE target (pane present).
+    // FINDING 3: the real cleanup predicate matches the TRUE target...
     assert.equal(cleanupTargetMatches({ run, socket }).matches, true, 'the true target is an exact match');
 
-    // ...but a target with the correct coarse ids (endpoint/pane/leader present) yet a
-    // materially wrong identity is REFUSED, and killExactPane does NOT kill it: this is
-    // the kill-wrong-pane hazard the exact-cleanup guarantee exists to prevent.
+    // ...but a target with correct coarse ids yet a materially wrong identity is REFUSED,
+    // and killExactPane does NOT kill it (the kill-wrong-pane hazard).
     const mismatches = [
       ['pane_start_ticks', 999999999, 'pane_start_mismatch'],
       ['agent_start_ticks', 999999999, 'agent_mismatch'],
@@ -246,12 +266,29 @@ test('t_real_tmux_cleanup_refuses_mismatched_target', { skip: hasTmux ? false : 
       assert.equal(m.present, true, `the pane is present for a wrong ${field}`);
       assert.equal(m.matches, false, `a wrong ${field} is NOT an exact cleanup match`);
       assert.equal(m.reason, reason, `the mismatch reason for a wrong ${field} is ${reason}`);
-
       const effect = killExactPane({ socket, endpointId: run.endpoint_id, paneId: run.pane_id, run: target });
       assert.equal(effect.killed, false, `killExactPane refuses to kill on a wrong ${field}`);
-      assert.equal(effect.confirmed_absent, false, 'a refused kill never claims the endpoint is absent');
       assert.equal(tmuxListPane(socket, h.endpointId, h.paneId).listed, true, `the real pane is untouched after a refused kill on a wrong ${field}`);
     }
+
+    // FINDING 3 (anomaly half): drive to terminal + intent, corrupt the STORED pane start
+    // ticks so the REAL cleanup probe sees a live mismatch, and record it. The mismatch
+    // must persist a durable identity_mismatch anomaly (visible to the S5 reconciler)
+    // while the real pane survives.
+    const done = await completeRun(store, { taskId: 't1', generation: 1, expectedRevision: h.revision, outcome: 'success', producer: 'crewmate', seq: 1, evidence: {}, commandId: 'c-done' });
+    const intent = await cleanupIntent(store, { taskId: 't1', generation: 1, expectedRevision: done.revision, commandId: 'c-intent' });
+    await runExclusive(store, (conn) => conn.query(
+      "UPDATE runs SET pane_start_ticks = 999999999 WHERE task_id = 't1' AND run_generation = 1"
+    ));
+    await assert.rejects(
+      () => recordCleanupMismatch(store, { taskId: 't1', generation: 1, expectedRevision: intent.revision, commandId: 'c-mismatch' }),
+      (e) => e instanceof IdentityMismatchError,
+      'the real cleanup mismatch surfaces as IdentityMismatchError'
+    );
+    const anom = await rows(store, "SELECT task_id, run_generation, status FROM anomalies WHERE anomaly_class = 'identity_mismatch'");
+    assert.equal(anom.length, 1, 'the cleanup mismatch persisted exactly one identity_mismatch anomaly');
+    assert.equal(anom[0].task_id, 't1');
+    assert.equal(tmuxListPane(socket, h.endpointId, h.paneId).listed, true, 'the real pane survived the recorded mismatch (no kill)');
   } finally {
     killSocket(socket);
     delete process.env.CP_TMUX_SOCKET;

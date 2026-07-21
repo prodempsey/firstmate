@@ -3,7 +3,7 @@ import { PgliteLocalStore } from './pglite-local-store.mjs';
 import { parseArgs } from './coordinator.mjs';
 import { ValidationError } from './errors.mjs';
 import {
-  recordSpawn, commitRunning, verifyRunning, cleanupIntent, cleanupFinish
+  recordSpawn, commitRunning, verifyRunning, cleanupIntent, cleanupFinish, recordCleanupMismatch
 } from './domain-store-s3.mjs';
 
 // S3 coordinator dispatcher (spec section 6). Owns the S3 lifecycle verbs; the S0
@@ -13,7 +13,7 @@ import {
 // the sanctioned in-package seam, and it uses the REAL tmux/proc probes by default -
 // tests drive the domain functions directly with injected deterministic doubles.
 
-export const S3_VERBS = new Set(['record-spawn', 'commit-running', 'verify-running', 'cleanup-intent', 'cleanup-finish']);
+export const S3_VERBS = new Set(['record-spawn', 'commit-running', 'verify-running', 'cleanup-intent', 'cleanup-finish', 'cleanup-mismatch']);
 
 export async function runS3Verb(verb, rest, { env = process.env } = {}) {
   const { flags, positionals } = parseArgs(rest);
@@ -78,6 +78,15 @@ async function dispatch(verb, flags, positionals, store) {
         generation: parseIntFlag(flags, 'generation'),
         expectedRevision: parseIntFlag(flags, 'expected-revision'),
         effectResult: readJsonFileFlag(verb, flags, 'effect-result-file', { required: true }),
+        commandId: flags['command-id']
+      });
+    case 'cleanup-mismatch':
+      // The adapter's cleanup effect refused to kill a materially mismatched target;
+      // this records the required identity_mismatch anomaly through the audit path.
+      return recordCleanupMismatch(store, {
+        taskId: positionals[0],
+        generation: parseIntFlag(flags, 'generation'),
+        expectedRevision: parseIntFlag(flags, 'expected-revision'),
         commandId: flags['command-id']
       });
     default:

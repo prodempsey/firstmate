@@ -9,7 +9,7 @@ import { completeRun } from '../lib/domain-store-s2.mjs';
 import { CausalOrderingError, StateTransitionError } from '../lib/errors-s1.mjs';
 import { IdentityMismatchError } from '../lib/errors-s3.mjs';
 import {
-  recordSpawn, commitRunning, verifyRunning, cleanupIntent, cleanupFinish
+  recordSpawn, commitRunning, verifyRunning, cleanupIntent, cleanupFinish, recordCleanupMismatch
 } from '../lib/domain-store-s3.mjs';
 import { mkFixtureHome, cleanupAll } from './helpers.mjs';
 
@@ -332,6 +332,52 @@ test('t_cleanup_crash_cuts_recover', async () => {
   assert.equal(run.cleanup_state, 'cleaned');
   assert.equal(run.binding_state, 'closed');
   assert.deepEqual(await counters(reopened), { domain: before.domain + 1, projection: 0, commit: before.commit + 1 });
+});
+
+test('t_cleanup_mismatch_records_anomaly', async () => {
+  const { store } = await freshStore();
+  const rev = await cleanupPendingTask(store, 't1');
+  const intent = await cleanupIntent(store, { taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-intent' });
+  const before = await counters(store);
+
+  // The adapter's cleanup effect refused to kill a materially mismatched target
+  // (killExactPane returns matches:false). Recording the mismatch persists an
+  // identity_mismatch anomaly through the audit path so the reconciler (S5) can see it -
+  // while performing NO kill and NO domain change beyond the audit.
+  const mismatchProbe = () => ({ present: true, matches: false, reason: 'pane_start_mismatch' });
+  await assert.rejects(
+    () => recordCleanupMismatch(store, { taskId: 't1', generation: 1, expectedRevision: intent.revision, commandId: 'c-mismatch' }, { cleanupProbe: mismatchProbe }),
+    (e) => e instanceof IdentityMismatchError && e.detail.reason === 'cleanup_target_mismatch' && e.detail.cleanup_reason === 'pane_start_mismatch',
+    'a cleanup target mismatch surfaces as IdentityMismatchError'
+  );
+
+  // The anomaly is durably persisted - mutation-sensitive on the row itself.
+  const anom = await anomalies(store, 'identity_mismatch');
+  assert.equal(anom.length, 1, 'exactly one identity_mismatch anomaly persisted for the cleanup mismatch');
+  assert.equal(anom[0].task_id, 't1');
+  assert.equal(Number(anom[0].run_generation), 1);
+  assert.equal(anom[0].status, 'active');
+
+  // No kill, no cleaned: the run stays intent_committed / cleanup_pending for a real
+  // cleanup or the reconciler. The audit advances domain+commit once and never touches
+  // task revision or projection_revision.
+  const run = await runRow(store, 't1');
+  assert.equal(run.cleanup_state, 'intent_committed');
+  assert.equal(run.binding_state, 'cleanup_pending');
+  assert.equal(await eventCount(store, 't1', 'cleaned'), 0, 'no cleaned event from a mismatch');
+  assert.deepEqual(await counters(store), { domain: before.domain + 1, projection: 0, commit: before.commit + 1 });
+  assert.equal(Number((await taskRow(store, 't1')).revision), intent.revision, 'the audit did not bump task revision');
+
+  // A target that actually MATCHES records nothing: a caller cannot fabricate an anomaly
+  // for a healthy target.
+  const before2 = await counters(store);
+  await assert.rejects(
+    () => recordCleanupMismatch(store, { taskId: 't1', generation: 1, expectedRevision: intent.revision, commandId: 'c-nomatch' }, { cleanupProbe: () => ({ present: true, matches: true, reason: 'exact_match' }) }),
+    (e) => e instanceof StateTransitionError && /no identity mismatch to record/.test(e.message),
+    'a matching target records no anomaly'
+  );
+  assert.equal((await anomalies(store, 'identity_mismatch')).length, 1, 'no second anomaly for a matching target');
+  assert.deepEqual(await counters(store), before2, 'the no-mismatch refusal wrote nothing');
 });
 
 test('t_cleanup_finish_rejects_unconfirmed_effect', async () => {

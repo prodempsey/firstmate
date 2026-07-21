@@ -4,7 +4,8 @@ import { StateTransitionError } from './errors-s1.mjs';
 import { IdentityMismatchError } from './errors-s3.mjs';
 import {
   captureIdentity as realCaptureIdentity,
-  probeIdentity as realProbeIdentity
+  probeIdentity as realProbeIdentity,
+  cleanupTargetMatches as realCleanupTargetMatches
 } from './tmux-adapter.mjs';
 import {
   executeCommand, ConflictSignal, insertEvent, upsertHighwater,
@@ -54,6 +55,9 @@ function defaultCaptureIdentity(arg) {
 }
 function defaultProbeIdentity(arg) {
   return realProbeIdentity({ ...arg, socket: defaultSocket() });
+}
+function defaultCleanupProbe(arg) {
+  return realCleanupTargetMatches({ ...arg, socket: defaultSocket() });
 }
 
 function nowIso() {
@@ -581,6 +585,89 @@ export async function cleanupFinish(store, params, { now = nowIso(), fault } = {
         },
         committedRevision: newRevision, domainChanged: true
       };
+    }
+  });
+}
+
+// cleanup-mismatch: the adapter's cleanup effect found the stored target present but
+// its identity materially disagrees, so it REFUSED to kill (tmux-adapter.killExactPane).
+// Refusing is only half the contract (spec section 7 step 2): the mismatch must also be
+// PERSISTED so the reconciler (S5) can see it. This routes an `identity_mismatch` anomaly
+// through the SAME sanctioned audit path commit-running uses - ConflictSignal('identity')
+// -> savepoint rollback -> anomaly persisted + audit counters advanced -> IdentityMismatch
+// Error - so a cleanup mismatch is durably auditable, coalesced by fingerprint, and never
+// mistaken for a successful cleanup. It performs NO kill and makes NO domain change beyond
+// the audit; the run stays exactly cleanup_pending/intent_committed for a real cleanup or
+// the reconciler.
+//
+// The mismatch is re-confirmed against the injected cleanup probe (real tmux/proc by
+// default) rather than trusted blindly: a caller cannot fabricate an anomaly for a target
+// that actually matches.
+export async function recordCleanupMismatch(store, params, { now = nowIso(), fault, cleanupProbe = defaultCleanupProbe } = {}) {
+  requireStr('cleanup-mismatch', params.taskId, 'task_id');
+  requireIntFlag('cleanup-mismatch', params.generation, 'generation', { min: 1 });
+  requireIntFlag('cleanup-mismatch', params.expectedRevision, 'expected-revision');
+
+  const requestHash = sha256hex(canonicalJson({
+    verb: 'cleanup-mismatch', task_id: params.taskId, generation: params.generation,
+    expected_revision: params.expectedRevision
+  }));
+
+  return executeCommand(store, {
+    verb: 'cleanup-mismatch', commandId: params.commandId, requestHash, taskId: params.taskId, now, fault,
+    conflictErrors: S3_CONFLICT_ERRORS,
+    mutate: async (conn, ctx) => {
+      const task = await readTask(conn, params.taskId);
+      if (!task) throw new StateTransitionError(`unknown task: ${params.taskId}`, { task_id: params.taskId });
+      const runQ = await conn.query(
+        `SELECT status, closed_at, binding_state, cleanup_state, endpoint_id, pane_id, pane_leader_pid,
+                pane_start_ticks, boot_id, agent_pid, agent_start_ticks, agent_exe, agent_argv_hash,
+                agent_ppid, agent_pty, launch_marker
+           FROM runs WHERE task_id = $1 AND run_generation = $2`,
+        [params.taskId, params.generation]
+      );
+      if (runQ.rows.length === 0) {
+        throw new StateTransitionError(
+          `no such run generation ${params.generation} for task ${params.taskId}`,
+          { task_id: params.taskId, generation: params.generation }
+        );
+      }
+      const run = runQ.rows[0];
+
+      if (Number(task.revision) !== params.expectedRevision) {
+        throw new ConflictSignal('causal', causalAnomaly(ctx.commandId, 'cleanup-mismatch', params, Number(task.revision)));
+      }
+      // A mismatch is only meaningful while the run still has an endpoint to clean.
+      if (run.binding_state !== 'cleanup_pending') {
+        throw new StateTransitionError(
+          `cleanup-mismatch requires a run still pending cleanup (binding_state 'cleanup_pending', got '${run.binding_state}')`,
+          { task_id: params.taskId, generation: params.generation, binding_state: run.binding_state }
+        );
+      }
+      // Re-confirm the mismatch against the probe; refuse to fabricate an anomaly for a
+      // target that actually matches (or is already absent - that is a clean cleanup, not
+      // a mismatch).
+      const probe = await cleanupProbe({ run: { ...run, task_id: params.taskId, run_generation: params.generation } });
+      if (!probe || probe.present !== true || probe.matches !== false) {
+        throw new StateTransitionError(
+          'cleanup-mismatch found no identity mismatch to record (the target matches or is absent)',
+          { task_id: params.taskId, generation: params.generation, probe: probe ?? null }
+        );
+      }
+      // Persist the anomaly through the sanctioned audit path (rolled back mutation,
+      // surviving anomaly, +1 domain/commit), NO kill, NO domain change.
+      throw new ConflictSignal('identity', {
+        anomalyClass: 'identity_mismatch',
+        taskId: params.taskId, runGeneration: params.generation,
+        endpointId: run.endpoint_id, paneId: run.pane_id,
+        agentPid: run.agent_pid, agentStartTicks: run.agent_start_ticks,
+        terminalFingerprint: run.launch_marker,
+        detail: {
+          command_id: ctx.commandId, verb: 'cleanup-mismatch', task_id: params.taskId,
+          generation: params.generation, reason: 'cleanup_target_mismatch',
+          cleanup_reason: probe.reason ?? null
+        }
+      });
     }
   });
 }
