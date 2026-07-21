@@ -541,6 +541,18 @@ const OUT_OF_SLICE_ANOMALY_CLASSES = new Set([
 // (the reconciler's own remediable observations: missing_pane, identity_mismatch,
 // pid_reuse_suspected, binding_lost_under_active, running_without_verification,
 // launch_marker_*, datadir_size_tripwire) resolves on agent authority with a reason.
+// detail_json comes back parsed on most drivers; tolerate a text form too. Never throws -
+// an unparseable detail simply yields {} so a predicate that needs a fact treats it absent.
+function coerceDetail(detailJson) {
+  if (detailJson === null || detailJson === undefined) return {};
+  if (typeof detailJson !== 'string') return detailJson;
+  try {
+    return JSON.parse(detailJson);
+  } catch {
+    return {};
+  }
+}
+
 async function resolutionPredicate(conn, anomaly, params) {
   const cls = anomaly.anomaly_class;
 
@@ -554,22 +566,24 @@ async function resolutionPredicate(conn, anomaly, params) {
       }
       return { ok: true };
     }
-    // marker-bearing orphan: resolved by safe adoption into the matching run OR by exact
-    // cleanup after terminal failure. Verify the run that owns this marker reached one of
-    // those states.
+    // marker-bearing orphan (spec 834): resolved by SAFE ADOPTION into the matching run, or
+    // by EXACT CLEANUP after TERMINAL FAILURE. Safe adoption requires the marker's run to be
+    // bound_verified with the FULL endpoint+pane identity the orphan named (not endpoint_id
+    // alone); the cleanup alternative requires a FAILED (not completed) run that is cleaned.
     const r = await conn.query(
-      'SELECT status, binding_state, cleanup_state, endpoint_id FROM runs WHERE launch_marker = $1',
+      'SELECT status, binding_state, cleanup_state, endpoint_id, pane_id FROM runs WHERE launch_marker = $1',
       [anomaly.terminal_fingerprint]
     );
     if (r.rows.length === 0) {
       return { ok: false, message: 'marker-bearing orphan_pane has no matching run to adopt or clean; not safely resolvable in this slice', detail: { marker: anomaly.terminal_fingerprint } };
     }
     const run = r.rows[0];
-    const adopted = (run.binding_state === 'bound_verified' || run.binding_state === 'bound_unverified')
-      && run.endpoint_id !== null && run.endpoint_id === anomaly.endpoint_id;
-    const exactlyCleaned = (run.status === 'failed' || run.status === 'completed') && run.cleanup_state === 'cleaned';
-    if (!adopted && !exactlyCleaned) {
-      return { ok: false, message: 'marker-bearing orphan_pane is neither adopted into its run nor exactly cleaned after terminal failure', detail: { run_status: run.status, binding_state: run.binding_state, cleanup_state: run.cleanup_state } };
+    const adopted = run.binding_state === 'bound_verified'
+      && run.endpoint_id !== null && run.endpoint_id === anomaly.endpoint_id
+      && run.pane_id !== null && run.pane_id === anomaly.pane_id;
+    const exactlyCleanedAfterFailure = run.status === 'failed' && run.cleanup_state === 'cleaned';
+    if (!adopted && !exactlyCleanedAfterFailure) {
+      return { ok: false, message: 'marker-bearing orphan_pane is neither safely adopted (bound_verified with matching endpoint+pane) nor exactly cleaned after terminal failure', detail: { run_status: run.status, binding_state: run.binding_state, cleanup_state: run.cleanup_state, endpoint_match: run.endpoint_id === anomaly.endpoint_id, pane_match: run.pane_id === anomaly.pane_id } };
     }
     return { ok: true };
   }
@@ -594,24 +608,104 @@ async function resolutionPredicate(conn, anomaly, params) {
   }
 
   if (cls === 'terminal_conflict') {
-    // spec 832: one canonical terminal chain. Verify exactly one terminal event exists for
-    // the generation (ux_terminal_per_gen guarantees at most one; require it to be present).
-    const r = await conn.query(
-      'SELECT count(*)::int AS n FROM task_events WHERE task_id = $1 AND run_generation = $2 AND is_terminal',
+    // spec 832: the WHOLE canonical chain must hold - one canonical terminal event, its
+    // outbox row ACKED, cleanup cleaned, AND the conflicting command deterministically
+    // rejected with no domain mutation. Not merely "a terminal event exists".
+    const tev = await conn.query(
+      "SELECT event_id FROM task_events WHERE task_id = $1 AND run_generation = $2 AND is_terminal",
       [anomaly.task_id, anomaly.run_generation]
     );
-    if (Number(r.rows[0].n) !== 1) {
-      return { ok: false, message: 'terminal_conflict requires exactly one canonical terminal event for the generation', detail: { terminal_events: Number(r.rows[0].n) } };
+    if (tev.rows.length !== 1) {
+      return { ok: false, message: 'terminal_conflict requires exactly one canonical terminal event for the generation', detail: { terminal_events: tev.rows.length } };
+    }
+    const ob = await conn.query(
+      'SELECT acked_at FROM outbox WHERE event_id = $1', [tev.rows[0].event_id]
+    );
+    if (ob.rows.length !== 1) {
+      return { ok: false, message: 'terminal_conflict: the canonical terminal has no outbox delivery row', detail: {} };
+    }
+    if (ob.rows[0].acked_at === null || ob.rows[0].acked_at === undefined) {
+      return { ok: false, message: 'terminal_conflict: the canonical terminal delivery is not yet acked', detail: {} };
+    }
+    const run = await conn.query(
+      'SELECT binding_state, cleanup_state FROM runs WHERE task_id = $1 AND run_generation = $2',
+      [anomaly.task_id, anomaly.run_generation]
+    );
+    if (run.rows.length !== 1 || !(run.rows[0].cleanup_state === 'cleaned' || run.rows[0].binding_state === 'closed')) {
+      return { ok: false, message: 'terminal_conflict: cleanup for the generation is not complete', detail: run.rows[0] || {} };
+    }
+    // The conflicting command must be deterministically rejected with NO domain mutation:
+    // a rejected/audited command leaves NO command_results row (an idempotency/replay row
+    // would mean it committed something).
+    const detail = coerceDetail(anomaly.detail_json);
+    const conflictingId = detail.command_id;
+    if (!conflictingId) {
+      return { ok: false, message: 'terminal_conflict anomaly lacks the conflicting command_id; the rejected-command fact cannot be verified', detail: {} };
+    }
+    const cr = await conn.query('SELECT 1 FROM command_results WHERE command_id = $1', [conflictingId]);
+    if (cr.rows.length !== 0) {
+      return { ok: false, message: 'terminal_conflict: the conflicting command left a committed result (a domain mutation), so it was not a clean rejection', detail: { command_id: conflictingId } };
     }
     return { ok: true };
   }
 
-  if (cls === 'idempotency_conflict' || cls === 'causal_ordering_violation') {
-    // spec 833: resolvable only when the offending command left no domain mutation and
-    // rejects deterministically. The envelope GUARANTEES this by construction - an audited
-    // conflict rolls its mutation back to the savepoint and re-raises the same typed error
-    // on replay - so the predicate holds structurally for any persisted conflict row.
+  if (cls === 'idempotency_conflict') {
+    // spec 833: the offending command key must have a DETERMINISTIC STORED result and the
+    // conflict must be real (a different incoming payload), and the offending reuse caused
+    // no new domain mutation (the stored result is the FIRST use's, unchanged).
+    const detail = coerceDetail(anomaly.detail_json);
+    if (!detail.command_id || !detail.stored_request_hash || !detail.incoming_request_hash) {
+      return { ok: false, message: 'idempotency_conflict anomaly lacks the command key/request-hash facts; not verifiable', detail: {} };
+    }
+    if (detail.stored_request_hash === detail.incoming_request_hash) {
+      return { ok: false, message: 'idempotency_conflict is not a real conflict (stored and incoming request hashes match)', detail: {} };
+    }
+    const cr = await conn.query('SELECT request_hash FROM command_results WHERE command_id = $1', [detail.command_id]);
+    if (cr.rows.length !== 1) {
+      return { ok: false, message: 'idempotency_conflict: the command key has no stored deterministic result', detail: { command_id: detail.command_id } };
+    }
+    if (cr.rows[0].request_hash !== detail.stored_request_hash) {
+      return { ok: false, message: 'idempotency_conflict: the stored result no longer matches the recorded stored_request_hash; not deterministically replaying', detail: { command_id: detail.command_id } };
+    }
     return { ok: true };
+  }
+
+  if (cls === 'causal_ordering_violation') {
+    // spec 833: the offending command must have a DETERMINISTIC REJECTED result (a replay
+    // re-rejects on the same stale causal fact) and have caused NO domain mutation (no
+    // command_results row for it).
+    const detail = coerceDetail(anomaly.detail_json);
+    if (!detail.command_id || !detail.reason) {
+      return { ok: false, message: 'causal_ordering_violation anomaly lacks the command key/causal facts; a fabricated or unverifiable row is not resolvable', detail: {} };
+    }
+    const cr = await conn.query('SELECT 1 FROM command_results WHERE command_id = $1', [detail.command_id]);
+    if (cr.rows.length !== 0) {
+      return { ok: false, message: 'causal_ordering_violation: the offending command left a committed result (a domain mutation occurred)', detail: { command_id: detail.command_id } };
+    }
+    if (detail.reason === 'stale_revision') {
+      if (!Number.isInteger(detail.expected_revision) || anomaly.task_id === null) {
+        return { ok: false, message: 'causal_ordering_violation (stale_revision) lacks the expected_revision/task facts', detail: {} };
+      }
+      const t = await conn.query('SELECT revision FROM tasks WHERE task_id = $1', [anomaly.task_id]);
+      if (t.rows.length !== 1 || Number(t.rows[0].revision) <= detail.expected_revision) {
+        return { ok: false, message: 'causal_ordering_violation (stale_revision) is not deterministically rejecting: the task revision has not advanced past the offending token', detail: { task_id: anomaly.task_id, expected_revision: detail.expected_revision, current_revision: t.rows[0] ? Number(t.rows[0].revision) : null } };
+      }
+      return { ok: true };
+    }
+    if (detail.reason === 'nonmonotonic_producer_seq') {
+      if (!detail.producer || !Number.isInteger(detail.seq) || anomaly.task_id === null) {
+        return { ok: false, message: 'causal_ordering_violation (nonmonotonic_producer_seq) lacks the producer/seq facts', detail: {} };
+      }
+      const hw = await conn.query(
+        'SELECT last_seq FROM producer_highwater WHERE task_id = $1 AND run_generation = $2 AND producer_id = $3',
+        [anomaly.task_id, anomaly.run_generation === null ? -1 : anomaly.run_generation, detail.producer]
+      );
+      if (hw.rows.length !== 1 || Number(hw.rows[0].last_seq) < detail.seq) {
+        return { ok: false, message: 'causal_ordering_violation (nonmonotonic_producer_seq) is not deterministically rejecting: the producer high-water is not at/above the offending seq', detail: { producer: detail.producer, seq: detail.seq } };
+      }
+      return { ok: true };
+    }
+    return { ok: false, message: `causal_ordering_violation has an unrecognized reason '${detail.reason}'; not verifiable`, detail: {} };
   }
 
   if (OUT_OF_SLICE_ANOMALY_CLASSES.has(cls)) {

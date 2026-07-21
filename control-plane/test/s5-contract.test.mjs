@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { PgliteLocalStore } from '../lib/pglite-local-store.mjs';
 import { runExclusive } from '../lib/internal-runtime.mjs';
 import { createTask, beginRun } from '../lib/domain-store.mjs';
-import { completeRun } from '../lib/domain-store-s2.mjs';
-import { recordSpawn, commitRunning } from '../lib/domain-store-s3.mjs';
+import { completeRun, failRun } from '../lib/domain-store-s2.mjs';
+import { recordSpawn, commitRunning, cleanupIntent, cleanupFinish } from '../lib/domain-store-s3.mjs';
 import { sha256hex } from '../lib/domain-store.mjs';
 import { resolveAnomaly, listAnomalies, recordReconcilerAnomaly } from '../lib/domain-store-s5.mjs';
 import { AnomalyResolutionError } from '../lib/errors-s5.mjs';
@@ -452,69 +452,115 @@ test('t_resolve_anomaly_predicates_enforced_row_preserved', async () => {
   assert.equal(all.anomalies.some((a) => a.fingerprint === orphanFp), true, 'but remain in the full ledger');
 });
 
-test('t_resolve_anomaly_class_predicates', async () => {
-  // Finding 3: resolve-anomaly enforces the class-specific spec-830-840 predicates against
-  // the canonical rows, positive AND negative, and the human_approved gate applies ONLY to
-  // markerless orphans - a marker-bearing orphan is gated on the adoption/exact-cleanup
-  // predicate instead, not on human approval.
-  const { store } = await freshStore();
-  // A running run whose marker + endpoint a marker-bearing orphan can be "adopted" into.
-  await runningTask(store, 't1');
-  const t1 = (await rows(store, "SELECT launch_marker, endpoint_id FROM runs WHERE task_id = 't1'"))[0];
+// Fetch the fingerprint of the single active anomaly of a class (optionally pinned by
+// terminal_fingerprint), for classes authored by the real envelope rather than returned.
+async function fpOf(store, cls, terminalFp) {
+  const r = await runExclusive(store, async (conn) => {
+    const sql = terminalFp
+      ? 'SELECT fingerprint FROM anomalies WHERE anomaly_class = $1 AND terminal_fingerprint = $2'
+      : 'SELECT fingerprint FROM anomalies WHERE anomaly_class = $1';
+    return (await conn.query(sql, terminalFp ? [cls, terminalFp] : [cls])).rows;
+  });
+  return r[0]?.fingerprint;
+}
 
-  // --- marker-bearing orphan: NEGATIVE (marker matches a run but endpoint not adopted) ---
-  const orphanBadFp = await recordReconcilerAnomaly(store, {
-    anomalyClass: 'orphan_pane', endpointId: '@nope', paneId: '%9', terminalFingerprint: t1.launch_marker,
-    detail: { reason: 'unknown_marker' }, commandId: 'a-orphan-bad'
+test('t_resolve_anomaly_class_predicates', async () => {
+  // Finding 3: resolve-anomaly enforces the FULL class-specific spec-830-840 predicates
+  // against the canonical rows, positive AND negative. The human_approved gate applies ONLY
+  // to markerless orphans; every other class is gated on its real canonical precondition.
+  const { store } = await freshStore();
+  await runningTask(store, 't1');
+  const t1 = (await rows(store, "SELECT launch_marker, endpoint_id, pane_id FROM runs WHERE task_id = 't1'"))[0];
+
+  // --- marker-bearing orphan adoption: needs bound_verified + FULL endpoint AND pane match ---
+  // NEGATIVE: endpoint matches but pane does not.
+  const orphanPaneMiss = await recordReconcilerAnomaly(store, {
+    anomalyClass: 'orphan_pane', endpointId: t1.endpoint_id, paneId: '%WRONG', terminalFingerprint: t1.launch_marker,
+    detail: { reason: 'unknown_marker' }, commandId: 'a-orphan-panemiss'
   });
   await assert.rejects(
-    () => resolveAnomaly(store, { fingerprint: orphanBadFp.fingerprint, reason: 'x', resolutionKind: 'agent_verified', commandId: 'r-orphan-bad' }),
-    (e) => e instanceof AnomalyResolutionError && /neither adopted.*nor exactly cleaned/.test(e.message),
-    'a marker-bearing orphan not adopted/cleaned cannot be resolved'
+    () => resolveAnomaly(store, { fingerprint: orphanPaneMiss.fingerprint, reason: 'x', resolutionKind: 'agent_verified', commandId: 'r-orphan-panemiss' }),
+    (e) => e instanceof AnomalyResolutionError && /neither safely adopted.*nor exactly cleaned/.test(e.message),
+    'adoption requires the pane to match, not endpoint alone'
   );
-  // A marker-bearing orphan is NOT captain-routed: human_approved does not bypass the predicate.
+  // human_approved does NOT bypass a marker-bearing orphan predicate.
   await assert.rejects(
-    () => resolveAnomaly(store, { fingerprint: orphanBadFp.fingerprint, reason: 'x', resolutionKind: 'human_approved', commandId: 'r-orphan-bad2' }),
+    () => resolveAnomaly(store, { fingerprint: orphanPaneMiss.fingerprint, reason: 'x', resolutionKind: 'human_approved', commandId: 'r-orphan-panemiss2' }),
     (e) => e instanceof AnomalyResolutionError,
     'human approval does not substitute for the marker-bearing orphan predicate'
   );
-
-  // --- marker-bearing orphan: POSITIVE (adopted - marker + endpoint match the live run) ---
-  const orphanOkFp = await recordReconcilerAnomaly(store, {
-    anomalyClass: 'orphan_pane', endpointId: t1.endpoint_id, paneId: '%0', terminalFingerprint: t1.launch_marker,
+  // POSITIVE: full endpoint+pane match on a bound_verified run.
+  const orphanOk = await recordReconcilerAnomaly(store, {
+    anomalyClass: 'orphan_pane', endpointId: t1.endpoint_id, paneId: t1.pane_id, terminalFingerprint: t1.launch_marker,
     detail: { reason: 'unknown_marker' }, commandId: 'a-orphan-ok'
   });
-  const okRes = await resolveAnomaly(store, { fingerprint: orphanOkFp.fingerprint, reason: 'adopted into its run', resolutionKind: 'agent_verified', commandId: 'r-orphan-ok' });
-  assert.equal(okRes.status, 'resolved', 'a marker-bearing orphan adopted into its run resolves on agent authority');
+  assert.equal((await resolveAnomaly(store, { fingerprint: orphanOk.fingerprint, reason: 'adopted, verified', resolutionKind: 'agent_verified', commandId: 'r-orphan-ok' })).status, 'resolved');
 
-  // --- terminal_conflict: POSITIVE (a canonical terminal exists) vs NEGATIVE (none) ---
+  // --- terminal_conflict: the WHOLE chain (single terminal + outbox acked + cleanup cleaned
+  //     + conflicting command deterministically rejected with no mutation) ---
   const rev2 = await runningTask(store, 't2');
-  await completeRun(store, { taskId: 't2', generation: 1, expectedRevision: rev2, outcome: 'success', producer: 'crewmate', seq: 1, evidence: {}, commandId: 'c-done-t2' });
-  const tcOk = await recordReconcilerAnomaly(store, { anomalyClass: 'terminal_conflict', taskId: 't2', generation: 1, terminalFingerprint: 't2:1', detail: {}, commandId: 'a-tc-ok' });
-  const tcRes = await resolveAnomaly(store, { fingerprint: tcOk.fingerprint, reason: 'one canonical terminal', resolutionKind: 'agent_verified', commandId: 'r-tc-ok' });
-  assert.equal(tcRes.status, 'resolved', 'terminal_conflict resolves when exactly one canonical terminal exists');
-
-  await runningTask(store, 't3'); // open, no terminal
-  const tcBad = await recordReconcilerAnomaly(store, { anomalyClass: 'terminal_conflict', taskId: 't3', generation: 1, terminalFingerprint: 't3:1', detail: {}, commandId: 'a-tc-bad' });
+  const done2 = await completeRun(store, { taskId: 't2', generation: 1, expectedRevision: rev2, outcome: 'success', producer: 'crewmate', seq: 1, evidence: {}, commandId: 'c-done-t2' });
+  // A REAL terminal conflict: a second terminal on the now-closed generation.
   await assert.rejects(
-    () => resolveAnomaly(store, { fingerprint: tcBad.fingerprint, reason: 'x', resolutionKind: 'agent_verified', commandId: 'r-tc-bad' }),
-    (e) => e instanceof AnomalyResolutionError && /exactly one canonical terminal/.test(e.message),
-    'terminal_conflict without a canonical terminal is not resolvable'
+    () => failRun(store, { taskId: 't2', generation: 1, expectedRevision: done2.revision, reason: 'second terminal', producer: 'firstmate', seq: 2, commandId: 'c-conflict-t2' }),
+    (e) => e.code === 'terminal_conflict'
+  );
+  const tcFp = await fpOf(store, 'terminal_conflict', 't2:1');
+  // NEGATIVE: the terminal delivery is not yet acked.
+  await assert.rejects(
+    () => resolveAnomaly(store, { fingerprint: tcFp, reason: 'x', resolutionKind: 'agent_verified', commandId: 'r-tc-noack' }),
+    (e) => e instanceof AnomalyResolutionError && /not yet acked/.test(e.message),
+    'terminal_conflict cannot resolve before the terminal delivery is acked'
+  );
+  // Ack the delivery (S4's job; set the canonical fact directly here) - still not cleaned.
+  await runExclusive(store, (conn) => conn.query("UPDATE outbox SET acked_at = now() WHERE task_id = 't2'"));
+  await assert.rejects(
+    () => resolveAnomaly(store, { fingerprint: tcFp, reason: 'x', resolutionKind: 'agent_verified', commandId: 'r-tc-nocleanup' }),
+    (e) => e instanceof AnomalyResolutionError && /cleanup .* not complete/.test(e.message),
+    'terminal_conflict cannot resolve before cleanup is complete'
+  );
+  // Finish cleanup, so the whole chain holds. POSITIVE.
+  const intent2 = await cleanupIntent(store, { taskId: 't2', generation: 1, expectedRevision: done2.revision, commandId: 'c-intent-t2' });
+  await cleanupFinish(store, { taskId: 't2', generation: 1, expectedRevision: intent2.revision, effectResult: { confirmed_absent: true }, commandId: 'c-finish-t2' });
+  assert.equal((await resolveAnomaly(store, { fingerprint: tcFp, reason: 'canonical chain complete', resolutionKind: 'agent_verified', commandId: 'r-tc-ok' })).status, 'resolved', 'terminal_conflict resolves once terminal+ack+cleanup hold and the conflicting command left no result');
+
+  // --- idempotency_conflict: deterministic stored result + real different payload ---
+  await createTask(store, { taskId: 'ti', kind: 'ship', title: 'x', origin: 'internal', internalReason: 'r', commandId: 'idem-key' });
+  await assert.rejects( // same command-id, different payload
+    () => createTask(store, { taskId: 'tj', kind: 'ship', title: 'y', origin: 'internal', internalReason: 'r', commandId: 'idem-key' }),
+    (e) => e.code === 'idempotency_conflict'
+  );
+  const idemFp = await fpOf(store, 'idempotency_conflict', 'idem-key');
+  assert.equal((await resolveAnomaly(store, { fingerprint: idemFp, reason: 'stored result deterministic; reuse rejected', resolutionKind: 'agent_verified', commandId: 'r-idem-ok' })).status, 'resolved');
+
+  // --- causal_ordering_violation: a REAL stale-revision rejection resolves; a FABRICATED one does not ---
+  await createTask(store, { taskId: 'tc', kind: 'ship', title: 'x', origin: 'internal', internalReason: 'r', commandId: 'c-tc' });
+  await beginRun(store, { taskId: 'tc', expectedRevision: 1, commandId: 'c-tc-begin1' }); // rev 1 -> 2
+  await assert.rejects( // stale token (expected 1, actual 2)
+    () => beginRun(store, { taskId: 'tc', expectedRevision: 1, commandId: 'c-tc-begin-stale' }),
+    (e) => e.code === 'causal_ordering_violation'
+  );
+  const causalFp = await fpOf(store, 'causal_ordering_violation', 'c-tc-begin-stale');
+  assert.equal((await resolveAnomaly(store, { fingerprint: causalFp, reason: 'token stale, revision advanced, no mutation', resolutionKind: 'agent_verified', commandId: 'r-causal-ok' })).status, 'resolved', 'a real stale-revision causal conflict resolves');
+  // FABRICATED causal anomaly naming a never-executed key with no facts: NOT resolvable.
+  const fabFp = (await recordReconcilerAnomaly(store, { anomalyClass: 'causal_ordering_violation', terminalFingerprint: 'never-executed-key', detail: {}, commandId: 'a-causal-fab' })).fingerprint;
+  await assert.rejects(
+    () => resolveAnomaly(store, { fingerprint: fabFp, reason: 'x', resolutionKind: 'agent_verified', commandId: 'r-causal-fab' }),
+    (e) => e instanceof AnomalyResolutionError && /fabricated or unverifiable|command key\/causal facts/.test(e.message),
+    'a fabricated causal anomaly without a deterministic rejected command cannot resolve'
   );
 
   // --- out-of-slice class: rejected (S4/S6 owns the predicate) ---
-  const spFp = await recordReconcilerAnomaly(store, { anomalyClass: 'stale_projection', terminalFingerprint: 'proj-1', detail: {}, commandId: 'a-sp' });
+  const spFp = (await recordReconcilerAnomaly(store, { anomalyClass: 'stale_projection', terminalFingerprint: 'proj-1', detail: {}, commandId: 'a-sp' })).fingerprint;
   await assert.rejects(
-    () => resolveAnomaly(store, { fingerprint: spFp.fingerprint, reason: 'x', resolutionKind: 'agent_verified', commandId: 'r-sp' }),
+    () => resolveAnomaly(store, { fingerprint: spFp, reason: 'x', resolutionKind: 'agent_verified', commandId: 'r-sp' }),
     (e) => e instanceof AnomalyResolutionError && /owned by another slice/.test(e.message),
     'a projection/consumer class is not resolvable in S5'
   );
 
-  // --- idempotency/causal: structurally satisfiable; a reconciler observation: agent-level ---
-  const causalFp = await recordReconcilerAnomaly(store, { anomalyClass: 'causal_ordering_violation', terminalFingerprint: 'cmd-x', detail: {}, commandId: 'a-causal' });
-  assert.equal((await resolveAnomaly(store, { fingerprint: causalFp.fingerprint, reason: 'rejected deterministically, no mutation', resolutionKind: 'agent_verified', commandId: 'r-causal' })).status, 'resolved');
-  const mpFp = await recordReconcilerAnomaly(store, { anomalyClass: 'missing_pane', taskId: 't3', generation: 1, terminalFingerprint: 'mk', detail: {}, commandId: 'a-mp' });
-  assert.equal((await resolveAnomaly(store, { fingerprint: mpFp.fingerprint, reason: 'operator remediated', resolutionKind: 'agent_verified', commandId: 'r-mp' })).status, 'resolved', 'a reconciler observation class resolves on agent authority');
+  // --- a reconciler observation class with no spec predicate: agent-level ---
+  const mpFp = (await recordReconcilerAnomaly(store, { anomalyClass: 'missing_pane', taskId: 'tc', generation: 1, terminalFingerprint: 'mk', detail: {}, commandId: 'a-mp' })).fingerprint;
+  assert.equal((await resolveAnomaly(store, { fingerprint: mpFp, reason: 'operator remediated', resolutionKind: 'agent_verified', commandId: 'r-mp' })).status, 'resolved', 'a reconciler observation class resolves on agent authority');
 });
 
 test('t_production_probe_reports_transient_on_unreachable_backend', async () => {

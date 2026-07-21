@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { probeIdentity as realProbeIdentity } from './tmux-adapter.mjs';
+import { readProcIdentity, readBootId } from './tmux-adapter.mjs';
 
 // S5 production backend seam: the REAL isolated-socket marker scan (spec 795) and a
 // transient-aware wrapper over the S3 identity probe (spec 455 "transient probe failed
@@ -81,17 +81,76 @@ export function scanIsolatedSocket(socket) {
   return panes;
 }
 
-// Transient-aware identity probe (spec 455/491). Reachability first: if the isolated tmux
-// server cannot be reached, the probe did not run - report a TRANSIENT failure so the
-// reconciler demotes to bound_unverified rather than declaring a live binding lost. When
-// the server IS reachable, delegate to the S3 definitive `identity_matches` predicate: a
-// pane the reachable server does not list is a genuine, provable absence.
-export function probeIdentityTransientAware({ run, socket, now }) {
-  if (!backendReachable(socket)) {
-    return {
-      matches: false, transient: true,
-      failingClause: 'backend_unreachable', anomalyClass: 'running_without_verification'
-    };
+// List every pane on the isolated socket in ONE call, carrying reachability with it. A
+// non-zero status (no server, missing binary, spawn failure) means UNREACHABLE - the list
+// did not run - which is distinct from a reachable server that listed zero matching panes.
+function listPanesRaw(socket) {
+  const r = tmux(socket, ['list-panes', '-a', '-F', '#{window_id} #{pane_id} #{pane_pid}']);
+  if (r.status !== 0 || typeof r.stdout !== 'string') return { reachable: false, entries: [] };
+  const entries = [];
+  for (const line of r.stdout.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    const [endpointId, paneId, pidStr] = t.split(/\s+/);
+    if (!endpointId || !paneId) continue;
+    entries.push({ endpointId, paneId, pid: Number(pidStr) });
   }
-  return realProbeIdentity({ run, socket, now });
+  return { reachable: true, entries };
+}
+
+const TRANSIENT_ANOMALY = 'running_without_verification';
+function transient(failingClause) {
+  return { matches: false, transient: true, failingClause, anomalyClass: TRANSIENT_ANOMALY };
+}
+function definitive(anomalyClass, failingClause) {
+  return { matches: false, transient: false, failingClause, anomalyClass };
+}
+
+// Transient-aware identity probe (qa-s5r2-q65 finding 4; spec 455/491). Reuses the S3
+// read helpers (readBootId, readProcIdentity) for the actual /proc identity reads and adds
+// the disposition S3's collapsed predicate cannot: TRANSIENT is the FAIL-SAFE DEFAULT
+// whenever the probe cannot PROVE absence, and a result is DEFINITIVE only when a
+// SUCCESSFUL operation affirmatively shows the identity gone or replaced.
+//
+// The reachability listing is ONE atomic call carrying presence with it, so there is no
+// preflight/probe gap: a socket that dies mid-probe surfaces as unreachable -> transient,
+// never as a spurious pane-absent. Every read failure - an unreachable server, an
+// unreadable boot id, an unreadable pane leader or agent /proc - is transient, because a
+// failed read never proves a process is gone (readProcIdentity returns the SAME null for
+// gone OR unreadable, tmux-adapter.mjs). The ONLY definitive losses are: a reachable
+// server that does not list the pane (affirmative absence), a readable but changed boot id
+// (affirmative reboot), a pane led by a different pid, or a readable process whose start
+// ticks / exe / argv / parent / pty affirmatively differ (a real identity replacement).
+export function probeIdentityTransientAware({ run, socket }) {
+  const list = listPanesRaw(socket);
+  if (!list.reachable) return transient('backend_unreachable');
+
+  // An incomplete stored binding cannot be verified either way -> transient, never proof.
+  const required = ['boot_id', 'pane_leader_pid', 'pane_start_ticks', 'agent_pid',
+    'agent_start_ticks', 'agent_exe', 'agent_argv_hash', 'agent_ppid', 'agent_pty', 'endpoint_id', 'pane_id'];
+  for (const f of required) {
+    if (run[f] === null || run[f] === undefined) return transient(`incomplete_binding:${f}`);
+  }
+
+  const bootId = readBootId();
+  if (bootId === null) return transient('boot_id_unreadable');        // can't read -> can't prove
+  if (bootId !== run.boot_id) return definitive('missing_pane', 'boot_changed'); // reboot: affirmative absence
+
+  const pane = list.entries.find((e) => e.endpointId === run.endpoint_id && e.paneId === run.pane_id);
+  if (!pane) return definitive('missing_pane', 'pane_absent'); // reachable server proves the pane gone
+
+  if (pane.pid !== Number(run.pane_leader_pid)) return definitive('identity_mismatch', 'pane_leader_pid'); // different pid leads the pane
+  const paneLeader = readProcIdentity(pane.pid);
+  if (!paneLeader) return transient('pane_leader_unreadable');         // read failed -> can't prove
+  if (paneLeader.startTicks !== Number(run.pane_start_ticks)) return definitive('pid_reuse_suspected', 'pane_start_ticks');
+
+  const agent = readProcIdentity(Number(run.agent_pid));
+  if (!agent) return transient('agent_unreadable');                    // read failed -> can't prove
+  if (agent.startTicks !== Number(run.agent_start_ticks)) return definitive('pid_reuse_suspected', 'agent_start_ticks');
+  if (agent.exe !== run.agent_exe) return definitive('identity_mismatch', 'agent_exe');
+  if (agent.argvHash !== run.agent_argv_hash) return definitive('identity_mismatch', 'agent_argv_hash');
+  if (agent.ppid !== Number(run.agent_ppid)) return definitive('identity_mismatch', 'agent_ppid');
+  if (agent.pty !== run.agent_pty) return definitive('identity_mismatch', 'agent_pty');
+
+  return { matches: true, failingClause: null, anomalyClass: null };
 }

@@ -82,14 +82,42 @@ test('t_real_marker_scan_reads_markers_and_flags_orphans', { skip: !hasTmux ? 't
     // The scan is READ-ONLY: it never killed or altered a pane. Both panes still live.
     assert.equal(tmux(socket, ['list-panes', '-a', '-F', '#{pane_id}']).stdout.trim().split('\n').filter(Boolean).length >= 2, true, 'the read-only scan disturbed nothing');
 
+    const bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+
     // The transient-aware probe against a run whose pane the reachable server does NOT list
     // is a DEFINITIVE absence (missing_pane), not a transient failure - the server answered.
+    // (boot_id matches, so the probe reaches the pane-presence check rather than boot_changed.)
+    const absent = probeIdentityTransientAware({
+      run: { endpoint_id: '@999', pane_id: '%999', boot_id: bootId, pane_leader_pid: 1, pane_start_ticks: 1, agent_pid: 1, agent_start_ticks: 1, agent_exe: '/x', agent_argv_hash: 'h', agent_ppid: 1, agent_pty: 'p' },
+      socket
+    });
+    assert.equal(absent.matches, false);
+    assert.notEqual(absent.transient, true, 'a reachable server proving a pane absent is definitive, not transient');
+    assert.equal(absent.failingClause, 'pane_absent');
+
+    // FINDING 4: reachable server + a PRESENT pane whose recorded /proc evidence cannot be
+    // read is TRANSIENT, never proof of death. Build a run whose pane-leader identity matches
+    // the live marker pane exactly, but whose agent pid is dead/unreadable: the probe reaches
+    // the agent read, cannot read it, and must classify transient (bound_unverified), not lost.
+    const markerPane = scanIsolatedSocket(socket).find((p) => p.marker === 'marker-known-1');
+    const paneRow = tmux(socket, ['list-panes', '-a', '-F', '#{window_id} #{pane_id} #{pane_pid}']).stdout
+      .trim().split('\n').map((l) => l.trim().split(/\s+/)).find((c) => c[1] === markerPane.paneId);
+    const panePid = Number(paneRow[2]);
+    const statRest = fs.readFileSync(`/proc/${panePid}/stat`, 'utf8');
+    const paneStartTicks = Number(statRest.slice(statRest.lastIndexOf(')') + 2).trim().split(/\s+/)[19]);
+    const deadPid = 0x7ffffffe; // an implausible pid; its /proc is unreadable
     const probe = probeIdentityTransientAware({
-      run: { endpoint_id: '@999', pane_id: '%999', boot_id: 'b', pane_leader_pid: 1, pane_start_ticks: 1, agent_pid: 1, agent_start_ticks: 1, agent_exe: '/x', agent_argv_hash: 'h', agent_ppid: 1, agent_pty: 'p' },
+      run: {
+        endpoint_id: markerPane.endpointId, pane_id: markerPane.paneId, boot_id: bootId,
+        pane_leader_pid: panePid, pane_start_ticks: paneStartTicks,
+        agent_pid: deadPid, agent_start_ticks: 1, agent_exe: '/x', agent_argv_hash: 'h', agent_ppid: 1, agent_pty: 'p'
+      },
       socket
     });
     assert.equal(probe.matches, false);
-    assert.notEqual(probe.transient, true, 'a reachable server proving a pane absent is definitive, not transient');
+    assert.equal(probe.transient, true, 'a present pane with unreadable agent /proc is transient, not proof of death');
+    assert.equal(probe.failingClause, 'agent_unreadable');
+    assert.equal(probe.anomalyClass, 'running_without_verification');
   } finally {
     killSocket(socket);
   }
