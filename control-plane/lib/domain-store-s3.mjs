@@ -368,8 +368,8 @@ export async function verifyRunning(store, params, { probeIdentity = defaultProb
     const t = await conn.query('SELECT status FROM tasks WHERE task_id = $1', [params.taskId]);
     if (t.rows.length === 0) throw new ValidationError(`task not found: ${params.taskId}`, { task_id: params.taskId });
     const runQ = await conn.query(
-      `SELECT status, binding_state, closed_at, endpoint_id, pane_id, pane_leader_pid, boot_id,
-              agent_pid, agent_start_ticks, agent_exe, agent_argv_hash
+      `SELECT status, binding_state, closed_at, endpoint_id, pane_id, pane_leader_pid, pane_start_ticks,
+              boot_id, agent_pid, agent_start_ticks, agent_exe, agent_argv_hash, agent_ppid, agent_pty
          FROM runs WHERE task_id = $1 AND run_generation = $2`,
       [params.taskId, params.generation]
     );
@@ -498,6 +498,20 @@ export async function cleanupFinish(store, params, { now = nowIso(), fault } = {
   requireIntFlag('cleanup-finish', params.expectedRevision, 'expected-revision');
   if (params.effectResult === undefined) {
     throw new ValidationError('cleanup-finish requires --effect-result-file', { task_id: params.taskId });
+  }
+  // The effect result must PROVE the endpoint is gone before cleanup may be recorded as
+  // done (spec section 7 step 4/5): a `cleaned` commit means the pane is confirmed
+  // absent. An effect that killed nothing, hit an identity mismatch, or otherwise leaves
+  // the endpoint present is refused loudly and surfaced, NEVER silently written as
+  // cleaned/closed - that would orphan a live endpoint while the DB claims it is gone
+  // (qa-s3-q58 finding 4). The refusal is a non-audited routing/environment error: the
+  // run stays intent_committed/cleanup_pending for a real cleanup or the reconciler.
+  if (params.effectResult === null || typeof params.effectResult !== 'object'
+      || Array.isArray(params.effectResult) || params.effectResult.confirmed_absent !== true) {
+    throw new StateTransitionError(
+      'cleanup-finish requires an effect result proving the endpoint is gone (confirmed_absent === true)',
+      { task_id: params.taskId, generation: params.generation, effect_result: params.effectResult ?? null }
+    );
   }
 
   const requestHash = sha256hex(canonicalJson({

@@ -1,18 +1,29 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
-import { execFileSync } from 'node:child_process';
-import { registrationHmac, argvHashOf } from '../lib/tmux-adapter.mjs';
+import { spawn } from 'node:child_process';
+import { registrationHmac, readProcIdentity, readBootId } from '../lib/tmux-adapter.mjs';
 
-// Self-identifying launch wrapper (spec section 5.2). The adapter starts THIS program
-// directly as a marker-bearing tmux window's initial command - never an interactive
-// shell, so no markerless endpoint is ever created. Its FIRST action is to write the
-// registration record record-spawn will HMAC-verify; it then execs the harness so the
-// wrapper PID (already recorded) is the harness PID and the /proc identity is stable.
+// Self-identifying launch wrapper (spec section 5.2 / 5.1). The adapter starts THIS
+// program directly as a marker-bearing tmux window's initial command - never an
+// interactive shell, so no markerless endpoint is ever created. The wrapper's env
+// carries CP_LAUNCH_MARKER / CP_TASK_ID / CP_RUN_GENERATION, so the marker is
+// observable from the first instant, before this registration write.
 //
-// It never opens PGlite and never touches the store: it only writes one file and execs.
-// Everything it needs is precommitted by begin-run and handed in via the environment,
-// which also carries CP_LAUNCH_MARKER / CP_TASK_ID / CP_RUN_GENERATION so the marker is
-// observable before record-spawn and before this registration write.
+// IDENTITY MODEL (spec section 5.1). A launched generation has two real processes: the
+// PANE LEADER - this wrapper, the pane's own command - and the AGENT, the harness the
+// wrapper launches, whose parent is the pane leader. The recorded /proc identity is the
+// ACTUAL AGENT, never the wrapper (qa-s3-q58 finding 2): the wrapper launches the
+// harness as its child (so agent PID/exe/argv/PTY are the harness's and agent_ppid is
+// this wrapper/pane-leader, satisfying the section 5.1 parent-chain clause), captures
+// the child's coherent /proc identity, writes the HMAC-signed registration over THAT
+// agent identity, and then blocks on the child so the recorded process stays live for
+// record-spawn to verify. Pure Node cannot execve to literally replace its own image,
+// so the harness is the wrapper's direct child rather than a re-exec of this pid; the
+// recorded agent identity is nonetheless the real harness, which is what the contract
+// requires.
+//
+// It never opens PGlite and never touches the store: it only launches one child and
+// writes one file.
 //
 // Required environment:
 //   CP_LAUNCH_MARKER  the run's launch marker (from begin-run)
@@ -20,7 +31,7 @@ import { registrationHmac, argvHashOf } from '../lib/tmux-adapter.mjs';
 //   CP_RUN_GENERATION the run generation
 //   CP_BIND_NONCE     the run's secret bind nonce (from begin-run); the HMAC key
 //   CP_REG_FILE       absolute path to write the registration record to
-//   CP_HARNESS_CMD    JSON array [cmd, ...args] to exec after registration
+//   CP_HARNESS_CMD    JSON array [cmd, ...args] to run as the agent
 // Optional: CP_WORKTREE, CP_HARNESS (recorded for observability, not identity).
 
 function requireEnv(name) {
@@ -32,9 +43,14 @@ function requireEnv(name) {
   return v;
 }
 
+function fail(msg, code = 64) {
+  process.stderr.write(`cp-launch: ${msg}\n`);
+  process.exit(code);
+}
+
 const marker = requireEnv('CP_LAUNCH_MARKER');
 const taskId = requireEnv('CP_TASK_ID');
-const generation = requireEnv('CP_RUN_GENERATION');
+const generation = Number(requireEnv('CP_RUN_GENERATION'));
 const bindNonce = requireEnv('CP_BIND_NONCE');
 const regFile = requireEnv('CP_REG_FILE');
 
@@ -42,44 +58,54 @@ let harnessCmd;
 try {
   harnessCmd = JSON.parse(requireEnv('CP_HARNESS_CMD'));
 } catch {
-  process.stderr.write('cp-launch: CP_HARNESS_CMD must be a JSON array\n');
-  process.exit(64);
+  fail('CP_HARNESS_CMD must be a JSON array');
 }
 if (!Array.isArray(harnessCmd) || harnessCmd.length === 0) {
-  process.stderr.write('cp-launch: CP_HARNESS_CMD must be a non-empty JSON array\n');
-  process.exit(64);
+  fail('CP_HARNESS_CMD must be a non-empty JSON array');
 }
 
-// The wrapper's own coherent /proc identity, captured before exec so record-spawn can
-// bind to it: this process's pid, its start ticks, its executable realpath, and its
-// argv hash. After the exec below these all survive because exec preserves the pid.
-const wrapperPid = process.pid;
-const exeRealpath = fs.realpathSync(process.execPath);
-const argvHash = argvHashOf(Buffer.from(process.argv.join('\x00'), 'utf8'));
+const [cmd, ...args] = harnessCmd;
 
-function wrapperStartTicks(pid) {
-  // Field 22 of /proc/<pid>/stat is starttime in clock ticks since boot.
-  const raw = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-  const rest = raw.slice(raw.lastIndexOf(')') + 2).trim().split(/\s+/);
-  return Number(rest[19]);
+// Launch the harness as the wrapper's direct child, sharing the pane's stdio so the
+// agent's controlling PTY is the pane's PTY.
+const child = spawn(cmd, args, { stdio: 'inherit' });
+child.on('error', (err) => fail(`failed to launch harness: ${err.message}`, 65));
+
+const delay = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+// Poll (bounded) until the child's /proc identity is coherently readable: the child
+// has fully exec'd into the harness and its start ticks are stable across two reads.
+let agent = null;
+for (let i = 0; i < 200 && agent === null; i += 1) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    fail(`harness exited before it could be identified (code ${child.exitCode}, signal ${child.signalCode})`, 66);
+  }
+  agent = readProcIdentity(child.pid);
+  if (agent === null) await delay(25); // eslint-disable-line no-await-in-loop
+}
+if (agent === null) {
+  fail('could not capture a coherent agent identity for the launched harness', 66);
 }
 
-const startTicks = wrapperStartTicks(wrapperPid);
+const bootId = readBootId();
+if (bootId === null) fail('could not read the host boot id', 66);
+
+const signed = {
+  marker, taskId, generation,
+  agentPid: child.pid,
+  agentStartTicks: agent.startTicks,
+  agentExe: agent.exe,
+  agentArgvHash: agent.argvHash,
+  agentPpid: agent.ppid,
+  agentPty: agent.pty
+};
 
 const record = {
-  marker,
-  taskId,
-  generation: Number(generation),
-  wrapperPid,
-  wrapperStartTicks: startTicks,
-  exeRealpath,
-  argvHash,
+  ...signed,
+  bootId,
   worktree: process.env.CP_WORKTREE ?? null,
   harness: process.env.CP_HARNESS ?? null,
-  hmac: registrationHmac(bindNonce, {
-    launchMarker: marker, taskId, generation: Number(generation),
-    wrapperPid, wrapperStartTicks: startTicks, exeRealpath, argvHash
-  })
+  hmac: registrationHmac(bindNonce, signed)
 };
 
 // Write the registration record atomically (write to a temp then rename) so record-spawn
@@ -88,15 +114,8 @@ const tmp = `${regFile}.tmp`;
 fs.writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 });
 fs.renameSync(tmp, regFile);
 
-// Exec the harness so the recorded wrapper PID becomes the harness PID (spec section
-// 5.2: "execs the harness so the PID is preserved"). execFileSync would fork a child;
-// to truly preserve the pid we replace the image. Node has no execve, so we approximate
-// with a synchronous foreground child that keeps THIS pid as the parent chain root and
-// blocks until the harness exits - acceptable for the isolated S3 adapter where the
-// recorded identity is the wrapper pid and its start ticks, both stable across this call.
-const [cmd, ...args] = harnessCmd;
-try {
-  execFileSync(cmd, args, { stdio: 'inherit' });
-} catch (err) {
-  process.exit(typeof err.status === 'number' ? err.status : 1);
-}
+// Block on the agent so the recorded process stays live for record-spawn/commit-running
+// to verify; propagate its exit status.
+child.on('exit', (code, signal) => {
+  process.exit(signal ? 128 : (code ?? 0));
+});

@@ -6,7 +6,7 @@ import { PgliteLocalStore } from '../lib/pglite-local-store.mjs';
 import { runExclusive } from '../lib/internal-runtime.mjs';
 import { createTask, beginRun } from '../lib/domain-store.mjs';
 import { completeRun } from '../lib/domain-store-s2.mjs';
-import { CausalOrderingError } from '../lib/errors-s1.mjs';
+import { CausalOrderingError, StateTransitionError } from '../lib/errors-s1.mjs';
 import { IdentityMismatchError } from '../lib/errors-s3.mjs';
 import {
   recordSpawn, commitRunning, verifyRunning, cleanupIntent, cleanupFinish
@@ -332,6 +332,49 @@ test('t_cleanup_crash_cuts_recover', async () => {
   assert.equal(run.cleanup_state, 'cleaned');
   assert.equal(run.binding_state, 'closed');
   assert.deepEqual(await counters(reopened), { domain: before.domain + 1, projection: 0, commit: before.commit + 1 });
+});
+
+test('t_cleanup_finish_rejects_unconfirmed_effect', async () => {
+  const { store } = await freshStore();
+  const rev = await cleanupPendingTask(store, 't1');
+  const intent = await cleanupIntent(store, { taskId: 't1', generation: 1, expectedRevision: rev, commandId: 'c-intent' });
+  const before = await counters(store);
+
+  // An effect that did NOT confirm the endpoint gone must be REFUSED. Turning an
+  // unsuccessful cleanup (a failed kill, an identity mismatch, a malformed result) into
+  // a canonical `cleaned/closed` would orphan a live endpoint while the DB claims the
+  // binding is closed (qa-s3-q58 finding 4).
+  const badEffects = [
+    { killed: false, confirmed_absent: false, reason: 'identity_mismatch' },
+    { killed: true, confirmed_absent: false, reason: 'kill_pane_failed' },
+    { confirmed_absent: 'true' }, // wrong type: not the boolean true
+    { killed: true }, // absent confirmed_absent
+    {},
+    null
+  ];
+  let i = 0;
+  for (const bad of badEffects) {
+    i += 1;
+    await assert.rejects(
+      () => cleanupFinish(store, { taskId: 't1', generation: 1, expectedRevision: intent.revision, effectResult: bad, commandId: `c-bad-${i}` }),
+      (e) => e instanceof StateTransitionError && /confirmed_absent === true/.test(e.message),
+      `cleanup-finish must refuse an unconfirmed effect ${JSON.stringify(bad)}`
+    );
+  }
+
+  // Every refusal wrote nothing: the run stays intent_committed / cleanup_pending for a
+  // real cleanup or the reconciler, with no cleaned event and no counter movement.
+  const run = await runRow(store, 't1');
+  assert.equal(run.cleanup_state, 'intent_committed');
+  assert.equal(run.binding_state, 'cleanup_pending');
+  assert.equal(await eventCount(store, 't1', 'cleaned'), 0, 'no cleaned event survived any refusal');
+  assert.deepEqual(await counters(store), before, 'the refusals wrote nothing');
+
+  // A confirmed-absent effect then commits normally, proving the guard is a real test of
+  // the effect result rather than a blanket block.
+  const ok = await cleanupFinish(store, { taskId: 't1', generation: 1, expectedRevision: intent.revision, effectResult: { killed: true, confirmed_absent: true }, commandId: 'c-ok' });
+  assert.equal(ok.binding_state, 'closed');
+  assert.equal((await runRow(store, 't1')).cleanup_state, 'cleaned');
 });
 
 test('t_cleanup_finish_idempotent_on_already_cleaned', async () => {

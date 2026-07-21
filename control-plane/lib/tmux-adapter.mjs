@@ -14,18 +14,27 @@ import { spawnSync } from 'node:child_process';
 // and file reads of the wrapper's registration record. Every tmux call is scoped to
 // the caller-supplied isolated socket; the cleanup effect kills only the exact
 // recorded pane, never a pattern and never a server (spec section 7 step 3).
+//
+// IDENTITY MODEL (spec section 5.1). A launched generation has two distinct real
+// processes: the PANE LEADER (the wrapper cp-launch, the pane's own command) and the
+// AGENT (the harness the wrapper spawns, whose parent is the pane leader). The full
+// predicate pins BOTH: pane leader PID + start ticks, and the agent's PID + start
+// ticks + executable realpath + argv hash + parent chain + PTY. The registration
+// record signs the AGENT identity so record-spawn can verify the signed identity
+// equals the LIVE agent /proc, closing the PID-reuse gap at record time.
 
 // ---- registration HMAC (shared by cp-launch's writer and record-spawn's verifier) ----
 
-// The wrapper's registration record proves the launched process is the one begin-run
-// precommitted: an HMAC keyed by the run's secret bind_nonce over the immutable
-// identity fields (spec section 5.2). Keying on the nonce is what makes the record
-// unforgeable by anything that did not receive the nonce from begin-run.
-export function registrationHmac(bindNonce, immutable) {
+// The registration record proves the launched AGENT is the one begin-run precommitted:
+// an HMAC keyed by the run's secret bind_nonce over the marker and the complete agent
+// identity tuple (spec section 5.2). Keying on the nonce makes the record unforgeable
+// by anything that did not receive the nonce from begin-run; signing the full agent
+// tuple is what lets record-spawn reject a stale or PID-reused registration.
+export function registrationHmac(bindNonce, s) {
   const canonical = [
-    immutable.launchMarker, immutable.taskId, String(immutable.generation),
-    String(immutable.wrapperPid), String(immutable.wrapperStartTicks),
-    immutable.exeRealpath, immutable.argvHash
+    s.marker, s.taskId, String(s.generation),
+    String(s.agentPid), String(s.agentStartTicks), s.agentExe, s.agentArgvHash,
+    String(s.agentPpid), s.agentPty
   ].join('\x00');
   return crypto.createHmac('sha256', bindNonce).update(canonical).digest('hex');
 }
@@ -41,7 +50,7 @@ export function argvHashOf(cmdlineBuf) {
 
 export function readBootId() {
   try {
-    return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+    return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null;
   } catch {
     return null;
   }
@@ -88,9 +97,12 @@ function readCmdlineHash(pid) {
 }
 
 // A coherent /proc identity snapshot for a pid: start ticks, executable realpath,
-// argv hash, ppid, and pty. Returns null if the process is gone or the reads are
-// incoherent (start ticks changed between the two reads => pid reuse mid-capture).
+// argv hash, ppid, and pty. Returns null if the process is gone, unreadable, or the
+// reads are incoherent (start ticks or ppid changed between the two stat reads =>
+// pid reuse mid-capture), or if any pinned field cannot be read (a partial identity
+// is never a match).
 export function readProcIdentity(pid) {
+  if (pid === null || pid === undefined) return null;
   const first = parseProcStat(pid);
   if (!first) return null;
   const exe = realpathOrNull(`/proc/${pid}/exe`);
@@ -98,16 +110,20 @@ export function readProcIdentity(pid) {
   const pty = realpathOrNull(`/proc/${pid}/fd/0`);
   const second = parseProcStat(pid);
   // Coherent /proc reads before and after identity capture (spec section 5.2): if the
-  // start ticks moved, the pid was reused underneath us and the capture is invalid.
+  // start ticks or ppid moved, the pid was reused underneath us and the capture is
+  // invalid.
   if (!second || second.startTicks !== first.startTicks || second.ppid !== first.ppid) {
     return null;
   }
+  // A pinned field that cannot be read is a partial identity, never a match: fail
+  // closed rather than returning a nullable tuple a caller might treat as verified.
+  if (exe === null || argvHash === null || pty === null) return null;
   return {
     startTicks: first.startTicks,
     ppid: first.ppid,
     exe,
     argvHash,
-    pty: pty || (Number.isFinite(first.ttyNr) ? String(first.ttyNr) : null)
+    pty
   };
 }
 
@@ -136,100 +152,154 @@ export function tmuxListPane(socket, endpointId, paneId) {
 
 // ---- record-spawn capture (production default for captureIdentity) ----
 
-// Verify the wrapper's registration HMAC and capture the coherent /proc + tmux
-// identity tuple for a freshly spawned run. Throws (via the caller's IdentityMismatch
-// handling) when the launch cannot be coherently identified; the domain layer treats
-// a thrown capture as an un-audited, whole-transaction-abandoning failure of the
-// caller's own spawn.
+// Verify the wrapper's registration HMAC AND that its signed agent identity equals the
+// LIVE agent /proc, confirm tmux really lists the endpoint/pane, capture the pane
+// leader, and return the COMPLETE non-null identity tuple for a freshly spawned run.
+// Any weak or incoherent binding fails (ok:false); the domain layer treats a failed
+// capture as an un-audited, whole-transaction-abandoning failure of the caller's own
+// spawn.
 //
-// `run` carries the DB-side launch intent (bind_nonce, launch_marker,
-// registration_path); `params` carries the caller's observed endpoint/pane; `socket`
-// is the isolated control-plane tmux socket.
+// `run` carries the DB-side launch intent (bind_nonce, launch_marker); `params`
+// carries the caller's observed endpoint/pane and reg file; `socket` is the isolated
+// control-plane tmux socket.
 export function captureIdentity({ run, params, socket }) {
   const reg = readRegistration(params.regFile ?? run.registration_path);
   if (!reg) {
     return { ok: false, reason: 'registration_unreadable', clause: 'registration' };
   }
-  // The wrapper's HMAC must recompute from the stored nonce over the record's own
-  // immutable identity fields: a record that does not was not written by a process
-  // holding this run's nonce.
+  const taskId = run.task_id ?? params.taskId;
+  const generation = run.run_generation ?? params.generation;
+  // The record must be HMAC-valid over its OWN signed agent tuple and name this run's
+  // marker; a record whose HMAC does not recompute was not written by a process holding
+  // this run's nonce.
   const expected = registrationHmac(run.bind_nonce, {
-    launchMarker: run.launch_marker, taskId: run.task_id ?? params.taskId,
-    generation: run.run_generation ?? params.generation,
-    wrapperPid: reg.wrapperPid, wrapperStartTicks: reg.wrapperStartTicks,
-    exeRealpath: reg.exeRealpath, argvHash: reg.argvHash
+    marker: run.launch_marker, taskId, generation,
+    agentPid: reg.agentPid, agentStartTicks: reg.agentStartTicks, agentExe: reg.agentExe,
+    agentArgvHash: reg.agentArgvHash, agentPpid: reg.agentPpid, agentPty: reg.agentPty
   });
   if (reg.marker !== run.launch_marker || reg.hmac !== expected) {
     return { ok: false, reason: 'registration_hmac_mismatch', clause: 'registration' };
   }
+  // Tie the SIGNED identity back to the LIVE agent /proc. A stale registration (the
+  // agent already exited) or a reused PID (a different process now holds reg.agentPid)
+  // is rejected here: the signed start ticks / exe / argv / parent / pty must all equal
+  // what the live process actually has right now.
+  const liveAgent = readProcIdentity(reg.agentPid);
+  if (!liveAgent) {
+    return { ok: false, reason: 'agent_not_live', clause: 'agent' };
+  }
+  if (reg.agentStartTicks !== liveAgent.startTicks
+      || reg.agentExe !== liveAgent.exe
+      || reg.agentArgvHash !== liveAgent.argvHash
+      || reg.agentPpid !== liveAgent.ppid
+      || reg.agentPty !== liveAgent.pty) {
+    return { ok: false, reason: 'signed_identity_not_live', clause: 'agent' };
+  }
+  // tmux must really list the marker-bound endpoint/pane, and the pane leader must be a
+  // coherently readable process.
   const pane = tmuxListPane(socket, params.endpoint, params.pane);
   if (!pane.listed) {
     return { ok: false, reason: 'pane_not_listed', clause: 'tmux' };
   }
-  const proc = readProcIdentity(reg.wrapperPid);
-  if (!proc) {
-    return { ok: false, reason: 'incoherent_proc', clause: 'proc' };
-  }
   const paneLeader = readProcIdentity(pane.paneLeaderPid);
-  return {
-    ok: true,
-    identity: {
-      endpointId: params.endpoint,
-      paneId: params.pane,
-      bootId: readBootId(),
-      paneLeaderPid: pane.paneLeaderPid,
-      paneStartTicks: paneLeader ? paneLeader.startTicks : null,
-      agentPid: reg.wrapperPid,
-      agentStartTicks: proc.startTicks,
-      agentExe: proc.exe,
-      agentArgvHash: proc.argvHash,
-      agentPpid: proc.ppid,
-      agentPty: proc.pty,
-      worktree: reg.worktree ?? null,
-      harness: reg.harness ?? null
-    }
+  if (!paneLeader) {
+    return { ok: false, reason: 'pane_leader_not_live', clause: 'pane_leader' };
+  }
+  const bootId = readBootId();
+  if (bootId === null) {
+    return { ok: false, reason: 'boot_id_unreadable', clause: 'boot_id' };
+  }
+  // Require the COMPLETE immutable tuple: no nullable clause, no weak binding.
+  const identity = {
+    endpointId: params.endpoint,
+    paneId: params.pane,
+    bootId,
+    paneLeaderPid: pane.paneLeaderPid,
+    paneStartTicks: paneLeader.startTicks,
+    agentPid: reg.agentPid,
+    agentStartTicks: liveAgent.startTicks,
+    agentExe: liveAgent.exe,
+    agentArgvHash: liveAgent.argvHash,
+    agentPpid: liveAgent.ppid,
+    agentPty: liveAgent.pty,
+    worktree: reg.worktree ?? null,
+    harness: reg.harness ?? null
   };
+  for (const k of ['endpointId', 'paneId', 'bootId', 'paneLeaderPid', 'paneStartTicks',
+    'agentPid', 'agentStartTicks', 'agentExe', 'agentArgvHash', 'agentPpid', 'agentPty']) {
+    if (identity[k] === null || identity[k] === undefined) {
+      return { ok: false, reason: `incomplete_identity:${k}`, clause: k };
+    }
+  }
+  return { ok: true, identity };
 }
 
 // ---- commit-running / verify-running probe (production default for probeIdentity) ----
 
-// The `identity_matches` predicate (spec section 5.1) against the STORED identity in
-// the run row. Returns { matches, failingClause, anomalyClass }: the first failing
+// The FULL `identity_matches` predicate (spec section 5.1) against the STORED identity
+// in the run row. Returns { matches, failingClause, anomalyClass }: the first failing
 // clause names why, and the anomaly class routes an audited commit-running rejection.
+// A stored identity that is not complete is a weak binding and fails closed - a missing
+// stored clause is never a clause to SKIP.
 export function probeIdentity({ run, socket }) {
+  // Fail closed on any incomplete stored identity: every pinned field must be present
+  // before a live match can even be attempted.
+  const required = ['boot_id', 'pane_leader_pid', 'pane_start_ticks', 'agent_pid',
+    'agent_start_ticks', 'agent_exe', 'agent_argv_hash', 'agent_ppid', 'agent_pty'];
+  for (const f of required) {
+    if (run[f] === null || run[f] === undefined) {
+      return { matches: false, failingClause: `incomplete_binding:${f}`, anomalyClass: 'running_without_verification' };
+    }
+  }
   const bootId = readBootId();
-  if (run.boot_id && bootId && run.boot_id !== bootId) {
+  if (bootId === null || bootId !== run.boot_id) {
     return { matches: false, failingClause: 'boot_id', anomalyClass: 'identity_mismatch' };
   }
   const pane = tmuxListPane(socket, run.endpoint_id, run.pane_id);
   if (!pane.listed) {
     return { matches: false, failingClause: 'pane_absent', anomalyClass: 'missing_pane' };
   }
-  if (run.pane_leader_pid !== null && pane.paneLeaderPid !== Number(run.pane_leader_pid)) {
+  if (pane.paneLeaderPid !== Number(run.pane_leader_pid)) {
     return { matches: false, failingClause: 'pane_leader_pid', anomalyClass: 'identity_mismatch' };
   }
-  const proc = readProcIdentity(Number(run.agent_pid));
-  if (!proc) {
+  const paneLeader = readProcIdentity(pane.paneLeaderPid);
+  if (!paneLeader) {
+    return { matches: false, failingClause: 'pane_leader_absent', anomalyClass: 'missing_pane' };
+  }
+  if (paneLeader.startTicks !== Number(run.pane_start_ticks)) {
+    return { matches: false, failingClause: 'pane_start_ticks', anomalyClass: 'pid_reuse_suspected' };
+  }
+  const agent = readProcIdentity(Number(run.agent_pid));
+  if (!agent) {
     return { matches: false, failingClause: 'agent_pid', anomalyClass: 'missing_pane' };
   }
-  if (run.agent_start_ticks !== null && proc.startTicks !== Number(run.agent_start_ticks)) {
+  if (agent.startTicks !== Number(run.agent_start_ticks)) {
     // start ticks differ though the pid is live: the pid was reused by a new process.
     return { matches: false, failingClause: 'agent_start_ticks', anomalyClass: 'pid_reuse_suspected' };
   }
-  if (run.agent_exe && proc.exe !== run.agent_exe) {
+  if (agent.exe !== run.agent_exe) {
     return { matches: false, failingClause: 'agent_exe', anomalyClass: 'identity_mismatch' };
   }
-  if (run.agent_argv_hash && proc.argvHash !== run.agent_argv_hash) {
+  if (agent.argvHash !== run.agent_argv_hash) {
     return { matches: false, failingClause: 'agent_argv_hash', anomalyClass: 'identity_mismatch' };
+  }
+  if (agent.ppid !== Number(run.agent_ppid)) {
+    // Parent chain: the agent's parent must still be the recorded pane leader/wrapper.
+    return { matches: false, failingClause: 'agent_ppid', anomalyClass: 'identity_mismatch' };
+  }
+  if (agent.pty !== run.agent_pty) {
+    return { matches: false, failingClause: 'agent_pty', anomalyClass: 'identity_mismatch' };
   }
   return { matches: true, failingClause: null, anomalyClass: null };
 }
 
 // ---- cleanup effect (spec section 7 steps 2-4) ----
 
-// cleanup_target_matches for a terminal run's stored target: stored boot ID still
-// matches or the endpoint is already absent; if present, endpoint/pane/leader
-// identity must match before any kill. Returns { present, matches, reason }.
+// cleanup_target_matches for a terminal run's stored target (spec section 7 step 2):
+// stored boot ID still matches or the endpoint is already absent; if the pane is
+// present, the pane leader PID AND start ticks must match; and if the agent still
+// exists, its full agent identity must match too. Any mismatch means NO kill. Returns
+// { present, matches, reason }.
 export function cleanupTargetMatches({ run, socket }) {
   const bootId = readBootId();
   if (run.boot_id && bootId && run.boot_id !== bootId) {
@@ -241,27 +311,62 @@ export function cleanupTargetMatches({ run, socket }) {
   if (!pane.listed) {
     return { present: false, matches: true, reason: 'already_absent' };
   }
-  if (run.pane_leader_pid !== null && pane.paneLeaderPid !== Number(run.pane_leader_pid)) {
+  // Present: the full pane-leader identity must agree before any kill.
+  if (run.pane_leader_pid === null || run.pane_leader_pid === undefined
+      || pane.paneLeaderPid !== Number(run.pane_leader_pid)) {
     return { present: true, matches: false, reason: 'pane_leader_mismatch' };
+  }
+  const paneLeader = readProcIdentity(pane.paneLeaderPid);
+  if (!paneLeader) {
+    // The listed pane's leader vanished mid-check: refuse rather than kill a pane whose
+    // identity we can no longer confirm.
+    return { present: true, matches: false, reason: 'pane_leader_unreadable' };
+  }
+  if (run.pane_start_ticks !== null && run.pane_start_ticks !== undefined
+      && paneLeader.startTicks !== Number(run.pane_start_ticks)) {
+    return { present: true, matches: false, reason: 'pane_start_mismatch' };
+  }
+  // If the agent still exists, its full identity must match too (spec section 7 step 2).
+  // If the agent is already gone, the pane leader match above is sufficient to kill the
+  // pane it belongs to.
+  if (run.agent_pid !== null && run.agent_pid !== undefined) {
+    const agent = readProcIdentity(Number(run.agent_pid));
+    if (agent) {
+      if ((run.agent_start_ticks !== null && agent.startTicks !== Number(run.agent_start_ticks))
+          || (run.agent_exe && agent.exe !== run.agent_exe)
+          || (run.agent_argv_hash && agent.argvHash !== run.agent_argv_hash)
+          || (run.agent_ppid !== null && agent.ppid !== Number(run.agent_ppid))
+          || (run.agent_pty && agent.pty !== run.agent_pty)) {
+        return { present: true, matches: false, reason: 'agent_mismatch' };
+      }
+    }
   }
   return { present: true, matches: true, reason: 'exact_match' };
 }
 
 // Kill ONLY the exact recorded pane on the isolated socket - never a pattern, never
-// the server (spec section 7 step 3). Returns { killed, confirmed_absent }.
+// the server (spec section 7 step 3) - and only after cleanup_target_matches proves the
+// present target is the recorded one. Checks the kill result rather than assuming it
+// happened. Returns { killed, confirmed_absent, reason }.
 export function killExactPane({ socket, endpointId, paneId, run }) {
-  const match = cleanupTargetMatches({ run: run ?? { endpoint_id: endpointId, pane_id: paneId }, socket });
+  const target = run ?? { endpoint_id: endpointId, pane_id: paneId };
+  const match = cleanupTargetMatches({ run: target, socket });
   if (!match.present) {
     return { killed: false, confirmed_absent: true, reason: match.reason };
   }
   if (!match.matches) {
-    // Identity mismatch: do not kill. The reconciler records the anomaly (S5); the
-    // cleanup effect refuses to touch a pane it cannot prove is the recorded one.
+    // Identity mismatch: do NOT kill. The reconciler records the anomaly (S5); the
+    // cleanup effect never touches a pane it cannot prove is the recorded one.
     return { killed: false, confirmed_absent: false, reason: match.reason };
   }
-  tmux(socket, ['kill-pane', '-t', paneId]);
+  const killed = tmux(socket, ['kill-pane', '-t', paneId]);
+  // Verify the kill actually removed the pane rather than assuming it did.
   const after = tmuxListPane(socket, endpointId, paneId);
-  return { killed: true, confirmed_absent: !after.listed, reason: 'killed_exact_pane' };
+  return {
+    killed: killed.status === 0,
+    confirmed_absent: !after.listed,
+    reason: killed.status === 0 ? 'killed_exact_pane' : 'kill_pane_failed'
+  };
 }
 
 // ---- registration record I/O ----
