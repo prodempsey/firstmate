@@ -36,9 +36,12 @@ fi
 CDPATH=''
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 
-# FIRST action: write the registration record for THIS shell's PID ($$), recording the
-# identity it will have after the exec below. `exec` preserves $$.
-node "$script_dir/cp-reg-write.mjs" "$$" "$CP_REG_FILE" "$@"
+# FIRST action: write the registration record for THIS shell's PID ($$), signing only the
+# exec-preserved identity facts (start ticks / parent / PTY). `exec` preserves $$, so the
+# registered PID becomes the harness. The harness executable and argv are NOT predicted
+# here - exec rewrites them (shebang interpreters included) - they are observed live by
+# record-spawn.
+node "$script_dir/cp-reg-write.mjs" "$$" "$CP_REG_FILE"
 
 # THEN replace this shell's process image with the harness so the registered PID is
 # preserved as the agent PID (spec section 5.2 "execs the harness so the PID is preserved").

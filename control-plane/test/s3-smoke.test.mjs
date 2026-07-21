@@ -82,12 +82,23 @@ async function runRow(store, taskId, generation = 1) {
 
 const cpLaunchSh = fileURLToPath(new URL('../bin/cp-launch.sh', import.meta.url));
 
-// Launch a real marker-bearing pane whose initial command is `exec sh cp-launch.sh sleep
-// 300`, so cp-launch.sh writes the registration and then EXECs the harness in place -
-// the pane's single PID-preserved process becomes the harness. Wait for registration and
-// for the exec to complete, then drive the domain lifecycle through record-spawn (real
-// capture) and commit-running (real probe) to a running binding. Returns the live handles.
-async function launchToRunning(store, socket, fmHome, taskId = 't1') {
+// The live /proc cmdline of a pid as a plain string (NUL-delimited args joined by space).
+function readCmdlineStr(pid) {
+  try {
+    return fs.readFileSync(`/proc/${pid}/cmdline`).toString('latin1').replace(/\0/g, ' ').trim();
+  } catch {
+    return null;
+  }
+}
+
+// Launch a real marker-bearing pane whose initial command is `exec sh cp-launch.sh
+// <harness...>`, so cp-launch.sh writes the registration and then EXECs the harness in
+// place - the pane's single PID-preserved process becomes the harness. Wait for
+// registration and for the exec to actually complete (the registered PID's argv is no
+// longer cp-launch's - reliable across native binaries AND shebang interpreters), then
+// drive the domain lifecycle through record-spawn (real capture) and commit-running (real
+// probe) to a running binding. Returns the live handles.
+async function launchToRunning(store, socket, fmHome, taskId = 't1', harnessArgv = ['sleep', '300']) {
   await createTask(store, { taskId, kind: 'ship', title: 'smoke', origin: 'internal', internalReason: 'r', commandId: `c-create-${taskId}` });
   const regFile = path.join(fmHome, `${taskId}.reg`);
   const beg = await beginRun(store, { taskId, expectedRevision: 1, commandId: `c-begin-${taskId}`, registrationPath: regFile });
@@ -103,21 +114,22 @@ async function launchToRunning(store, socket, fmHome, taskId = 't1') {
   // new-session both starts the isolated server and creates the first (marker-bearing)
   // window; `exec sh cp-launch.sh` makes the launcher the pane process, and its own
   // `exec "$@"` then replaces it in place with the harness (PID preserved).
-  const paneCmd = `${env} exec sh ${cpLaunchSh} sleep 300`;
+  const paneCmd = `${env} exec sh ${cpLaunchSh} ${harnessArgv.join(' ')}`;
   const created = tmux(socket, ['new-session', '-d', '-P', '-F', '#{window_id} #{pane_id}', '-s', `cp-${taskId}`, '-n', winName, paneCmd]);
   assert.equal(created.status, 0, `tmux new-session failed: ${created.stderr}`);
   const [endpointId, paneId] = created.stdout.trim().split(/\s+/);
 
   assert.equal(waitFor(() => fs.existsSync(regFile)), true, 'cp-launch wrote the registration record');
   const reg = JSON.parse(fs.readFileSync(regFile, 'utf8'));
-  // Wait for the exec to complete: the pane's live process at the registered PID must be
-  // the harness the registration signed.
+  // Wait for the exec to COMPLETE: the registered PID's live argv must no longer be the
+  // cp-launch wrapper's. This is reliable even when exec does not change the executable
+  // realpath (a `#!/bin/sh` harness stays /usr/bin/dash), because exec always rewrites argv.
   assert.equal(
     waitFor(() => {
-      const p = readProcIdentity(reg.agentPid);
-      return p !== null && p.exe === reg.agentExe;
+      const cl = readCmdlineStr(reg.agentPid);
+      return cl !== null && !cl.includes('cp-launch');
     }),
-    true, 'the registered PID exec\'d into the harness'
+    true, 'the registered PID exec\'d into the harness (argv no longer the wrapper\'s)'
   );
   assert.equal(waitFor(() => tmuxListPane(socket, endpointId, paneId).listed), true, 'tmux lists the marker-bearing pane');
 
@@ -142,23 +154,20 @@ test('t_real_tmux_marker_launch_smoke', { skip: hasTmux ? false : 'tmux not avai
     assert.equal(vr.running_verified, true, 'the real predicate confirms the running binding');
 
     // FINDING 2: register-first, THEN exec with the PID PRESERVED. The registered agent
-    // PID equals the LIVE pane process, that live process is the HARNESS (not the node
-    // helper, which has already exited), and the agent IS the pane leader - a single
-    // PID-preserved process, no lingering wrapper and no distinct child.
+    // PID equals the LIVE pane process, and record-spawn stored the OBSERVED live /proc
+    // executable/argv as the authoritative identity (not a pre-exec prediction). The agent
+    // IS the pane leader - a single PID-preserved process, no lingering wrapper.
     const run = await runRow(store, 't1');
     const paneLeaderPid = tmuxListPane(socket, h.endpointId, h.paneId).paneLeaderPid;
     const live = readProcIdentity(h.reg.agentPid);
     const nodeReal = fs.realpathSync(process.execPath);
     assert.equal(h.reg.agentPid, paneLeaderPid, 'the registered PID IS the live pane process (PID preserved by exec)');
-    assert.equal(live.exe, h.reg.agentExe, 'the live process at the registered PID is the signed harness');
-    assert.notEqual(h.reg.agentExe, nodeReal, 'the registered agent is the harness, not the node helper');
+    assert.equal(run.agent_exe, live.exe, 'record-spawn stored the OBSERVED live executable, not a prediction');
+    assert.equal(run.agent_argv_hash, live.argvHash, 'record-spawn stored the OBSERVED live argv hash');
+    assert.notEqual(run.agent_exe, nodeReal, 'the recorded agent is the harness, not the node registration helper');
     assert.equal(Number(run.agent_pid), h.reg.agentPid, 'record-spawn stored the PID-preserved agent');
     assert.equal(Number(run.pane_leader_pid), paneLeaderPid, 'the pane leader is that same PID-preserved process');
     assert.equal(Number(run.agent_pid), Number(run.pane_leader_pid), 'the agent and the pane leader are one PID-preserved process');
-    // No separate child harness lingers: no process on the host has the pane process as
-    // its parent AND the harness executable (the two-process design would leave exactly
-    // that). The harness IS the pane process itself.
-    assert.equal(live.ppid !== h.reg.agentPid, true, 'the harness is not a child of itself; there is no wrapper->child split');
 
     // Terminal, then the exact-pane cleanup saga against the real socket.
     const done = await completeRun(store, { taskId: 't1', generation: 1, expectedRevision: h.revision, outcome: 'success', producer: 'crewmate', seq: 1, evidence: {}, commandId: 'c-done' });
@@ -170,6 +179,53 @@ test('t_real_tmux_marker_launch_smoke', { skip: hasTmux ? false : 'tmux not avai
 
     const fin = await cleanupFinish(store, { taskId: 't1', generation: 1, expectedRevision: intent.revision, effectResult: effect, commandId: 'c-finish' });
     assert.equal(fin.binding_state, 'closed', 'the binding closed after the real cleanup');
+  } finally {
+    killSocket(socket);
+    delete process.env.CP_TMUX_SOCKET;
+    await store.close();
+  }
+});
+
+test('t_real_tmux_shebang_harness_registers', { skip: hasTmux ? false : 'tmux not available' }, async () => {
+  // A DIRECTLY-INVOKED shebang script harness (the shape `codex` has: #!/usr/bin/env
+  // node). The kernel execs the INTERPRETER and rewrites argv, so a pre-exec prediction
+  // of the harness executable/argv would be wrong and would make record-spawn reject a
+  // conforming launch (qa-s3r3-q61 finding 1). Because S3 now OBSERVES the live post-exec
+  // identity instead of predicting it, this legitimate agent registers, commits running,
+  // and verifies - and the stored identity is the real interpreter, robust to the chain.
+  const { fmHome } = mkFixtureHome();
+  const socket = isolatedSocket();
+  const store = new PgliteLocalStore({ fmHome });
+  await store.init({ homeLabel: 'smoke' });
+  process.env.CP_TMUX_SOCKET = socket;
+
+  // An executable `#!/bin/sh` harness: when exec'd directly the kernel runs /usr/bin/dash,
+  // so /proc/<pid>/exe is the INTERPRETER, NOT this script path. It runs `sleep` as a
+  // child (no `exec`), so the interpreter stays the live pane process to be probed.
+  const harnessPath = path.join(fmHome, 'shebang-harness.sh');
+  fs.writeFileSync(harnessPath, '#!/bin/sh\nsleep 300\n', { mode: 0o755 });
+
+  try {
+    const h = await launchToRunning(store, socket, fmHome, 't1', [harnessPath]);
+
+    // The launch registered and committed running - the whole point: a real live shebang
+    // agent is no longer rejected.
+    const vr = await verifyRunning(store, { taskId: 't1', generation: 1 });
+    assert.equal(vr.running_verified, true, 'a shebang-harness launch verifies running');
+
+    // The STORED identity is the OBSERVED live /proc identity of the exec'd process - the
+    // interpreter, never the script path a prediction would have signed.
+    const run = await runRow(store, 't1');
+    const live = readProcIdentity(h.reg.agentPid);
+    assert.equal(h.reg.agentPid, tmuxListPane(socket, h.endpointId, h.paneId).paneLeaderPid, 'PID preserved through the shebang exec');
+    assert.equal(run.agent_exe, live.exe, 'the stored agent exe is the OBSERVED interpreter');
+    assert.notEqual(run.agent_exe, harnessPath, 'the stored agent exe is the interpreter, not the (mispredicted) script path');
+    assert.equal(run.agent_argv_hash, live.argvHash, 'the stored argv hash is the OBSERVED kernel-rewritten argv');
+
+    // And the registration itself never contained an executable/argv prediction to be
+    // wrong about: it signs only the exec-preserved facts.
+    assert.equal(h.reg.agentExe, undefined, 'registration does not predict the executable');
+    assert.equal(h.reg.agentArgvHash, undefined, 'registration does not predict the argv hash');
   } finally {
     killSocket(socket);
     delete process.env.CP_TMUX_SOCKET;
@@ -216,13 +272,13 @@ test('t_real_tmux_identity_predicate_fails_closed', { skip: hasTmux ? false : 't
     }
 
     // FINDING 1 (record time): a registration with a VALID HMAC over deliberately wrong
-    // immutable values must be rejected by capture - the signed identity must equal the
-    // live process.
+    // exec-preserved values (start ticks / parent / PTY) must be rejected by capture -
+    // the signed identity must equal the live process, closing the stale/PID-reuse gap.
     const badReg = path.join(fmHome, 'stale.reg');
     const signed = {
       marker: run.launch_marker, taskId: 't1', generation: 1,
-      agentPid: Number(run.agent_pid), agentStartTicks: 999999999, agentExe: '/definitely/wrong',
-      agentArgvHash: 'wrong-hash', agentPpid: 999999, agentPty: '/definitely/wrong'
+      agentPid: Number(run.agent_pid), agentStartTicks: 999999999,
+      agentPpid: 999999, agentPty: '/definitely/wrong'
     };
     fs.writeFileSync(badReg, JSON.stringify({ ...signed, bootId: run.boot_id, hmac: registrationHmac(run.bind_nonce, signed) }));
     const cap = captureIdentity({

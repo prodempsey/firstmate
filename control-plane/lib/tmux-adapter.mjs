@@ -26,14 +26,20 @@ import { spawnSync } from 'node:child_process';
 // ---- registration HMAC (shared by cp-launch's writer and record-spawn's verifier) ----
 
 // The registration record proves the launched AGENT is the one begin-run precommitted:
-// an HMAC keyed by the run's secret bind_nonce over the marker and the complete agent
-// identity tuple (spec section 5.2). Keying on the nonce makes the record unforgeable
-// by anything that did not receive the nonce from begin-run; signing the full agent
-// tuple is what lets record-spawn reject a stale or PID-reused registration.
+// an HMAC keyed by the run's secret bind_nonce over the marker and the EXEC-PRESERVED
+// identity facts (spec section 5.2). It signs ONLY facts that survive `exec` unchanged -
+// the marker, task/generation, and the wrapper PID plus its start ticks, parent, and PTY
+// (all preserved when the shell execs the harness in place). It deliberately does NOT
+// sign the executable realpath or argv hash: those are REWRITTEN by exec (a shebang
+// script becomes its interpreter, e.g. `#!/usr/bin/env node` -> /usr/bin/node with a
+// rewritten argv), so they cannot be predicted before exec and are instead OBSERVED live
+// by record-spawn (captureIdentity). Keying on the nonce makes the record unforgeable by
+// anything that did not receive the nonce from begin-run; the signed start-ticks/parent/
+// PTY tuple is what lets record-spawn reject a stale or PID-reused registration.
 export function registrationHmac(bindNonce, s) {
   const canonical = [
     s.marker, s.taskId, String(s.generation),
-    String(s.agentPid), String(s.agentStartTicks), s.agentExe, s.agentArgvHash,
+    String(s.agentPid), String(s.agentStartTicks),
     String(s.agentPpid), s.agentPty
   ].join('\x00');
   return crypto.createHmac('sha256', bindNonce).update(canonical).digest('hex');
@@ -169,28 +175,29 @@ export function captureIdentity({ run, params, socket }) {
   }
   const taskId = run.task_id ?? params.taskId;
   const generation = run.run_generation ?? params.generation;
-  // The record must be HMAC-valid over its OWN signed agent tuple and name this run's
-  // marker; a record whose HMAC does not recompute was not written by a process holding
-  // this run's nonce.
+  // The record must be HMAC-valid over its OWN signed (exec-preserved) tuple and name
+  // this run's marker; a record whose HMAC does not recompute was not written by a
+  // process holding this run's nonce.
   const expected = registrationHmac(run.bind_nonce, {
     marker: run.launch_marker, taskId, generation,
-    agentPid: reg.agentPid, agentStartTicks: reg.agentStartTicks, agentExe: reg.agentExe,
-    agentArgvHash: reg.agentArgvHash, agentPpid: reg.agentPpid, agentPty: reg.agentPty
+    agentPid: reg.agentPid, agentStartTicks: reg.agentStartTicks,
+    agentPpid: reg.agentPpid, agentPty: reg.agentPty
   });
   if (reg.marker !== run.launch_marker || reg.hmac !== expected) {
     return { ok: false, reason: 'registration_hmac_mismatch', clause: 'registration' };
   }
-  // Tie the SIGNED identity back to the LIVE agent /proc. A stale registration (the
-  // agent already exited) or a reused PID (a different process now holds reg.agentPid)
-  // is rejected here: the signed start ticks / exe / argv / parent / pty must all equal
-  // what the live process actually has right now.
+  // Tie the SIGNED (exec-preserved) identity back to the LIVE agent /proc. A stale
+  // registration (the agent already exited) or a reused PID (a different process now
+  // holds reg.agentPid) is rejected here: the signed start ticks, parent, and PTY - all
+  // preserved unchanged across exec - must equal what the live process has right now. The
+  // executable realpath and argv hash are NOT predicted/signed (exec rewrites them,
+  // including for shebang interpreters); they are OBSERVED live below and become the
+  // authoritative stored identity that commit-running and cleanup later verify against.
   const liveAgent = readProcIdentity(reg.agentPid);
   if (!liveAgent) {
     return { ok: false, reason: 'agent_not_live', clause: 'agent' };
   }
   if (reg.agentStartTicks !== liveAgent.startTicks
-      || reg.agentExe !== liveAgent.exe
-      || reg.agentArgvHash !== liveAgent.argvHash
       || reg.agentPpid !== liveAgent.ppid
       || reg.agentPty !== liveAgent.pty) {
     return { ok: false, reason: 'signed_identity_not_live', clause: 'agent' };
