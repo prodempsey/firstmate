@@ -1,133 +1,139 @@
 import assert from 'node:assert/strict';
-import path from 'node:path';
+import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { createTask, beginRun, appendEvent, taskHead } from '../../lib/domain-store.mjs';
-import { completeRun } from '../../lib/domain-store-s2.mjs';
-import {
-  recordSpawn, commitRunning, cleanupIntent, cleanupFinish
-} from '../../lib/domain-store-s3.mjs';
-import { archiveTask } from '../../lib/domain-store-archive.mjs';
 import { readCursor } from '../../lib/domain-store-s4.mjs';
 import { projectBridge, projectHelm } from '../../lib/projections.mjs';
-import { launchAgentPane, killAgentExactPane } from '../fixtures/agent.mjs';
-import { makeSink, drainToIdle, sinkEffectCount } from '../fixtures/consumer.mjs';
-import { waitFor, waitForFile } from '../fixtures/proc.mjs';
-import { tmuxListPane } from '../../lib/tmux-adapter.mjs';
+import { sinkEffectCount } from '../fixtures/consumer.mjs';
 
-// Workflow 1 - Success (spec matrix row 860): the full happy path against a REAL
-// marker-bearing pane on the dedicated socket, with TWO REAL PROCESS restarts MID-lifecycle.
-// Each restart spawns a driver child that opens the store and hangs INSIDE the exclusive
-// section holding the flock with an uncommitted sentinel write, then SIGKILLs that exact
-// process; the parent reopens from the durable dataDir and proves no resurrection - the
-// uncommitted write rolled back, task/run state is byte-identical, and there are no duplicate
-// cards or sink effects. This is an abrupt process death mid-lifecycle, not an in-process
-// close after the work is already done.
+// Workflow 1 - Success (spec matrix row 860; qa-s7r2-q76). The full happy path against a REAL
+// marker-bearing pane, driven by a real DRIVER child process that OWNS the task lifecycle AND
+// the FirstMate consumer lease (fixtures/driver.mjs). Twice, mid-lifecycle, the parent
+// SIGKILLs the owning driver and launches a FRESH driver process against the same durable
+// fixture data/sink to resume the remaining steps. Because the killed process owns the
+// consumer lease and the lifecycle, each relaunch forces a genuine store+consumer reopen: the
+// fresh process re-claims the lease (a strictly higher owner_epoch) and performs the remaining
+// work. If a relaunch were removed, those remaining steps (progress/complete/drain, then
+// cleanup/archive) would never run and the workflow would not reach an acked, cleaned,
+// archived end state - so the restart is load-bearing, not decorative.
 export const meta = { tmuxRequired: true };
 
-const FLOCK_HOLDER = fileURLToPath(new URL('../fixtures/flock-holder.mjs', import.meta.url));
+const DRIVER = fileURLToPath(new URL('../fixtures/driver.mjs', import.meta.url));
 
-// A real store-driver process restart at the current lifecycle point: it holds the store
-// flock mid-transaction (uncommitted sentinel), is SIGKILLed abruptly, and the parent reopens
-// from durable storage. Asserts the uncommitted write left no ghost.
-async function realRestart(h, label) {
-  const readyFile = path.join(h.fmHome, `restart-ready-${label}`);
-  const sentinel = `e2e-sentinel-${label}`;
-  const child = h.spawnDriver(FLOCK_HOLDER, { CP_MODE: 'kill', CP_READY_FILE: readyFile, CP_SENTINEL: sentinel });
-  h.recordChild(child.pid, `restart-${label}`);
-  assert.equal(waitForFile(readyFile), true, `${label}: the store driver reached its mid-transaction hold`);
-  const dead = await h.crashRecordedChild(child.pid, child);
-  assert.equal(dead.signalCode, 'SIGKILL', `${label}: the store driver was SIGKILLed mid-transaction`);
-  await h.reopenStore();
-  const ghost = await h.read('SELECT count(*)::int AS n FROM command_results WHERE command_id = $1', [sentinel]);
-  assert.equal(Number(ghost[0].n), 0, `${label}: the mid-transaction write rolled back after the abrupt death (no resurrection)`);
+// A line-protocol handle over a driver child: read newline-delimited JSON results, send
+// newline commands. ready() reads the driver's startup record; send(cmd) awaits its result.
+function driverHandle(child) {
+  const rl = readline.createInterface({ input: child.stdout });
+  const q = []; const waiters = [];
+  rl.on('line', (line) => {
+    const obj = JSON.parse(line);
+    if (waiters.length) waiters.shift().resolve(obj); else q.push(obj);
+  });
+  // Bounded wait for the next driver line: a dead/absent driver (e.g. a relaunch that was
+  // skipped) rejects promptly instead of hanging forever, so the restart is mutation-sensitive
+  // - removing a relaunch makes the workflow FAIL rather than deadlock.
+  const next = (what) => new Promise((resolve, reject) => {
+    if (q.length) { resolve(q.shift()); return; }
+    const timer = setTimeout(() => reject(new Error(`driver did not respond to ${what} within 20s (is a fresh driver running?)`)), 20000);
+    waiters.push({ resolve: (obj) => { clearTimeout(timer); resolve(obj); } });
+  });
+  return {
+    ready: () => next('startup'),
+    send: (cmd) => { child.stdin.write(cmd + '\n'); return next(cmd); }
+  };
+}
+
+export async function run(h) {
+  const taskId = 't-success';
+  // A fixed logical consumer owner across restarts, so each fresh driver's claim is a renew
+  // that ROTATES the epoch - the observable proof a distinct process took over the consumer.
+  const owner = { CP_TASK_ID: taskId, CP_OWNER_BOOT: 'boot-wf1', CP_OWNER_PID: '424242' };
+  let instance = 0;
+  let pane = null;
+
+  // Launch a fresh driver process (a real store+consumer owner) and return its handle + the
+  // epoch it re-claimed. Each instance number is distinct so the lease re-claim is a real renew.
+  const launchDriver = async () => {
+    instance += 1;
+    const child = h.spawnDriver(DRIVER, { ...owner, CP_INSTANCE: String(instance) });
+    h.recordChild(child.pid, `driver-${instance}`);
+    const handle = driverHandle(child);
+    const ready = await handle.ready();
+    assert.equal(ready.ready, true, `driver instance ${instance} came up and owns the consumer`);
+    return { child, handle, epoch: ready.epoch };
+  };
+
+  // Driver instance 1 owns the lifecycle up to a verified running binding.
+  let d = await launchDriver();
+  const epoch1 = d.epoch;
+  const spawned = await d.handle.send('spawn');
+  assert.equal(spawned.ok, true, 'the driver spawned the run to a verified binding');
+  assert.equal(spawned.binding_state, 'bound_verified');
+  pane = spawned.pane;
+  h.recordAgent({ pid: pane.agentPid, marker: pane.launchMarker, endpointId: pane.endpointId, paneId: pane.paneId });
+
+  // one Bridge card and one Helm live pane (observed by the parent - a read, not lifecycle).
+  const snap1 = await h.snapshot();
+  assert.equal(projectBridge(snap1).cards.filter((c) => c.task_id === taskId).length, 1, 'exactly one Bridge card for the task');
+  assert.deepEqual(projectHelm(snap1).live.map((p) => p.task_id), [taskId], 'exactly one live Helm pane for the task');
+  const runningBaseline = await runState(h, taskId);
+
+  // ---- RESTART 1 (mid-lifecycle @ running): kill the OWNING driver, relaunch a fresh one ----
+  const dead1 = await h.crashRecordedChild(d.child.pid, d.child);
+  assert.equal(dead1.signalCode, 'SIGKILL', 'restart@running: the lifecycle/consumer owner was SIGKILLed');
+  d = await launchDriver();
+  const epoch2 = d.epoch;
+  assert.ok(epoch2 > epoch1, `restart@running: the fresh process re-claimed the consumer lease (epoch ${epoch1} -> ${epoch2})`);
+  assert.deepEqual(await runState(h, taskId), runningBaseline, 'restart@running: task/run state is byte-identical after the abrupt owner restart');
+  assert.deepEqual(projectHelm(await h.snapshot()).live.map((p) => p.task_id), [taskId], 'restart@running: the live pane survived (its own tmux process)');
+
+  // The FRESH driver performs the remaining running-phase lifecycle: progress, complete, drain.
+  assert.equal((await d.handle.send('progress')).ok, true, 'the fresh driver appended progress');
+  const completed = await d.handle.send('complete');
+  assert.equal(completed.status, 'completed', 'the fresh driver completed the run');
+  assert.equal(completed.delivered, true, 'the completion produced an outbox delivery');
+  const drained = await d.handle.send('drain');
+  assert.equal(drained.idle, true, 'the fresh driver drained the terminal delivery to idle');
+  assert.equal(drained.epoch, epoch2, 'the drain used the fresh owner epoch');
+
+  const terminalOutbox = (await h.read("SELECT outbox_id FROM outbox WHERE task_id = $1 AND event_type = 'completed'", [taskId]))[0];
+  assert.ok((await h.read('SELECT acked_at FROM outbox WHERE outbox_id = $1', [Number(terminalOutbox.outbox_id)]))[0].acked_at, 'the terminal delivery is acked');
+  assert.equal(sinkEffectCount(h.sinkDir), 1, 'exactly one durable sink effect, keyed by event_id');
+  const completedBaseline = await runState(h, taskId);
+  const cursorBefore = (await readCursor(h.store, {})).last_acked_outbox_id;
+
+  // ---- RESTART 2 (mid-lifecycle @ completed+acked): kill the OWNING driver, relaunch ----
+  const dead2 = await h.crashRecordedChild(d.child.pid, d.child);
+  assert.equal(dead2.signalCode, 'SIGKILL', 'restart@completed: the lifecycle/consumer owner was SIGKILLed');
+  d = await launchDriver();
+  const epoch3 = d.epoch;
+  assert.ok(epoch3 > epoch2, `restart@completed: the fresh process re-claimed the consumer lease (epoch ${epoch2} -> ${epoch3})`);
+  assert.deepEqual(await runState(h, taskId), completedBaseline, 'restart@completed: task/run state is byte-identical after the abrupt owner restart');
+  assert.equal((await readCursor(h.store, {})).last_acked_outbox_id, cursorBefore, 'restart@completed: the consumer cursor survived the abrupt death');
+  assert.equal(sinkEffectCount(h.sinkDir), 1, 'restart@completed: no duplicate sink effect');
+
+  // The FRESH driver performs the remaining lifecycle: exact-pane cleanup, then archive.
+  const cleaned = await d.handle.send('cleanup');
+  assert.equal(cleaned.ok, true, 'the fresh driver cleaned up the exact pane');
+  assert.equal(cleaned.binding_state, 'closed');
+  assert.equal(cleaned.killed, true, 'the cleanup effect killed the exact recorded pane');
+  h.markAgentDead(pane.agentPid);
+  const archived = await d.handle.send('archive');
+  assert.equal(archived.status, 'archived', 'the fresh driver archived the task');
+
+  // The acked terminal is never resurrected across the restarts - still one effect.
+  assert.equal(sinkEffectCount(h.sinkDir), 1, 'exactly one durable sink effect across both restarts (no resurrection)');
+  await h.snapshot();
+
+  // Cleanly shut down the final driver (EOF on stdin ends its command loop) and reap it, so it
+  // is not a lingering fixture process at the finals.
+  d.child.stdin.end();
+  await new Promise((res) => { if (d.child.exitCode !== null || d.child.signalCode !== null) res(); else d.child.once('exit', res); });
+
+  return { expectedActiveAnomalies: [] };
 }
 
 async function runState(h, taskId) {
   const t = (await h.read('SELECT status, revision, current_generation FROM tasks WHERE task_id = $1', [taskId]))[0];
   const r = (await h.read('SELECT run_generation, status, binding_state, cleanup_state, closed_at FROM runs WHERE task_id = $1', [taskId]))[0];
   return { t, r };
-}
-
-export async function run(h) {
-  const store = h.store;
-  const taskId = 't-success';
-
-  // create + read
-  const created = await createTask(store, {
-    taskId, kind: 'ship', title: 'e2e success', origin: 'captain_order', orderRef: 'ORD-1', commandId: 'c-create'
-  });
-  assert.equal(created.status, 'queued');
-  const head = await taskHead(store, { taskId });
-  assert.equal(head.status, 'queued');
-  assert.equal(head.revision, created.revision);
-
-  // begin run + real marker-bound spawn
-  const beg = await beginRun(store, { taskId, expectedRevision: created.revision, commandId: 'c-begin' });
-  const pane = launchAgentPane({ socket: h.socket, fmHome: h.fmHome, taskId, launchMarker: beg.launch_marker, bindNonce: beg.bind_nonce });
-  h.recordAgent({ pid: pane.agentPid, marker: beg.launch_marker, endpointId: pane.endpointId, paneId: pane.paneId });
-
-  // record-spawn (real /proc+tmux capture) then commit-running (real anti-ghost probe)
-  const rs = await recordSpawn(store, {
-    taskId, generation: 1, expectedRevision: beg.revision, launchMarker: beg.launch_marker,
-    endpoint: pane.endpointId, pane: pane.paneId, regFile: pane.regFile, commandId: 'c-spawn'
-  });
-  const cr = await commitRunning(store, { taskId, generation: 1, expectedRevision: rs.revision, commandId: 'c-run' });
-  assert.equal(cr.binding_state, 'bound_verified');
-
-  // one Bridge card and one Helm live pane
-  const snap1 = await h.snapshot();
-  assert.equal(projectBridge(snap1).cards.filter((c) => c.task_id === taskId).length, 1, 'exactly one Bridge card for the task');
-  assert.deepEqual(projectHelm(snap1).live.map((p) => p.task_id), [taskId], 'exactly one live Helm pane for the task');
-
-  // ---- RESTART 1 (mid-lifecycle, at running): abrupt store-driver death, no resurrection ----
-  const runningBaseline = await runState(h, taskId);
-  await realRestart(h, 'running');
-  assert.deepEqual(await runState(h, taskId), runningBaseline, 'restart@running: task/run state is byte-identical after the abrupt restart');
-  const snapAfter1 = await h.snapshot();
-  assert.equal(projectBridge(snapAfter1).cards.filter((c) => c.task_id === taskId).length, 1, 'restart@running: still exactly one card, not duplicated');
-  assert.deepEqual(projectHelm(snapAfter1).live.map((p) => p.task_id), [taskId], 'restart@running: the live pane survived (it is its own tmux process)');
-
-  // progress then completed
-  const prog = await appendEvent(store, {
-    taskId, generation: 1, eventType: 'progress', producer: 'crewmate', seq: 1, expectedRevision: cr.revision, commandId: 'c-prog'
-  });
-  const done = await completeRun(store, {
-    taskId, generation: 1, expectedRevision: prog.revision, outcome: 'success', producer: 'crewmate', seq: 2, evidence: { ok: true }, commandId: 'c-done'
-  });
-  assert.equal(done.status, 'completed');
-  assert.equal(done.delivered, true, 'the terminal completion produced an outbox delivery');
-
-  // sink effect by event_id; mark-applied; ack (the real consumer adapter drains to idle)
-  const drain = await drainToIdle(store, { sink: makeSink(h.sinkDir) });
-  assert.equal(drain.result.idle, true, 'the consumer drained the terminal delivery to idle');
-  const terminalOutbox = (await h.read("SELECT outbox_id FROM outbox WHERE task_id = $1 AND event_type = 'completed'", [taskId]))[0];
-  assert.ok((await h.read('SELECT acked_at FROM outbox WHERE outbox_id = $1', [Number(terminalOutbox.outbox_id)]))[0].acked_at, 'the terminal delivery is acked');
-  assert.equal(sinkEffectCount(h.sinkDir), 1, 'exactly one durable sink effect, keyed by event_id');
-
-  // ---- RESTART 2 (mid-lifecycle, at completed+acked): consumer state survives, no dup ----
-  const completedBaseline = await runState(h, taskId);
-  const cursorBefore = (await readCursor(store, {})).last_acked_outbox_id;
-  await realRestart(h, 'completed');
-  assert.deepEqual(await runState(h, taskId), completedBaseline, 'restart@completed: task/run state is byte-identical after the abrupt restart');
-  assert.equal((await readCursor(h.store, {})).last_acked_outbox_id, cursorBefore, 'restart@completed: the consumer cursor survived the abrupt death');
-  assert.equal(sinkEffectCount(h.sinkDir), 1, 'restart@completed: no duplicate sink effect');
-  const reDrain = await drainToIdle(h.store, { sink: makeSink(h.sinkDir) });
-  assert.equal(reDrain.result.idle, true, 'restart@completed: nothing is redelivered - the acked terminal is not resurrected');
-  assert.equal(sinkEffectCount(h.sinkDir), 1, 'restart@completed: recovery drain added no effect');
-
-  // cleanup: exact-pane kill through the production cleanup effect, then finish
-  const intent = await cleanupIntent(store, { taskId, generation: 1, expectedRevision: done.revision, commandId: 'c-intent' });
-  const effect = killAgentExactPane({ socket: h.socket, endpointId: intent.target.endpoint_id, paneId: intent.target.pane_id, run: intent.target });
-  assert.equal(effect.killed, true, 'the cleanup effect killed the exact recorded pane');
-  h.markAgentDead(pane.agentPid);
-  assert.equal(waitFor(() => !tmuxListPane(h.socket, pane.endpointId, pane.paneId).listed), true, 'the exact pane is gone');
-  const fin = await cleanupFinish(store, { taskId, generation: 1, expectedRevision: intent.revision, effectResult: effect, commandId: 'c-finish' });
-  assert.equal(fin.binding_state, 'closed');
-
-  // archive (terminal + acked + cleaned)
-  const arch = await archiveTask(store, { taskId, expectedRevision: fin.revision, commandId: 'c-arch' });
-  assert.equal(arch.status, 'archived');
-  await h.snapshot();
-
-  return { expectedActiveAnomalies: [] };
 }
