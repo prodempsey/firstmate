@@ -114,6 +114,37 @@ cp init [--data-dir <path>] [--home-label <label>]
 Applies the core schema and seeds `home_uuid` (idempotent). `--data-dir`
 overrides the `FM_HOME`-derived location.
 
+## Cutover stage CW2 (shadow run + archived-history back-fill)
+
+CW2 (ORD-256) adds the shadow-run wiring and the archived-history back-fill on top of
+the landed S0-S8 + CW1 modules, which stay byte-identical apart from the one sanctioned
+verb registration in `lib/coordinator.mjs`. Legacy stores remain the operational
+authority until a later cutover stage; nothing here switches writer authority.
+
+- **Shadow writer** (`lib/shadow-writer.mjs`, `bin/cp-shadow.mjs`, and the repo-root
+  `bin/fm-cp-shadow.sh` hook). A fire-and-forget mirror firstmate's lifecycle chokepoints
+  invoke to write control-plane records in parallel with the legacy op. Three contracts:
+  it NEVER blocks or fails a legacy op (every error is logged to a divergence file and
+  swallowed, and the shell hook backgrounds the call); it fabricates NO runs (task filed →
+  `create-task` queued; every run-based action degrades to an audit annotation in
+  `shadow_annotations` unless a real run generation already exists, in which case it drives
+  the landed verb); and it is idempotent by deterministic command-id. The hook is INERT
+  unless `CP_SHADOW=1`; enabling and wiring it is firstmate's operational act.
+- **Divergence monitor** — `cp shadow-diff --out <path> --data-dir <store> [--home <legacy>]`.
+  Read-only. Regenerates the S8 mapper's view of the legacy stores on demand, translates it
+  through the same CW1 classification the production migration used, and reports
+  missing/mismatched/extra live tasks plus archived history that is deferred vs back-filled.
+  Applies nothing to the legacy home or the store.
+- **Archived-history back-fill** — `cp migrate-backfill --residual <cw1-residual> --data-dir
+  <store> --out <path> [--resume]`. Imports the archived-history residual CW1 deferred
+  (done-archive / superseded-generation / task-scope-archived-event records) as AUDIT-ONLY
+  rows in a distinct `archived_history` table. Live-path synthesis of the terminal-delivery/
+  ack/cleanup/archive chain is judged FORBIDDEN (spec §4/§14 + the CW1 anti-ghost rule), so
+  the import writes no task/run/event/outbox/consumer row; see `lib/migrate-backfill.mjs`
+  `BACKFILL_DECISION` for the full reasoning. Idempotent by `record_key`; input is the
+  residual FILE, so no legacy store is read. The snapshot layer can carry `archived_history`;
+  folding it into a snapshot is a later (CW3) concern, intentionally not wired into S6 here.
+
 ## Tests
 
 Colocated under `test/`, run with the Node test runner. `npm test` runs the

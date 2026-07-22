@@ -9,6 +9,7 @@ import { runArchiveVerb, ARCHIVE_VERBS } from './domain-store-archive.mjs';
 import { runS6Verb, S6_VERBS } from './coordinator-s6.mjs';
 import { runS8Verb, S8_VERBS } from './coordinator-s8.mjs';
 import { runCw1Verb, CW1_VERBS } from './coordinator-cw1.mjs';
+import { runCw2Verb, CW2_VERBS } from './coordinator-cw2.mjs';
 
 // Coordinator entrypoint skeleton (spec section 6). S0 implements exactly one
 // verb, `init`. Every other verb in the spec's command surface (create-task,
@@ -37,6 +38,7 @@ export async function runVerb(argv, { env = process.env } = {}) {
     if (S6_VERBS.has(verb)) return runS6Verb(verb, rest, { env });
     if (S8_VERBS.has(verb)) return runS8Verb(verb, rest, { env });
     if (CW1_VERBS.has(verb)) return runCw1Verb(verb, rest, { env });
+    if (CW2_VERBS.has(verb)) return runCw2Verb(verb, rest, { env });
     throw new ValidationError(
       `unknown or not-yet-implemented verb: ${verb}`,
       { s0Verbs: [...S0_VERBS] }
