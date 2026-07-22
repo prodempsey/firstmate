@@ -31,6 +31,8 @@ export async function runS8Verb(verb, rest, { env = process.env } = {}) {
     throw new ValidationError(`'migrate-report' requires --out <path>`, { verb });
   }
   const home = typeof flags.home === 'string' ? flags.home : undefined;
-  const { receipt } = runMigrateReport({ home, outPath, env });
+  const ordersPath = typeof flags['orders-path'] === 'string' ? flags['orders-path'] : undefined;
+  const bridgeHistoryPath = typeof flags['bridge-history'] === 'string' ? flags['bridge-history'] : undefined;
+  const { receipt } = runMigrateReport({ home, outPath, ordersPath, bridgeHistoryPath, env });
   return { ok: true, result: receipt };
 }
