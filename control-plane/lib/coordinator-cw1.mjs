@@ -47,6 +47,19 @@ export async function runCw1Verb(verb, rest, { env = process.env } = {}) {
   const resume = flags.resume === true;
   const orderSourcePath = typeof flags['order-source'] === 'string' ? flags['order-source'] : undefined;
 
-  const result = await runMigrateApply({ reportPath, dataDir, outPath, resume, orderSourcePath, env });
+  // --allow-residual-over <pct>: raise the ceiling on the residual fraction of mapped
+  // records the operator will accept (default DEFAULT_MAX_RESIDUAL_PCT). A bare flag or a
+  // non-numeric value is a loud error, never a silent "accept everything".
+  let allowResidualOver;
+  if ('allow-residual-over' in flags) {
+    const v = flags['allow-residual-over'];
+    const n = Number(v);
+    if (v === true || !Number.isFinite(n) || n < 0 || n > 100) {
+      throw new ValidationError(`'migrate-apply' --allow-residual-over requires a percent in [0,100]`, { verb, value: v === true ? null : v });
+    }
+    allowResidualOver = n;
+  }
+
+  const result = await runMigrateApply({ reportPath, dataDir, outPath, resume, orderSourcePath, allowResidualOver, env });
   return { ok: true, result };
 }
