@@ -22,11 +22,12 @@ import { ControlPlaneError } from '../lib/errors.mjs';
 //   failed      --task [--reason <text>] [--detail]
 //   teardown    --task [--detail]
 //   archived    --task [--detail]
+//   finalize    --task [--evidence <json>] [--detail]   (ordered complete->ack->cleanup->archive)
 //
 // Store location: --data-dir, else CP_SHADOW_DATA_DIR, else FM_HOME/state/control-plane/pgdata.
 // Divergence log: --divergence-log, else CP_SHADOW_DIVERGENCE, else <pgdata parent>/shadow-divergence.jsonl.
 
-const ACTIONS = new Set(['task-filed', 'dispatched', 'status', 'completed', 'failed', 'teardown', 'archived']);
+const ACTIONS = new Set(['task-filed', 'dispatched', 'status', 'completed', 'failed', 'teardown', 'archived', 'finalize']);
 
 function parseMaybeJson(v) {
   if (typeof v !== 'string' || v.length === 0) return undefined;
@@ -108,6 +109,9 @@ async function main() {
         break;
       case 'archived':
         outcome = await writer.archived({ taskId, detail: parseMaybeJson(flags.detail) });
+        break;
+      case 'finalize':
+        outcome = await writer.finalize({ taskId, evidence: parseMaybeJson(flags.evidence), detail: parseMaybeJson(flags.detail) });
         break;
       default:
         throw new ShadowWriteError(`unhandled action: ${action}`, { action });

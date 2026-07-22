@@ -135,7 +135,9 @@ operational authority until a later cutover stage; nothing here switches writer 
   sequence/revision so a double-mirror replays instead of conflicting. **The hook is wired
   into the real legacy chokepoints** — `bin/fm-spawn.sh` (task filed + dispatched),
   `bin/fm-pr-merge.sh` and `bin/fm-merge-local.sh` (completed), and `bin/fm-teardown.sh`
-  (teardown, plus `archived` for a ship task). `bin/fm-task-events.sh` is the terminal-outcome
+  (a ship task drives `finalize` — the single ordered, retryable operation
+  complete → ack terminal outbox → cleanup → archive — so the mirror actually reaches
+  `archived`; a non-ship task mirrors the cleanup signal only). `bin/fm-task-events.sh` is the terminal-outcome
   + status-transition chokepoint: on a SUCCESSFUL closeout it maps the committed disposition —
   `failed` → the `failed` verb, `landed` → the `completed` verb, everything else → a generic
   status transition — so a failure or archival is mirrored on exactly the terminal transition

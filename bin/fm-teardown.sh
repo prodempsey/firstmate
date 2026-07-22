@@ -1247,13 +1247,17 @@ if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only 
 fi
 echo "teardown $ID complete (window $T, worktree $WT)"
 
-# CW2 shadow-run mirror (ORD-256): teardown is the task leaving the live fleet. Mirror the
-# cleanup (teardown), and for a ship task - whose closeout above just committed the legacy
-# archive of finished work - the archive itself. Inert unless CP_SHADOW=1; backgrounded and
-# always-0, so neither can block or fail teardown.
-"$SCRIPT_DIR/fm-cp-shadow.sh" teardown --task "$ID" || true
+# CW2 shadow-run mirror (ORD-256): teardown is the task leaving the live fleet. For a ship
+# task - whose closeout above committed the legacy archive of finished work - drive the single
+# ORDERED terminal operation `finalize` (complete -> ack terminal outbox -> cleanup -> archive)
+# so the mirror actually reaches `archived`; independent fire-and-forget calls cannot, because
+# each step's precondition depends on the previous one (qa-cw2r3-q89). A non-ship task (scout/
+# secondmate) has no archive lifecycle, so it mirrors the cleanup signal only. Inert unless
+# CP_SHADOW=1; backgrounded and always-0, so neither can block or fail teardown.
 if [ "$KIND" = ship ]; then
-  "$SCRIPT_DIR/fm-cp-shadow.sh" archived --task "$ID" || true
+  "$SCRIPT_DIR/fm-cp-shadow.sh" finalize --task "$ID" || true
+else
+  "$SCRIPT_DIR/fm-cp-shadow.sh" teardown --task "$ID" || true
 fi
 backlog_refresh_reminder
 # Closeout is the highest-value triage trigger: a torn-down task can clear a blocker,

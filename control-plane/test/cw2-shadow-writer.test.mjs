@@ -346,6 +346,55 @@ test('an uninitialized store directory (no home_uuid) is a divergence', async ()
   assert.match(outcome.error, /not an initialized control-plane store|fail closed/);
 });
 
+// =====================================================================================
+// finalize: the ordered terminal operation a ship teardown drives (qa-cw2r3-q89)
+// =====================================================================================
+
+test('finalize drives the ordered chain complete->ack->cleanup->archive to `archived`', async () => {
+  const dataDir = await initStore();
+  const store = new PgliteLocalStore({ dataDir });
+  await runningTask(store, 'fin-1'); // an ordinary running generation, NOT pre-completed
+  await store.close();
+  const w = createShadowWriter({ dataDir, now: () => '1970-01-01T00:00:00.000Z' });
+  const r = await w.finalize({ taskId: 'fin-1' });
+  await w.close();
+  assert.equal(r.ok, true);
+  assert.equal(r.mode, 'verb');
+  assert.equal(r.archived, true);
+  assert.deepEqual(r.steps, ['complete', 'ack', 'cleanup', 'archive'], 'the whole ordered chain runs in one operation');
+  assert.equal((await q(dataDir, 'SELECT status FROM tasks WHERE task_id=$1', ['fin-1']))[0].status, 'archived');
+  for (const et of ['completed', 'cleaned', 'archived']) {
+    assert.equal((await q(dataDir, 'SELECT count(*)::int n FROM task_events WHERE task_id=$1 AND event_type=$2', ['fin-1', et]))[0].n, 1, `exactly one ${et} event`);
+  }
+});
+
+test('finalize is idempotent: a second finalize replays, no duplicate archived event', async () => {
+  const dataDir = await initStore();
+  const store = new PgliteLocalStore({ dataDir });
+  await runningTask(store, 'fin-2');
+  await store.close();
+  const w = createShadowWriter({ dataDir, now: () => '1970-01-01T00:00:00.000Z' });
+  await w.finalize({ taskId: 'fin-2' });
+  const r2 = await w.finalize({ taskId: 'fin-2' });
+  await w.close();
+  assert.equal(r2.ok, true);
+  assert.equal(r2.replayed, true);
+  assert.equal(r2.archived, true);
+  assert.equal((await q(dataDir, 'SELECT status FROM tasks WHERE task_id=$1', ['fin-2']))[0].status, 'archived');
+  assert.equal((await q(dataDir, "SELECT count(*)::int n FROM task_events WHERE task_id=$1 AND event_type='archived'", ['fin-2']))[0].n, 1);
+});
+
+test('finalize on a runless task is an annotation, never a fabricated run', async () => {
+  const dataDir = await initStore();
+  const w = createShadowWriter({ dataDir, now: () => '1970-01-01T00:00:00.000Z' });
+  await w.taskFiled({ taskId: 'fin-3', kind: 'ship', title: 'x' });
+  const r = await w.finalize({ taskId: 'fin-3' });
+  await w.close();
+  assert.equal(r.mode, 'annotation', 'no run generation -> annotation, not a fabricated terminal chain');
+  assert.equal(await num(dataDir, 'runs'), 0, 'zero runs');
+  assert.equal((await q(dataDir, 'SELECT status FROM tasks WHERE task_id=$1', ['fin-3']))[0].status, 'queued');
+});
+
 test('a home_uuid pin mismatch is a divergence (split-brain guard)', async () => {
   const dataDir = await initStore();
   const divergenceLog = path.join(mkTempDir('cp-cw2-pin-'), 'div.jsonl');

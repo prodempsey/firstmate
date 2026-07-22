@@ -5,6 +5,7 @@ import { PgliteLocalStore } from './pglite-local-store.mjs';
 import { createTask, appendEvent, taskHead } from './domain-store.mjs';
 import { completeRun, failRun } from './domain-store-s2.mjs';
 import { cleanupIntent, cleanupFinish } from './domain-store-s3.mjs';
+import { claimConsumer, claimDelivery, markApplied, ack } from './domain-store-s4.mjs';
 import { archiveTask } from './domain-store-archive.mjs';
 import { readOnlyQuery } from './cw1-readonly.mjs';
 import { recordAnnotation } from './cw2-annotations.mjs';
@@ -402,6 +403,106 @@ export function createShadowWriter({
           }
         }
         return annotate(s, taskId, 'archived', detail ?? null, payloadHash({ detail }));
+      });
+    },
+
+    // finalize: the ORDERED, RETRYABLE terminal shadow operation a ship teardown invokes
+    // (ORD-256, qa-cw2r3-q89 finding 1). Reaching `archived` requires a chain whose steps
+    // depend on one another - a terminal run, its outbox delivery ACKNOWLEDGED, cleanup
+    // `cleaned`, then archive - and independent fire-and-forget calls cannot order that (the
+    // race is exactly why the real teardown left the task `completed`). This drives the whole
+    // chain in ONE process, in order, each step idempotent by deterministic command-id (so a
+    // second teardown replays), and WHERE APPLICABLE: with no real generation it degrades to a
+    // single annotation, never fabricating a run. It speaks the firstmate consumer's own ack -
+    // firstmate has by definition observed the terminal before tearing the task down.
+    async finalize({ taskId, evidence, detail } = {}) {
+      return mirror('finalize', taskId, async (s) => {
+        let head = await readHead(s, taskId);
+        const gen = head ? head.current_generation : 0;
+        if (!head || gen < 1) {
+          return annotate(s, taskId, 'finalize', detail ?? null, payloadHash({ detail }));
+        }
+        const steps = [];
+
+        // 1. Complete the run if it is still running (idempotent; a concurrent `completed`
+        // mirror that already committed is replayed, not double-applied).
+        const run0 = await readRun(s, taskId, gen);
+        if (run0 && run0.closed_at === null && head.status === 'running') {
+          const completeId = `${CMD_PREFIX}:complete:${taskId}:${gen}`;
+          if (!(await readCommandResult(s, completeId))) {
+            const seq = await nextSeq(s, taskId, gen, actor);
+            await completeRun(s, {
+              taskId, generation: gen, expectedRevision: head.revision, outcome: 'success',
+              producer: actor, seq, evidence: evidence ?? { shadow: true }, commandId: completeId
+            });
+          }
+          head = await readHead(s, taskId);
+          steps.push('complete');
+        }
+
+        // 2. Acknowledge the terminal outbox row (the archive prerequisite). Only when a
+        // terminal outbox exists and is still UNACKED; the whole consumer chain uses stable
+        // command-ids so a retry replays.
+        const term = await readOnlyQuery(
+          s,
+          `SELECT outbox_id, event_id, acked_at FROM outbox
+             WHERE task_id = $1 AND event_type IN ('completed','failed') ORDER BY outbox_id LIMIT 1`,
+          [taskId]
+        );
+        if (term.length > 0 && term[0].acked_at === null) {
+          const outboxId = Number(term[0].outbox_id);
+          const eventId = term[0].event_id;
+          const lease = await claimConsumer(s, { bootId: 'cp-shadow', pid: 0, commandId: `${CMD_PREFIX}:claim:${taskId}` });
+          await claimDelivery(s, {
+            outboxId, ownerToken: lease.owner_token, ownerEpoch: lease.owner_epoch,
+            sinkKind: 'disposition', commandId: `${CMD_PREFIX}:claim-delivery:${taskId}:${gen}`
+          });
+          await markApplied(s, {
+            eventId, ownerToken: lease.owner_token, ownerEpoch: lease.owner_epoch,
+            sinkResult: { ok: true, event_id: eventId, shadow: true }, commandId: `${CMD_PREFIX}:mark-applied:${taskId}:${gen}`
+          });
+          await ack(s, {
+            outboxId, ownerToken: lease.owner_token, ownerEpoch: lease.owner_epoch,
+            commandId: `${CMD_PREFIX}:ack:${taskId}:${gen}`
+          });
+          steps.push('ack');
+        }
+
+        // 3. Cleanup the terminal generation (idempotent). Needed for the archive `cleaned`
+        // precondition; the shadow effect confirms the (already-gone) pane absent.
+        const run1 = await readRun(s, taskId, gen);
+        if (run1 && (run1.status === 'completed' || run1.status === 'failed') && run1.cleanup_state !== 'cleaned') {
+          const finishId = `${CMD_PREFIX}:cleanup-finish:${taskId}:${gen}`;
+          if (!(await readCommandResult(s, finishId))) {
+            head = await readHead(s, taskId);
+            const intent = await cleanupIntent(s, {
+              taskId, generation: gen, expectedRevision: head.revision,
+              commandId: `${CMD_PREFIX}:cleanup-intent:${taskId}:${gen}`
+            });
+            await cleanupFinish(s, {
+              taskId, generation: gen, expectedRevision: intent.revision,
+              effectResult: { confirmed_absent: true, shadow: true }, commandId: finishId
+            });
+          }
+          steps.push('cleanup');
+        }
+
+        // 4. Archive (idempotent). The store enforces terminal + acked + cleaned; by here all
+        // three hold for a normal ship closeout, so this reaches `archived`.
+        const archiveId = `${CMD_PREFIX}:archive:${taskId}`;
+        const archivePrior = await readCommandResult(s, archiveId);
+        if (archivePrior) {
+          return { mode: 'verb', verb: 'finalize', steps, archived: true, replayed: true, result: archivePrior };
+        }
+        head = await readHead(s, taskId);
+        if (head.status === 'completed' || head.status === 'failed') {
+          const result = await archiveTask(s, { taskId, expectedRevision: head.revision, commandId: archiveId });
+          steps.push('archive');
+          return { mode: 'verb', verb: 'finalize', steps, archived: true, result };
+        }
+        // Preconditions not reachable (e.g. a never-completed generation): record the partial
+        // chain honestly rather than force an illegal archive.
+        return { mode: 'verb', verb: 'finalize', steps, archived: false };
       });
     },
 
