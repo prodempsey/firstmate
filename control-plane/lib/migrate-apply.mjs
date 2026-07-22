@@ -25,8 +25,8 @@ import { MigrateApplyError, MigrateReconcileError } from './errors-cw1.mjs';
 //    active backlog is current and its historical archive rows fall through to superseded
 //    residuals. Events order by a NUMERIC ordinal (the `#L<n>` line number, or a lifecycle
 //    timestamp), never by a lexical source_ref, so `#L10` no longer sorts before `#L2`. A
-//    completeness GATE (same class as totality/ceiling) fails the run if any live In flight /
-//    Queued backlog task ends fully residual.
+//    completeness GATE (same class as totality/ceiling) fails the run if ANY live backlog task
+//    - In flight, Queued, OR Done-unarchived - ends fully residual.
 //
 //  * NO FABRICATED RUNS FOR CURRENT WORK (finding 4 / ruling Q1b). A migrated run has NO live
 //    endpoint, so a currently in-flight task materializes as QUEUED with NO run row - the
@@ -609,13 +609,16 @@ export async function runMigrateApply({
     // Finding 1: verify applied records against COMMITTED store state; downgrade mismatches.
     const downgraded = await verifyAppliedAgainstStore(store, dispoBySource);
 
-    // F2 COMPLETENESS GATE: a task with LIVE-BACKLOG In flight/Queued membership is current
-    // operational work and MUST be materialized (at least one of its records applied). If any
-    // such task ends fully residual, that is a hard failure in the same class as the
-    // totality/ceiling gates - current live work must never silently drop into the residual.
+    // F2 COMPLETENESS GATE: a task with ANY LIVE-BACKLOG membership is current operational
+    // work and MUST be materialized (at least one of its records applied). Live membership is
+    // ALL current backlog sections - In flight (running), Queued (queued), AND Done-unarchived
+    // (completed) - defined once here as `t.liveBacklog.size > 0` so the gate can never restate
+    // a narrower subset than the assembler/classifier (qa-cw1r4-q85 finding 1: a fully residual
+    // Done-unarchived task must not slip through). If any such task ends fully residual, that
+    // is a hard failure in the same class as the totality/ceiling gates.
     const liveSurfaceViolations = [];
     for (const t of orderedTasks) {
-      if (!(t.liveBacklog.has('running') || t.liveBacklog.has('queued'))) continue;
+      if (t.liveBacklog.size === 0) continue;
       const anyApplied = t.records.some((p) => { const v = dispoBySource.get(p.source_ref); return v && v.applied; });
       if (!anyApplied) liveSurfaceViolations.push(t.taskId);
     }

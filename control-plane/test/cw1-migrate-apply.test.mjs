@@ -212,23 +212,40 @@ test('F2: a task on the live backlog AND in done-archive is materialized (live w
   assert.equal(residual.applied.some((a) => a.source_ref === 'bk#react'), true);
 });
 
-test('F2 completeness GATE: a live In flight/Queued backlog task that ends fully residual is a HARD failure', async () => {
+// The gate covers EVERY current backlog section; this runs the identical fully-residual
+// scenario across In flight, Queued, AND Done-unarchived so the Done predicate cannot regress.
+for (const [label, section] of [['In flight', 'In flight'], ['Queued', 'Queued'], ['Done-unarchived', 'Done']]) {
+  test(`F2 completeness GATE: a fully-residual live ${label} backlog task is a HARD failure`, async () => {
+    const dataDir = await initStore();
+    const out = path.join(mkTempDir('o-'), 'r.json');
+    // `gate-nokind` is on the live backlog (this section) but has no resolvable kind -> fully
+    // residual -> the live-surface gate must fail the whole run (same class as totality/ceiling).
+    // One good applied task + explicit ceiling 100 + exact totality isolate the gate predicate.
+    const report = makeReport([
+      md('backlog', 'bk#gnk', [trow({ task_id: 'gate-nokind', title: 'GNK', status: section === 'In flight' ? 'running' : section === 'Queued' ? 'queued' : 'completed' })], { line: '- [x] gate-nokind - GNK', section }),
+      md('state-meta', 'state/ok.meta', [trow({ task_id: 'ok', kind: 'ship' })], { kind: 'ship' }),
+      md('backlog', 'bk#ok', [trow({ task_id: 'ok', title: 'OK', status: 'queued' })], { line: '- [ ] ok - OK (kind: ship)', section: 'Queued' })
+    ]);
+    await assert.rejects(
+      runMigrateApply({ reportPath: writeJson(report), dataDir, outPath: out, allowResidualOver: 100, env: {} }),
+      (e) => e instanceof MigrateReconcileError
+    );
+    const residual = JSON.parse(fs.readFileSync(out, 'utf8'));
+    assert.equal(residual.reconciliation.live_surface_complete, false);
+    assert.deepEqual(residual.reconciliation.live_surface_violations, ['gate-nokind']);
+  });
+}
+
+test('F2: a Done-unarchived backlog task lands completed (never silently residual)', async () => {
   const dataDir = await initStore();
   const out = path.join(mkTempDir('o-'), 'r.json');
-  // `nokind` is on the live In-flight backlog but has no resolvable kind -> fully residual ->
-  // the live-surface gate must fail the whole run (same class as totality/ceiling).
   const report = makeReport([
-    md('backlog', 'bk#nokind', [trow({ task_id: 'nokind', title: 'NK', status: 'running' })], { line: '- [ ] nokind - NK', section: 'In flight' }),
-    md('state-meta', 'state/ok.meta', [trow({ task_id: 'ok', kind: 'ship' })], { kind: 'ship' }),
-    md('backlog', 'bk#ok', [trow({ task_id: 'ok', title: 'OK', status: 'queued' })], { line: '- [ ] ok - OK (kind: ship)', section: 'Queued' })
+    md('backlog', 'bk#dn', [trow({ task_id: 'dn', title: 'Done task', status: 'completed' })], { line: '- [x] dn - Done task (kind: ship)', section: 'Done' })
   ]);
-  await assert.rejects(
-    runMigrateApply({ reportPath: writeJson(report), dataDir, outPath: out, allowResidualOver: 95, env: {} }),
-    (e) => e instanceof MigrateReconcileError
-  );
-  const residual = JSON.parse(fs.readFileSync(out, 'utf8'));
-  assert.equal(residual.reconciliation.live_surface_complete, false);
-  assert.deepEqual(residual.reconciliation.live_surface_violations, ['nokind']);
+  const receipt = await runMigrateApply({ reportPath: writeJson(report), dataDir, outPath: out, allowResidualOver: 60, env: {} });
+  assert.equal(await taskStatus(dataDir, 'dn'), 'completed');
+  assert.equal(receipt.reconciliation.live_surface_complete, true);
+  assert.deepEqual(receipt.reconciliation.live_surface_violations, []);
 });
 
 test('statusConsistent: a migrated in-flight (running) task lands queued; archived/terminal mismatch caught', () => {
