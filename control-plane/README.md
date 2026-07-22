@@ -134,10 +134,15 @@ operational authority until a later cutover stage; nothing here switches writer 
   by deterministic command-id, resolving the prior command result BEFORE deriving any mutable
   sequence/revision so a double-mirror replays instead of conflicting. **The hook is wired
   into the real legacy chokepoints** — `bin/fm-spawn.sh` (task filed + dispatched),
-  `bin/fm-pr-merge.sh` and `bin/fm-merge-local.sh` (completed), `bin/fm-teardown.sh`
-  (teardown), and `bin/fm-task-events.sh` (status transitions) — as inert, unconditional
-  calls. It is INERT unless `CP_SHADOW=1` (the gate lives inside the wrapper), so enabling the
-  shadow run in a runtime home is ONE env var, not a code change.
+  `bin/fm-pr-merge.sh` and `bin/fm-merge-local.sh` (completed), and `bin/fm-teardown.sh`
+  (teardown, plus `archived` for a ship task). `bin/fm-task-events.sh` is the terminal-outcome
+  + status-transition chokepoint: on a SUCCESSFUL closeout it maps the committed disposition —
+  `failed` → the `failed` verb, `landed` → the `completed` verb, everything else → a generic
+  status transition — so a failure or archival is mirrored on exactly the terminal transition
+  it names, not left as an annotation. All calls are inert, unconditional, and `|| true`. The
+  hook is INERT unless `CP_SHADOW=1` (the gate lives inside the wrapper), so enabling the
+  shadow run in a runtime home is ONE env var, not a code change. Actual-shell coverage of the
+  full wired matrix lives in `tests/fm-cp-shadow-wiring.test.sh`.
 - **Divergence monitor** — `cp shadow-diff --out <path> --data-dir <store> [--home <legacy>]`.
   Read-only. Regenerates the S8 mapper's view of the legacy stores on demand, translates it
   through the same CW1 classification the production migration used, and reports

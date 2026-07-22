@@ -84,10 +84,19 @@ terminal_record_has_valid_evidence() {
 ID=$1 DISPOSITION=$2 OUTCOME=$3 BRANCH=$4 MODE=$5 EVIDENCE=$6
 
 # CW2 shadow-run mirror (ORD-256): every durable task lifecycle event flows through here, so
-# this is the status-transition chokepoint. Mirror the disposition into the control-plane
-# store, inert unless CP_SHADOW=1; backgrounded and always-0, so it can never block or fail
-# the closure-evidence write below.
-"$SCRIPT_DIR/fm-cp-shadow.sh" status --task "$ID" --status "$DISPOSITION" --detail "$OUTCOME" || true
+# this is the TERMINAL-OUTCOME + status-transition chokepoint. Map the COMMITTED legacy
+# disposition to the matching control-plane action - a `failed` closeout must drive the
+# `failed` verb (not a status annotation), and a `landed` closeout is the task's completion;
+# every other disposition is a generic status transition. Fired only on a SUCCESSFUL close
+# below (the committed outcome), never on a refused closeout. Inert unless CP_SHADOW=1;
+# backgrounded and always-0, so it can never block or fail the closure-evidence write.
+shadow_mirror_disposition() {
+  case "$DISPOSITION" in
+    failed) "$SCRIPT_DIR/fm-cp-shadow.sh" failed --task "$ID" --reason "$OUTCOME" || true ;;
+    landed) "$SCRIPT_DIR/fm-cp-shadow.sh" completed --task "$ID" --detail "$OUTCOME" || true ;;
+    *)      "$SCRIPT_DIR/fm-cp-shadow.sh" status --task "$ID" --status "$DISPOSITION" --detail "$OUTCOME" || true ;;
+  esac
+}
 CLI=$(visibility_cli) || { echo "blocked: fleet-bridge visibility CLI not found" >&2; exit 1; }
 
 META="$STATE/$ID.meta"
@@ -100,6 +109,7 @@ if [ "$MODE" = scout-report ]; then CLOSE_ARGS+=(--report "$EVIDENCE"); else CLO
 
 if out=$(close_task 2>&1); then
   printf '%s\n' "$out"
+  shadow_mirror_disposition
   exit 0
 fi
 
@@ -115,12 +125,14 @@ case $out in
     fi
     if out=$(close_task 2>&1); then
       printf '%s\n' "$out"
+      shadow_mirror_disposition
       exit 0
     fi
     ;;
   *"terminal task cannot accept"*)
     if terminal_record_has_valid_evidence; then
       echo "already closed: $HOME_NAME/$ID has a terminal TaskRecord with valid closure evidence" >&2
+      shadow_mirror_disposition
       exit 0
     fi
     printf '%s\n' "$out" >&2
