@@ -19,20 +19,22 @@ import { MigrateApplyError, MigrateReconcileError } from './errors-cw1.mjs';
 //
 // Design, and the round-2 QA (qa-cw1r2-q83) corrections it encodes:
 //
-//  * CURRENT STATE, NOT HISTORY (finding 2). A task lands at its ACTUAL current state,
-//    derived from the authoritative current signal (backlog section, else the LAST
-//    chronological status line), never from the mere existence of a historical terminal.
-//    Events are ordered by a NUMERIC ordinal (the `#L<n>` line number, or a lifecycle
-//    timestamp), never by a lexical source_ref, so `#L10` no longer sorts before `#L2`.
-//    A task whose history passes through `done` then continues (rework) lands at its
-//    later state, and the superseded historical terminal is an explicit residual.
+//  * CURRENT STATE, NOT HISTORY (finding 2 / ruling Q2). A task lands at its ACTUAL current
+//    state. LIVE backlog membership (store=backlog In flight/Queued/Done) is authoritative and
+//    WINS over any done-archive source for the same task_id, so a task that has RETURNED to the
+//    active backlog is current and its historical archive rows fall through to superseded
+//    residuals. Events order by a NUMERIC ordinal (the `#L<n>` line number, or a lifecycle
+//    timestamp), never by a lexical source_ref, so `#L10` no longer sorts before `#L2`. A
+//    completeness GATE (same class as totality/ceiling) fails the run if any live In flight /
+//    Queued backlog task ends fully residual.
 //
-//  * HONEST BINDINGS (finding 4). A migrated run has NO live endpoint, so a currently
-//    running task lands as `spawning` (binding unverified) via begin-run - it is NEVER
-//    promoted to `bound_verified`, which `cp verify-running` would immediately disprove.
-//    The S5 reconciler settles these runs post-migration. A terminal (completed/failed)
-//    task's run ends CLOSED, so it may pass transiently through the verified promotion
-//    with a synthesized identity; no live binding lie persists.
+//  * NO FABRICATED RUNS FOR CURRENT WORK (finding 4 / ruling Q1b). A migrated run has NO live
+//    endpoint, so a currently in-flight task materializes as QUEUED with NO run row - the
+//    was-in-flight/worktree fact rides the internalReason metadata channel, never a run.
+//    Because a queued task is not a reconcile candidate (snapshotCandidates selects only
+//    spawning/open/cleanup_pending), elapsed migration time can never terminal-fail imported
+//    live work. Only a genuinely terminal (completed/failed) task materializes a run, and its
+//    run ends CLOSED - no live binding is ever asserted for imported work.
 //
 //  * TRUTHFUL COUNTS (finding 1). Archive-shaped records prescribe an `archived` state
 //    that needs an acked terminal delivery + finished cleanup saga (S4/S3 live path); CW1
@@ -197,7 +199,8 @@ export function assembleTasks(report) {
     if (!t) {
       t = {
         taskId: p.taskId, records: [], kinds: new Set(), titles: new Set(), repos: new Set(),
-        orderRefs: new Set(), backlogStatuses: new Set(), stores: new Set(), hasLiveMeta: false, hasWorktree: false,
+        orderRefs: new Set(), backlogStatuses: new Set(), liveBacklog: new Set(), hasArchivedBacklog: false,
+        stores: new Set(), hasLiveMeta: false, hasWorktree: false,
         runRecords: [], eventRecords: [], taskRecords: []
       };
       tasks.set(p.taskId, t);
@@ -212,6 +215,13 @@ export function assembleTasks(report) {
       if (typeof f.repo === 'string' && f.repo.length > 0) t.repos.add(f.repo);
       if (typeof f.order_ref === 'string' && f.order_ref.length > 0) t.orderRefs.add(f.order_ref);
       if (typeof f.status === 'string' && f.status.length > 0) t.backlogStatuses.add(f.status);
+    }
+    // LIVE backlog membership is store=backlog ONLY (a task's presence on the current
+    // In flight / Queued / Done backlog). A done-archive source is NOT live membership.
+    if (d.store === 'backlog' && p.taskRow && typeof p.taskRow.fields.status === 'string') {
+      const st = p.taskRow.fields.status;
+      if (st === 'running' || st === 'queued' || st === 'completed') t.liveBacklog.add(st);
+      else if (st === 'archived') t.hasArchivedBacklog = true;
     }
     const h = harvestFromSource(d);
     if (h.kind) t.kinds.add(h.kind);
@@ -248,10 +258,15 @@ const EVENT_TO_STATE = { progress: 'running', blocked: 'running', needs_human: '
 // done-archive record) is authoritative; absent that, the LAST chronological run-scope
 // status line; absent that, the last run's outcome; a bare live meta is in-flight.
 export function deriveCurrentState(t) {
-  if (t.backlogStatuses.has('archived') || t.stores.has('done-archive')) return 'archived';
-  if (t.backlogStatuses.has('running')) return 'running';
-  if (t.backlogStatuses.has('queued')) return 'queued';
-  if (t.backlogStatuses.has('completed')) return 'completed';
+  // F2 (ruling Q2): LIVE backlog membership (store=backlog In flight/Queued/Done) WINS over
+  // any done-archive/archived source for the same task_id. A task that has RETURNED to the
+  // active backlog is current; its historical archive rows fall through to superseded-history
+  // residuals. Archived is a last-resort classification ONLY when no live-backlog membership
+  // exists.
+  if (t.liveBacklog.has('running')) return 'running';
+  if (t.liveBacklog.has('queued')) return 'queued';
+  if (t.liveBacklog.has('completed')) return 'completed';
+  if (t.stores.has('done-archive') || t.hasArchivedBacklog) return 'archived';
   const runEvents = t.eventRecords.filter((p) => p.eventRow.fields.event_scope === 'run').sort((a, b) => a.ordinal - b.ordinal);
   if (runEvents.length > 0) {
     const last = runEvents[runEvents.length - 1].eventRow.fields.event_type;
@@ -338,16 +353,24 @@ async function materializeTask(store, t, ctx) {
 
   const current = deriveCurrentState(t);
   if (current === 'archived') {
-    flagAll('archived/finished task: the terminal-delivery + ack + cleanup + archive chain is a later cutover stage; not materialized into the live control plane in CW1');
+    flagAll('archived/finished task with no live-backlog membership: the terminal-delivery + ack + cleanup + archive chain is deferred to the named CW2 archive back-fill stage; not materialized into the live control plane in CW1');
     return dispo;
   }
 
-  // 1. create-task.
+  // 1. create-task. F1 (ruling Q1b): a current-running task with no captured live endpoint
+  // materializes as QUEUED with NO run row - a queued task is not a reconcile candidate
+  // (snapshotCandidates selects only spawning/open/cleanup_pending), so elapsed migration
+  // time can never terminal-fail it. The was-in-flight/worktree fact rides the internalReason
+  // metadata channel (internal origin only), NEVER a fabricated run.
   const owner = createOwner(t);
   const ownerKey = owner ? cmdId('create-task', owner.key) : cmdId('create-task', recordKey({ source_ref: t.taskId, source: { digest: t.taskId } }));
+  let internalReason = t.internalReason;
+  if (current === 'running' && t.origin === 'internal') {
+    internalReason = `${t.internalReason}; migrated in-flight backlog task${t.hasWorktree ? ' (worktree present)' : ''} materialized queued for re-dispatch - no live endpoint captured`;
+  }
   let rev;
   try {
-    const r = await createTask(store, { taskId: t.taskId, kind: t.kind, title: t.title, repo: t.repo, origin: t.origin, orderRef: t.orderRef, internalReason: t.internalReason, commandId: ownerKey });
+    const r = await createTask(store, { taskId: t.taskId, kind: t.kind, title: t.title, repo: t.repo, origin: t.origin, orderRef: t.orderRef, internalReason, commandId: ownerKey });
     rev = r.revision;
     ctx.counters.tasksCreated += 1;
     for (const p of t.records) {
@@ -363,8 +386,12 @@ async function materializeTask(store, t, ctx) {
     }
   }
 
-  if (current === 'queued') {
-    for (const p of t.records) if (!dispo.has(p.source_ref)) set(p.source_ref, { applied: false, reason: 'task is currently queued; run/event history not materialized for a queued task' });
+  // F1: a queued task, AND a migrated in-flight task, both land queued with NO run row.
+  if (current === 'queued' || current === 'running') {
+    const note = current === 'running'
+      ? 'migrated in-flight backlog task materialized queued (no live endpoint captured); its run/event history is not replayed as a live run in CW1 - retained for CW2 re-dispatch/back-fill'
+      : 'task is currently queued; run/event history not materialized for a queued task';
+    for (const p of t.records) if (!dispo.has(p.source_ref)) set(p.source_ref, { applied: false, reason: note });
     return dispo;
   }
 
@@ -444,7 +471,7 @@ async function materializeTask(store, t, ctx) {
     const st = p.runRow.fields.status;
     if ((st === undefined || st === 'open') && current === 'running') set(p.source_ref, { applied: true, verb: 'begin-run(unverified)' });
     else if (st === current && terminalApplied) set(p.source_ref, { applied: true, verb: 'terminal(collapsed)' });
-    else set(p.source_ref, { applied: false, reason: 'historical/additional run generation superseded by the current state; not materialized in the CW1 single-generation migration' });
+    else set(p.source_ref, { applied: false, reason: 'historical/additional run generation superseded by the current state (single-generation collapse); retained for CW2 history back-fill' });
   }
   for (const p of t.eventRecords) {
     if (dispo.has(p.source_ref)) continue;
@@ -466,7 +493,9 @@ async function materializeTask(store, t, ctx) {
 export function statusConsistent(prescribed, actual) {
   if (!prescribed) return true;
   if (prescribed === actual) return true;
-  if (prescribed === 'running') return ['spawning', 'running', 'blocked', 'needs_human', 'waiting_firstmate'].includes(actual);
+  // A migrated in-flight ('running') backlog task lands 'queued' (F1: no fabricated run), and
+  // the spawning/in-flight family is also acceptable, so all count as consistent.
+  if (prescribed === 'running') return ['queued', 'spawning', 'running', 'blocked', 'needs_human', 'waiting_firstmate'].includes(actual);
   return false;
 }
 
@@ -580,6 +609,17 @@ export async function runMigrateApply({
     // Finding 1: verify applied records against COMMITTED store state; downgrade mismatches.
     const downgraded = await verifyAppliedAgainstStore(store, dispoBySource);
 
+    // F2 COMPLETENESS GATE: a task with LIVE-BACKLOG In flight/Queued membership is current
+    // operational work and MUST be materialized (at least one of its records applied). If any
+    // such task ends fully residual, that is a hard failure in the same class as the
+    // totality/ceiling gates - current live work must never silently drop into the residual.
+    const liveSurfaceViolations = [];
+    for (const t of orderedTasks) {
+      if (!(t.liveBacklog.has('running') || t.liveBacklog.has('queued'))) continue;
+      const anyApplied = t.records.some((p) => { const v = dispoBySource.get(p.source_ref); return v && v.applied; });
+      if (!anyApplied) liveSurfaceViolations.push(t.taskId);
+    }
+
     // Build the applied receipt (new vs replayed per SOURCE record) and the residual.
     const executorFlagged = [];
     const appliedRecords = [];
@@ -625,13 +665,15 @@ export async function runMigrateApply({
       totality_holds: totalityHolds,
       applied_nonzero: appliedRecords.length > 0,
       residual_within_ceiling: residualOfMapped <= allowResidualOver,
+      live_surface_complete: liveSurfaceViolations.length === 0,
+      live_surface_violations: liveSurfaceViolations,
       store_counts: counts,
       materialized: ctx.counters,
       counts_coherent: countsCoherent,
       snapshot_ok: snapshotOk,
       snapshot_revision: snapshotRevision,
       snapshot_error: snapshotError,
-      ok: totalityHolds && appliedRecords.length > 0 && residualOfMapped <= allowResidualOver && countsCoherent && snapshotOk
+      ok: totalityHolds && appliedRecords.length > 0 && residualOfMapped <= allowResidualOver && countsCoherent && snapshotOk && liveSurfaceViolations.length === 0
     };
 
     const body = buildResidualReport({ report, reportPath, dataDir, resumed: resume, appliedRecords, residual, reconciliation });

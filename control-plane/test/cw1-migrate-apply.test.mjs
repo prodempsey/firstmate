@@ -9,7 +9,7 @@ import { runVerb } from '../lib/coordinator.mjs';
 import { PgliteLocalStore } from '../lib/pglite-local-store.mjs';
 import { runExclusive } from '../lib/internal-runtime.mjs';
 import { createTask } from '../lib/domain-store.mjs';
-import { verifyRunning } from '../lib/domain-store-s3.mjs';
+import { reconcilePass } from '../lib/reconciler.mjs';
 import {
   runMigrateApply, loadReport, assembleTasks, deriveCurrentState, ordinalOf,
   statusConsistent, recordKey, RESIDUAL_SCHEMA
@@ -110,43 +110,73 @@ test('ordinalOf reads the numeric #L line number, not the lexical ref', () => {
   assert.equal(ordinalOf({ source_ref: 'x#L10', source: {} }) > ordinalOf({ source_ref: 'x#L2', source: {} }), true, 'L10 orders AFTER L2 (numeric, not lexical)');
 });
 
-test('deriveCurrentState uses the authoritative current signal, not any historical terminal', () => {
+test('deriveCurrentState uses the authoritative current signal; LIVE backlog WINS over archive', () => {
   const tasks = assembleTasks(mixedReport());
   assert.equal(deriveCurrentState(tasks.get('live')), 'running');   // In flight despite a historical done line
   assert.equal(deriveCurrentState(tasks.get('done')), 'completed');
   assert.equal(deriveCurrentState(tasks.get('fail')), 'failed');
   assert.equal(deriveCurrentState(tasks.get('q')), 'queued');
   assert.equal(deriveCurrentState(tasks.get('old')), 'archived');
+  // F2: a task on the live backlog AND in done-archive is current, not archived.
+  const react = assembleTasks(makeReport([
+    md('done-archive', 'arch#r', [trow({ task_id: 'r', title: 'R', status: 'archived' })], { line: '- [x] r - R (kind: ship)', section: 'Archived' }),
+    md('backlog', 'bk#r', [trow({ task_id: 'r', title: 'R', status: 'queued' })], { line: '- [ ] r - R (kind: ship)', section: 'Queued' })
+  ])).get('r');
+  assert.equal(deriveCurrentState(react), 'queued');
 });
 
 test('a historical terminal followed by later activity lands at the LATER state, terminal residualized', async () => {
   const dataDir = await initStore();
   const out = path.join(mkTempDir('o-'), 'r.json');
   await runMigrateApply({ reportPath: writeJson(mixedReport()), dataDir, outPath: out, allowResidualOver: 60, env: {} });
-  // live is currently in-flight -> lands spawning (NOT completed from its historical done line).
-  assert.equal(await taskStatus(dataDir, 'live'), 'spawning');
+  // live is currently in-flight -> lands queued (NOT completed from its historical done line).
+  assert.equal(await taskStatus(dataDir, 'live'), 'queued');
   const residual = JSON.parse(fs.readFileSync(out, 'utf8'));
   const byRef = Object.fromEntries(residual.residual.map((r) => [r.source_ref, r]));
-  assert.match(byRef['state/live.status#L2'].reason, /historical terminal superseded/);
+  assert.ok(/superseded|CW2/.test(byRef['state/live.status#L2'].reason));
 });
 
 // =====================================================================================
-// Finding 4: honest bindings
+// Finding 4 / ruling Q1b: no fabricated runs for current work
 // =====================================================================================
 
-test('a migrated running task lands spawning/unverified and FAILS cp verify-running', async () => {
+test('a migrated in-flight task materializes QUEUED with NO run row (not a reconcile candidate)', async () => {
   const dataDir = await initStore();
   await runMigrateApply({ reportPath: writeJson(mixedReport()), dataDir, outPath: path.join(mkTempDir('o-'), 'r.json'), allowResidualOver: 60, env: {} });
-  assert.equal(await taskStatus(dataDir, 'live'), 'spawning');
+  assert.equal(await taskStatus(dataDir, 'live'), 'queued');
+  // The in-flight task has NO run, so nothing for the reconciler to time out.
+  const liveRuns = Number((await q(dataDir, "SELECT count(*)::int n FROM runs r JOIN tasks t ON t.task_id=r.task_id WHERE t.task_id='live'"))[0].n);
+  assert.equal(liveRuns, 0);
+  // No migrated run is ever bound_verified/open.
+  const bad = Number((await q(dataDir, "SELECT count(*)::int n FROM runs WHERE binding_state='bound_verified' AND status='open'"))[0].n);
+  assert.equal(bad, 0);
+});
+
+test('F1 regression: a real cp reconcile after the launch window elapsed causes ZERO migrated-current terminal failures', async () => {
+  const dataDir = await initStore();
+  // Many in-flight tasks (each would have terminal-failed via an expired spawning deadline
+  // under the old run-fabricating path) plus a completed and a failed task.
+  const dispositions = [];
+  for (let i = 0; i < 8; i += 1) dispositions.push(md('backlog', `bk#f${i}`, [trow({ task_id: `f${i}`, title: `F${i}`, status: 'running' })], { line: `- [ ] f${i} - F (kind: ship)`, section: 'In flight' }));
+  dispositions.push(md('backlog', 'bk#dn', [trow({ task_id: 'dn', title: 'D', status: 'completed' })], { line: '- [x] dn - D (kind: ship)', section: 'Done' }));
+  dispositions.push(md('task-runs', 'trn#fl', [rrow('fl', 'failed')], { task: 'fl', kind: 'scout' }));
+  await runMigrateApply({ reportPath: writeJson(makeReport(dispositions)), dataDir, outPath: path.join(mkTempDir('o-'), 'r.json'), allowResidualOver: 95, env: {} });
+
+  const before = await q(dataDir, "SELECT count(*)::int n FROM tasks WHERE status='failed'");
   const store = new PgliteLocalStore({ dataDir });
   try {
-    const vr = await verifyRunning(store, { taskId: 'live', generation: 1 });
-    assert.equal(vr.running_verified, false, 'a migrated run is NOT verified-running');
-    assert.equal(vr.binding_state, 'spawning', 'it rests unverified for the reconciler, never bound_verified');
-    // No run in the store claims a verified-open live binding.
-    const bad = await readOnlyQuery(store, "SELECT count(*)::int n FROM runs WHERE binding_state = 'bound_verified' AND status = 'open'");
-    assert.equal(Number(bad[0].n), 0, 'no migrated run asserts a live bound_verified binding');
+    // A REAL reconcile pass with the deadline clock far past the launch window; injected
+    // probes stand in for the (absent) live endpoints a production reconcile would also miss.
+    await reconcilePass(store, {
+      now: '2099-01-01T00:00:00.000Z', deadlineNow: '2099-01-01T00:00:00.000Z', nonce: 'cw1-f1-regression',
+      probeIdentity: () => ({ matches: false, failingClause: 'migrated', anomalyClass: 'identity_mismatch' }),
+      cleanupProbe: () => ({ present: false, matches: false, reason: 'absent' })
+    });
   } finally { await store.close(); }
+  const after = await q(dataDir, "SELECT count(*)::int n FROM tasks WHERE status='failed'");
+  assert.equal(Number(after[0].n) - Number(before[0].n), 0, 'reconcile fabricated ZERO terminal failures on migrated current work');
+  // The eight in-flight tasks are still queued, untouched by the reconciler.
+  for (let i = 0; i < 8; i += 1) assert.equal(await taskStatus(dataDir, `f${i}`), 'queued');
 });
 
 // =====================================================================================
@@ -167,12 +197,46 @@ test('archived tasks are RESIDUALIZED, never created and never counted applied',
   assert.equal(residual.applied.some((a) => a.source_ref === 'arch#old'), false, 'archive record is NOT in applied');
 });
 
-test('statusConsistent: running family tolerated for a migrated in-flight task; archived mismatch caught', () => {
+test('F2: a task on the live backlog AND in done-archive is materialized (live wins), not residualized as archived', async () => {
+  const dataDir = await initStore();
+  const out = path.join(mkTempDir('o-'), 'r.json');
+  const report = makeReport([
+    md('done-archive', 'arch#react', [trow({ task_id: 'react', title: 'R', status: 'archived' })], { line: '- [x] react - R (kind: ship)', section: 'Archived' }),
+    md('backlog', 'bk#react', [trow({ task_id: 'react', title: 'R', status: 'queued' })], { line: '- [ ] react - R (kind: ship)', section: 'Queued' })
+  ]);
+  const receipt = await runMigrateApply({ reportPath: writeJson(report), dataDir, outPath: out, allowResidualOver: 90, env: {} });
+  assert.equal(await taskStatus(dataDir, 'react'), 'queued', 'reactivated task is current, not archived');
+  assert.equal(receipt.reconciliation.live_surface_complete, true);
+  // The live backlog record is applied; the historical archive duplicate is a superseded residual.
+  const residual = JSON.parse(fs.readFileSync(out, 'utf8'));
+  assert.equal(residual.applied.some((a) => a.source_ref === 'bk#react'), true);
+});
+
+test('F2 completeness GATE: a live In flight/Queued backlog task that ends fully residual is a HARD failure', async () => {
+  const dataDir = await initStore();
+  const out = path.join(mkTempDir('o-'), 'r.json');
+  // `nokind` is on the live In-flight backlog but has no resolvable kind -> fully residual ->
+  // the live-surface gate must fail the whole run (same class as totality/ceiling).
+  const report = makeReport([
+    md('backlog', 'bk#nokind', [trow({ task_id: 'nokind', title: 'NK', status: 'running' })], { line: '- [ ] nokind - NK', section: 'In flight' }),
+    md('state-meta', 'state/ok.meta', [trow({ task_id: 'ok', kind: 'ship' })], { kind: 'ship' }),
+    md('backlog', 'bk#ok', [trow({ task_id: 'ok', title: 'OK', status: 'queued' })], { line: '- [ ] ok - OK (kind: ship)', section: 'Queued' })
+  ]);
+  await assert.rejects(
+    runMigrateApply({ reportPath: writeJson(report), dataDir, outPath: out, allowResidualOver: 95, env: {} }),
+    (e) => e instanceof MigrateReconcileError
+  );
+  const residual = JSON.parse(fs.readFileSync(out, 'utf8'));
+  assert.equal(residual.reconciliation.live_surface_complete, false);
+  assert.deepEqual(residual.reconciliation.live_surface_violations, ['nokind']);
+});
+
+test('statusConsistent: a migrated in-flight (running) task lands queued; archived/terminal mismatch caught', () => {
+  assert.equal(statusConsistent('running', 'queued'), true);   // F1: in-flight -> queued
   assert.equal(statusConsistent('running', 'spawning'), true);
-  assert.equal(statusConsistent('running', 'running'), true);
   assert.equal(statusConsistent('completed', 'completed'), true);
   assert.equal(statusConsistent('archived', 'queued'), false);
-  assert.equal(statusConsistent('completed', 'spawning'), false);
+  assert.equal(statusConsistent('completed', 'queued'), false);
   assert.equal(statusConsistent(undefined, 'queued'), true);
 });
 
@@ -180,7 +244,7 @@ test('post-commit verification DOWNGRADES a record whose prescribed status is no
   const dataDir = await initStore();
   const out = path.join(mkTempDir('o-'), 'r.json');
   // Conflicting backlog rows: an In flight (running) bullet AND a Done (completed) bullet
-  // for the same task. Current state is running -> the task lands spawning, so the
+  // for the same task. Current state is running -> the task lands queued, so the
   // completed-prescribing record must be downgraded to residual by verification.
   const report = makeReport([
     md('state-meta', 'state/z.meta', [trow({ task_id: 'z', kind: 'ship' }), rrow('z')], { kind: 'ship', worktree: '/wt' }),
@@ -188,7 +252,7 @@ test('post-commit verification DOWNGRADES a record whose prescribed status is no
     md('backlog', 'bk#z-done', [trow({ task_id: 'z', title: 'Z', status: 'completed' })], { line: '- [x] z - Z (kind: ship)', section: 'Done' })
   ]);
   const receipt = await runMigrateApply({ reportPath: writeJson(report), dataDir, outPath: out, allowResidualOver: 90, env: {} });
-  assert.equal(await taskStatus(dataDir, 'z'), 'spawning');
+  assert.equal(await taskStatus(dataDir, 'z'), 'queued');
   assert.equal(receipt.reconciliation.downgraded_by_verification >= 1, true);
   const residual = JSON.parse(fs.readFileSync(out, 'utf8'));
   const downgraded = residual.residual.find((r) => r.source_ref === 'bk#z-done');
@@ -348,7 +412,7 @@ function hashTree(root) {
   return h.digest('hex');
 }
 
-test('end-to-end: real migrate-report -> migrate-apply; live task lands spawning; legacy untouched', async () => {
+test('end-to-end: real migrate-report -> migrate-apply; live task lands queued; legacy untouched', async () => {
   const home = mkTempDir('cp-cw1-legacy-');
   const state = path.join(home, 'state'); const data = path.join(home, 'data');
   fs.mkdirSync(state, { recursive: true }); fs.mkdirSync(data, { recursive: true });
@@ -365,7 +429,7 @@ test('end-to-end: real migrate-report -> migrate-apply; live task lands spawning
   const out = path.join(mkTempDir('o-'), 'r.json');
   const receipt = await runMigrateApply({ reportPath, dataDir, outPath: out, allowResidualOver: 70, env: {} });
   assert.equal(receipt.reconciliation.ok, true);
-  // eps is in-flight -> lands spawning (unverified), not a fake terminal.
-  assert.equal(await taskStatus(dataDir, 'eps'), 'spawning');
+  // eps is in-flight -> lands queued with no run (not a fake terminal, not a reconcile candidate).
+  assert.equal(await taskStatus(dataDir, 'eps'), 'queued');
   assert.equal(hashTree(home), legacyBefore, 'legacy home byte-identical across apply');
 });
