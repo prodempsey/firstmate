@@ -85,18 +85,26 @@ export function createShadowWriter({
   env = process.env,
   now = nowIso,
   actor = DEFAULT_ACTOR,
-  storeFactory
+  storeFactory,
+  expectedHomeUuid,
+  // Fail-closed store identity (finding 5). ON for real usage; OFF when a test injects its
+  // own storeFactory (the test owns the store's existence/identity).
+  verifyStoreIdentity = storeFactory === undefined
 } = {}) {
   if (typeof dataDir !== 'string' || dataDir.length === 0) {
     throw new Error('createShadowWriter requires a dataDir (this is the ONE thrown surface; mirror methods never throw)');
   }
   const clock = typeof now === 'function' ? now : () => now;
+  const resolvedExpectedHomeUuid = typeof expectedHomeUuid === 'string' && expectedHomeUuid.length > 0
+    ? expectedHomeUuid
+    : (typeof env.CP_SHADOW_HOME_UUID === 'string' && env.CP_SHADOW_HOME_UUID.length > 0 ? env.CP_SHADOW_HOME_UUID : undefined);
   const makeStore = typeof storeFactory === 'function'
     ? storeFactory
     : () => PgliteLocalStore.create({ dataDir, env });
 
   let store = null;
   let opened = false;
+  let identityChecked = false;
 
   function getStore() {
     if (!opened) {
@@ -105,6 +113,50 @@ export function createShadowWriter({
     }
     if (!store) throw new Error('shadow store handle is null');
     return store;
+  }
+
+  // Fail-closed on store identity (finding 5). A shadow write must target an ALREADY
+  // initialized control-plane store, never implicitly create a second one at a mistyped or
+  // unmounted path. The filesystem-existence check runs BEFORE any open (opening a
+  // nonexistent PGlite path would create the store), and the home_uuid read confirms it is a
+  // real, initialized control-plane store - optionally pinned to an expected identity.
+  async function ensureStoreReady(s) {
+    if (identityChecked || !verifyStoreIdentity) { identityChecked = true; return; }
+    if (!nodeFs.existsSync(dataDir)) {
+      throw new Error(`shadow store path does not exist: ${dataDir} (refusing to create a store in shadow mode - fail closed)`);
+    }
+    let homeUuid = null;
+    try {
+      const rows = await readOnlyQuery(s, "SELECT value FROM schema_meta WHERE key = 'home_uuid'");
+      homeUuid = rows.length > 0 ? rows[0].value : null;
+    } catch {
+      homeUuid = null;
+    }
+    if (!homeUuid) {
+      throw new Error(`shadow store at ${dataDir} is not an initialized control-plane store (no home_uuid) - fail closed`);
+    }
+    if (resolvedExpectedHomeUuid && homeUuid !== resolvedExpectedHomeUuid) {
+      throw new Error(`shadow store home_uuid mismatch at ${dataDir}: expected ${resolvedExpectedHomeUuid}, found ${homeUuid} - fail closed`);
+    }
+    identityChecked = true;
+  }
+
+  // Resolve a prior committed command result by deterministic command-id (finding 2). This
+  // is read BEFORE any mutable revision/sequence/state is derived, so a double-mirror of the
+  // same logical verb REPLAYS the original result instead of re-deriving a now-different
+  // sequence (which the command envelope would reject as an idempotency conflict) or
+  // selecting a different branch (annotation) after the first mutation closed the run.
+  async function readCommandResult(s, commandId) {
+    try {
+      const present = await readOnlyQuery(s, "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'command_results'");
+      if (present.length === 0) return null;
+      const rows = await readOnlyQuery(s, 'SELECT result_json FROM command_results WHERE command_id = $1', [commandId]);
+      if (rows.length === 0) return null;
+      const raw = rows[0].result_json;
+      return typeof raw === 'string' ? JSON.parse(raw) : raw;
+    } catch {
+      return null;
+    }
   }
 
   // Best-effort divergence log append. This is the LAST-RESORT channel and is itself total:
@@ -132,6 +184,7 @@ export function createShadowWriter({
   async function mirror(action, taskId, fn) {
     try {
       const s = getStore();
+      await ensureStoreReady(s);
       const out = await fn(s);
       return { ok: true, action, task_id: taskId, ...out };
     } catch (err) {
@@ -218,7 +271,8 @@ export function createShadowWriter({
 
     // status transition -> event, when a real run generation is OPEN; else annotation. The
     // writer never opens the run itself (no fabricated runs), so this fires as a real event
-    // only once some launch path has produced an open generation.
+    // only once some launch path has produced an open generation. Finding 2: the command
+    // result is resolved BEFORE the mutable sequence is derived, so a double-mirror replays.
     async statusTransition({ taskId, status, detail } = {}) {
       return mirror(`status:${status}`, taskId, async (s) => {
         if (!STATUS_EVENTS.has(status)) {
@@ -228,47 +282,47 @@ export function createShadowWriter({
         }
         const head = await readHead(s, taskId);
         const gen = head ? head.current_generation : 0;
-        const run = head ? await readRun(s, taskId, gen) : null;
-        if (!head || !run || run.closed_at !== null) {
-          return annotate(s, taskId, `status:${status}`, detail ?? null, payloadHash({ status, detail }));
+        if (head && gen >= 1) {
+          const payload = detail && typeof detail === 'object' ? detail : (detail ? { note: detail } : {});
+          const commandId = `${CMD_PREFIX}:event:${taskId}:${gen}:${status}:${payloadHash(payload)}`;
+          const prior = await readCommandResult(s, commandId);
+          if (prior) return { mode: 'verb', verb: 'event', result: prior, replayed: true };
+          const run = await readRun(s, taskId, gen);
+          if (run && run.closed_at === null) {
+            const seq = await nextSeq(s, taskId, gen, actor);
+            const result = await appendEvent(s, {
+              taskId, generation: gen, eventType: status, producer: actor, seq,
+              expectedRevision: head.revision, payload, commandId
+            });
+            return { mode: 'verb', verb: 'event', result };
+          }
         }
-        const seq = await nextSeq(s, taskId, gen, actor);
-        const payload = detail && typeof detail === 'object' ? detail : (detail ? { note: detail } : {});
-        const result = await appendEvent(s, {
-          taskId,
-          generation: gen,
-          eventType: status,
-          producer: actor,
-          seq,
-          expectedRevision: head.revision,
-          payload,
-          commandId: `${CMD_PREFIX}:event:${taskId}:${gen}:${status}:${payloadHash(payload)}`
-        });
-        return { mode: 'verb', verb: 'event', result };
+        return annotate(s, taskId, `status:${status}`, detail ?? null, payloadHash({ status, detail }));
       });
     },
 
-    // completion -> complete, when a real open run generation exists; else annotation.
+    // completion -> complete, when a real open run generation exists; else annotation. The
+    // deterministic complete command-id is resolved first, so a retry replays even after the
+    // first complete closed the run (which would otherwise flip to the annotation branch).
     async completed({ taskId, evidence, detail } = {}) {
       return mirror('completed', taskId, async (s) => {
         const head = await readHead(s, taskId);
         const gen = head ? head.current_generation : 0;
-        const run = head ? await readRun(s, taskId, gen) : null;
-        if (!head || !run || run.closed_at !== null) {
-          return annotate(s, taskId, 'completed', detail ?? evidence ?? null, payloadHash({ evidence, detail }));
+        if (head && gen >= 1) {
+          const commandId = `${CMD_PREFIX}:complete:${taskId}:${gen}`;
+          const prior = await readCommandResult(s, commandId);
+          if (prior) return { mode: 'verb', verb: 'complete', result: prior, replayed: true };
+          const run = await readRun(s, taskId, gen);
+          if (run && run.closed_at === null) {
+            const seq = await nextSeq(s, taskId, gen, actor);
+            const result = await completeRun(s, {
+              taskId, generation: gen, expectedRevision: head.revision, outcome: 'success',
+              producer: actor, seq, evidence: evidence ?? { shadow: true }, commandId
+            });
+            return { mode: 'verb', verb: 'complete', result };
+          }
         }
-        const seq = await nextSeq(s, taskId, gen, actor);
-        const result = await completeRun(s, {
-          taskId,
-          generation: gen,
-          expectedRevision: head.revision,
-          outcome: 'success',
-          producer: actor,
-          seq,
-          evidence: evidence ?? { shadow: true },
-          commandId: `${CMD_PREFIX}:complete:${taskId}:${gen}`
-        });
-        return { mode: 'verb', verb: 'complete', result };
+        return annotate(s, taskId, 'completed', detail ?? evidence ?? null, payloadHash({ evidence, detail }));
       });
     },
 
@@ -277,52 +331,53 @@ export function createShadowWriter({
       return mirror('failed', taskId, async (s) => {
         const head = await readHead(s, taskId);
         const gen = head ? head.current_generation : 0;
-        const run = head ? await readRun(s, taskId, gen) : null;
-        if (!head || !run || run.closed_at !== null) {
-          return annotate(s, taskId, 'failed', detail ?? reason ?? null, payloadHash({ reason, detail }));
+        if (head && gen >= 1) {
+          const commandId = `${CMD_PREFIX}:fail:${taskId}:${gen}`;
+          const prior = await readCommandResult(s, commandId);
+          if (prior) return { mode: 'verb', verb: 'fail', result: prior, replayed: true };
+          const run = await readRun(s, taskId, gen);
+          if (run && run.closed_at === null) {
+            const seq = await nextSeq(s, taskId, gen, actor);
+            const result = await failRun(s, {
+              taskId, generation: gen, expectedRevision: head.revision,
+              reason: reason || 'shadow-mirrored failure', producer: actor, seq, commandId
+            });
+            return { mode: 'verb', verb: 'fail', result };
+          }
         }
-        const seq = await nextSeq(s, taskId, gen, actor);
-        const result = await failRun(s, {
-          taskId,
-          generation: gen,
-          expectedRevision: head.revision,
-          reason: reason || 'shadow-mirrored failure',
-          producer: actor,
-          seq,
-          commandId: `${CMD_PREFIX}:fail:${taskId}:${gen}`
-        });
-        return { mode: 'verb', verb: 'fail', result };
+        return annotate(s, taskId, 'failed', detail ?? reason ?? null, payloadHash({ reason, detail }));
       });
     },
 
     // teardown -> cleanup-intent + cleanup-finish, WHERE APPLICABLE: only when a terminal
     // run generation with cleanup still pending exists. The shadow effect is "confirmed
     // absent" - a mirrored teardown asserts the (never-really-launched) pane is gone, which
-    // for shadow-mirrored work it is. Absent an applicable run, an annotation.
+    // for shadow-mirrored work it is. Absent an applicable run, an annotation. The cleanup-
+    // finish command-id is resolved first, so a retry replays after cleanup completed.
     async teardown({ taskId, detail } = {}) {
       return mirror('teardown', taskId, async (s) => {
         const head = await readHead(s, taskId);
         const gen = head ? head.current_generation : 0;
-        const run = head ? await readRun(s, taskId, gen) : null;
-        const terminalRun = run && (run.status === 'completed' || run.status === 'failed');
-        if (!head || !terminalRun || run.cleanup_state === 'cleaned') {
-          return annotate(s, taskId, 'teardown', detail ?? null, payloadHash({ detail }));
+        if (head && gen >= 1) {
+          const finishId = `${CMD_PREFIX}:cleanup-finish:${taskId}:${gen}`;
+          const prior = await readCommandResult(s, finishId);
+          if (prior) return { mode: 'verb', verb: 'cleanup', result: { finish: prior }, replayed: true };
+          const run = await readRun(s, taskId, gen);
+          const terminalRun = run && (run.status === 'completed' || run.status === 'failed');
+          if (terminalRun && run.cleanup_state !== 'cleaned') {
+            const intent = await cleanupIntent(s, {
+              taskId, generation: gen, expectedRevision: head.revision,
+              commandId: `${CMD_PREFIX}:cleanup-intent:${taskId}:${gen}`
+            });
+            const headAfter = await readHead(s, taskId);
+            const finish = await cleanupFinish(s, {
+              taskId, generation: gen, expectedRevision: headAfter ? headAfter.revision : head.revision,
+              effectResult: { confirmed_absent: true, shadow: true }, commandId: finishId
+            });
+            return { mode: 'verb', verb: 'cleanup', result: { intent, finish } };
+          }
         }
-        const intent = await cleanupIntent(s, {
-          taskId,
-          generation: gen,
-          expectedRevision: head.revision,
-          commandId: `${CMD_PREFIX}:cleanup-intent:${taskId}:${gen}`
-        });
-        const headAfter = await readHead(s, taskId);
-        const finish = await cleanupFinish(s, {
-          taskId,
-          generation: gen,
-          expectedRevision: headAfter ? headAfter.revision : head.revision,
-          effectResult: { confirmed_absent: true, shadow: true },
-          commandId: `${CMD_PREFIX}:cleanup-finish:${taskId}:${gen}`
-        });
-        return { mode: 'verb', verb: 'cleanup', result: { intent, finish } };
+        return annotate(s, taskId, 'teardown', detail ?? null, payloadHash({ detail }));
       });
     },
 
@@ -334,15 +389,19 @@ export function createShadowWriter({
     async archived({ taskId, detail } = {}) {
       return mirror('archived', taskId, async (s) => {
         const head = await readHead(s, taskId);
-        if (!head || (head.status !== 'completed' && head.status !== 'failed')) {
-          return annotate(s, taskId, 'archived', detail ?? null, payloadHash({ detail }));
+        if (head) {
+          // Resolve the archive command FIRST: after a successful archive the status is
+          // 'archived', which would otherwise fall through to the annotation branch on a
+          // retry instead of replaying the archive (finding 2).
+          const commandId = `${CMD_PREFIX}:archive:${taskId}`;
+          const prior = await readCommandResult(s, commandId);
+          if (prior) return { mode: 'verb', verb: 'archive', result: prior, replayed: true };
+          if (head.status === 'completed' || head.status === 'failed') {
+            const result = await archiveTask(s, { taskId, expectedRevision: head.revision, commandId });
+            return { mode: 'verb', verb: 'archive', result };
+          }
         }
-        const result = await archiveTask(s, {
-          taskId,
-          expectedRevision: head.revision,
-          commandId: `${CMD_PREFIX}:archive:${taskId}`
-        });
-        return { mode: 'verb', verb: 'archive', result };
+        return annotate(s, taskId, 'archived', detail ?? null, payloadHash({ detail }));
       });
     },
 

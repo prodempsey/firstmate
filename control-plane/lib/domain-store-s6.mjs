@@ -169,7 +169,7 @@ async function buildPayload(conn, orderPrefix) {
     }
   }
 
-  return {
+  const payload = {
     tasks,
     runs,
     anomalies: { active: activeAnomalies, active_count: activeAnomalies.length, resolved_count: resolvedAnomalyCount },
@@ -183,6 +183,36 @@ async function buildPayload(conn, orderPrefix) {
       records: orderPrefix.records
     }
   };
+
+  // CW2 (ORD-256): carry the audit-only archived_history projection so the archive back-fill
+  // is VISIBLE to the canonical snapshot/export/projection boundary rather than invisible to
+  // it. The section is deterministic (ORDER BY record_key, stable scalars, no wall-clock) so
+  // it folds into the dedup checksum exactly like every other section. The key is added ONLY
+  // when the table exists AND holds rows, so a store that never ran the CW2 back-fill
+  // produces the byte-identical S0-S8 payload it always did - existing snapshot checksums and
+  // dedup behavior are unchanged; the payload grows only once history is actually imported.
+  if (await tablePresent(conn, 'archived_history')) {
+    const ah = await conn.query(
+      `SELECT record_key, task_id, record_class, terminal_outcome, run_generation,
+              source_ref, source_store, source_digest, archived_at
+         FROM archived_history ORDER BY record_key`
+    );
+    if (ah.rows.length > 0) {
+      payload.archived_history = ah.rows.map((r) => ({
+        record_key: r.record_key,
+        task_id: r.task_id,
+        record_class: r.record_class,
+        terminal_outcome: r.terminal_outcome ?? null,
+        run_generation: numOrNull(r.run_generation),
+        source_ref: r.source_ref,
+        source_store: r.source_store ?? null,
+        source_digest: r.source_digest,
+        archived_at: r.archived_at ?? null
+      }));
+    }
+  }
+
+  return payload;
 }
 
 // createSnapshot: acquire the stable order prefix, then in ONE exclusive transaction

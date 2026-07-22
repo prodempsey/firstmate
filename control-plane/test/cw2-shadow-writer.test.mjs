@@ -7,9 +7,47 @@ import { PgliteLocalStore } from '../lib/pglite-local-store.mjs';
 import { readOnlyQuery } from '../lib/cw1-readonly.mjs';
 import { createShadowWriter } from '../lib/shadow-writer.mjs';
 import { loadAnnotations } from '../lib/cw2-annotations.mjs';
-import { beginRun } from '../lib/domain-store.mjs';
-import { createTask } from '../lib/domain-store.mjs';
+import { createTask, beginRun } from '../lib/domain-store.mjs';
+import { completeRun } from '../lib/domain-store-s2.mjs';
+import { recordSpawn, commitRunning, cleanupIntent, cleanupFinish } from '../lib/domain-store-s3.mjs';
+import { claimConsumer, claimDelivery, markApplied, ack } from '../lib/domain-store-s4.mjs';
 import { mkTempDir, cleanupAll } from './helpers.mjs';
+
+// Deterministic identity double (the same one the S3/archive suites inject) so a full
+// running->completed->cleaned->archivable lifecycle can be built with no real host, letting
+// the real-verb double-mirror branches be exercised (finding 2).
+const IDENTITY = {
+  endpointId: '@0', paneId: '%0', bootId: 'boot-xyz', paneLeaderPid: 4242, paneStartTicks: 111111,
+  agentPid: 4243, agentStartTicks: 222222, agentExe: '/usr/bin/node', agentArgvHash: 'argvhash-abc',
+  agentPpid: 4242, agentPty: 'pts/7', worktree: '/tmp/wt', harness: 'claude'
+};
+const captureOk = () => ({ ok: true, identity: { ...IDENTITY } });
+const probeMatch = () => ({ matches: true, failingClause: null, anomalyClass: null });
+async function runningTask(store, taskId) {
+  await createTask(store, { taskId, kind: 'ship', title: 'x', origin: 'internal', internalReason: 'r', commandId: `c-create-${taskId}` });
+  const beg = await beginRun(store, { taskId, expectedRevision: 1, commandId: `c-begin-${taskId}` });
+  const rs = await recordSpawn(store, { taskId, generation: 1, expectedRevision: beg.revision, launchMarker: beg.launch_marker, endpoint: IDENTITY.endpointId, pane: IDENTITY.paneId, regFile: '/reg', commandId: `c-spawn-${taskId}` }, { captureIdentity: captureOk });
+  const cr = await commitRunning(store, { taskId, generation: 1, expectedRevision: rs.revision, commandId: `c-run-${taskId}` }, { probeIdentity: probeMatch });
+  return cr.revision;
+}
+async function completedCleanupPending(store, taskId) {
+  const rev = await runningTask(store, taskId);
+  const done = await completeRun(store, { taskId, generation: 1, expectedRevision: rev, outcome: 'success', producer: 'crewmate', seq: 1, evidence: {}, commandId: `c-done-${taskId}` });
+  const r = await store2rows(store, "SELECT outbox_id, event_id FROM outbox WHERE task_id=$1 AND event_type IN ('completed','failed')", [taskId]);
+  return { rev: done.revision, terminal: { outboxId: Number(r[0].outbox_id), eventId: r[0].event_id } };
+}
+async function archivableTask(store, taskId) {
+  const { rev, terminal } = await completedCleanupPending(store, taskId);
+  const intent = await cleanupIntent(store, { taskId, generation: 1, expectedRevision: rev, commandId: `c-intent-${taskId}` });
+  await cleanupFinish(store, { taskId, generation: 1, expectedRevision: intent.revision, effectResult: { killed: true, confirmed_absent: true }, commandId: `c-finish-${taskId}` });
+  const lease = await claimConsumer(store, { bootId: 'boot-a', pid: 1000, commandId: `c-claim-${taskId}` });
+  await claimDelivery(store, { outboxId: terminal.outboxId, ownerToken: lease.owner_token, ownerEpoch: lease.owner_epoch, sinkKind: 'disposition', commandId: `c-cd-${taskId}` });
+  await markApplied(store, { eventId: terminal.eventId, ownerToken: lease.owner_token, ownerEpoch: lease.owner_epoch, sinkResult: { ok: true, event_id: terminal.eventId }, commandId: `c-ma-${taskId}` });
+  await ack(store, { outboxId: terminal.outboxId, ownerToken: lease.owner_token, ownerEpoch: lease.owner_epoch, commandId: `c-ak-${taskId}` });
+}
+async function store2rows(store, sql, params) {
+  return readOnlyQuery(store, sql, params);
+}
 
 // CW2 Part A - the SHADOW WRITER. Proves its three hard contracts:
 //  1. never blocks or fails a legacy op (an injected store failure is caught, logged to the
@@ -190,4 +228,131 @@ test('statusTransition drives a real `event` when an open run generation exists'
   assert.equal(prog.verb, 'event');
   const events = await q(dataDir, "SELECT event_type FROM task_events WHERE task_id=$1 AND event_type='progress'", ['run-1']);
   assert.equal(events.length, 1, 'a real progress event was appended to the open generation');
+});
+
+// =====================================================================================
+// Finding 2: EVERY real-verb branch replays under identical double delivery
+// =====================================================================================
+
+test('real-verb double-mirror REPLAYS, never conflicts: progress event', async () => {
+  const dataDir = await initStore();
+  const store = new PgliteLocalStore({ dataDir });
+  await runningTask(store, 'ev-1');
+  await store.close();
+  const w = createShadowWriter({ dataDir, now: () => '1970-01-01T00:00:00.000Z' });
+  const r1 = await w.statusTransition({ taskId: 'ev-1', status: 'progress', detail: { note: 'p' } });
+  const r2 = await w.statusTransition({ taskId: 'ev-1', status: 'progress', detail: { note: 'p' } });
+  await w.close();
+  assert.equal(r1.ok && r2.ok, true);
+  assert.equal(r1.mode, 'verb');
+  assert.equal(r2.mode, 'verb');
+  assert.equal(r2.replayed, true, 'the second identical mirror replays');
+  assert.equal((await q(dataDir, "SELECT count(*)::int n FROM task_events WHERE task_id=$1 AND event_type='progress'", ['ev-1']))[0].n, 1);
+});
+
+test('real-verb double-mirror REPLAYS: complete (retry after the run closed)', async () => {
+  const dataDir = await initStore();
+  const store = new PgliteLocalStore({ dataDir });
+  await runningTask(store, 'cp-1');
+  await store.close();
+  const w = createShadowWriter({ dataDir, now: () => '1970-01-01T00:00:00.000Z' });
+  const r1 = await w.completed({ taskId: 'cp-1' });
+  const r2 = await w.completed({ taskId: 'cp-1' });
+  await w.close();
+  assert.equal(r1.ok && r2.ok, true, 'neither conflicts');
+  assert.equal(r1.mode, 'verb');
+  assert.equal(r1.verb, 'complete');
+  assert.equal(r2.mode, 'verb', 'retry replays the complete instead of falling to annotation');
+  assert.equal(r2.replayed, true);
+  assert.equal((await q(dataDir, "SELECT count(*)::int n FROM task_events WHERE task_id=$1 AND event_type='completed'", ['cp-1']))[0].n, 1, 'exactly one terminal event');
+  assert.equal((await q(dataDir, 'SELECT status FROM tasks WHERE task_id=$1', ['cp-1']))[0].status, 'completed');
+});
+
+test('real-verb double-mirror REPLAYS: fail', async () => {
+  const dataDir = await initStore();
+  const store = new PgliteLocalStore({ dataDir });
+  await runningTask(store, 'fl-1');
+  await store.close();
+  const w = createShadowWriter({ dataDir, now: () => '1970-01-01T00:00:00.000Z' });
+  const r1 = await w.failed({ taskId: 'fl-1', reason: 'boom' });
+  const r2 = await w.failed({ taskId: 'fl-1', reason: 'boom' });
+  await w.close();
+  assert.equal(r1.mode, 'verb');
+  assert.equal(r1.verb, 'fail');
+  assert.equal(r2.replayed, true);
+  assert.equal((await q(dataDir, "SELECT count(*)::int n FROM task_events WHERE task_id=$1 AND event_type='failed'", ['fl-1']))[0].n, 1);
+});
+
+test('real-verb double-mirror REPLAYS: teardown/cleanup (retry after cleaned)', async () => {
+  const dataDir = await initStore();
+  const store = new PgliteLocalStore({ dataDir });
+  await completedCleanupPending(store, 'td-1');
+  await store.close();
+  const w = createShadowWriter({ dataDir, now: () => '1970-01-01T00:00:00.000Z' });
+  const r1 = await w.teardown({ taskId: 'td-1' });
+  const r2 = await w.teardown({ taskId: 'td-1' });
+  await w.close();
+  assert.equal(r1.mode, 'verb');
+  assert.equal(r1.verb, 'cleanup');
+  assert.equal(r2.mode, 'verb', 'retry replays cleanup instead of annotating');
+  assert.equal(r2.replayed, true);
+  assert.equal((await q(dataDir, "SELECT count(*)::int n FROM task_events WHERE task_id=$1 AND event_type='cleaned'", ['td-1']))[0].n, 1);
+});
+
+test('real-verb double-mirror REPLAYS: archive (retry after status archived)', async () => {
+  const dataDir = await initStore();
+  const store = new PgliteLocalStore({ dataDir });
+  await archivableTask(store, 'ar-1');
+  await store.close();
+  const w = createShadowWriter({ dataDir, now: () => '1970-01-01T00:00:00.000Z' });
+  const r1 = await w.archived({ taskId: 'ar-1' });
+  const r2 = await w.archived({ taskId: 'ar-1' });
+  await w.close();
+  assert.equal(r1.mode, 'verb');
+  assert.equal(r1.verb, 'archive');
+  assert.equal(r2.mode, 'verb', 'retry replays archive instead of annotating the now-archived task');
+  assert.equal(r2.replayed, true);
+  assert.equal((await q(dataDir, "SELECT count(*)::int n FROM task_events WHERE task_id=$1 AND event_type='archived'", ['ar-1']))[0].n, 1);
+  assert.equal((await q(dataDir, 'SELECT status FROM tasks WHERE task_id=$1', ['ar-1']))[0].status, 'archived');
+});
+
+// =====================================================================================
+// Finding 5: fail-closed on store identity
+// =====================================================================================
+
+test('a missing data directory is a divergence, NEVER an implicit new store', async () => {
+  const dir = mkTempDir('cp-cw2-missing-');
+  const missing = path.join(dir, 'does-not-exist', 'pgdata');
+  const divergenceLog = path.join(dir, 'div.jsonl');
+  const w = createShadowWriter({ dataDir: missing, divergenceLog, now: () => '1970-01-01T00:00:00.000Z' });
+  const outcome = await w.dispatched({ taskId: 'ghost-1' });
+  await w.close();
+  assert.equal(outcome.ok, false);
+  assert.equal(fs.existsSync(missing), false, 'no store was created at the mistaken path');
+  assert.match(outcome.error, /does not exist|fail closed/);
+  const lines = fs.readFileSync(divergenceLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  assert.equal(lines[0].kind, 'shadow_write_error');
+});
+
+test('an uninitialized store directory (no home_uuid) is a divergence', async () => {
+  const dir = mkTempDir('cp-cw2-uninit-');
+  const empty = path.join(dir, 'pgdata');
+  fs.mkdirSync(empty, { recursive: true }); // exists but never `cp init`ed
+  const divergenceLog = path.join(dir, 'div.jsonl');
+  const w = createShadowWriter({ dataDir: empty, divergenceLog, now: () => '1970-01-01T00:00:00.000Z' });
+  const outcome = await w.dispatched({ taskId: 'uninit-1' });
+  await w.close();
+  assert.equal(outcome.ok, false);
+  assert.match(outcome.error, /not an initialized control-plane store|fail closed/);
+});
+
+test('a home_uuid pin mismatch is a divergence (split-brain guard)', async () => {
+  const dataDir = await initStore();
+  const divergenceLog = path.join(mkTempDir('cp-cw2-pin-'), 'div.jsonl');
+  const w = createShadowWriter({ dataDir, divergenceLog, expectedHomeUuid: 'not-the-real-uuid', now: () => '1970-01-01T00:00:00.000Z' });
+  const outcome = await w.taskFiled({ taskId: 'pin-1', kind: 'ship', title: 'x' });
+  await w.close();
+  assert.equal(outcome.ok, false);
+  assert.match(outcome.error, /home_uuid mismatch/);
+  assert.equal(await num(dataDir, 'tasks'), 0, 'nothing was written under a mismatched identity');
 });

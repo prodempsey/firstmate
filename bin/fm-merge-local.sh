@@ -226,6 +226,10 @@ if ! "$SCRIPT_DIR/fm-task-events.sh" "$ID" landed "merged into local $TRUNK_BRAN
 fi
 echo "merged $BRANCH into canonical trunk $TRUNK_BRANCH ($before -> $after) in $TRUNK_ABS"
 
+# CW2 shadow-run mirror (ORD-256): a local-only merge is the ship task's completion. Inert
+# unless CP_SHADOW=1; backgrounded and always-0, so it can never block or fail the merge.
+"$SCRIPT_DIR/fm-cp-shadow.sh" completed --task "$ID" --detail "merged into local $TRUNK_BRANCH" || true
+
 # A local-only merge is a ship completion with no PR and no CI, so this is the only
 # moment the work lands. It can clear a blocker or resolve a bug before teardown runs.
 "$SCRIPT_DIR/fm-triage-duty.sh" ship-complete --detail "$ID landed on local $TRUNK_BRANCH in $TRUNK_ABS." || true

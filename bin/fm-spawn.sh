@@ -1382,3 +1382,12 @@ spawn_send_key "$T" Enter
 TH_ABORT_CLEANUP=0
 
 echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT"
+
+# CW2 shadow-run mirror (ORD-256). Inert unless CP_SHADOW=1 (the gate lives inside the
+# wrapper), backgrounded and always-0, so enabling the shadow run is one env var and this
+# can never block or fail a spawn. A crewmate/scout spawn is a task filed then dispatched;
+# a secondmate is not a control-plane task and is not mirrored.
+if [ "$KIND" = ship ] || [ "$KIND" = scout ]; then
+  "$FM_ROOT/bin/fm-cp-shadow.sh" task-filed --task "$ID" --kind "$KIND" --title "$ID" --repo "$(basename "$PROJ_ABS")" || true
+  "$FM_ROOT/bin/fm-cp-shadow.sh" dispatched --task "$ID" || true
+fi

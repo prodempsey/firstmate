@@ -116,34 +116,49 @@ overrides the `FM_HOME`-derived location.
 
 ## Cutover stage CW2 (shadow run + archived-history back-fill)
 
-CW2 (ORD-256) adds the shadow-run wiring and the archived-history back-fill on top of
-the landed S0-S8 + CW1 modules, which stay byte-identical apart from the one sanctioned
-verb registration in `lib/coordinator.mjs`. Legacy stores remain the operational
-authority until a later cutover stage; nothing here switches writer authority.
+CW2 (ORD-256) adds the shadow-run wiring and the archived-history back-fill on top of the
+landed S0-S8 + CW1 modules. The only edits to landed slices are the sanctioned
+`lib/coordinator.mjs` registration and one QA-mandated, backward-compatible addition to S6's
+`buildPayload` (the archived-history snapshot projection below). Legacy stores remain the
+operational authority until a later cutover stage; nothing here switches writer authority.
 
 - **Shadow writer** (`lib/shadow-writer.mjs`, `bin/cp-shadow.mjs`, and the repo-root
   `bin/fm-cp-shadow.sh` hook). A fire-and-forget mirror firstmate's lifecycle chokepoints
-  invoke to write control-plane records in parallel with the legacy op. Three contracts:
-  it NEVER blocks or fails a legacy op (every error is logged to a divergence file and
-  swallowed, and the shell hook backgrounds the call); it fabricates NO runs (task filed →
-  `create-task` queued; every run-based action degrades to an audit annotation in
-  `shadow_annotations` unless a real run generation already exists, in which case it drives
-  the landed verb); and it is idempotent by deterministic command-id. The hook is INERT
-  unless `CP_SHADOW=1`; enabling and wiring it is firstmate's operational act.
+  invoke to write control-plane records in parallel with the legacy op. Contracts: it NEVER
+  blocks or fails a legacy op (every error is logged to a divergence file and swallowed, and
+  the shell hook backgrounds the call); it fails CLOSED on store identity (a missing or
+  uninitialized configured store, or a `home_uuid` pin mismatch, is a divergence, never an
+  implicit new store); it fabricates NO runs (task filed → `create-task` queued; every
+  run-based action degrades to an audit annotation in `shadow_annotations` unless a real run
+  generation already exists, in which case it drives the landed verb); and it is idempotent
+  by deterministic command-id, resolving the prior command result BEFORE deriving any mutable
+  sequence/revision so a double-mirror replays instead of conflicting. **The hook is wired
+  into the real legacy chokepoints** — `bin/fm-spawn.sh` (task filed + dispatched),
+  `bin/fm-pr-merge.sh` and `bin/fm-merge-local.sh` (completed), `bin/fm-teardown.sh`
+  (teardown), and `bin/fm-task-events.sh` (status transitions) — as inert, unconditional
+  calls. It is INERT unless `CP_SHADOW=1` (the gate lives inside the wrapper), so enabling the
+  shadow run in a runtime home is ONE env var, not a code change.
 - **Divergence monitor** — `cp shadow-diff --out <path> --data-dir <store> [--home <legacy>]`.
   Read-only. Regenerates the S8 mapper's view of the legacy stores on demand, translates it
   through the same CW1 classification the production migration used, and reports
   missing/mismatched/extra live tasks plus archived history that is deferred vs back-filled.
   Applies nothing to the legacy home or the store.
 - **Archived-history back-fill** — `cp migrate-backfill --residual <cw1-residual> --data-dir
-  <store> --out <path> [--resume]`. Imports the archived-history residual CW1 deferred
-  (done-archive / superseded-generation / task-scope-archived-event records) as AUDIT-ONLY
-  rows in a distinct `archived_history` table. Live-path synthesis of the terminal-delivery/
-  ack/cleanup/archive chain is judged FORBIDDEN (spec §4/§14 + the CW1 anti-ghost rule), so
-  the import writes no task/run/event/outbox/consumer row; see `lib/migrate-backfill.mjs`
-  `BACKFILL_DECISION` for the full reasoning. Idempotent by `record_key`; input is the
-  residual FILE, so no legacy store is read. The snapshot layer can carry `archived_history`;
-  folding it into a snapshot is a later (CW3) concern, intentionally not wired into S6 here.
+  <store> --out <path> [--resume]`. Imports archived history from the CW1 residual as
+  AUDIT-ONLY rows in a distinct `archived_history` table. Capture is SHAPE-AWARE (the
+  done-archive ledger by store, task-scope `archived` events by canonical shape, superseded
+  generations, plus the reason predicates), and reconciliation is over the FULL residual set:
+  every record is `imported`, explicitly `flagged`, or explicitly `out_of_scope` with an
+  auditable reason — nothing is silently dropped. Live-path synthesis of the terminal-
+  delivery/ack/cleanup/archive chain is judged FORBIDDEN (spec §4/§14 + the CW1 anti-ghost
+  rule), so the import writes no task/run/event/outbox/consumer row; see
+  `lib/migrate-backfill.mjs` `BACKFILL_DECISION` for the full reasoning. Idempotent by
+  `record_key`; input is the residual FILE, so no legacy store is read.
+- **Snapshot carriage.** `cp snapshot` carries the archived-history projection: S6's
+  `buildPayload` adds a deterministic `archived_history` section (ORDER BY `record_key`,
+  stable scalars) so the back-fill is visible to the canonical snapshot/export/projection
+  boundary. The key is added ONLY when the table holds rows, so a store that never ran the
+  back-fill produces the byte-identical S0-S8 payload and dedup checksum it always did.
 
 ## Tests
 

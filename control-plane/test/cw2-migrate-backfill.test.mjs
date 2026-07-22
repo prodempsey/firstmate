@@ -9,9 +9,10 @@ import { readOnlyQuery } from '../lib/cw1-readonly.mjs';
 import { runMigrateApply, RESIDUAL_SCHEMA } from '../lib/migrate-apply.mjs';
 import { REPORT_SCHEMA } from '../lib/migrate-report.mjs';
 import {
-  runMigrateBackfill, classifyRecordClass, buildHistoryEntry, loadResidual, BACKFILL_RESIDUAL_SCHEMA
+  runMigrateBackfill, classifyRecordClass, classifyRecord, buildHistoryEntry, loadResidual, BACKFILL_RESIDUAL_SCHEMA
 } from '../lib/migrate-backfill.mjs';
 import { loadArchivedHistory } from '../lib/cw2-archived-history.mjs';
+import { createSnapshot, getSnapshot } from '../lib/domain-store-s6.mjs';
 import { BackfillError } from '../lib/errors-cw2.mjs';
 import { mkTempDir, cleanupAll } from './helpers.mjs';
 
@@ -111,6 +112,20 @@ test('classifyRecordClass matches only the three archived-history reasons', () =
   assert.equal(classifyRecordClass(undefined), null);
 });
 
+test('classifyRecord is shape-aware: done-archive STORE and task-scope archived EVENTS are captured regardless of reason (finding 3)', () => {
+  // A done-archive LEDGER row whose reason is NOT the accepted no-live-membership string is
+  // still archived history (this is exactly the 84 QA found silently dropped).
+  assert.equal(classifyRecord({ store: 'done-archive', reason: 'kind un-prescribed (no state-meta/lifecycle/ledger record supplies a kind)', canonical: [{ table: 'tasks', fields: { task_id: 't' } }] }), 'done_archive');
+  assert.equal(classifyRecord({ store: 'done-archive', reason: "prescribed status 'archived' not committed (store status 'queued')", canonical: [{ table: 'tasks', fields: { task_id: 't' } }] }), 'done_archive');
+  // A task-scope archived lifecycle event, by canonical SHAPE, even without the reason string.
+  assert.equal(classifyRecord({ store: 'task-lifecycle', reason: 'some other reason', canonical: [{ fields: { event_scope: 'task', event_type: 'archived', task_id: 't' } }] }), 'archive_event');
+  // An in-flight re-dispatch record is NOT archived history.
+  assert.equal(classifyRecord({ store: 'state-meta', reason: IN_FLIGHT_REDISPATCH_REASON, canonical: [{ table: 'tasks', fields: { task_id: 't' } }] }), null);
+  // The three reason-based classes still hold.
+  assert.equal(classifyRecord({ store: 'state-status', reason: DONE_ARCHIVE_REASON, canonical: [] }), 'done_archive');
+  assert.equal(classifyRecord({ store: 'state-meta', reason: MULTI_GEN_REASON, canonical: [] }), 'multi_gen');
+});
+
 test('buildHistoryEntry extracts task_id, run_generation, and terminal_outcome; flags when no task_id', () => {
   const doc = mixedResidual();
   const g = buildHistoryEntry(doc.residual[1], 'multi_gen');
@@ -131,25 +146,49 @@ test('buildHistoryEntry extracts task_id, run_generation, and terminal_outcome; 
 // Executor: totality, no live-path writes, idempotency
 // =====================================================================================
 
-test('back-fill imports every archived-history record and reconciles by totality', async () => {
+test('back-fill imports every archived-history record and reconciles by FULL-SET totality (finding 3)', async () => {
   const dataDir = await initStore();
   const out = path.join(mkTempDir('cp-cw2-bfout-'), 'bf.json');
   const receipt = await runMigrateBackfill({ residualPath: writeResidual(mixedResidual()), dataDir, outPath: out, env: {} });
 
   assert.equal(receipt.ok, true);
   assert.equal(receipt.totals.residual_scanned, 5);
-  assert.equal(receipt.totals.archived_history_matched, 3, 'only the 3 archived-history reasons match');
+  assert.equal(receipt.totals.archived_history_matched, 3, 'the 3 archived-history records match');
   assert.equal(receipt.totals.imported, 3);
   assert.equal(receipt.totals.flagged, 0);
+  assert.equal(receipt.totals.out_of_scope, 2, 'the 2 non-archived records are explicitly out-of-scope, not silently dropped');
   assert.deepEqual(receipt.totals.by_class, { done_archive: 1, multi_gen: 1, archive_event: 1 });
-  assert.equal(receipt.reconciliation.totality_holds, true);
-  assert.equal(receipt.reconciliation.imported + receipt.reconciliation.flagged, receipt.reconciliation.matched);
+  assert.equal(receipt.reconciliation.full_totality_holds, true);
+  assert.equal(receipt.reconciliation.matched_totality_holds, true);
+  // Nothing lost: every scanned record is in exactly one bucket.
+  assert.equal(
+    receipt.totals.imported + receipt.totals.flagged + receipt.totals.out_of_scope,
+    receipt.totals.residual_scanned
+  );
 
   const report = JSON.parse(fs.readFileSync(out, 'utf8'));
   assert.equal(report.schema, BACKFILL_RESIDUAL_SCHEMA);
   assert.match(report.decision, /FORBIDDEN/);
+  // The out-of-scope records are enumerated with an auditable reason.
+  assert.equal(report.out_of_scope.length, 2);
+  assert.ok(report.out_of_scope.every((o) => typeof o.reason === 'string' && o.source_ref));
   const rows = await loadArchivedHistory(new PgliteLocalStore({ dataDir }));
   assert.deepEqual(rows.map((r) => r.task_id).sort(), ['closed-c', 'finished-a', 'gen-b']);
+});
+
+test('a done-archive LEDGER row with a non-accepted reason is captured, not dropped (finding 3 regression)', async () => {
+  const dataDir = await initStore();
+  const doc = residualDoc([
+    // done-archive store, reason is NOT the accepted no-live-membership string (the class QA
+    // proved was silently omitted). It MUST be imported as archived history.
+    residualRecord({ sourceRef: 'data/done-archive.md#L1190', store: 'done-archive', reason: "prescribed status 'archived' not committed (store status 'queued')", canonical: [{ table: 'tasks', key: 'reactivated-x', fields: { task_id: 'reactivated-x', title: 'X', status: 'archived' } }], value: { line: '- [x] reactivated-x' } }),
+    residualRecord({ sourceRef: 'data/done-archive.md#L1302', store: 'done-archive', reason: 'kind un-prescribed (no state-meta/lifecycle/ledger record supplies a kind)', canonical: [{ table: 'tasks', key: 'nokind-y', fields: { task_id: 'nokind-y', title: 'Y', status: 'archived' } }], value: { line: '- [x] nokind-y' } })
+  ]);
+  const receipt = await runMigrateBackfill({ residualPath: writeResidual(doc), dataDir, outPath: path.join(mkTempDir('o-'), 'bf.json'), env: {} });
+  assert.equal(receipt.totals.imported, 2, 'both done-archive ledger rows captured despite non-accepted reasons');
+  assert.equal(receipt.totals.out_of_scope, 0);
+  const rows = await loadArchivedHistory(new PgliteLocalStore({ dataDir }));
+  assert.deepEqual(rows.map((r) => r.task_id).sort(), ['nokind-y', 'reactivated-x']);
 });
 
 test('back-fill writes ONLY the audit table - NO task/run/event/outbox/consumer rows (no faked live path)', async () => {
@@ -164,6 +203,47 @@ test('back-fill writes ONLY the audit table - NO task/run/event/outbox/consumer 
   }
   assert.equal(await tablePresent(dataDir, 'archived_history'), true);
   assert.equal(Number((await q(dataDir, 'SELECT count(*)::int n FROM archived_history'))[0].n), 3);
+});
+
+test('the back-filled history is carried by cp snapshot (finding 4)', async () => {
+  const dataDir = await initStore();
+  await runMigrateBackfill({ residualPath: writeResidual(mixedResidual()), dataDir, outPath: path.join(mkTempDir('o-'), 'bf.json'), env: {} });
+
+  const orderSrc = path.join(mkTempDir('cp-cw2-ord-'), 'orders.jsonl');
+  fs.writeFileSync(orderSrc, '');
+  const store = new PgliteLocalStore({ dataDir });
+  let snapRev;
+  try {
+    const snap = await createSnapshot(store, { orderSourcePath: orderSrc });
+    snapRev = snap.projection_revision;
+    // The canonical snapshot payload includes the archived-history projection.
+    const got = await getSnapshot(store, { revision: snapRev });
+    assert.ok(Array.isArray(got.payload.archived_history), 'snapshot payload carries archived_history');
+    assert.equal(got.payload.archived_history.length, 3);
+    assert.deepEqual(got.payload.archived_history.map((r) => r.task_id).sort(), ['closed-c', 'finished-a', 'gen-b']);
+    // A rebuild over unchanged state dedups to the SAME snapshot (deterministic checksum).
+    const again = await createSnapshot(store, { orderSourcePath: orderSrc });
+    assert.equal(again.projection_revision, snapRev, 'deterministic: history section dedups, no new snapshot');
+  } finally {
+    await store.close();
+  }
+});
+
+test('a store that never ran the back-fill has NO archived_history key (S6 payload unchanged)', async () => {
+  const dataDir = await initStore();
+  // Create a task so there is domain state to snapshot, but never back-fill.
+  const store = new PgliteLocalStore({ dataDir });
+  try {
+    const { createTask } = await import('../lib/domain-store.mjs');
+    await createTask(store, { taskId: 'plain-1', kind: 'ship', title: 'x', origin: 'internal', internalReason: 'r', commandId: 'c:plain-1' });
+    const orderSrc = path.join(mkTempDir('cp-cw2-ord2-'), 'orders.jsonl');
+    fs.writeFileSync(orderSrc, '');
+    const snap = await createSnapshot(store, { orderSourcePath: orderSrc });
+    const got = await getSnapshot(store, { revision: snap.projection_revision });
+    assert.equal('archived_history' in got.payload, false, 'no archived_history key when the table has no rows - existing payload byte-identical');
+  } finally {
+    await store.close();
+  }
 });
 
 test('back-fill is idempotent: a second run replays and never duplicates', async () => {

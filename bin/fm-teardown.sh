@@ -1246,6 +1246,10 @@ if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only 
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi
 echo "teardown $ID complete (window $T, worktree $WT)"
+
+# CW2 shadow-run mirror (ORD-256): teardown is the task leaving the live fleet. Inert unless
+# CP_SHADOW=1; backgrounded and always-0, so it can never block or fail teardown.
+"$SCRIPT_DIR/fm-cp-shadow.sh" teardown --task "$ID" || true
 backlog_refresh_reminder
 # Closeout is the highest-value triage trigger: a torn-down task can clear a blocker,
 # leave a scout report needing a successor, or resolve a bug, and none of that surfaces

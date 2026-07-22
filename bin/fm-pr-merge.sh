@@ -99,6 +99,10 @@ if ! "$SCRIPT_DIR/fm-task-events.sh" "$ID" landed "merged PR $URL" "$BRANCH" PR 
   exit 1
 fi
 
+# CW2 shadow-run mirror (ORD-256): the PR merge is the ship task's completion. Inert unless
+# CP_SHADOW=1; backgrounded and always-0, so it can never block or fail the merge flow.
+"$SCRIPT_DIR/fm-cp-shadow.sh" completed --task "$ID" --detail "merged PR $URL" || true
+
 # The merge is the moment the ship task's work actually landed, and it can clear a
 # blocker or resolve a bug well before the matching teardown runs. Prompt the triage
 # duty on the merge itself, not only on closeout.

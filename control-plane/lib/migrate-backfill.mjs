@@ -59,21 +59,41 @@ export const BACKFILL_DECISION =
   + 'no live-path (task/run/event/outbox/consumer) writes.';
 
 // The CW1 residual deferral reasons that mark a record as archived history to back-fill.
-// This predicate is the authoritative, documented scope of the back-fill; QA adjudicates it.
 // The "migrated in-flight backlog task ... retained for CW2 re-dispatch/back-fill" reason is
 // deliberately EXCLUDED - that is live work retained for re-dispatch (a later cutover
 // concern), not archived history.
-const CLASS_PREDICATES = [
-  { cls: 'done_archive', match: 'archived/finished task with no live-backlog membership' },
-  { cls: 'multi_gen', match: 'historical/additional run generation superseded' },
-  { cls: 'archive_event', match: 'task-scope archived event needs the acked-terminal' }
-];
+const DONE_ARCHIVE_MATCH = 'archived/finished task with no live-backlog membership';
+const MULTI_GEN_MATCH = 'historical/additional run generation superseded';
+const ARCHIVE_EVENT_MATCH = 'task-scope archived event needs the acked-terminal';
 
+// Reason-only classifier (kept for direct unit testing of the reason predicates).
 export function classifyRecordClass(reason) {
   if (typeof reason !== 'string') return null;
-  for (const { cls, match } of CLASS_PREDICATES) {
-    if (reason.includes(match)) return cls;
-  }
+  if (reason.includes(DONE_ARCHIVE_MATCH)) return 'done_archive';
+  if (reason.includes(MULTI_GEN_MATCH)) return 'multi_gen';
+  if (reason.includes(ARCHIVE_EVENT_MATCH)) return 'archive_event';
+  return null;
+}
+
+// Full, SHAPE-AWARE classifier (finding 3). Reason substrings alone under-capture archived
+// history: the done-archive LEDGER carries rows whose executor reason is `kind un-prescribed`,
+// `conflicting kinds`, or `prescribed status archived not committed`, and task-scope
+// `archived` lifecycle events exist whose reason does not match the narrow string. So a record
+// is archived history when ANY of these hold, checked in priority order:
+//   multi_gen     - a superseded historical run generation (reason);
+//   archive_event - a canonical task-scope `archived` event (by SHAPE), or the reason;
+//   done_archive  - a row from the done-archive LEDGER (by store), or the reason.
+// Everything else is out of this stage's scope (live/in-flight/re-dispatch/order/marker) and
+// is accounted for explicitly, never silently dropped.
+export function classifyRecord(rec) {
+  if (!rec || typeof rec !== 'object') return null;
+  const reason = typeof rec.reason === 'string' ? rec.reason : '';
+  if (reason.includes(MULTI_GEN_MATCH)) return 'multi_gen';
+  const rows = canonicalRows(rec);
+  if (rows.some((r) => r && r.fields && r.fields.event_scope === 'task' && r.fields.event_type === 'archived')) return 'archive_event';
+  if (reason.includes(ARCHIVE_EVENT_MATCH)) return 'archive_event';
+  if (rec.store === 'done-archive') return 'done_archive';
+  if (reason.includes(DONE_ARCHIVE_MATCH)) return 'done_archive';
   return null;
 }
 
@@ -267,17 +287,26 @@ export async function runMigrateBackfill({ residualPath, dataDir, outPath, resum
   const legacyHome = typeof doc.legacy_home === 'string' ? doc.legacy_home : undefined;
   const resolvedOut = resolveContainedOut(outPath, dataDir, legacyHome);
 
-  // Classify and extract (pure). Totality population is the set of residual records that
-  // match the archived-history predicate; everything else is out of this stage's scope.
-  const matched = [];
-  for (const rec of doc.residual) {
-    const cls = classifyRecordClass(rec && rec.reason);
-    if (cls) matched.push({ rec, cls });
-  }
+  // Classify and extract (pure), reconciling over the FULL residual set (finding 3). EVERY
+  // record lands in exactly one bucket - imported, flagged, or out_of_scope - so nothing is
+  // silently filtered. Archived history (shape-aware classifyRecord) is imported or flagged;
+  // everything else (live/in-flight/re-dispatch/order/marker) is recorded out_of_scope with
+  // its store+reason, an auditable disposition rather than a silent drop.
   const entries = [];
   const flagged = [];
+  const outOfScope = [];
   const byClass = { done_archive: 0, multi_gen: 0, archive_event: 0 };
-  for (const { rec, cls } of matched) {
+  const outByReason = {};
+  let matchedCount = 0;
+  for (const rec of doc.residual) {
+    const cls = classifyRecord(rec);
+    if (!cls) {
+      const reason = rec && typeof rec.reason === 'string' ? rec.reason : '(no reason)';
+      outOfScope.push({ source_ref: rec && rec.source_ref, store: rec && rec.store, reason });
+      outByReason[reason] = (outByReason[reason] || 0) + 1;
+      continue;
+    }
+    matchedCount += 1;
     const built = buildHistoryEntry(rec, cls);
     if (built.flagged) {
       flagged.push(built.flagged);
@@ -305,23 +334,30 @@ export async function runMigrateBackfill({ residualPath, dataDir, outPath, resum
   const imported = entries.length;
   const importedNew = writeResult.newKeys.length;
   const importedReplayed = writeResult.replayedKeys.length;
+  const scanned = doc.residual.length;
 
-  const totalityHolds = imported + flagged.length === matched.length;
+  // FULL-SET totality (finding 3): every retained residual record is imported, explicitly
+  // flagged, or explicitly out of scope - nothing is silently lost.
+  const fullTotalityHolds = imported + flagged.length + outOfScope.length === scanned;
+  const matchedTotalityHolds = imported + flagged.length === matchedCount;
   const countsCoherent = storeCount >= importedKeys.size
     && importedNew + importedReplayed === entries.length;
-  const importedNonzero = matched.length === 0 || imported > 0;
-  const ok = totalityHolds && countsCoherent && importedNonzero;
+  const importedNonzero = matchedCount === 0 || imported > 0;
+  const ok = fullTotalityHolds && matchedTotalityHolds && countsCoherent && importedNonzero;
 
   const reconciliation = {
-    matched: matched.length,
+    residual_scanned: scanned,
+    matched: matchedCount,
     imported,
     imported_new: importedNew,
     imported_replayed: importedReplayed,
     flagged: flagged.length,
+    out_of_scope: outOfScope.length,
     by_class: byClass,
     store_archived_history_count: storeCount,
     imported_distinct_keys: importedKeys.size,
-    totality_holds: totalityHolds,
+    full_totality_holds: fullTotalityHolds,
+    matched_totality_holds: matchedTotalityHolds,
     counts_coherent: countsCoherent,
     imported_nonzero: importedNonzero,
     ok
@@ -329,20 +365,22 @@ export async function runMigrateBackfill({ residualPath, dataDir, outPath, resum
 
   const report = {
     schema: BACKFILL_RESIDUAL_SCHEMA,
-    posture: 'audit-only archived-history import; live-path terminal/ack/cleanup/archive synthesis forbidden (see decision); legacy stores untouched (input is the CW1 residual file)',
+    posture: 'audit-only archived-history import; live-path terminal/ack/cleanup/archive synthesis forbidden (see decision); legacy stores untouched (input is the CW1 residual file). Every residual record is imported, flagged, or explicitly out-of-scope.',
     decision: BACKFILL_DECISION,
     source_residual: path.resolve(residualPath),
     source_residual_schema: CW1_RESIDUAL_SCHEMA,
     data_dir: dataDir,
     resumed: resume === true,
     totals: {
-      residual_scanned: doc.residual.length,
-      archived_history_matched: matched.length,
+      residual_scanned: scanned,
+      archived_history_matched: matchedCount,
       imported,
       imported_new: importedNew,
       imported_replayed: importedReplayed,
       flagged: flagged.length,
-      by_class: byClass
+      out_of_scope: outOfScope.length,
+      by_class: byClass,
+      out_of_scope_by_reason: outByReason
     },
     reconciliation,
     imported: entries.map((e) => ({
@@ -354,13 +392,14 @@ export async function runMigrateBackfill({ residualPath, dataDir, outPath, resum
       source_ref: e.source_ref,
       archived_at: e.archived_at
     })),
-    flagged
+    flagged,
+    out_of_scope: outOfScope
   };
 
   atomicWriteOwnerOnly(resolvedOut, `${JSON.stringify(report, null, 2)}\n`);
 
-  if (!totalityHolds || !countsCoherent) {
-    throw new BackfillReconcileError('migrate-backfill reconciliation failed (totality or store counts do not reconcile); residual report written for audit', {
+  if (!fullTotalityHolds || !matchedTotalityHolds || !countsCoherent) {
+    throw new BackfillReconcileError('migrate-backfill reconciliation failed (full-set totality, matched totality, or store counts do not reconcile); residual report written for audit', {
       out: resolvedOut, reconciliation
     });
   }

@@ -82,6 +82,12 @@ terminal_record_has_valid_evidence() {
 
 [ "$#" -ge 6 ] || { echo "usage: fm-task-events.sh <id> <disposition> <outcome> <branch> <mode> <sha-or-report>" >&2; exit 2; }
 ID=$1 DISPOSITION=$2 OUTCOME=$3 BRANCH=$4 MODE=$5 EVIDENCE=$6
+
+# CW2 shadow-run mirror (ORD-256): every durable task lifecycle event flows through here, so
+# this is the status-transition chokepoint. Mirror the disposition into the control-plane
+# store, inert unless CP_SHADOW=1; backgrounded and always-0, so it can never block or fail
+# the closure-evidence write below.
+"$SCRIPT_DIR/fm-cp-shadow.sh" status --task "$ID" --status "$DISPOSITION" --detail "$OUTCOME" || true
 CLI=$(visibility_cli) || { echo "blocked: fleet-bridge visibility CLI not found" >&2; exit 1; }
 
 META="$STATE/$ID.meta"
