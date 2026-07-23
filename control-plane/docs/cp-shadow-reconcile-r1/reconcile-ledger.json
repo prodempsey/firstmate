@@ -1,6 +1,6 @@
 {
   "schema": "control-plane/shadow-reconcile/ledger/v1",
-  "reason": "PROPOSED (UNAPPROVED) reconcile ledger for the 8 documented pre-shadow-enable divergent rows in the production store (/home/prode/fleet/control-plane/pgdata). Each task's legacy-derived expected terminal status is `completed`, but its store row is `failed` after the reconciler's spawn-timeout close of a synthetic generation-1 run (audit annotations from cp-shadow are already on each row). The S3 identity-binding guard correctly refuses hand-authored completions, so this administrative reconcile ledger is the sanctioned path. Evidence references are the DURABLE, immutable per-task closeout artifacts under legacy_home (each task's brief.md, plus report.md where a QA report exists) - NOT the pruning backlog/done-archive rows (which move between files) and NOT volatile state/<task>.meta files. firstmate/captain must review the evidence and the corresponding done-archive/backlog Done disposition before approval; the ledger is bound to target_data_dir, so the approval digest changes if the target store or legacy root changes. Run only with CP_SHADOW=1 and `cp shadow-reconcile --captain-approved`. Do NOT run against the production store without that approval.",
+  "reason": "PROPOSED (UNAPPROVED) reconcile ledger for the 8 documented pre-shadow-enable divergent rows in the production store (/home/prode/fleet/control-plane/pgdata). Each task's legacy-derived expected terminal status is `completed`, but its store row is `failed` after the reconciler's spawn-timeout close of a synthetic generation-1 run (audit annotations from cp-shadow are already on each row). The S3 identity-binding guard correctly refuses hand-authored completions, so this administrative reconcile ledger is the sanctioned path. Evidence: the six QA rows cite their durable, immutable per-task closeout artifacts (brief.md + delivered report.md); the two cutover rows, which have no per-task report, cite their completion row in data/done-archive.md (with a task-id anchor) plus the durable brief. NO volatile state/<task>.meta files are used. The done-archive/backlog rows are the pruning fleet backlog, so if a cited completion row later moves the fail-closed evidence gate refuses and the ref must be repointed before approval; firstmate/captain must re-verify all evidence at approval time. The ledger is bound to target_data_dir and its digest covers the whole document, so the approval digest changes if any field changes. Run only with CP_SHADOW=1 and `cp shadow-reconcile --captain-approved`. Do NOT run against the production store without that approval.",
   "legacy_home": "/home/prode/fleet/firstmate-runtime",
   "target_data_dir": "/home/prode/fleet/control-plane/pgdata",
   "entries": [
@@ -64,8 +64,8 @@
       "task_id": "cutover-w3",
       "expected_status": "completed",
       "evidence": {
-        "source_refs": ["data/backlog.md#cutover-w3", "data/cutover-w3/brief.md"],
-        "note": "completion evidence: backlog Done row records merged d38376e (2 QA rounds, cockpit/CP preview live), plus the durable task brief; store row wrongly `failed` after synthetic gen-1 spawn-timeout close. If the backlog row later prunes to done-archive, the validator refuses and the ref must be repointed before approval."
+        "source_refs": ["data/done-archive.md#cutover-w3", "data/cutover-w3/brief.md"],
+        "note": "completion evidence: done-archive row records fleet-bridge merged d38376e (2 QA rounds, cockpit/CP preview live at snapshot rev 2), plus the durable task brief; store row wrongly `failed` after synthetic gen-1 spawn-timeout close. If the archive row later moves, the validator refuses and the ref must be repointed before approval."
       }
     }
   ]
