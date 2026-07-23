@@ -61,6 +61,63 @@ function registryBytes(dir) {
   return fs.existsSync(rp.registry) ? fs.readFileSync(rp.registry) : Buffer.alloc(0);
 }
 
+// A deliberately RICH corpus so the generated proposal exercises every source shape:
+// extract records (candidate + superseded), a survey file with populated
+// surveyedHeadings, a glob source with BOTH an accepted file (populated `files`) and a
+// refused symlinked child (populated `refusedFiles`), and an absent glob (empty
+// arrays). This makes the whole-document leaf walk below cover every leaf the schema
+// can produce, not just the ones present in a minimal corpus.
+function makeRichProposal() {
+  const corpus = mkCorpus({
+    ...CORPUS,
+    'data/captain.md': '# Captain\n\n## Working style\n\nterse\n\n## Escalation\n\nfull urls\n',
+    'projects/demo/AGENTS.md': '# Demo\n\n## Build\n\nmake\n'
+  });
+  const outer = mkdir('mem-outer-');
+  fs.writeFileSync(path.join(outer, 'creds.env'), 'TOKEN=SECRET\n');
+  fs.mkdirSync(path.join(corpus, 'projects', 'evil'), { recursive: true });
+  fs.symlinkSync(path.join(outer, 'creds.env'), path.join(corpus, 'projects', 'evil', 'AGENTS.md'));
+  const out = mkdir('mem-out-');
+  const result = runDryRun(corpus, out);
+  const proposal = JSON.parse(fs.readFileSync(result.proposalFile, 'utf8'));
+  return { proposalFile: result.proposalFile, proposal, digest: result.digest };
+}
+
+// The volatile top-level keys that are intentionally NOT bound by the approval digest.
+const SKIP_TOP = new Set(['generatedAt', 'corpusRoot', 'digest']);
+
+// Enumerate every leaf path of a proposal document (arrays element-wise; an empty
+// array/object is itself a leaf), skipping the three volatile top-level keys.
+function leafPaths(node, prefix = []) {
+  if (Array.isArray(node)) {
+    if (node.length === 0) return [prefix];
+    return node.flatMap((v, i) => leafPaths(v, [...prefix, i]));
+  }
+  if (node && typeof node === 'object') {
+    const keys = Object.keys(node).filter((k) => !(prefix.length === 0 && SKIP_TOP.has(k)));
+    if (keys.length === 0) return [prefix];
+    return keys.flatMap((k) => leafPaths(node[k], [...prefix, k]));
+  }
+  return [prefix];
+}
+
+function setPath(obj, p, value) {
+  let node = obj;
+  for (let i = 0; i < p.length - 1; i += 1) node = node[p[i]];
+  node[p[p.length - 1]] = value;
+}
+
+// A guaranteed-different value for any leaf type, so the mutation always changes the
+// canonical document.
+function tamperValue(v) {
+  if (typeof v === 'string') return `${v}__TAMPER`;
+  if (typeof v === 'number') return v + 1;
+  if (typeof v === 'boolean') return !v;
+  if (Array.isArray(v)) return ['__TAMPER__'];
+  if (v && typeof v === 'object') return { __TAMPER__: 1 };
+  return '__TAMPER__'; // null
+}
+
 test('apply refuses with no --captain-approved and never writes', async () => {
   const { proposalFile } = makeProposal();
   const registry = tmpRegistry();
@@ -178,56 +235,71 @@ test('re-applying the same approved proposal is a no-op (idempotent)', async () 
   assert.ok(registryBytes(registry).equals(afterFirst), 'registry bytes unchanged by the idempotent re-apply');
 });
 
-// ---- F1: the approval digest binds the WHOLE canonicalized proposal ----------
+// ---- F1: the approval digest binds EVERY leaf of the canonicalized proposal ---
 
-// Every candidate/source field one at a time: mutating it while keeping the stored
+// Table-driven, one test per leaf: mutating any single leaf while keeping the stored
 // digest and the original approval must be refused with a byte-identical (empty)
-// registry. This proves the digest covers the complete document, not a projection.
-const FIELD_MUTATIONS = [
-  ['summary', (p) => { p.proposals[0].summary += ' TAMPER'; }],
-  ['body', (p) => { p.proposals[0].body += ' TAMPER'; }],
-  ['memoryType', (p) => { p.proposals[0].memoryType = p.proposals[0].memoryType === 'factual' ? 'procedural' : 'factual'; }],
-  ['scope', (p) => { p.proposals[0].scope = 'project'; }],
-  ['projects', (p) => { p.proposals[0].projects = ['evil']; }],
-  ['taskKinds', (p) => { p.proposals[0].taskKinds = ['evil']; }],
-  ['keywords', (p) => { p.proposals[0].keywords = ['evil']; }],
-  ['aliases', (p) => { p.proposals[0].aliases = ['evil']; }],
-  ['entities', (p) => { p.proposals[0].entities = ['evil']; }],
-  ['commands', (p) => { p.proposals[0].commands = ['evil']; }],
-  ['failureModes', (p) => { p.proposals[0].failureModes = ['evil']; }],
-  ['relatedTerms', (p) => { p.proposals[0].relatedTerms = ['evil']; }],
-  ['confidence', (p) => { p.proposals[0].confidence = 'guarded'; }],
-  ['validFrom', (p) => { p.proposals[0].validFrom = '2000-01-01T00:00:00.000Z'; }],
-  ['disposition', (p) => { p.proposals[0].disposition = 'active'; }],
-  ['dispositionReason', (p) => { p.proposals[0].dispositionReason = 'forged reason'; }],
-  ['supersededBy', (p) => { p.proposals[0].supersededBy = 'MEM-9999'; }],
-  ['activationNominee', (p) => { p.proposals[0].activationNominee = true; }],
-  ['contentDigest', (p) => { p.proposals[0].contentDigest = '0'.repeat(64); }],
-  ['proposalId', (p) => { p.proposals[0].proposalId = 'MIG-000000000000'; }],
-  ['provenance.path', (p) => { p.proposals[0].provenance.path = 'data/evil.md'; }],
-  ['provenance.anchor', (p) => { p.proposals[0].provenance.anchor = 'evil-anchor'; }],
-  ['provenance.lineStart', (p) => { p.proposals[0].provenance.lineStart = 999; }],
-  ['evidence', (p) => { p.proposals[0].evidence = [{ type: 'x', ref: 'y' }]; }],
-  ['counts', (p) => { p.counts.total = 999; }],
-  ['source.sha256', (p) => { p.sources.find((s) => s.key === 'learnings').sha256 = 'f'.repeat(64); }],
-  ['source.reason', (p) => { p.sources[0].reason = 'forged'; }]
-];
+// registry. The leaf set is derived from the whole rich proposal document, so it
+// covers every candidate leaf (type/content/provenance.{source,path,anchor,
+// lineStart,lineEnd}/confidence/evidence/disposition/.../contentDigest), both nested
+// `counts` maps, and every source-review leaf across all shapes (file, survey with
+// `surveyedHeadings`, glob `files[]` and `refusedFiles[]`, and empty-array leaves).
+// This is the exhaustive per-field mutation-regression proof.
+const RICH_LEAVES = leafPaths(makeRichProposal().proposal);
 
-for (const [name, mutate] of FIELD_MUTATIONS) {
-  test(`F1: mutating candidate/source field '${name}' invalidates the prior approval (no write)`, async () => {
-    const { proposalFile, proposal, digest } = makeProposal();
+for (const leaf of RICH_LEAVES) {
+  const name = leaf.join('.');
+  test(`F1 leaf tamper refused (empty registry): ${name}`, async () => {
+    const { proposalFile, proposal, digest } = makeRichProposal();
     const clone = JSON.parse(JSON.stringify(proposal));
-    mutate(clone);
+    const current = leaf.reduce((node, key) => node[key], clone);
+    setPath(clone, leaf, tamperValue(current));
     fs.writeFileSync(proposalFile, JSON.stringify(clone, null, 2));
     const registry = tmpRegistry();
     await assert.rejects(
       () => applyMigration(registry, { proposalFile, approvedDigest: digest }),
-      /stored digest does not match its content|does not match this proposal/,
-      `mutation of ${name} must be refused`
+      /stored digest does not match its content|wrong or missing schema|no proposals array/,
+      `mutating ${name} must be refused`
     );
     assert.equal(registryBytes(registry).length, 0, `${name}: registry must be byte-identical (empty)`);
   });
 }
+
+// Sanity guard on the matrix itself: the enumerated leaf set must actually include
+// the specific fields QA called out, so the coverage can never silently regress.
+test('F1 coverage guard: the leaf matrix includes every named candidate and source leaf', () => {
+  const flat = new Set(RICH_LEAVES.map((l) => l.join('.')));
+  // A field is covered when its (possibly dotted) segment sequence appears anywhere in
+  // some leaf path — including as `field.N` when the field is a non-empty array whose
+  // elements are enumerated individually.
+  const has = (field) => {
+    const parts = field.split('.');
+    return RICH_LEAVES.some((leaf) => {
+      for (let i = 0; i + parts.length <= leaf.length; i += 1) {
+        if (parts.every((seg, j) => String(leaf[i + j]) === seg)) return true;
+      }
+      return false;
+    });
+  };
+  for (const field of [
+    'memoryType', 'summary', 'body', 'scope', 'projects', 'taskKinds', 'keywords',
+    'aliases', 'entities', 'commands', 'failureModes', 'relatedTerms', 'confidence',
+    'provenance.source', 'provenance.path', 'provenance.anchor', 'provenance.lineStart',
+    'provenance.lineEnd', 'validFrom', 'disposition', 'dispositionReason', 'supersededBy',
+    'activationNominee', 'proposalId', 'contentDigest'
+  ]) {
+    assert.ok(has(field), `candidate leaf ${field} must be in the mutation matrix`);
+  }
+  // Source-review leaves and both counts maps.
+  for (const field of ['key', 'policy', 'label', 'reason', 'path', 'exists', 'refused',
+    'refusedReason', 'itemCount', 'surveyedHeadings', 'sha256', 'fileCount']) {
+    assert.ok(has(field), `source leaf ${field} must be in the mutation matrix`);
+  }
+  assert.ok([...flat].some((p) => p.startsWith('counts.byDisposition.')), 'counts.byDisposition mutated');
+  assert.ok([...flat].some((p) => p.startsWith('counts.byType.')), 'counts.byType mutated');
+  assert.ok([...flat].some((p) => /sources\.\d+\.files\.\d+\.(path|sections|sha256)/.test(p)), 'nested files leaves mutated');
+  assert.ok([...flat].some((p) => /sources\.\d+\.refusedFiles\.\d+\.(path|reason)/.test(p)), 'nested refusedFiles leaves mutated');
+});
 
 test('F1: an internally-inconsistent candidate contentDigest is refused even when re-digested and re-approved', async () => {
   const { proposalFile, proposal } = makeProposal();
