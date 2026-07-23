@@ -453,22 +453,25 @@ HERR=$("$ORDER" hold ORD-005 --reason r 2>&1) && fail "a hold with no review con
 printf '%s' "$HERR" | grep -q 'review-after' || fail "an empty-review hold did not name the missing condition: $HERR"
 pass "a hold's review condition must be a machine-checkable date or typed event key, never free text"
 
-# --- the ACCOUNTED predicate, branch by branch ------------------------------------------
+# --- the ACCOUNTED predicate, branch by branch (control plane NOT reachable) -------------
 # audit writes a deterministic result file, so give it a temp state dir of its own and never
 # the production one. FM_ORDER_ACCOUNT_GRACE_SECS=0 removes the freshness grace so every
 # non-fresh branch is exercised directly; the fresh branch is checked separately below.
+# FM_ORDER_CP_DATA_DIR points at a nonexistent dir so no control plane is reachable here; the
+# control-plane-verified live-work and task-event branches get their own section further down.
 ACC=$(new_inbox accounted)
 export FM_ORDERS_PATH="$ACC"
+export FM_ORDER_CP_DATA_DIR="$TMP_ROOT/no-such-cp-store"
 ACC_STATE="$TMP_ROOT/accounted-state"
 OLD=2026-01-01T00:00:00Z   # old enough to be well past any grace
 "$ORDER" add --received-at "$OLD" \
   "live owner" "no owner" "queued good" "queued no reason" "queued no blocker" \
   "held future" "held past" "held order live" "held order fired" "held task" \
   "decision" "received stale" "blocker target" >/dev/null 2>&1
-# ORD-001 dispatched with an owner and linked work -> live_owner.
+# ORD-001 dispatched with an owner and linked work; no control plane -> live_owner_unverified.
 "$ORDER" dispatch ORD-001 --task task-live >/dev/null
 "$ORDER" claim ORD-001 --owner crew-live >/dev/null
-# ORD-002 dispatched but never claimed -> unaccounted (no owner).
+# ORD-002 dispatched but never claimed -> unaccounted (no owner, no live task).
 "$ORDER" dispatch ORD-002 --task task-orphan >/dev/null
 # ORD-003 queued WITH a recorded reason AND a blocker (ORD-012, still live) -> accounted.
 "$ORDER" queue ORD-003 --reason "waits on ORD-012" --depends-on ORD-012 >/dev/null
@@ -483,8 +486,8 @@ OLD=2026-01-01T00:00:00Z   # old enough to be well past any grace
 # ORD-009 held until ORD-013 terminal, and ORD-013 is completed below -> fired -> unaccounted.
 "$ORDER" hold ORD-008 --reason r --review-after "order:ORD-012:terminal" >/dev/null
 "$ORDER" hold ORD-009 --reason r --review-after "order:ORD-013:terminal" >/dev/null
-# ORD-010 held on a task terminal event: machine-checkable, but the control plane evaluates
-# it (slice S4), so here it cannot fire and stays accounted.
+# ORD-010 held on a task terminal event: machine-checkable, but with no control plane reachable
+# it cannot be evaluated here -> held_task_event_unverified (accounted, but flagged unverified).
 "$ORDER" hold ORD-010 --reason r --review-after "task:some-task-x9:terminal" >/dev/null
 # ORD-011 captain_decision with no board receipt -> unaccounted.
 "$ORDER" decision ORD-011 --reason "captain must pick A or B" >/dev/null
@@ -500,9 +503,11 @@ audit_field() {  # <order-id> <jq-field>
     | jq -r --arg id "$1" --arg f "$2" \
         '[.orders[] | select(.order_id == $id) | .[$f]] | if length == 0 then "-" else (.[0] | tostring) end'
 }
-[ "$(audit_field ORD-001 basis)" = live_owner ] || fail "a dispatched order with a live owner was not accounted as live_owner"
-[ "$(audit_field ORD-002 accounted)" = false ] || fail "a dispatched order with no owner was accounted"
-[ "$(audit_field ORD-002 unaccounted_reason)" = "dispatched with no owner" ] || fail "an ownerless dispatch did not name its gap"
+# With no control plane, the audit records that fact rather than silently pretending to verify.
+[ "$(FM_STATE_OVERRIDE="$ACC_STATE" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit --json | jq -r '.control_plane.available')" = false ] \
+  || fail "the audit claimed a control plane was reachable when none was"
+[ "$(audit_field ORD-001 basis)" = live_owner_unverified ] || fail "a dispatched order without a reachable control plane was not flagged live_owner_unverified"
+[ "$(audit_field ORD-002 accounted)" = false ] || fail "a dispatched order with no owner and no live task was accounted"
 [ "$(audit_field ORD-003 basis)" = queued_with_reason_and_blocker ] || fail "a queued order with a reason and a blocker was not accounted"
 [ "$(audit_field ORD-004 accounted)" = false ] || fail "a queued order with no reason was accounted"
 [ "$(audit_field ORD-005 accounted)" = false ] || fail "a queued order with no blocker was accounted"
@@ -511,10 +516,10 @@ audit_field() {  # <order-id> <jq-field>
 [ "$(audit_field ORD-007 accounted)" = false ] || fail "a hold whose review date has passed was accounted"
 [ "$(audit_field ORD-008 basis)" = held_event_pending ] || fail "a hold on a live order's terminal event was not accounted"
 [ "$(audit_field ORD-009 accounted)" = false ] || fail "a hold whose order-terminal event has fired was still accounted"
-[ "$(audit_field ORD-010 basis)" = held_task_event_deferred ] || fail "a hold on a task terminal event was not deferred-accounted"
+[ "$(audit_field ORD-010 basis)" = held_task_event_unverified ] || fail "a task-terminal hold with no control plane was not flagged unverified"
 [ "$(audit_field ORD-011 accounted)" = false ] || fail "a captain_decision with no board receipt was accounted"
 [ "$(audit_field ORD-012 accounted)" = false ] || fail "a received order past grace was accounted"
-pass "ACCOUNTED evaluates every branch: fresh/live-owner/queued/held/decision, over non-terminal orders only"
+pass "ACCOUNTED evaluates every branch with no control plane: fresh/unverified-live/queued/held/decision"
 
 # The blocker target ORD-013 completed -> terminal -> excluded from the audit entirely.
 [ "$(audit_field ORD-013 accounted)" = "-" ] \
@@ -619,3 +624,132 @@ RUAUDIT=$(FM_STATE_OVERRIDE="$TMP_ROOT/rollup-state" FM_ORDER_ACCOUNT_GRACE_SECS
 [ "$(printf '%s' "$RUAUDIT" | jq '[.orders[] | select(.order_id == "ORD-002" or .order_id == "ORD-003")] | length')" = 0 ] \
   || fail "an absorbed order still appears in the non-terminal audit"
 pass "rollup supersedes a saga's orders into one lead thread and refuses cycles and terminal absorbs"
+
+# === QA round 1 regressions (report qa-dj-s1-q94) =======================================
+
+# --- Finding 2: `blocked` is never accounted by paperwork alone -------------------------
+# The authority grants the queue-with-a-reason exception to `queued` only. A blocked order
+# carrying a reason and a dependency but no live work must NOT be accounted.
+BLK=$(new_inbox blockedpaper)
+export FM_ORDERS_PATH="$BLK"
+"$ORDER" add --received-at "$OLD" "blocked with paperwork" "its blocker" >/dev/null 2>&1
+"$ORDER" block ORD-001 --reason "waits on ORD-002" --depends-on ORD-002 >/dev/null
+BA=$(FM_STATE_OVERRIDE="$TMP_ROOT/blk-state" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit --json \
+     | jq -r '.orders[] | select(.order_id == "ORD-001") | "\(.accounted) \(.basis)"')
+[ "$BA" = "false unaccounted" ] \
+  || fail "a blocked order with only a reason and a dependency was accounted as paperwork: $BA"
+pass "a blocked order is not accounted merely because a block event carries prose and a dependency"
+
+# --- Finding 3: a park receipt never satisfies a captain decision -----------------------
+# A captain_parked order is terminal, so it cannot be rewritten into captain_decision at all;
+# and even a captain_decision that somehow carries a captain_ack (never a board receipt) is
+# unaccounted. Both halves are checked.
+DEC=$(new_inbox decisionreceipt)
+export FM_ORDERS_PATH="$DEC"
+"$ORDER" add --received-at "$OLD" "park then decision" >/dev/null 2>&1
+"$ORDER" park ORD-001 --captain-ack "park receipt" >/dev/null
+"$ORDER" decision ORD-001 --reason "a different decision" 2>/dev/null \
+  && fail "a terminal captain_parked order was rewritten into a captain_decision"
+DECR=$("$ORDER" decision ORD-001 --reason "x" 2>&1) || true
+printf '%s' "$DECR" | grep -q 'already terminal' || fail "rewriting a terminal order was not refused by name: $DECR"
+# A raw captain_decision row carrying a stale captain_ack but no board receipt is unaccounted.
+DEC2=$(new_inbox decisionreceipt2)
+export FM_ORDERS_PATH="$DEC2"
+"$ORDER" add "raw decision" >/dev/null 2>&1
+printf '{"schema":"firstmate/captain-order/v1","order_id":"ORD-001","event":"decision","ts":"2026-01-02T00:00:00Z","received_at":"2026-01-01T00:00:00Z","status":"captain_decision","captain_ack":"park receipt","board_receipt":null,"hold_reason":"different decision needed","updated_at":"2026-01-02T00:00:00Z"}\n' >> "$DEC2"
+D2A=$(FM_STATE_OVERRIDE="$TMP_ROOT/dec2-state" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit --json \
+      | jq -r '.orders[] | select(.order_id == "ORD-001") | "\(.accounted) \(.unaccounted_reason)"')
+[ "$D2A" = "false captain decision pending with no board receipt" ] \
+  || fail "a captain_decision carrying only a park receipt was accounted: $D2A"
+pass "a park receipt never satisfies a captain decision, and a terminal order cannot be rewritten"
+
+# --- Finding 4: supersede/rollup never leave a dangling or looping chain -----------------
+CHN=$(new_inbox chains)
+export FM_ORDERS_PATH="$CHN"
+"$ORDER" add "a" "b" "c" >/dev/null 2>&1
+# The sanctioned supersede writer refuses a nonexistent survivor, so the dangling chain in
+# the QA reproduction can never be created.
+"$ORDER" supersede ORD-001 --by ORD-999 2>/dev/null \
+  && fail "supersede accepted a nonexistent survivor target"
+SERR=$("$ORDER" supersede ORD-001 --by ORD-999 2>&1) || true
+printf '%s' "$SERR" | grep -q 'does not exist' || fail "supersede did not name the missing target: $SERR"
+# duplicate --of a missing order is refused the same way.
+"$ORDER" duplicate ORD-001 --of ORD-999 2>/dev/null && fail "duplicate accepted a nonexistent survivor target"
+# A rollup whose lead sits on a pre-existing dangling chain (injected raw) is refused: the
+# writer resolves the lead's whole survivor chain before writing.
+CHN2=$(new_inbox chains2)
+export FM_ORDERS_PATH="$CHN2"
+"$ORDER" add "dangling lead" "absorb me" >/dev/null 2>&1
+printf '{"schema":"firstmate/captain-order/v1","order_id":"ORD-001","event":"supersede","ts":"2026-01-02T00:00:00Z","status":"superseded","outcome_link":"ORD-777","updated_at":"2026-01-02T00:00:00Z"}\n' >> "$CHN2"
+RERR=$("$ORDER" rollup ORD-001 --absorb ORD-002 2>&1) || true
+printf '%s' "$RERR" | grep -q 'ORD-777 does not exist' \
+  || fail "rollup did not reject a lead whose survivor chain dangles: $RERR"
+pass "supersede and rollup reject missing survivors and dangling chains at the sanctioned writer"
+
+# --- Finding 5: audit fails nonzero when it cannot publish its result file ---------------
+WF=$(new_inbox writefail)
+export FM_ORDERS_PATH="$WF"
+"$ORDER" add "one order" >/dev/null 2>&1
+# A regular file where the state dir should be makes mkdir -p and the atomic write fail.
+WF_STATE_PARENT="$TMP_ROOT/writefail-state"
+mkdir -p "$WF_STATE_PARENT"
+: > "$WF_STATE_PARENT/blocker"
+set +e
+WFOUT=$(FM_STATE_OVERRIDE="$WF_STATE_PARENT/blocker" "$ORDER" audit 2>&1)
+WFRC=$?
+set -e
+[ "$WFRC" -ne 0 ] || fail "audit exited zero when it could not publish its result file"
+printf '%s' "$WFOUT" | grep -q 'could not atomically publish' \
+  || fail "audit did not report the publish failure: $WFOUT"
+[ ! -f "$WF_STATE_PARENT/blocker/.order-audit-last.json" ] \
+  || fail "audit wrote a result file into a path that should have failed"
+pass "audit fails nonzero when its deterministic result file cannot be atomically published"
+
+# --- Finding 1: control-plane task truth drives the live-work and task-event branches ----
+# This requires a runnable control plane (node + an initialized PGlite store). When one is
+# not available - e.g. CI does not install control-plane deps - the branch is unverifiable
+# here, and the CP-unavailable fallback is already covered above, so this is skipped.
+unset FM_ORDER_CP_DATA_DIR
+CP_BIN="$ROOT/control-plane/bin/cp.mjs"
+CP_STORE="$TMP_ROOT/cp-store"
+if command -v node >/dev/null 2>&1 && [ -f "$CP_BIN" ] \
+   && node "$CP_BIN" init --data-dir "$CP_STORE" >/dev/null 2>&1; then
+  cp_do() { node "$CP_BIN" "$@" --data-dir "$CP_STORE"; }
+  # t-live stays queued (a non-terminal, live status); t-dead is cancelled -> archived.
+  cp_do create-task --command-id c1 t-live --kind ship --origin captain_order --order-ref ORD-001 --title live >/dev/null 2>&1
+  cp_do create-task --command-id c2 t-dead --kind ship --origin captain_order --order-ref ORD-002 --title dead >/dev/null 2>&1
+  DEADREV=$(cp_do task-head t-dead | jq -r '.revision')
+  cp_do cancel --command-id c3 --expected-revision "$DEADREV" t-dead --reason "done" >/dev/null 2>&1
+  [ "$(cp_do task-head t-dead | jq -r '.status')" = archived ] \
+    || fail "the control-plane test fixture did not reach a terminal (archived) task"
+
+  CPBOX=$(new_inbox cpaudit)
+  export FM_ORDERS_PATH="$CPBOX"
+  CP_STATE="$TMP_ROOT/cpaudit-state"
+  "$ORDER" add --received-at "$OLD" "linked live" "linked dead" "held task live" "held task dead" >/dev/null 2>&1
+  "$ORDER" dispatch ORD-001 --task t-live >/dev/null; "$ORDER" claim ORD-001 --owner c >/dev/null
+  "$ORDER" dispatch ORD-002 --task t-dead >/dev/null; "$ORDER" claim ORD-002 --owner c >/dev/null
+  "$ORDER" hold ORD-003 --reason r --review-after "task:t-live:terminal" >/dev/null
+  "$ORDER" hold ORD-004 --reason r --review-after "task:t-dead:terminal" >/dev/null
+  cp_audit() {  # <order-id> <field>
+    FM_STATE_OVERRIDE="$CP_STATE" FM_ORDER_CP_DATA_DIR="$CP_STORE" FM_ORDER_ACCOUNT_GRACE_SECS=0 \
+      "$ORDER" audit --json \
+      | jq -r --arg id "$1" --arg f "$2" \
+          '[.orders[] | select(.order_id == $id) | .[$f]] | if length == 0 then "-" else (.[0] | tostring) end'
+  }
+  [ "$(FM_STATE_OVERRIDE="$CP_STATE" FM_ORDER_CP_DATA_DIR="$CP_STORE" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit --json | jq -r '.control_plane.available')" = true ] \
+    || fail "the audit did not report the control plane as reachable"
+  [ "$(cp_audit ORD-001 basis)" = live_owner ] \
+    || fail "an order linked to a LIVE control-plane task was not accounted as live_owner"
+  [ "$(cp_audit ORD-002 accounted)" = false ] \
+    || fail "an order linked only to an ARCHIVED control-plane task was still accounted"
+  [ "$(cp_audit ORD-002 unaccounted_reason)" = "dispatched but no linked task is live" ] \
+    || fail "a dead-task order did not name that its linked work is not live"
+  [ "$(cp_audit ORD-003 basis)" = held_task_event_pending ] \
+    || fail "a task-terminal hold on a LIVE task was not accounted pending"
+  [ "$(cp_audit ORD-004 accounted)" = false ] \
+    || fail "a task-terminal hold whose task is ARCHIVED (fired) was still accounted"
+  pass "the live-work and task-event branches read control-plane task truth: live accounts, dead does not"
+else
+  pass "SKIPPED: control-plane task-truth check needs a runnable control plane (node + PGlite store)"
+fi

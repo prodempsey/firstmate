@@ -292,6 +292,40 @@ fm_order_status_terminal() {  # <status>
   esac
 }
 
+# Control-plane task statuses that mean a task is no longer live work. The order audit's
+# live-work branch - the authoritative ACCOUNTED predicate (report section 5.0: "a linked
+# task in a non-terminal control-plane state") - treats a linked task as alive only when the
+# control plane reports a status OUTSIDE this set. A task that is terminal, missing, or
+# unreadable is NOT live. The audit reads task heads read-only (bin/fm-order.sh audit); it
+# never mutates the control plane - that is the reconciler's job (slice S4).
+FM_ORDER_CP_TERMINAL_TASK_STATES='completed failed archived cancelled cleaned anomaly'
+
+fm_order_task_state_is_terminal() {  # <task-status>
+  local s
+  for s in $FM_ORDER_CP_TERMINAL_TASK_STATES; do
+    [ "$1" = "$s" ] && return 0
+  done
+  return 1
+}
+
+# Print the control-plane read CLI ("<cli-path>") for read-only task-head lookups, or fail
+# (return 1) when no control plane is reachable - node missing, or the cp.mjs entrypoint
+# absent. FM_ORDER_CP_CLI overrides the path (tests, and a non-default install layout).
+fm_order_cp_cli() {  # <fm-root>
+  local cli
+  cli=${FM_ORDER_CP_CLI:-$1/control-plane/bin/cp.mjs}
+  command -v node >/dev/null 2>&1 || return 1
+  [ -f "$cli" ] || return 1
+  printf '%s' "$cli"
+}
+
+# Print the control-plane pgdata directory for a state dir, honoring an explicit override.
+# Mirrors the coordinator's own default (<state>/control-plane/pgdata) so the audit reads the
+# same store the shadow run writes.
+fm_order_cp_data_dir() {  # <state-dir>
+  printf '%s' "${FM_ORDER_CP_DATA_DIR:-$1/control-plane/pgdata}"
+}
+
 # Classify a hold's --review-after condition. A machine-checkable hold is one a script can
 # evaluate on its own, which is what stops a hold from being a permanent silent mute (the
 # L3 loss mode in the ORD-237 report): free text nothing can read never expires, so the

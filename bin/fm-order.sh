@@ -359,6 +359,40 @@ pending_json() {
   } | jq -sc 'sort_by(.captured_at // "")'
 }
 
+# Refuse a supersede/rollup that would leave a chain a script cannot follow to an end. Every
+# supersede links an order to a SURVIVING one, and following those links from any order must
+# reach a real, non-superseded tail in bounded steps - never a missing order, never a loop.
+# The sanctioned writer validates the target's whole survivor chain, so a dangling or cyclic
+# chain can never be created through any supported verb (ORD-260 slice S1, QA finding #4).
+# Requires FOLD_PATH to be populated (call fold_file first).
+validate_supersede_chain() {  # <new-id> <target-id>
+  local newid=$1 target=$2 result ok reason
+  result=$(jq -c --arg start "$target" --arg newid "$newid" '
+    . as $fold
+    | def walk($id; $seen):
+        if ($seen | index($id)) then {ok: false, reason: ("supersede chain loops back through " + $id)}
+        elif (($fold[$id]) // null) == null then {ok: false, reason: ("supersede target " + $id + " does not exist")}
+        elif (($seen | length) > 128) then {ok: false, reason: "supersede chain is too deep to resolve"}
+        else ($fold[$id]) as $o | ($seen + [$id]) as $s2
+          | if (($o.status // "") == "superseded")
+            then (($o.outcome_link // "") as $n
+                  | if $n == "" then {ok: false, reason: ("superseded order " + $id + " names no surviving order")}
+                    else walk($n; $s2) end)
+            else {ok: true, chain: $s2} end
+        end;
+      (walk($start; [])) as $w
+      | if ($w.ok | not) then $w
+        elif (($w.chain // []) | index($newid)) then
+          {ok: false, reason: ($newid + " is already in " + $start + "'"'"'s survivor chain, so this would loop")}
+        else {ok: true} end
+    ' "$FOLD_PATH")
+  ok=$(printf '%s' "$result" | jq -r '.ok')
+  if [ "$ok" != true ]; then
+    reason=$(printf '%s' "$result" | jq -r '.reason // "invalid supersede chain"')
+    die "refused: $reason; supersede chains must terminate in a real surviving order" 2
+  fi
+}
+
 # --- verbs ---------------------------------------------------------------------------
 
 VERB=${1:-}
@@ -753,14 +787,17 @@ case "$VERB" in
 
   audit)
     # The ACCOUNTED predicate over every non-terminal order (ORD-260 slice S1, report
-    # sections 5.0/5.1-C1). An order is accounted when it is fresh (< grace), a dispatched
-    # order with a live owner and linked work, a queued/blocked order with a recorded
-    # reason AND a blocker, a held order on a machine-checkable condition that has not yet
-    # fired, or a captain_decision carrying a board receipt. Anything else past grace is an
-    # anomaly. The result is written to state/.order-audit-last.json - a deterministic
-    # script product, never conversational, the same pattern as state/.triage-duty-last.json
-    # - so a later reader (slice S2's turn-end gate) does a cheap file read, never a
-    # re-enumeration. This verb only READS the inbox; it takes no writer lock.
+    # sections 5.0/5.1-C1). An order is accounted when it is fresh (< grace); has >=1 linked
+    # task the control plane reports in a non-terminal (live) state - the authoritative
+    # live-work branch, evaluated for EVERY non-terminal order regardless of its own status;
+    # is queued with a recorded reason AND a blocker; is held on a machine-checkable
+    # condition that has not fired (an ISO date, an order:<id>:terminal event read from the
+    # ledger, or a task:<id>:terminal event read from the control plane); or is a
+    # captain_decision carrying a validated board receipt. Anything else past grace is an
+    # anomaly. The result is written to state/.order-audit-last.json - a deterministic script
+    # product, the same pattern as state/.triage-duty-last.json - so a later reader (slice
+    # S2's turn-end gate) does a cheap file read, never a re-enumeration. This verb only READS
+    # the inbox and the control-plane task heads; it takes no writer lock and mutates nothing.
     require_inbox
     JSON=false
     while [ "$#" -gt 0 ]; do
@@ -775,42 +812,97 @@ case "$VERB" in
     case "$NOW_EPOCH" in ''|*[!0-9]*) NOW_EPOCH=0 ;; esac
     GRACE=${FM_ORDER_ACCOUNT_GRACE_SECS:-14400}
     case "$GRACE" in ''|*[!0-9]*) GRACE=14400 ;; esac
+    STATE_DIR="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+
+    # --- Read control-plane task truth (read-only). Every task id referenced by a
+    # non-terminal order - as linked work, or as a task:<id>:terminal hold condition - is
+    # looked up once via `cp task-head`. A task the control plane reports in a non-terminal
+    # status is live; terminal, missing, or unreadable is not. When no control plane is
+    # reachable (node/cp absent, or no initialized store), CP_AVAILABLE stays false and the
+    # live-work branch falls back to the ledger heuristic, flagged live_owner_unverified so
+    # the un-checked state is never mistaken for verified liveness. ------------------------
+    ALL_TASK_IDS=$(jq -r '
+      def terminal($s): $s=="completed" or $s=="superseded" or $s=="rejected" or $s=="captain_parked";
+      ([ .[] | select(terminal(.status // "received") | not) | (.linked_task_ids // [])[] ]
+       + [ .[] | select((.status // "") == "held") | (.review_after // "")
+           | select(test("^task:[A-Za-z0-9._-]+:terminal$")) | split(":")[1] ])
+      | unique | .[]' "$FOLD_PATH" 2>/dev/null || true)
+    CP_AVAILABLE=false
+    TASK_LIVE='{}'
+    CP_TASKS_CHECKED=0
+    if [ -n "$ALL_TASK_IDS" ]; then
+      CP_CLI=$(fm_order_cp_cli "$FM_ROOT" || true)
+      CP_DATA_DIR=$(fm_order_cp_data_dir "$STATE_DIR")
+      if [ -n "$CP_CLI" ] && [ -d "$CP_DATA_DIR" ]; then
+        # A store that answers "task not found" for a sentinel is initialized and reachable;
+        # "not initialized" or an import error is neither, and degrades to the fallback.
+        CP_PROBE=$(node "$CP_CLI" task-head --data-dir "$CP_DATA_DIR" __fm_order_probe__ 2>&1 || true)
+        printf '%s' "$CP_PROBE" | grep -q 'task not found' && CP_AVAILABLE=true
+      fi
+      if [ "$CP_AVAILABLE" = true ]; then
+        TASK_LIVE=$(
+          for tid in $ALL_TASK_IDS; do
+            st=$(node "$CP_CLI" task-head --data-dir "$CP_DATA_DIR" "$tid" 2>/dev/null \
+                 | jq -r '.status // ""' 2>/dev/null || true)
+            if [ -n "$st" ] && ! fm_order_task_state_is_terminal "$st"; then
+              printf '%s\ttrue\n' "$tid"
+            else
+              printf '%s\tfalse\n' "$tid"
+            fi
+          done | jq -Rn '[inputs | split("\t") | {(.[0]): (.[1] == "true")}] | add // {}'
+        )
+        CP_TASKS_CHECKED=$(printf '%s' "$ALL_TASK_IDS" | grep -c . || true)
+      fi
+    fi
+
     # The date parser (review_age) is shared with the fleet-triage ledger so the two can
     # never disagree about what a review date means; it is prepended to this program.
     jq -n \
       --arg now "$NOW" \
       --argjson now_epoch "$NOW_EPOCH" \
       --argjson grace "$GRACE" \
+      --argjson cp_available "$CP_AVAILABLE" \
+      --argjson task_live "$TASK_LIVE" \
+      --argjson cp_checked "$CP_TASKS_CHECKED" \
       --slurpfile foldf "$FOLD_PATH" \
       "$FM_TRIAGE_REVIEW_AGE_JQ"'
       def terminal($s):
         $s == "completed" or $s == "superseded" or $s == "rejected" or $s == "captain_parked";
-      def linked($o):
-        ($o.linked_task_ids // []) + ($o.linked_scout_ids // []) + ($o.linked_bug_ids // []);
+      def linked_tasks($o): ($o.linked_task_ids // []);
+      # The authoritative live-work test: >=1 linked task the control plane reports live.
+      def has_live_task($o): [ linked_tasks($o)[] | select($task_live[.] == true) ] | length > 0;
       # Evaluate ACCOUNTED for one non-terminal order. $sbi is the status-by-id map, passed
       # in because a top-level def cannot see a variable a later pipeline stage binds.
       def verdict($o; $sbi):
         ($o.status // "received") as $s
         | (review_age($o.received_at; $now_epoch)) as $age
         | if ($age != null and $age < $grace) then {accounted: true, basis: "fresh"}
+          # Live-work branch, applied to EVERY non-terminal order regardless of its status.
+          elif has_live_task($o) then {accounted: true, basis: "live_owner"}
+          # Fallback ONLY when no control plane was reachable: a dispatched order with an
+          # owner and linked work is presumed live, but flagged so it is never mistaken for
+          # a control-plane-verified reading.
+          elif ($cp_available | not) and $s == "dispatched"
+               and (($o.owner // "") != "") and ((linked_tasks($o)) | length > 0)
+            then {accounted: true, basis: "live_owner_unverified"}
           elif $s == "dispatched" then
-            (if (($o.owner // "") != "") and ((linked($o)) | length > 0)
-             then {accounted: true, basis: "live_owner"}
+            (if ((linked_tasks($o)) | length) == 0
+             then {accounted: false, basis: "unaccounted", reason: "dispatched with no linked work"}
              elif (($o.owner // "") == "")
-             then {accounted: false, basis: "unaccounted", reason: "dispatched with no owner"}
-             else {accounted: false, basis: "unaccounted", reason: "dispatched with no linked work"}
+             then {accounted: false, basis: "unaccounted", reason: "dispatched with no owner and no live linked task"}
+             else {accounted: false, basis: "unaccounted", reason: "dispatched but no linked task is live"}
              end)
-          elif ($s == "queued" or $s == "blocked") then
-            # A queued/blocked order is accounted only when it records BOTH why it waits and
-            # a blocker it waits on. Queue-with-a-reason IS accounting; queue-into-silence is
-            # the paperwork loop the report calls out.
-            (($o.queue_reason // $o.hold_reason // "") as $qr
+          # Only `queued` gets the queue-with-a-reason exception (the authority grants it to
+          # queued alone); `blocked` is accounted only through fresh or live-work truth, never
+          # because a block event carries prose and a dependency id.
+          elif $s == "queued" then
+            (($o.queue_reason // "") as $qr
              | (($o.dependency_ids // []) | length) as $nd
              | if ($qr != "" and $nd > 0)
                then {accounted: true, basis: "queued_with_reason_and_blocker"}
                elif ($qr == "")
-               then {accounted: false, basis: "unaccounted", reason: ($s + " with no recorded reason")}
-               else {accounted: false, basis: "unaccounted", reason: ($s + " with no blocker dependency")}
+               then {accounted: false, basis: "unaccounted", reason: "queued with no recorded reason"}
+               else {accounted: false, basis: "unaccounted", reason: "queued with no blocker dependency"}
                end)
           elif $s == "held" then
             (($o.review_after // "") as $ra
@@ -823,9 +915,14 @@ case "$VERB" in
                                reason: ("held until " + $ra + ", which has fired")}
                          else {accounted: true, basis: "held_event_pending"} end)
                     else
-                      # task:<id>:terminal is machine-checkable but the control plane (slice
-                      # S4) evaluates it; here it cannot fire, so it stays accounted.
-                      {accounted: true, basis: "held_task_event_deferred"} end)
+                      # task:<id>:terminal - evaluate against the same control-plane truth as
+                      # the live-work branch. Fired when the task is terminal or gone; pending
+                      # while it is live; unverified (still accounted) when no CP was reachable.
+                      ($p[1] as $tid
+                       | if ($cp_available | not) then {accounted: true, basis: "held_task_event_unverified"}
+                         elif ($task_live[$tid] == true) then {accounted: true, basis: "held_task_event_pending"}
+                         else {accounted: false, basis: "unaccounted",
+                               reason: ("held until " + $ra + ", which has fired")} end) end)
                else
                  (review_age($ra; $now_epoch) as $r
                   | if $r == null
@@ -836,7 +933,9 @@ case "$VERB" in
                     end)
                end)
           elif $s == "captain_decision" then
-            (if (($o.board_receipt // "") != "") or (($o.captain_ack // "") != "")
+            # ONLY a validated board receipt accounts a captain decision. A park receipt
+            # (captain_ack) is not a decision receipt and must never substitute for one.
+            (if (($o.board_receipt // "") != "")
              then {accounted: true, basis: "decision_receipted"}
              else {accounted: false, basis: "unaccounted",
                    reason: "captain decision pending with no board receipt"} end)
@@ -863,6 +962,7 @@ case "$VERB" in
       | {schema: "fm-order-audit/v1",
          generated_at: $now,
          grace_seconds: $grace,
+         control_plane: {available: $cp_available, tasks_checked: $cp_checked},
          non_terminal: ($evaluated | length),
          accounted: ($evaluated | map(select(.accounted)) | length),
          unaccounted: ($evaluated | map(select(.accounted | not)) | length),
@@ -871,19 +971,18 @@ case "$VERB" in
       ' > "$SCRATCH/audit.json" 2> "$SCRATCH/audit.err" \
         || read_failed 'the folded inbox could not be evaluated for the ACCOUNTED predicate' "$SCRATCH/audit.err"
 
-    STATE_DIR="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-    if mkdir -p "$STATE_DIR" 2>/dev/null; then
-      # Atomic write: slice S2's turn-end gate reads this file and must never see a partial.
-      if cp "$SCRATCH/audit.json" "$STATE_DIR/.order-audit-last.json.tmp.$$" 2>/dev/null \
-         && mv -f "$STATE_DIR/.order-audit-last.json.tmp.$$" "$STATE_DIR/.order-audit-last.json" 2>/dev/null; then
-        :
-      else
-        rm -f "$STATE_DIR/.order-audit-last.json.tmp.$$" 2>/dev/null || true
-        printf 'fm-order: WARNING could not write %s/.order-audit-last.json (audit still printed)\n' \
-          "$STATE_DIR" >&2
-      fi
+    # The result file IS the contract: a reader (slice S2's gate) consumes it, so a failure
+    # to atomically publish it must fail nonzero rather than let automation see a successful
+    # refresh over a stale file. The computed result is still printed below so it is never
+    # swallowed, and the atomic tmp+mv leaves any previous valid file untouched on failure.
+    AUDIT_WRITE_OK=1
+    if mkdir -p "$STATE_DIR" 2>/dev/null \
+       && cp "$SCRATCH/audit.json" "$STATE_DIR/.order-audit-last.json.tmp.$$" 2>/dev/null \
+       && mv -f "$STATE_DIR/.order-audit-last.json.tmp.$$" "$STATE_DIR/.order-audit-last.json" 2>/dev/null; then
+      :
     else
-      printf 'fm-order: WARNING could not create state dir %s (audit still printed)\n' "$STATE_DIR" >&2
+      AUDIT_WRITE_OK=0
+      rm -f "$STATE_DIR/.order-audit-last.json.tmp.$$" 2>/dev/null || true
     fi
 
     if [ "$JSON" = true ]; then
@@ -903,6 +1002,9 @@ case "$VERB" in
                 + .unaccounted_reason
                 + (if .short_title != "" then " - " + .short_title else "" end))
         end' "$SCRATCH/audit.json"
+    fi
+    if [ "$AUDIT_WRITE_OK" -ne 1 ]; then
+      die "could not atomically publish the audit result to $STATE_DIR/.order-audit-last.json; any previous result file is untouched. A later reader must not consume a stale audit as fresh." 1
     fi
     exit 0
     ;;
@@ -998,16 +1100,6 @@ case "$VERB" in
     fold_file
     leadrec=$(jq -c --arg id "$LEAD" '.[$id] // empty' "$FOLD_PATH")
     [ -n "$leadrec" ] || die "no such lead order: $LEAD" 2
-    # The set of orders reachable from the lead by following supersede survivor links. If an
-    # order to be absorbed is already in it, absorbing it would close a cycle - refused.
-    SURV=$(jq -c --arg lead "$LEAD" '
-      . as $fold
-      | reduce range(0; 128) as $_ ([$lead];
-          . as $acc
-          | ($acc | map($fold[.] // {}
-                        | select((.status // "") == "superseded")
-                        | (.outcome_link // empty))) as $links
-          | ($acc + $links) | unique)' "$FOLD_PATH")
     for a in "${ABSORB[@]}"; do
       [ "$a" != "$LEAD" ] || die "refused: cannot roll $LEAD up into itself" 2
       arec=$(jq -c --arg id "$a" '.[$id] // empty' "$FOLD_PATH")
@@ -1016,9 +1108,9 @@ case "$VERB" in
       if fm_order_status_terminal "$ast"; then
         die "refused: $a is already terminal ($ast); rolling it up would overwrite its disposition" 2
       fi
-      if printf '%s' "$SURV" | jq -e --arg a "$a" 'index($a) != null' >/dev/null 2>&1; then
-        die "refused: rolling $a up into $LEAD would create a supersede cycle ($LEAD already supersedes back into $a); chains must terminate in a terminal order" 2
-      fi
+      # The full chain check: the lead's survivor chain must resolve to a real tail, and
+      # absorbing $a must not close a loop through it.
+      validate_supersede_chain "$a" "$LEAD"
     done
     lock_or_die
     NOW=$(now_ts)
@@ -1102,6 +1194,16 @@ fold_file
 CURRENT=$(jq -c --arg id "$ID" '.[$id] // empty' "$FOLD_PATH")
 [ -n "$CURRENT" ] || die "no such order: $ID" 2
 
+# A terminal order is settled. Rewriting it to a new status through a general lifecycle verb
+# would revive it while carrying forward accumulated evidence fields (e.g. a park receipt onto
+# a captain_decision), which is exactly how a stale ack came to satisfy an unrelated decision
+# (QA finding #3). There is no reopen contract in slice S1, so every lifecycle mutation of a
+# terminal order is refused; a genuinely new request is a new order.
+CUR_STATUS=$(printf '%s' "$CURRENT" | jq -r '.status // "received"')
+if fm_order_status_terminal "$CUR_STATUS"; then
+  die "refused: $ID is already terminal ($CUR_STATUS); a terminal order is settled and cannot be rewritten by '$VERB'. Record a new order for a new request." 2
+fi
+
 STATUS=''
 case "$VERB" in
   triage) STATUS=triaging ;;
@@ -1125,12 +1227,16 @@ case "$VERB" in
   claim) [ -n "$OWNER" ] || die 'refused: claim requires --owner' 2 ;;
   duplicate)
     [ -n "$BY" ] || die 'refused: duplicate requires --of <order-id>' 2
+    # The survivor must exist and its chain must resolve, so a duplicate can never point at a
+    # missing or looping order (QA finding #4).
+    validate_supersede_chain "$ID" "$BY"
     LINK=$BY
     ORDERS+=("$BY")
     [ -n "$REASON" ] || REASON="duplicate of $BY"
     ;;
   supersede)
     [ -n "$BY" ] || die 'refused: supersede requires --by <order-id>' 2
+    validate_supersede_chain "$ID" "$BY"
     LINK=$BY
     ORDERS+=("$BY")
     ;;
