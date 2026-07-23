@@ -2753,6 +2753,19 @@ write_order_audit_rawarr() {  # <dir> <age> <grace> <unaccounted-count> <orders-
       unaccounted_orders: $arr, orders: $arr}' > "$dir/state/.order-audit-last.json"
 }
 
+# Write an audit file from an arbitrary jq OBJECT expression (design ruling qa-dj-s2 §2.2 rows
+# that omit or null a structurally-required field). A FRESH `$gen` timestamp is available to the
+# expression; the expression may omit generated_at / unaccounted / unaccounted_orders entirely
+# to exercise the missing-field validation branches the reader must fail closed on (q108).
+write_order_audit_obj() {  # <dir> <jq-object-expr, may reference $gen>
+  local dir=$1 expr=$2 now gen
+  now=$(date -u +%s)
+  gen=$(date -u -d "@$((now - 60))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+        || date -u -r "$((now - 60))" +%Y-%m-%dT%H:%M:%SZ)
+  mkdir -p "$dir/state"
+  jq -n --arg gen "$gen" "$expr" > "$dir/state/.order-audit-last.json"
+}
+
 # The core case: healthy supervision, a clear crew lane, and a fresh audit reporting
 # unaccounted orders must block, name the orders, and record blocked_unaccounted_orders.
 test_hook_blocks_on_unaccounted_orders() {
@@ -3314,32 +3327,100 @@ test_hook_retry_partial_id_audit_retains_all_prior_orders() {
 
 # Assert one first-stop completeness-failure shape is corrupt: fail-open allowed_guard_error
 # permit, loud banner, exactly one coalesced audit anomaly (design ruling section 3.1 F8-F12).
-assert_first_stop_corrupt() {  # <name> <unaccounted> <orders-json-array>
-  local name=$1 u=$2 arr=$3 dir home coalesce buglog out status log pid
-  dir=$(make_primary_dir "$TMP_ROOT/hook-fstop-$name")
+# Core first-stop corrupt assertion over a dir whose audit file is ALREADY written: a
+# non-authoritative read fails OPEN as allowed_guard_error, loud banner, one coalesced audit
+# anomaly, and the SPECIFIC named 2.2 reason (design ruling section 3.1 F3-F12 + missing/null).
+run_and_assert_first_stop_corrupt() {  # <name> <expected-order-error> <dir>
+  local name=$1 reason=$2 dir=$3 home coalesce buglog out status log pid
   home=$(cd "$dir" && pwd); coalesce="$dir/coalesce"; buglog="$home/bug-calls.log"
   install_bug_stub "$dir" "$buglog" >/dev/null
   pid=$(start_healthy_watcher "$dir")
-  write_order_audit_rawarr "$dir" 60 14400 "$u" "$arr"
   out=$(run_stop_sandboxed "$dir" false "$coalesce" "$dir/stubbin/bugstub"); status=$?
   stop_watcher "$pid"
   expect_code 0 "$status" "$name: a corrupt audit must fail open on the first stop, not block or wedge"
   assert_contains "$out" "CAPTAIN-ORDER ACCOUNTING FILE COULD NOT BE TRUSTED" "$name: the corrupt audit must be loud"
   log=$(last_guard_log "$dir")
   [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_guard_error ] \
-    || fail "$name: a completeness failure must be corrupt/non-authoritative (allowed_guard_error), never a block: $log"
-  case "$(printf '%s' "$log" | jq -r '.order_error')" in order-audit-*) : ;; *) fail "$name: order_error must name a corrupt read: $log" ;; esac
+    || fail "$name: a validation failure must be corrupt/non-authoritative (allowed_guard_error), never a block or clean permit: $log"
+  [ "$(printf '%s' "$log" | jq -r '.order_error')" = "$reason" ] \
+    || fail "$name: order_error must name the specific 2.2 branch ($reason): $log"
   [ "$(grep -c 'order-audit-last.json' "$buglog" 2>/dev/null)" -eq 1 ] || fail "$name: exactly one coalesced audit anomaly: $(cat "$buglog" 2>/dev/null)"
+}
+
+assert_first_stop_corrupt_arr() {  # <name> <expected-order-error> <unaccounted> <orders-json-array>
+  local dir; dir=$(make_primary_dir "$TMP_ROOT/hook-fstop-$1")
+  write_order_audit_rawarr "$dir" 60 14400 "$3" "$4"
+  run_and_assert_first_stop_corrupt "$1" "$2" "$dir"
+}
+
+assert_first_stop_corrupt_obj() {  # <name> <expected-order-error> <jq-object-expr>
+  local dir; dir=$(make_primary_dir "$TMP_ROOT/hook-fstop-$1")
+  write_order_audit_obj "$dir" "$3"
+  run_and_assert_first_stop_corrupt "$1" "$2" "$dir"
+}
+
+# F4-F7 plus the q108 structural rows: bad/missing schema, bad/missing timestamp, non-numeric /
+# missing count, count mismatch, and a MISSING or NULL unaccounted_orders. No structurally
+# required field may be normalized to a valid value: absence is a validation failure.
+# shellcheck disable=SC2016  # $gen is a jq variable (bound by write_order_audit_obj), kept literal.
+test_hook_first_stop_structural_failures_are_corrupt() {
+  assert_first_stop_corrupt_obj bad-schema        order-audit-bad-schema       '{schema:"nope",generated_at:$gen,grace_seconds:14400,unaccounted:0,unaccounted_orders:[]}'
+  assert_first_stop_corrupt_obj missing-schema    order-audit-bad-schema       '{generated_at:$gen,grace_seconds:14400,unaccounted:0,unaccounted_orders:[]}'
+  assert_first_stop_corrupt_obj bad-timestamp     order-audit-bad-timestamp    '{schema:"fm-order-audit/v1",generated_at:"not-a-date",grace_seconds:14400,unaccounted:0,unaccounted_orders:[]}'
+  assert_first_stop_corrupt_obj missing-timestamp order-audit-bad-timestamp    '{schema:"fm-order-audit/v1",grace_seconds:14400,unaccounted:0,unaccounted_orders:[]}'
+  assert_first_stop_corrupt_obj nonnumeric-count  order-audit-no-count         '{schema:"fm-order-audit/v1",generated_at:$gen,grace_seconds:14400,unaccounted:"two",unaccounted_orders:[]}'
+  assert_first_stop_corrupt_obj missing-count     order-audit-no-count         '{schema:"fm-order-audit/v1",generated_at:$gen,grace_seconds:14400,unaccounted_orders:[]}'
+  assert_first_stop_corrupt_obj count-mismatch    order-audit-count-mismatch   '{schema:"fm-order-audit/v1",generated_at:$gen,grace_seconds:14400,unaccounted:3,unaccounted_orders:[{order_id:"A"}]}'
+  assert_first_stop_corrupt_obj missing-array      order-audit-bad-orders-array '{schema:"fm-order-audit/v1",generated_at:$gen,grace_seconds:14400,unaccounted:0}'
+  assert_first_stop_corrupt_obj null-array         order-audit-bad-orders-array '{schema:"fm-order-audit/v1",generated_at:$gen,grace_seconds:14400,unaccounted:0,unaccounted_orders:null}'
+  assert_first_stop_corrupt_obj not-object         order-audit-not-object       '[]'
+  pass "fm-turnend-guard: first-stop structural failures (F4-F7, missing/null schema/timestamp/count/array, non-object) are all corrupt with their named reason"
 }
 
 # F8-F12: every completeness failure a naive count==length check would pass is corrupt.
 test_hook_first_stop_completeness_failures_are_corrupt() {
-  assert_first_stop_corrupt partial-id      2 '[{"order_id":"A"},{"nope":1}]'
-  assert_first_stop_corrupt empty-id        1 '[{"order_id":""}]'
-  assert_first_stop_corrupt non-string-id   1 '[{"order_id":123}]'
-  assert_first_stop_corrupt duplicate-id    2 '[{"order_id":"A"},{"order_id":"A"}]'
-  assert_first_stop_corrupt non-object-elem 2 '[{"order_id":"A"},"loose"]'
-  pass "fm-turnend-guard: first-stop completeness failures (partial/empty/non-string/duplicate/non-object id) are all corrupt and fail open with one coalesced anomaly"
+  assert_first_stop_corrupt_arr partial-id      order-audit-partial-id   2 '[{"order_id":"A"},{"nope":1}]'
+  assert_first_stop_corrupt_arr empty-id        order-audit-partial-id   1 '[{"order_id":""}]'
+  assert_first_stop_corrupt_arr non-string-id   order-audit-partial-id   1 '[{"order_id":123}]'
+  assert_first_stop_corrupt_arr duplicate-id    order-audit-duplicate-id 2 '[{"order_id":"A"},{"order_id":"A"}]'
+  assert_first_stop_corrupt_arr non-object-elem order-audit-partial-id   2 '[{"order_id":"A"},"loose"]'
+  pass "fm-turnend-guard: first-stop completeness failures (partial/empty/non-string/duplicate/non-object id) are all corrupt with their named reason"
+}
+
+# R6 ("corrupt: any 2.2 failure" on retry): a fresh block on {ORD-C1,ORD-C2} followed by a
+# retry audit that fails ANY structural check - including a MISSING or NULL unaccounted_orders
+# (q108) - must RETAIN both prior orders, stand down, and NEVER discharge.
+assert_retry_corrupt_retains() {  # <name> <retry-jq-object-expr>
+  local name=$1 expr=$2 dir home coalesce buglog log status pid
+  dir=$(make_primary_dir "$TMP_ROOT/hook-retryS-$name")
+  home=$(cd "$dir" && pwd); coalesce="$dir/coalesce"; buglog="$home/bug-calls.log"
+  install_bug_stub "$dir" "$buglog" >/dev/null
+  pid=$(start_healthy_watcher "$dir")
+  write_order_audit "$dir" 60 14400 ORD-C1 ORD-C2
+  run_stop_sandboxed "$dir" false "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1
+  write_order_audit_obj "$dir" "$expr"
+  run_stop_sandboxed "$dir" true "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1
+  status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "$name: the loop-guarded retry must be permitted"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" != allowed_after_valid_progress ] \
+    || fail "$name: a non-authoritative retry audit must NEVER establish progress: $log"
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_loop_protection_without_progress ] \
+    || fail "$name: a non-authoritative retry audit must RETAIN prior orders and stand down: $log"
+  grep -q "ORD-C1" "$dir/state/.wake-queue" || fail "$name: ORD-C1 must be retained in the durable wake"
+  grep -q "ORD-C2" "$dir/state/.wake-queue" || fail "$name: ORD-C2 must be retained in the durable wake"
+  [ "$(grep -c 'stood the' "$buglog" 2>/dev/null)" -eq 1 ] || fail "$name: one coalesced stand-down anomaly: $(cat "$buglog" 2>/dev/null)"
+  [ "$(grep -c 'order-audit-last.json' "$buglog" 2>/dev/null)" -eq 1 ] || fail "$name: one independent coalesced audit anomaly: $(cat "$buglog" 2>/dev/null)"
+}
+
+# shellcheck disable=SC2016  # $gen is a jq variable (bound by write_order_audit_obj), kept literal.
+test_hook_retry_structural_failures_retain_prior_orders() {
+  assert_retry_corrupt_retains missing-array  '{schema:"fm-order-audit/v1",generated_at:$gen,grace_seconds:14400,unaccounted:0}'
+  assert_retry_corrupt_retains null-array     '{schema:"fm-order-audit/v1",generated_at:$gen,grace_seconds:14400,unaccounted:0,unaccounted_orders:null}'
+  assert_retry_corrupt_retains bad-schema     '{schema:"x",generated_at:$gen,grace_seconds:14400,unaccounted:0,unaccounted_orders:[]}'
+  assert_retry_corrupt_retains count-mismatch '{schema:"fm-order-audit/v1",generated_at:$gen,grace_seconds:14400,unaccounted:5,unaccounted_orders:[]}'
+  pass "fm-turnend-guard: retry with ANY 2.2 failure (missing/null array, bad schema, count mismatch) retains the full prior block and stands down"
 }
 
 test_predicate_healthy_no_inflight
@@ -3460,4 +3541,6 @@ test_hook_retry_fresh_authoritative_discharge_permits_clean
 test_hook_retry_mixed_axes_recognizes_crew_but_retains_order
 test_hook_retry_stale_audit_no_prior_order_crew_departed_permits_clean
 test_hook_retry_partial_id_audit_retains_all_prior_orders
+test_hook_first_stop_structural_failures_are_corrupt
 test_hook_first_stop_completeness_failures_are_corrupt
+test_hook_retry_structural_failures_retain_prior_orders

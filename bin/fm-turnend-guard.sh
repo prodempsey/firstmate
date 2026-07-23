@@ -793,22 +793,28 @@ if [ -f "$ORDER_AUDIT" ]; then
   # It emits "OK<TAB>age<TAB>grace" followed by the validated order_ids one per line on success,
   # or "ERR<TAB>reason" on any structural/completeness failure; an unparseable file makes jq exit
   # non-zero, caught by the `||`. Every requirement is FAIL-CLOSED - authority is granted only by
-  # positively proving ALL of: schema; an ISO generated_at; unaccounted is a number;
-  # unaccounted == array length; unaccounted_orders is an array; EVERY element is an object with a
-  # UNIQUE NON-EMPTY STRING order_id; and the validated-id count equals unaccounted. Completeness
-  # is part of authority, not an afterthought: a file that count-matches but does not cover every
-  # id it declares (the q107 shape) is corrupt, and a corrupt file speaks for NO id.
+  # positively proving ALL of: the top level is an object; schema; an ISO generated_at;
+  # unaccounted is a number; unaccounted_orders is an array; unaccounted == array length; EVERY
+  # element is an object with a UNIQUE NON-EMPTY STRING order_id; and the validated-id count
+  # equals unaccounted. No structurally-required field is normalized: it is bound RAW and its
+  # type is proven, so a MISSING or null field is a validation FAILURE, never coerced to a valid
+  # value (a `// []` on unaccounted_orders would forge an authoritative empty set from absence and
+  # silently discharge prior orders - the q108 shape). Only grace_seconds may default (the ruling
+  # permits it), because it never speaks for the unaccounted set. Completeness is part of authority:
+  # a file that count-matches but does not cover every id it declares (the q107 shape) is corrupt,
+  # and a corrupt file speaks for NO id.
   order_meta=$(jq -r --argjson now "$now_epoch" '
     def valid_ids($arr):
       [ $arr[] | if (type == "object") then .order_id else null end
                | if (type == "string" and . != "") then . else empty end ];
-    if (.schema // "") != "fm-order-audit/v1" then "ERR\tbad-schema"
-    else ((.generated_at // "") | (try fromdateiso8601 catch null)) as $gen
+    if (type != "object") then "ERR\tnot-object"
+    elif (.schema != "fm-order-audit/v1") then "ERR\tbad-schema"
+    else ((.generated_at) | (try fromdateiso8601 catch null)) as $gen
       | if $gen == null then "ERR\tbad-timestamp"
         else ((.grace_seconds // 14400) | if type == "number" then . else 14400 end) as $grace
-          | (.unaccounted // null) as $u
+          | (.unaccounted) as $u
           | if ($u | type) != "number" then "ERR\tno-count"
-            else (.unaccounted_orders // []) as $arr
+            else (.unaccounted_orders) as $arr
               | if ($arr | type) != "array" then "ERR\tbad-orders-array"
                 elif $u != ($arr | length) then "ERR\tcount-mismatch"
                 else (valid_ids($arr)) as $ids
