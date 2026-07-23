@@ -2736,6 +2736,23 @@ write_order_audit() {  # <dir> <age-seconds> <grace> [<unaccounted-id>...]
       unaccounted_orders: $list, orders: $list}' > "$dir/state/.order-audit-last.json"
 }
 
+# A RAW audit writer for adversarial shapes (design ruling qa-dj-s2 §3): fresh timestamp and a
+# caller-supplied `unaccounted` count and `unaccounted_orders` JSON array, so a file can be
+# constructed that passes the naive count==length check yet violates completeness (partial /
+# empty / non-string / duplicate / non-object ids). <age> keeps it fresh unless overridden.
+write_order_audit_rawarr() {  # <dir> <age> <grace> <unaccounted-count> <orders-json-array>
+  local dir=$1 age=$2 grace=$3 u=$4 arr=$5 now gen
+  now=$(date -u +%s)
+  gen=$(date -u -d "@$((now - age))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+        || date -u -r "$((now - age))" +%Y-%m-%dT%H:%M:%SZ)
+  mkdir -p "$dir/state"
+  jq -n --arg gen "$gen" --argjson grace "$grace" --argjson u "$u" --argjson arr "$arr" \
+    '{schema: "fm-order-audit/v1", generated_at: $gen, grace_seconds: $grace,
+      control_plane: {available: false, tasks_checked: 0},
+      non_terminal: ($u + 1), accounted: 1, unaccounted: $u,
+      unaccounted_orders: $arr, orders: $arr}' > "$dir/state/.order-audit-last.json"
+}
+
 # The core case: healthy supervision, a clear crew lane, and a fresh audit reporting
 # unaccounted orders must block, name the orders, and record blocked_unaccounted_orders.
 test_hook_blocks_on_unaccounted_orders() {
@@ -3254,6 +3271,77 @@ test_hook_retry_stale_audit_no_prior_order_crew_departed_permits_clean() {
   pass "fm-turnend-guard: with no prior order, a stale audit does not manufacture a stand-down when the crew signal clears"
 }
 
+# --- Design ruling qa-dj-s2 (audit authority): completeness is part of authority --------------
+#
+# Root cause across q104/q106/q107: authority was inferred from an id's ABSENCE in a set of
+# UNKNOWN COVERAGE. The ruling makes authority a single positive invariant granted only by one
+# atomic total validation, consumed only as positive proof. A file that is fresh and
+# count-consistent (unaccounted == array length) but whose array does not completely and
+# unambiguously enumerate a UNIQUE NON-EMPTY STRING order_id per element is NOT authoritative -
+# it may not speak for any id, so every prior order is retained. R7 is the canary for the whole
+# ruling: if it ever yields allowed_after_valid_progress, the authority contract is not
+# implemented. It is deliberately the first case in this block.
+
+# R7 CANARY (design ruling section 3.2 row R7 + section 5). Fresh, count==length=2, but only one
+# element carries a readable order_id: incomplete coverage => corrupt => the full prior block is
+# RETAINED and the retry stands down. It must NEVER be allowed_after_valid_progress.
+test_hook_retry_partial_id_audit_retains_all_prior_orders() {
+  local dir home pid log coalesce buglog status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-retry-r7")
+  home=$(cd "$dir" && pwd); coalesce="$dir/coalesce"; buglog="$home/bug-calls.log"
+  install_bug_stub "$dir" "$buglog" >/dev/null
+  pid=$(start_healthy_watcher "$dir")
+  write_order_audit "$dir" 60 14400 ORD-R3A ORD-R3B                      # fresh valid: blocks on both
+  run_stop_sandboxed "$dir" false "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1
+  # A file that DECLARES two unaccounted (count == length == 2) but only ORD-R3A has a readable
+  # id - the exact q107 shape. The naive count==length check passes; completeness does not.
+  write_order_audit_rawarr "$dir" 60 14400 2 '[{"order_id":"ORD-R3A"},{"note":"no id here"}]'
+  run_stop_sandboxed "$dir" true "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1
+  status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "the loop-guarded retry must be permitted, never wedge"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" != allowed_after_valid_progress ] \
+    || fail "R7 CANARY: a partial-id audit must NEVER establish progress - it does not cover ORD-R3B: $log"
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_loop_protection_without_progress ] \
+    || fail "R7: a partial-id audit must retain the full prior block and stand down: $log"
+  grep -q "ORD-R3A" "$dir/state/.wake-queue" || fail "R7: the retained order ORD-R3A must be in the wake"
+  grep -q "ORD-R3B" "$dir/state/.wake-queue" || fail "R7: the uncovered order ORD-R3B must be RETAINED in the wake (never silently discharged)"
+  [ "$(grep -c 'stood the' "$buglog" 2>/dev/null)" -eq 1 ] || fail "R7: exactly one coalesced stand-down anomaly: $(cat "$buglog" 2>/dev/null)"
+  [ "$(grep -c 'order-audit-last.json' "$buglog" 2>/dev/null)" -eq 1 ] || fail "R7: exactly one independent coalesced audit anomaly: $(cat "$buglog" 2>/dev/null)"
+  pass "fm-turnend-guard: R7 CANARY - a fresh but partial-id audit retains ALL prior orders and stands down, never discharges"
+}
+
+# Assert one first-stop completeness-failure shape is corrupt: fail-open allowed_guard_error
+# permit, loud banner, exactly one coalesced audit anomaly (design ruling section 3.1 F8-F12).
+assert_first_stop_corrupt() {  # <name> <unaccounted> <orders-json-array>
+  local name=$1 u=$2 arr=$3 dir home coalesce buglog out status log pid
+  dir=$(make_primary_dir "$TMP_ROOT/hook-fstop-$name")
+  home=$(cd "$dir" && pwd); coalesce="$dir/coalesce"; buglog="$home/bug-calls.log"
+  install_bug_stub "$dir" "$buglog" >/dev/null
+  pid=$(start_healthy_watcher "$dir")
+  write_order_audit_rawarr "$dir" 60 14400 "$u" "$arr"
+  out=$(run_stop_sandboxed "$dir" false "$coalesce" "$dir/stubbin/bugstub"); status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "$name: a corrupt audit must fail open on the first stop, not block or wedge"
+  assert_contains "$out" "CAPTAIN-ORDER ACCOUNTING FILE COULD NOT BE TRUSTED" "$name: the corrupt audit must be loud"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_guard_error ] \
+    || fail "$name: a completeness failure must be corrupt/non-authoritative (allowed_guard_error), never a block: $log"
+  case "$(printf '%s' "$log" | jq -r '.order_error')" in order-audit-*) : ;; *) fail "$name: order_error must name a corrupt read: $log" ;; esac
+  [ "$(grep -c 'order-audit-last.json' "$buglog" 2>/dev/null)" -eq 1 ] || fail "$name: exactly one coalesced audit anomaly: $(cat "$buglog" 2>/dev/null)"
+}
+
+# F8-F12: every completeness failure a naive count==length check would pass is corrupt.
+test_hook_first_stop_completeness_failures_are_corrupt() {
+  assert_first_stop_corrupt partial-id      2 '[{"order_id":"A"},{"nope":1}]'
+  assert_first_stop_corrupt empty-id        1 '[{"order_id":""}]'
+  assert_first_stop_corrupt non-string-id   1 '[{"order_id":123}]'
+  assert_first_stop_corrupt duplicate-id    2 '[{"order_id":"A"},{"order_id":"A"}]'
+  assert_first_stop_corrupt non-object-elem 2 '[{"order_id":"A"},"loose"]'
+  pass "fm-turnend-guard: first-stop completeness failures (partial/empty/non-string/duplicate/non-object id) are all corrupt and fail open with one coalesced anomaly"
+}
+
 test_predicate_healthy_no_inflight
 test_predicate_unhealthy_no_beacon
 test_predicate_unhealthy_stale_beacon
@@ -3371,3 +3459,5 @@ test_hook_retry_corrupt_audit_retains_prior_order_block
 test_hook_retry_fresh_authoritative_discharge_permits_clean
 test_hook_retry_mixed_axes_recognizes_crew_but_retains_order
 test_hook_retry_stale_audit_no_prior_order_crew_departed_permits_clean
+test_hook_retry_partial_id_audit_retains_all_prior_orders
+test_hook_first_stop_completeness_failures_are_corrupt

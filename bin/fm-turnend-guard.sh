@@ -786,50 +786,65 @@ order_authoritative=0
 if [ -f "$ORDER_AUDIT" ]; then
   now_epoch=$(date -u +%s 2>/dev/null || printf 0)
   case "$now_epoch" in ''|*[!0-9]*) now_epoch=0 ;; esac
-  # One jq pass validates the schema, converts generated_at to an age, and cross-checks that
-  # the file's own unaccounted count equals its unaccounted_orders length. It emits either
-  # "OK<TAB>age<TAB>count<TAB>grace" or "ERR<TAB>reason"; a jq non-zero exit (unparseable
-  # JSON) is caught by the `||` and treated as unreadable.
+  # ONE ATOMIC validate-and-emit pass (design ruling qa-dj-s2 sections 2.2 and 5.1). A single jq
+  # read proves the file is a COMPLETE, unambiguous snapshot and emits the validated ids from
+  # that very generation, so no downstream consumer can observe a different (partial or swapped)
+  # generation - closing the two-pass read race that is itself a covert partial-coverage source.
+  # It emits "OK<TAB>age<TAB>grace" followed by the validated order_ids one per line on success,
+  # or "ERR<TAB>reason" on any structural/completeness failure; an unparseable file makes jq exit
+  # non-zero, caught by the `||`. Every requirement is FAIL-CLOSED - authority is granted only by
+  # positively proving ALL of: schema; an ISO generated_at; unaccounted is a number;
+  # unaccounted == array length; unaccounted_orders is an array; EVERY element is an object with a
+  # UNIQUE NON-EMPTY STRING order_id; and the validated-id count equals unaccounted. Completeness
+  # is part of authority, not an afterthought: a file that count-matches but does not cover every
+  # id it declares (the q107 shape) is corrupt, and a corrupt file speaks for NO id.
   order_meta=$(jq -r --argjson now "$now_epoch" '
+    def valid_ids($arr):
+      [ $arr[] | if (type == "object") then .order_id else null end
+               | if (type == "string" and . != "") then . else empty end ];
     if (.schema // "") != "fm-order-audit/v1" then "ERR\tbad-schema"
     else ((.generated_at // "") | (try fromdateiso8601 catch null)) as $gen
       | if $gen == null then "ERR\tbad-timestamp"
-        else (.unaccounted // null) as $u
-          | ((.unaccounted_orders // []) | length) as $len
-          | ((.grace_seconds // 14400) | if type == "number" then . else 14400 end) as $grace
+        else ((.grace_seconds // 14400) | if type == "number" then . else 14400 end) as $grace
+          | (.unaccounted // null) as $u
           | if ($u | type) != "number" then "ERR\tno-count"
-            elif $u != $len then "ERR\tcount-mismatch"
-            else "OK\t" + (($now - $gen) | tostring) + "\t" + ($u | tostring) + "\t" + ($grace | tostring)
+            else (.unaccounted_orders // []) as $arr
+              | if ($arr | type) != "array" then "ERR\tbad-orders-array"
+                elif $u != ($arr | length) then "ERR\tcount-mismatch"
+                else (valid_ids($arr)) as $ids
+                  | if ($ids | length) != $u then "ERR\tpartial-id"
+                    elif (($ids | unique | length) != ($ids | length)) then "ERR\tduplicate-id"
+                    else "OK\t" + (($now - $gen) | tostring) + "\t" + ($grace | tostring)
+                         + (if ($ids | length) > 0 then "\n" + ($ids | join("\n")) else "" end)
+                    end
+                end
             end
         end
-    end' "$ORDER_AUDIT" 2>/dev/null) || order_meta='ERR	unreadable'
-  order_kind=${order_meta%%$'\t'*}
-  order_rest=${order_meta#*$'\t'}
+    end' "$ORDER_AUDIT" 2>/dev/null) || order_meta=$'ERR\tunreadable'
+  order_first=${order_meta%%$'\n'*}          # first line: OK<TAB>age<TAB>grace | ERR<TAB>reason
+  order_kind=${order_first%%$'\t'*}
   if [ "$order_kind" = OK ]; then
-    o_age=${order_rest%%$'\t'*}; order_rest=${order_rest#*$'\t'}
-    o_count=${order_rest%%$'\t'*}; o_grace=${order_rest#*$'\t'}
+    order_rest=${order_first#*$'\t'}
+    o_age=${order_rest%%$'\t'*}; o_grace=${order_rest#*$'\t'}
     case "$o_age" in ''|*[!0-9-]*) o_age=0 ;; esac
-    case "$o_count" in ''|*[!0-9]*) o_count=0 ;; esac
     case "$o_grace" in ''|*[!0-9]*) o_grace=14400 ;; esac
     order_audit_age=$o_age
-    # Staleness bound: the audit's own accounting grace, overridable. An audit older than
-    # this is too stale to enforce on; younger is trusted (a blocking episode's own discharge
-    # act - re-running audit - keeps the file fresh, so a within-window file is authoritative).
+    # Staleness bound: the audit's own accounting grace, overridable. Older than this is too
+    # stale to enforce on (benign, non-authoritative); within it a positively-validated snapshot
+    # is authoritative for its complete id set - and only then.
     order_max_age=${FM_TURNEND_ORDER_AUDIT_MAX_AGE:-$o_grace}
     case "$order_max_age" in ''|*[!0-9]*) order_max_age=$o_grace ;; esac
     if [ "$o_age" -gt "$order_max_age" ]; then
       order_error='order-audit-stale'
     else
-      orders=$o_count
+      # Authoritative: orders/order_ids come ONLY from this pass's validated, complete list -
+      # the lines emitted after the OK header.
       order_authoritative=1
-      if [ "$orders" -gt 0 ]; then
-        order_ids=$(jq -r '(.unaccounted_orders // [])[] | .order_id // empty' "$ORDER_AUDIT" 2>/dev/null || true)
-        # If the id list cannot be read despite a valid count, the file is untrustworthy.
-        [ -z "$order_ids" ] && { orders=0; order_error='order-audit-unreadable'; order_authoritative=0; }
-      fi
+      [ "$order_meta" != "$order_first" ] && order_ids=${order_meta#*$'\n'}
+      [ -n "$order_ids" ] && orders=$(printf '%s\n' "$order_ids" | grep -c .)
     fi
   else
-    order_error="order-audit-${order_rest:-unreadable}"
+    order_error="order-audit-${order_first#*$'\t'}"
   fi
 fi
 case "$orders" in ''|*[!0-9]*) orders=0 ;; esac

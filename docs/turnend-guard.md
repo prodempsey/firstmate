@@ -43,28 +43,48 @@ This is a **cheap file read on the turn-end path, never a re-enumeration** of th
 The gate demands **accounting, not completion**, which is what makes it flood-proof: an order is discharged by linking live work, queuing it with a recorded reason and blocker, a machine-checkable hold, a board-confirmed park or decision, or a terminal outcome with evidence - all cheap, all legitimate - so even a hundred orders can be honestly accounted in bounded time, and a backfill flood gets the `fm-order.sh park --captain-ack` batch verb (one captain ack accounts the batch).
 Re-running the audit is **not** discharge: the predicate is over the orders, so an order leaves the list only when a real accounting act is followed by a fresh `fm-order.sh audit`.
 
-The read fails open, inheriting the guard's discipline:
+### The audit-authority contract (normative)
 
-- **absent** file - the audit is not wired in this home (S2 can ship ahead of the refresh cadence); the predicate does not fire, silently, and files no anomaly.
-- **stale** (older than the audit's own `grace_seconds`, or `FM_TURNEND_ORDER_AUDIT_MAX_AGE`) - a not-refreshed file is a cadence gap, not a breakage: the gate fails open, records `order-audit-stale` in the decision log, and files **no** bug, so an unwired refresh cadence can never reopen the bug-per-occurrence spam class.
-- **unreadable, malformed, or count-mismatched** - the writer produced an untrustworthy file: the gate fails open, prints a loud banner, and raises **one coalesced anomaly** (the same fail-open-with-coalesced-anomaly discipline the guard-error path uses).
-- **present, parseable, fresh** - the gate enforces (and only this read is **authoritative**: `order_authoritative = 1`).
+This is the invariant the whole predicate derives from, so a future change reasons from it rather than rediscovering a corruption shape one adversary at a time (design ruling `data/dj-orders-s2/design-ruling.md`).
+The root cause the ruling names: the gate used to infer an order's discharge from that id's **absence** in the current read - but an id can be absent because it was genuinely accounted, **or** because the file is stale, missing, truncated, partial, corrupt, or a different generation.
+Reading the second as the first was the spine under three separate QA rounds.
+The fix is one positive invariant with a fail-closed default:
+
+> A discharge-or-progress conclusion about order `X` may be drawn ONLY from a positively-validated, fresh, structurally-complete audit snapshot that provably enumerates `X`'s accounting status. In every other state the prior blocked fact about `X` survives unchanged.
+
+`AUTHORITATIVE(audit)` is decided by a **single atomic validate-and-emit `jq` read** (`bin/fm-turnend-guard.sh`, the order-audit block) - never a separate validate pass plus id extraction, because two reads can observe two generations, and that read race is itself a covert partial-coverage source.
+The writer's guarantees are **not** assumed; a truncated, hand-edited, or read-raced file can violate any of them, so the reader proves them.
+Authority requires **all** of: `schema == "fm-order-audit/v1"`; an ISO-8601 `generated_at`; `unaccounted` is a number; `unaccounted == (unaccounted_orders | length)`; `unaccounted_orders` is an array; **every** element is an object carrying a **unique, non-empty, string** `order_id`; and the validated-id count equals `unaccounted`.
+The same pass **emits the validated ids**, so `orders`/`order_ids` come only from the generation that was validated.
+Completeness is part of authority, not an afterthought: a file that count-matches but does not cover every id it declares (the q107 shape) is **corrupt**, and a corrupt file speaks for **no** id - there is no partial trust.
+
+The read then lands in exactly one state, each with a fail-closed default:
+
+- **absent** file - the predicate does not fire: no block, no anomaly, no discharge.
+- **stale** (`age > max_age`, default the audit's own `grace_seconds`, overridable by `FM_TURNEND_ORDER_AUDIT_MAX_AGE`) - **non-authoritative, benign**: records `order-audit-stale` for observability only, files **no** anomaly, and is **not** counted in the `read_broken` boolean, so it never diverts control flow (the q104 fix).
+- **corrupt** (any structural/completeness failure above) - **non-authoritative, broken**: `order_error=order-audit-<reason>`, one fingerprint-coalesced anomaly, a loud banner.
+- **fresh and complete** - the only **authoritative** read (`order_authoritative = 1`); its emitted id set is the complete unaccounted set.
+
+**The create/discharge symmetry** resolves the apparent tension between "fail open" and "fail closed": they are one principle applied to opposite operations, because the audit may only ever speak *positively*.
+On **block creation** (first stop) a non-authoritative audit **fails OPEN** - it may never invent a block, so an unverifiable file cannot wedge the primary.
+On **block discharge** (retry) a non-authoritative audit **fails CLOSED** - it may never clear a known obligation, because unverifiable truth must never discharge.
+Absent, stale, and corrupt therefore land in "cannot create AND cannot clear" by construction, which is what closes the class rather than a per-shape checklist.
 
 ### Audit authority across the two stop attempts (fail-closed retry)
 
-Only a **fresh** read is authoritative; absent, stale, and corrupt are all non-authoritative.
-That distinction is load-bearing on the loop-guarded second stop, because the previously blocked order ids in `state/.turnend-guard-block-ids` are **durable knowledge** that a non-authoritative current read must never erase.
-The failure this closes: a first stop blocks on a fresh audit listing order `X`, then merely letting that audit go stale (or vanish, or corrupt) before the retry made `X` disappear from the current read, and the retry silently permitted it as a clean empty lane - a discharge with no accounting act, no wake, and no anomaly.
+The previously blocked order ids in `state/.turnend-guard-block-ids` are **durable knowledge** that a non-authoritative current read must never erase.
+The failure this closes: a first stop blocks on a fresh audit listing order `X`, then merely letting that audit go stale (or vanish, or corrupt, or lose `X`'s id to truncation) before the retry made `X` disappear from the current read, and the retry silently permitted it as a clean empty lane or valid shrinkage - a discharge with no accounting act, no wake, and no anomaly.
 
 The retry state machine, keyed on the current audit's authority and the prior blocked set:
 
 - **The order component of the still-outstanding set** is the current authoritative order ids when the audit is fresh, otherwise the **retained** prior `order:` ids from the blocked-id file. A non-authoritative read never shrinks or discharges a prior order.
-- **Only a fresh authoritative audit that no longer lists an order** establishes accounting progress for it. Staleness, absence, and corruption are not accounting acts.
+- **Only a fresh authoritative audit that no longer lists an order** establishes accounting progress for it. Staleness, absence, and corruption (including a count-matched but partial file) are not accounting acts, and re-running the audit is not itself one.
 - **Crew ids are always live-checkable** against the `needs_firstmate` lane, so a real crew-lane shrink is recognized independently even while the order axis is temporarily unknown - a departed crew id is dropped from the outstanding set and the wake, while an unknown order stays retained. This keeps an unknown order read from ever impersonating an order discharge, in either direction.
 - **When a prior order is retained under a non-authoritative read**, the retry is an `allowed_loop_protection_without_progress` stand-down that carries the retained order ids in the durable check wake and files the one coalesced stand-down anomaly; a corrupt read additionally files its own independent audit anomaly. Neither masks the other.
 - **When the outstanding set is genuinely empty** (every prior blocked item authoritatively gone), the retry is a clean permit (or a watcher-down stand-down if supervision is still off, or a guard-error permit if a genuine read failed with nothing else outstanding).
 
-`tests/fm-turnend-guard.test.sh` encodes this table cell by cell (the `test_hook_retry_*` cases): the fresh-block-then-stale/absent/corrupt transitions all retain the order; a fresh zero-unaccounted audit after a real accounting act discharges cleanly; and the mixed-axis case proves per-axis recognition.
+`tests/fm-turnend-guard.test.sh` encodes the ruling's exhaustive `(audit x stop x prior)` table (the `test_hook_retry_*`, `test_hook_first_stop_completeness_failures_*`, and the stale/absent/corrupt/mixed cases).
+The **R7 canary** (`test_hook_retry_partial_id_audit_retains_all_prior_orders`) is the single load-bearing case: a fresh, count-matched audit that covers only one of two declared orders must RETAIN both and stand down - if it ever yields `allowed_after_valid_progress`, the authority contract is not implemented.
 
 ## Shared Predicate
 
@@ -297,7 +317,8 @@ No Herdr command was issued and no fleet state was touched; the experiment wrote
 
 `tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping in both a git-checkout home and a non-git rebaselined home (including a secondmate's own home being guarded like the main primary while its child worktrees stay exempt), the linked-worktree exemption under a non-empty lane, session-lock ownership (armed when absent, stale, or ours; inert and non-mutating under a live foreign holder), `FM_HOME` and `FM_STATE_OVERRIDE` precedence, Pi logical-run latch behavior for no-tool and multi-tool runs, fail-open behavior without `jq`, tracked hook registration for all five harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
 It also covers the third predicate (ORD-260 S2): blocking on unaccounted captain orders read from the audit file, the four fail-open outcomes (absent is silent, stale fails open without a bug, corrupt fails open with one coalesced anomaly, fresh enforces), the combined crew-plus-order block and progress accounting under loop protection, the away-mode stand-down, and the coalesced no-progress stand-down anomaly.
-The `test_hook_retry_*` cases encode the audit-authority-across-two-stops table cell by cell: a fresh order block followed by a stale, absent, or corrupt audit on the loop-guarded retry retains the order as a stand-down (never a silent discharge), a fresh zero-unaccounted audit after a real accounting act discharges cleanly, and the mixed-axis case proves per-axis recognition (a departed crew id is recognized while an unknown order stays retained).
+The `test_hook_retry_*` and `test_hook_first_stop_completeness_failures_*` cases encode the ruling's exhaustive `(audit x stop x prior)` table cell by cell: a fresh order block followed by a stale, absent, or corrupt audit on the loop-guarded retry retains the order as a stand-down (never a silent discharge), a fresh zero-unaccounted audit after a real accounting act discharges cleanly, the mixed-axis case proves per-axis recognition (a departed crew id is recognized while an unknown order stays retained), and every completeness failure (partial, empty, non-string, duplicate, or non-object `order_id`) is corrupt at both stops.
+The **R7 canary** (`test_hook_retry_partial_id_audit_retains_all_prior_orders`) is the single case that proves or disproves the authority contract: a fresh, count-matched audit covering only one of two declared orders must retain both, never `allowed_after_valid_progress`.
 All are hermetic, with a sandboxed coalesce store and bug CLI so the live captain ledger is never touched.
 The default behavior suite does not invoke live language-model harnesses.
 `FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh` opts into the isolated interactive Pi regression recorded above.
