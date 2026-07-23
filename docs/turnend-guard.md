@@ -48,7 +48,23 @@ The read fails open, inheriting the guard's discipline:
 - **absent** file - the audit is not wired in this home (S2 can ship ahead of the refresh cadence); the predicate does not fire, silently, and files no anomaly.
 - **stale** (older than the audit's own `grace_seconds`, or `FM_TURNEND_ORDER_AUDIT_MAX_AGE`) - a not-refreshed file is a cadence gap, not a breakage: the gate fails open, records `order-audit-stale` in the decision log, and files **no** bug, so an unwired refresh cadence can never reopen the bug-per-occurrence spam class.
 - **unreadable, malformed, or count-mismatched** - the writer produced an untrustworthy file: the gate fails open, prints a loud banner, and raises **one coalesced anomaly** (the same fail-open-with-coalesced-anomaly discipline the guard-error path uses).
-- **present, parseable, fresh** - the gate enforces.
+- **present, parseable, fresh** - the gate enforces (and only this read is **authoritative**: `order_authoritative = 1`).
+
+### Audit authority across the two stop attempts (fail-closed retry)
+
+Only a **fresh** read is authoritative; absent, stale, and corrupt are all non-authoritative.
+That distinction is load-bearing on the loop-guarded second stop, because the previously blocked order ids in `state/.turnend-guard-block-ids` are **durable knowledge** that a non-authoritative current read must never erase.
+The failure this closes: a first stop blocks on a fresh audit listing order `X`, then merely letting that audit go stale (or vanish, or corrupt) before the retry made `X` disappear from the current read, and the retry silently permitted it as a clean empty lane - a discharge with no accounting act, no wake, and no anomaly.
+
+The retry state machine, keyed on the current audit's authority and the prior blocked set:
+
+- **The order component of the still-outstanding set** is the current authoritative order ids when the audit is fresh, otherwise the **retained** prior `order:` ids from the blocked-id file. A non-authoritative read never shrinks or discharges a prior order.
+- **Only a fresh authoritative audit that no longer lists an order** establishes accounting progress for it. Staleness, absence, and corruption are not accounting acts.
+- **Crew ids are always live-checkable** against the `needs_firstmate` lane, so a real crew-lane shrink is recognized independently even while the order axis is temporarily unknown - a departed crew id is dropped from the outstanding set and the wake, while an unknown order stays retained. This keeps an unknown order read from ever impersonating an order discharge, in either direction.
+- **When a prior order is retained under a non-authoritative read**, the retry is an `allowed_loop_protection_without_progress` stand-down that carries the retained order ids in the durable check wake and files the one coalesced stand-down anomaly; a corrupt read additionally files its own independent audit anomaly. Neither masks the other.
+- **When the outstanding set is genuinely empty** (every prior blocked item authoritatively gone), the retry is a clean permit (or a watcher-down stand-down if supervision is still off, or a guard-error permit if a genuine read failed with nothing else outstanding).
+
+`tests/fm-turnend-guard.test.sh` encodes this table cell by cell (the `test_hook_retry_*` cases): the fresh-block-then-stale/absent/corrupt transitions all retain the order; a fresh zero-unaccounted audit after a real accounting act discharges cleanly; and the mixed-axis case proves per-axis recognition.
 
 ## Shared Predicate
 
@@ -155,6 +171,7 @@ The decision taxonomy (outcome names per ORD-060), and what counts toward the ac
 The Claude Stop-hook contract forbids blocking when `stop_hook_active=true`: a hook that blocks its own forced continuation recurses, and an agent that cannot make progress would be wedged in an un-endable session.
 So the second stop IS allowed - and the honest record plus a bounded fallback is what prevents "do nothing and exit" from being free: the permit is logged as `allowed_loop_protection_without_progress` (never compliant), one coalesced `turnend-standdown-no-progress` anomaly is filed, and the guard queues one durable `check` wake (`turnend-guard` key, deduped to one pending record) naming the unresolved crew signals and unaccounted orders through the same `state/.wake-queue` every turn drains FIRST, so the unresolved items are forced to the front of the next primary turn.
 The unchanged unattended item does remain after the turn ends - that is the documented, bounded limitation of a non-recursive hook - but it remains VISIBLY: counted in the log, queued as the next turn's first work, and re-blocked at that turn's first stop attempt.
+Progress across the two attempts is judged from the durable prior blocked-id set, not from the current read alone: a crew id is discharged when it leaves the live lane, but a prior order id is discharged **only** by a fresh authoritative audit that no longer lists it, so a stale, absent, or corrupt current audit can never manufacture progress or silently drop a retained order (see "Audit authority across the two stop attempts" above).
 
 ## Anti-Evasion Metrics
 
@@ -279,6 +296,8 @@ No Herdr command was issued and no fleet state was touched; the experiment wrote
 ## Tests
 
 `tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping in both a git-checkout home and a non-git rebaselined home (including a secondmate's own home being guarded like the main primary while its child worktrees stay exempt), the linked-worktree exemption under a non-empty lane, session-lock ownership (armed when absent, stale, or ours; inert and non-mutating under a live foreign holder), `FM_HOME` and `FM_STATE_OVERRIDE` precedence, Pi logical-run latch behavior for no-tool and multi-tool runs, fail-open behavior without `jq`, tracked hook registration for all five harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
-It also covers the third predicate (ORD-260 S2): blocking on unaccounted captain orders read from the audit file, the four fail-open outcomes (absent is silent, stale fails open without a bug, corrupt fails open with one coalesced anomaly, fresh enforces), the combined crew-plus-order block and progress accounting under loop protection, the away-mode stand-down, and the coalesced no-progress stand-down anomaly - all hermetic, with a sandboxed coalesce store and bug CLI so the live captain ledger is never touched.
+It also covers the third predicate (ORD-260 S2): blocking on unaccounted captain orders read from the audit file, the four fail-open outcomes (absent is silent, stale fails open without a bug, corrupt fails open with one coalesced anomaly, fresh enforces), the combined crew-plus-order block and progress accounting under loop protection, the away-mode stand-down, and the coalesced no-progress stand-down anomaly.
+The `test_hook_retry_*` cases encode the audit-authority-across-two-stops table cell by cell: a fresh order block followed by a stale, absent, or corrupt audit on the loop-guarded retry retains the order as a stand-down (never a silent discharge), a fresh zero-unaccounted audit after a real accounting act discharges cleanly, and the mixed-axis case proves per-axis recognition (a departed crew id is recognized while an unknown order stays retained).
+All are hermetic, with a sandboxed coalesce store and bug CLI so the live captain ledger is never touched.
 The default behavior suite does not invoke live language-model harnesses.
 `FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh` opts into the isolated interactive Pi regression recorded above.

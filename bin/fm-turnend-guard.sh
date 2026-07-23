@@ -550,10 +550,12 @@ signal_order_audit_anomaly() {  # <reason>
 # forced a permit while unattended work or an unaccounted order remained. ONE coalesced,
 # occurrence-counted anomaly - never a bug per turn - so a repeated enforcement stand-down is
 # durably visible without reopening the bug-per-occurrence spam class this slice subsumes.
-signal_standdown_anomaly() {  # <reason-text>
+signal_standdown_anomaly() {  # <reason-text> [<ids-digest>]
+  local digest=${2:-${combined_digest:-none}}
+  [ -n "$digest" ] || digest=none
   signal_coalesced_bug turnend-standdown-no-progress \
     "turn-end guard stood the unattended-work / unaccounted-order gate down under loop protection without discharging work: $1. The harness loop guard forbids blocking a turn twice, so this is an enforcement stand-down, not a compliant permit." \
-    "nf=$nf orders=$orders ids=${combined_digest:-none}"
+    "nf=$nf orders=$orders ids=$digest"
 }
 
 guard_error_banner() {  # <component> <detail>
@@ -775,6 +777,12 @@ orders=0
 order_ids=''
 order_error=''
 order_audit_age=''   # empty => file absent (predicate did not fire); else integer seconds
+# order_authoritative is the LINCHPIN of the retry state machine (QA qa-dj-s2r2-q106): it is 1
+# ONLY for a present, parseable, valid, FRESH file whose ids read cleanly. Absent, stale, and
+# corrupt reads are all non-authoritative (0). A non-authoritative read can never DISCHARGE a
+# previously blocked order on a loop-guarded retry - only a fresh authoritative audit that no
+# longer lists an order establishes accounting progress for it.
+order_authoritative=0
 if [ -f "$ORDER_AUDIT" ]; then
   now_epoch=$(date -u +%s 2>/dev/null || printf 0)
   case "$now_epoch" in ''|*[!0-9]*) now_epoch=0 ;; esac
@@ -813,10 +821,11 @@ if [ -f "$ORDER_AUDIT" ]; then
       order_error='order-audit-stale'
     else
       orders=$o_count
+      order_authoritative=1
       if [ "$orders" -gt 0 ]; then
         order_ids=$(jq -r '(.unaccounted_orders // [])[] | .order_id // empty' "$ORDER_AUDIT" 2>/dev/null || true)
         # If the id list cannot be read despite a valid count, the file is untrustworthy.
-        [ -z "$order_ids" ] && { orders=0; order_error='order-audit-unreadable'; }
+        [ -z "$order_ids" ] && { orders=0; order_error='order-audit-unreadable'; order_authoritative=0; }
       fi
     fi
   else
@@ -1053,9 +1062,11 @@ announce_read_errors() {  # <nf-detail> <order-detail>
 }
 
 # One coalesced anomaly per no-progress stand-down, plus its honest decision record. This is
-# what makes an enforcement stand-down durably visible without a bug per occurrence.
-record_standdown_no_progress() {  # <reason-text>
-  signal_standdown_anomaly "$1"
+# what makes an enforcement stand-down durably visible without a bug per occurrence. The
+# optional ids-digest names the still-outstanding set (which, on a retry with a
+# non-authoritative audit, includes RETAINED prior order ids the current read cannot see).
+record_standdown_no_progress() {  # <reason-text> [<ids-digest>]
+  signal_standdown_anomaly "$1" "${2:-}"
   log_decision allowed_loop_protection_without_progress "$1"
 }
 
@@ -1076,16 +1087,49 @@ if [ "$STOP_HOOK_ACTIVE" = true ]; then
   # known no-progress stand-down (from the READABLE axes - unchanged work, or the watcher
   # still down) must still be recorded with its coalesced anomaly and durable wake, never
   # swallowed by an independent audit failure (QA qa-dj-s2-q104).
+  # A GENUINELY broken read (corrupt audit / crew-lane read failure) is announced and gets its
+  # own independent coalesced anomaly. It never DECIDES the retry outcome: the state machine
+  # below classifies from the durable prior block and the readable axes regardless.
   if [ "$read_broken" -eq 1 ]; then
     announce_read_errors 'the loop-guarded stop is permitted, but the lane state is unknown.' \
                          'the loop-guarded stop is permitted, but the order-accounting state is unknown.'
     signal_read_errors
   fi
-  if [ "$work" -eq 0 ]; then
+
+  # --- RETRY STATE MACHINE (QA qa-dj-s2r2-q106) --------------------------------------------
+  # The prior BLOCK_IDS_FILE is DURABLE knowledge across the two stop attempts. An order id in
+  # it stays outstanding until a FRESH AUTHORITATIVE audit proves it removed; a non-authoritative
+  # current read (absent | stale | corrupt) can NEVER discharge a prior order or count as
+  # progress. Crew ids are always live-checkable against nf_ids, so a real crew shrink is still
+  # recognized even when the order axis is temporarily unknown. The full (audit-authority x
+  # prior-block x watcher) table this encodes lives in docs/turnend-guard.md.
+  prior_orders=''
+  [ -f "$BLOCK_IDS_FILE" ] && prior_orders=$(grep '^order:' "$BLOCK_IDS_FILE" 2>/dev/null || true)
+  has_prior_orders=0
+  [ -n "$prior_orders" ] && has_prior_orders=1
+  # The order component of the still-outstanding set: the current authoritative ids when the
+  # audit is fresh, else the RETAINED prior order ids (fail closed - unknown != discharged).
+  if [ "$order_authoritative" -eq 1 ]; then
+    retained_orders=$order_prefixed
+  else
+    retained_orders=$prior_orders
+  fi
+  outstanding=$(printf '%s\n' "$nf_ids" "$retained_orders" | grep . || true)
+  outstanding_count=0
+  [ -n "$outstanding" ] && outstanding_count=$(printf '%s\n' "$outstanding" | grep -c .)
+  outstanding_digest=''
+  if [ "$outstanding_count" -gt 0 ]; then
+    outstanding_digest=$(printf '%s\n' "$outstanding" | head -n "$LOG_IDS" | paste -sd, -)
+    [ "$outstanding_count" -gt "$LOG_IDS" ] && outstanding_digest="$outstanding_digest,+$((outstanding_count - LOG_IDS)) more"
+  fi
+
+  if [ "$outstanding_count" -eq 0 ]; then
+    # Nothing outstanding: every prior blocked item is provably gone (crew left the lane, and
+    # any prior order was authoritatively removed, or there were none). The stale/absent/corrupt
+    # cases never reach here while a prior order is retained.
     if [ "$blind" -eq 1 ]; then
       record_standdown_no_progress 'loop protection forced the permit; the watcher is still down'
     elif [ "$read_broken" -eq 1 ]; then
-      # Nothing readable compels a stand-down, but a genuine read failed: fail-open guard_error.
       log_decision allowed_guard_error "$(read_error_reason)"
     else
       mark_healthy
@@ -1093,33 +1137,42 @@ if [ "$STOP_HOOK_ACTIVE" = true ]; then
     fi
     exit 0
   fi
-  progress=0
-  if [ -f "$BLOCK_IDS_FILE" ]; then
-    while IFS= read -r prior_id; do
-      [ -n "$prior_id" ] || continue
-      if ! printf '%s\n' "$combined_ids" | grep -qxF -- "$prior_id"; then
-        progress=1
-        break
-      fi
-    done < "$BLOCK_IDS_FILE"
+
+  # Outstanding work remains. Decide authoritative progress vs a no-progress stand-down.
+  if [ "$order_authoritative" -eq 0 ] && [ "$has_prior_orders" -eq 1 ]; then
+    # FAIL CLOSED: prior orders of UNKNOWN current status keep this a no-progress stand-down,
+    # even if the crew lane shrank - staleness is not an accounting act (qa-dj-s2r2-q106).
+    progress=0
+  else
+    # Fresh authoritative order state, or no prior orders: a prior blocked id provably absent
+    # from the outstanding set is a real accounting/crew discharge.
+    progress=0
+    if [ -f "$BLOCK_IDS_FILE" ]; then
+      while IFS= read -r prior_id; do
+        [ -n "$prior_id" ] || continue
+        if ! printf '%s\n' "$outstanding" | grep -qxF -- "$prior_id"; then
+          progress=1
+          break
+        fi
+      done < "$BLOCK_IDS_FILE"
+    fi
   fi
+
   if [ "$progress" -eq 1 ]; then
     rm -f "$BLOCK_IDS_FILE" 2>/dev/null || true
-    log_decision allowed_after_valid_progress 'the unattended id set shrank since the blocked attempt'
+    log_decision allowed_after_valid_progress 'the blocked id set shrank via an authoritative read'
   else
-    # The turn is ending with unresolved terminal work or unaccounted orders and only
-    # recursion protection let it (the hook contract forbids a second block; a wedged primary
-    # is worse). The limitation is not hidden: queue one durable check wake so
-    # bin/fm-wake-drain.sh puts the unresolved items at the FRONT of the next primary turn,
-    # then record the stand-down with its one coalesced anomaly.
-    # Deduped: one pending record at a time, or a stuck pile would flood the queue.
+    # The turn is ending with unresolved terminal work or unaccounted (or unknown-status
+    # retained) orders and only recursion protection let it. Queue one durable check wake
+    # naming the STILL-OUTSTANDING set (retained prior orders included), deduped to one pending
+    # record, then record the stand-down with its one coalesced anomaly.
     if command -v fm_wake_append >/dev/null 2>&1 \
       && ! grep -q "	check	turnend-guard	" "$STATE/.wake-queue" 2>/dev/null; then
       fm_wake_append check turnend-guard \
-        "turn ended with unresolved terminal work or unaccounted orders under loop protection: $combined_digest - handle these before any new work" \
+        "turn ended with unresolved terminal work or unaccounted orders under loop protection: $outstanding_digest - handle these before any new work" \
         >/dev/null 2>&1 || true
     fi
-    record_standdown_no_progress 'loop protection forced the permit; no unattended item or unaccounted order was discharged'
+    record_standdown_no_progress 'loop protection forced the permit; no unattended item or unaccounted order was discharged' "$outstanding_digest"
   fi
   exit 0
 fi

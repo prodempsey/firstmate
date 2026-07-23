@@ -3070,6 +3070,190 @@ test_hook_corrupt_audit_does_not_mask_nf_standdown() {
   pass "fm-turnend-guard: a corrupt audit and a known nf stand-down each file their own anomaly; neither masks the other"
 }
 
+# --- QA qa-dj-s2r2-q106: the audit-freshness x guard-phase x retry-state transition table ---
+#
+# The blocking finding: on a loop-guarded RETRY, order state came only from the CURRENT audit,
+# so a non-authoritative audit (stale/absent/corrupt) made a PREVIOUSLY BLOCKED order vanish
+# and be misread as an empty lane or valid shrinkage - a silent discharge with no accounting
+# act. The state machine below (encoded in bin/fm-turnend-guard.sh's retry branch) makes the
+# prior blocked-ID set durable: an order stays outstanding until a FRESH AUTHORITATIVE audit
+# proves it removed. These tests enumerate the ship-relevant cells of the table.
+#
+# Fail-closed invariant, on the RETRY, with a prior order:X in the blocked set:
+#   current audit  | outcome                                    | order X | anomalies        | wake
+#   -------------- | ------------------------------------------ | ------- | ---------------- | -------
+#   fresh, lists X | allowed_loop_protection_without_progress   | retained| stand-down       | X
+#   fresh, X gone  | allowed_needs_firstmate_empty (cleared)    | discharged | none          | none
+#   fresh, {X,Y}->{X} | allowed_after_valid_progress            | Y gone  | none             | none
+#   stale          | allowed_loop_protection_without_progress   | RETAINED| stand-down       | X
+#   absent         | allowed_loop_protection_without_progress   | RETAINED| stand-down       | X
+#   corrupt        | allowed_loop_protection_without_progress   | RETAINED| stand-down + audit | X
+# Crew ids are always live-checkable, so a real crew shrink is recognized independently even
+# while the order axis is unknown, and an unknown order read never impersonates order discharge.
+
+# Run the guard directly with a sandboxed coalesce store and bug stub (for cases that file
+# anomalies across the two stop attempts). Echoes the hook output; inspect log/wake/bug after.
+run_stop_sandboxed() {  # <dir> <stop_active> <coalesce> <bug-cli>
+  local dir=$1 sa=$2 coalesce=$3 cli=$4 home
+  home=$(cd "$dir" && pwd)
+  printf '{"stop_hook_active":%s}' "$sa" | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$cli" \
+    bash "$dir/bin/fm-turnend-guard.sh" 2>&1
+}
+
+# THE ROUND-TWO REPRODUCTION. Fresh order block -> the SAME order goes stale on retry ->
+# staleness is not an accounting act, so the order is retained: a no-progress stand-down with
+# the order in the wake and one coalesced stand-down anomaly, NOT a clean discharge.
+test_hook_retry_stale_audit_retains_prior_order_block() {
+  local dir home pid log coalesce buglog status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-retry-stale")
+  home=$(cd "$dir" && pwd); coalesce="$dir/coalesce"; buglog="$home/bug-calls.log"
+  install_bug_stub "$dir" "$buglog" >/dev/null
+  pid=$(start_healthy_watcher "$dir")
+  write_order_audit "$dir" 60 14400 ORD-R2A
+  run_stop_sandboxed "$dir" false "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1   # blocks: records order:ORD-R2A
+  write_order_audit "$dir" 20000 14400 ORD-R2A                                          # same order, now stale
+  run_stop_sandboxed "$dir" true "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1
+  status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "the loop-guarded retry must be permitted, not wedge"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_loop_protection_without_progress ] \
+    || fail "staleness is not a real accounting act and must not cleanly discharge the prior order block: $log"
+  [ "$(printf '%s' "$log" | jq -r '.order_error')" = order-audit-stale ] || fail "the stale audit must be recorded: $log"
+  grep -q "ORD-R2A" "$dir/state/.wake-queue" || fail "the retained prior order must be carried in the durable wake"
+  [ "$(grep -c 'stood the' "$buglog" 2>/dev/null)" -eq 1 ] || fail "the stand-down must file exactly one coalesced anomaly: $(cat "$buglog" 2>/dev/null)"
+  [ "$(grep -c 'order-audit-last.json' "$buglog" 2>/dev/null)" -eq 0 ] || fail "a stale (not broken) audit must NOT file its own audit anomaly: $(cat "$buglog" 2>/dev/null)"
+  pass "fm-turnend-guard: a stale audit on retry retains the prior order block (stand-down + wake + anomaly), never a clean discharge"
+}
+
+# Fresh order block -> audit file MISSING on retry -> same fail-closed retention (absent is
+# non-authoritative). No audit anomaly (absence is not a breakage).
+test_hook_retry_absent_audit_retains_prior_order_block() {
+  local dir home pid log coalesce buglog status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-retry-absent")
+  home=$(cd "$dir" && pwd); coalesce="$dir/coalesce"; buglog="$home/bug-calls.log"
+  install_bug_stub "$dir" "$buglog" >/dev/null
+  pid=$(start_healthy_watcher "$dir")
+  write_order_audit "$dir" 60 14400 ORD-R2B
+  run_stop_sandboxed "$dir" false "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1
+  rm -f "$dir/state/.order-audit-last.json"
+  run_stop_sandboxed "$dir" true "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1
+  status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "the loop-guarded retry must be permitted"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_loop_protection_without_progress ] \
+    || fail "a missing audit must not silently discharge the prior order block: $log"
+  [ "$(printf '%s' "$log" | jq -r '.order_audit_age')" = null ] || fail "an absent audit must record a null age: $log"
+  grep -q "ORD-R2B" "$dir/state/.wake-queue" || fail "the retained prior order must be carried in the durable wake"
+  [ "$(grep -c 'stood the' "$buglog" 2>/dev/null)" -eq 1 ] || fail "the stand-down must file exactly one coalesced anomaly: $(cat "$buglog" 2>/dev/null)"
+  [ "$(grep -c 'order-audit-last.json' "$buglog" 2>/dev/null)" -eq 0 ] || fail "an absent audit must NOT file an audit anomaly: $(cat "$buglog" 2>/dev/null)"
+  pass "fm-turnend-guard: a missing audit on retry retains the prior order block, never a clean discharge"
+}
+
+# Fresh order block -> CORRUPT audit on retry -> fail-closed retention PLUS the independent
+# audit-error anomaly. Two distinct coalesced anomalies; neither masks the other.
+test_hook_retry_corrupt_audit_retains_prior_order_block() {
+  local dir home pid log coalesce buglog status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-retry-corrupt")
+  home=$(cd "$dir" && pwd); coalesce="$dir/coalesce"; buglog="$home/bug-calls.log"
+  install_bug_stub "$dir" "$buglog" >/dev/null
+  pid=$(start_healthy_watcher "$dir")
+  write_order_audit "$dir" 60 14400 ORD-R2C
+  run_stop_sandboxed "$dir" false "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1
+  printf 'not json{\n' > "$dir/state/.order-audit-last.json"
+  run_stop_sandboxed "$dir" true "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1
+  status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "the loop-guarded retry must be permitted"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_loop_protection_without_progress ] \
+    || fail "a corrupt audit must not silently discharge the prior order block: $log"
+  [ "$(printf '%s' "$log" | jq -r '.order_error')" = order-audit-unreadable ] || fail "the corrupt audit must be recorded: $log"
+  grep -q "ORD-R2C" "$dir/state/.wake-queue" || fail "the retained prior order must be carried in the durable wake"
+  [ "$(grep -c 'stood the' "$buglog" 2>/dev/null)" -eq 1 ] || fail "the stand-down anomaly must be filed once: $(cat "$buglog" 2>/dev/null)"
+  [ "$(grep -c 'order-audit-last.json' "$buglog" 2>/dev/null)" -eq 1 ] || fail "the independent audit anomaly must be filed once alongside the stand-down: $(cat "$buglog" 2>/dev/null)"
+  pass "fm-turnend-guard: a corrupt audit on retry retains the prior order block and files both anomalies"
+}
+
+# Fresh order block -> a REAL accounting act reflected by a fresh zero-unaccounted audit ->
+# the order is authoritatively discharged: a clean permit, no stand-down, no wake.
+test_hook_retry_fresh_authoritative_discharge_permits_clean() {
+  local dir home pid log coalesce buglog status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-retry-discharge")
+  home=$(cd "$dir" && pwd); coalesce="$dir/coalesce"; buglog="$home/bug-calls.log"
+  install_bug_stub "$dir" "$buglog" >/dev/null
+  pid=$(start_healthy_watcher "$dir")
+  write_order_audit "$dir" 60 14400 ORD-R2D
+  run_stop_sandboxed "$dir" false "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1
+  write_order_audit "$dir" 5 14400                                   # fresh, zero unaccounted = accounted
+  run_stop_sandboxed "$dir" true "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1
+  status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "the loop-guarded retry must be permitted"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_needs_firstmate_empty ] \
+    || fail "an authoritative discharge must be a clean permit: $log"
+  [ ! -s "$buglog" ] || fail "an authoritative discharge must file no anomaly: $(cat "$buglog")"
+  grep -q "	check	turnend-guard	" "$dir/state/.wake-queue" 2>/dev/null && fail "an authoritative discharge must not queue a stand-down wake"
+  [ ! -f "$dir/state/.turnend-guard-block-ids" ] || [ ! -s "$dir/state/.turnend-guard-block-ids" ] || fail "the block episode must be cleared on discharge"
+  pass "fm-turnend-guard: a fresh authoritative discharge on retry is a clean permit with no stand-down"
+}
+
+# Mixed prior crew and order ids, per-axis: crew departs (recognized) while the audit goes
+# stale (order retained). The crew shrink is recognized - the departed crew id is NOT in the
+# wake - but the unknown order is NOT impersonated as discharged, so it is a stand-down that
+# retains the order.
+test_hook_retry_mixed_axes_recognizes_crew_but_retains_order() {
+  local dir home pid log coalesce buglog status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-retry-mixed")
+  home=$(cd "$dir" && pwd); coalesce="$dir/coalesce"; buglog="$home/bug-calls.log"
+  install_bug_stub "$dir" "$buglog" >/dev/null
+  pid=$(start_healthy_watcher "$dir")
+  write_nf_signal "$dir" crew-R2E 'done: ready in branch fm/crew-R2E'
+  write_order_audit "$dir" 60 14400 ORD-R2E
+  run_stop_sandboxed "$dir" false "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1   # blocks on both
+  # crew departs (its status moves off the terminal verb), and the audit goes stale.
+  printf 'working: resumed the change\n' > "$dir/state/crew-R2E.status"
+  write_order_audit "$dir" 20000 14400 ORD-R2E
+  run_stop_sandboxed "$dir" true "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1
+  status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "the loop-guarded retry must be permitted"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_loop_protection_without_progress ] \
+    || fail "an unknown order read must not impersonate order discharge: $log"
+  grep -q "ORD-R2E" "$dir/state/.wake-queue" || fail "the retained order must be carried in the wake"
+  grep -q "crew-R2E" "$dir/state/.wake-queue" && fail "the departed crew id must be recognized as gone (absent from the wake)"
+  [ "$(grep -c 'stood the' "$buglog" 2>/dev/null)" -eq 1 ] || fail "exactly one stand-down anomaly: $(cat "$buglog" 2>/dev/null)"
+  pass "fm-turnend-guard: mixed axes on retry - crew departure recognized, unknown order retained, never impersonated as discharge"
+}
+
+# The crew axis is independent the other direction: with NO prior order and a stale audit,
+# a departed crew signal clears the block cleanly - staleness does not manufacture a stand-down
+# when there is no order to retain.
+test_hook_retry_stale_audit_no_prior_order_crew_departed_permits_clean() {
+  local dir home pid log coalesce buglog status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-retry-crewclear")
+  home=$(cd "$dir" && pwd); coalesce="$dir/coalesce"; buglog="$home/bug-calls.log"
+  install_bug_stub "$dir" "$buglog" >/dev/null
+  pid=$(start_healthy_watcher "$dir")
+  write_nf_signal "$dir" crew-R2F 'done: ready in branch fm/crew-R2F'
+  write_order_audit "$dir" 20000 14400            # stale from the start: no order block recorded
+  run_stop_sandboxed "$dir" false "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1   # blocks on crew only
+  printf 'working: resumed\n' > "$dir/state/crew-R2F.status"
+  run_stop_sandboxed "$dir" true "$coalesce" "$dir/stubbin/bugstub" >/dev/null 2>&1
+  status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "the loop-guarded retry must be permitted"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_needs_firstmate_empty ] \
+    || fail "with no prior order, a departed crew signal must clear cleanly despite a stale audit: $log"
+  [ ! -s "$buglog" ] || fail "no order to retain means no stand-down anomaly: $(cat "$buglog")"
+  pass "fm-turnend-guard: with no prior order, a stale audit does not manufacture a stand-down when the crew signal clears"
+}
+
 test_predicate_healthy_no_inflight
 test_predicate_unhealthy_no_beacon
 test_predicate_unhealthy_stale_beacon
@@ -3181,3 +3365,9 @@ test_metrics_counts_order_block_and_permit
 test_hook_stale_audit_does_not_mask_nf_standdown
 test_hook_stale_audit_does_not_mask_watcher_standdown
 test_hook_corrupt_audit_does_not_mask_nf_standdown
+test_hook_retry_stale_audit_retains_prior_order_block
+test_hook_retry_absent_audit_retains_prior_order_block
+test_hook_retry_corrupt_audit_retains_prior_order_block
+test_hook_retry_fresh_authoritative_discharge_permits_clean
+test_hook_retry_mixed_axes_recognizes_crew_but_retains_order
+test_hook_retry_stale_audit_no_prior_order_crew_departed_permits_clean
