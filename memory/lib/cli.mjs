@@ -6,6 +6,8 @@ import { canonicalCheckout, registryDir, registryPaths } from './paths.mjs';
 import { buildRetrievalIndex, captureCanonical, cleanRetrievalIndex, inspectRetrievalIndex } from './retrieval-index.mjs';
 import { retrieveMemory } from './retrieve.mjs';
 import { DEFAULT_MAX_ACTIVATION, applyMigration, migrationPaths, runDryRun } from './migrate.mjs';
+import { recall } from './recall.mjs';
+import { extractTaskSection, hasUnresolvedPlaceholder, injectBrief, proofPathFor, verifyBrief, writeProof } from './injection.mjs';
 
 function parseArgs(args) {
   const out = { _: [] };
@@ -162,6 +164,44 @@ function retrievalOptions(flags) {
     if (!asOf) throw new Error('--as-of requires an ISO-8601 timestamp (e.g. 2026-07-23T00:00:00Z)');
   }
   return { project: flags.project, kind: flags.kind, top, asOf };
+}
+
+// Bounded pointer-budget flags for recall/inject-brief. Each is optional and
+// validated; an omitted flag falls through to recall.mjs's DEFAULT_BUDGET.
+function budgetFromFlags(flags) {
+  const budget = {};
+  const posInt = (flag, min) => {
+    if (flags[flag] === undefined) return undefined;
+    const n = Number(flags[flag]);
+    if (!Number.isInteger(n) || n < min) throw new Error(`--${flag} requires an integer >= ${min}`);
+    return n;
+  };
+  const mp = posInt('max-pointers', 0);
+  const mb = posInt('max-bytes', 1);
+  const cc = posInt('candidate-cap', 1);
+  if (mp !== undefined) budget.maxPointers = mp;
+  if (mb !== undefined) budget.maxBytes = mb;
+  if (cc !== undefined) budget.candidateCap = cc;
+  return budget;
+}
+
+// Recall filters. Unlike `retrieve`, project/kind are OPTIONAL here: omitting them
+// is a deliberate broad (session-wide) recall, while supplying them scopes recall
+// to a task's project/kind exactly as injection does.
+function recallFiltersFromFlags(flags) {
+  let asOf;
+  if (flags['as-of'] !== undefined) {
+    asOf = parseIso8601(flags['as-of']);
+    if (!asOf) throw new Error('--as-of requires an ISO-8601 timestamp (e.g. 2026-07-23T00:00:00Z)');
+  }
+  return {
+    project: typeof flags.project === 'string' && flags.project.length ? flags.project : null,
+    kind: typeof flags.kind === 'string' && flags.kind.length ? flags.kind : null,
+    scopes: list(flags.scope),
+    memoryTypes: list(flags['memory-type']),
+    statuses: flags.status !== undefined ? list(flags.status) : ['active'],
+    asOf
+  };
 }
 
 function print(value, json = false) {
@@ -331,6 +371,85 @@ export async function main(args, options = {}) {
       } else {
         throw new Error('usage: mem migrate dry-run [--corpus-root <dir>] [--out-dir <dir>] | migrate apply --proposal <file> --captain-approved <digest> [--activate <id> ...]');
       }
+    } else if (verb === 'recall') {
+      // Governed recall surface (PR-4): consumes the single retrieval authority and
+      // returns a POINTER-BUDGET pack. Suitable for workflow use and for a
+      // session-start "what fleet memory is relevant" read. Query comes from exactly
+      // one of --query/--query-file/--stdin, or --brief (its `# Task` section).
+      const filters = recallFiltersFromFlags(flags);
+      const budget = budgetFromFlags(flags);
+      let query;
+      let querySource;
+      if (typeof flags.brief === 'string') {
+        const briefText = fs.readFileSync(flags.brief, 'utf8');
+        const task = extractTaskSection(briefText);
+        query = task || briefText;
+        querySource = task ? 'brief-task-section' : 'brief-whole';
+      } else {
+        query = retrievalQuery(flags);
+        querySource = flags.stdin ? 'stdin' : (typeof flags['query-file'] === 'string' ? 'query-file' : 'inline');
+      }
+      const pack = await recall({ registryDir: dir, query, querySource, ...filters, budget });
+      if (flags.json) print(pack, true);
+      else {
+        console.log(`State: ${pack.state}${pack.fallbackReason ? ` (${pack.fallbackReason})` : ''} [mode ${pack.retrievalMode}]`);
+        console.log(`Watermark: seq ${pack.canonicalWatermark?.seq ?? '?'}  Generation: ${pack.retrievalGeneration ?? 'none'}`);
+        console.log(`Budget: ${pack.budget.maxPointers} pointers / ${pack.budget.maxBytes} bytes  Active: ${pack.counts.active}`);
+        console.log(`Pointers (${pack.pointers.length}):`);
+        for (const p of pack.pointers) console.log(`  ${p.id} [${p.memoryType}/${p.scope}] ${p.summary} — ${p.matchReasons.join(',')} — mem show ${p.id}`);
+        if (pack.omitted.length) console.log(`Omitted: ${pack.omitted.map((o) => `${o.id}(${o.reason})`).join(', ')}`);
+      }
+      // A recall-failure is a non-zero exit so a caller can detect it; a proven
+      // zero-hit is a successful recall (exit 0).
+      process.exitCode = pack.ok ? 0 : 1;
+    } else if (verb === 'inject-brief') {
+      // Spawn-time verified injection (PR-4): recall + atomic pointer-only injection
+      // into a finalized brief + a spawn-time proof. Inert by default (no pointers ->
+      // brief untouched) and fail-open (recall failure -> brief untouched). Always
+      // writes the proof sidecar so the outcome is auditable even when inert.
+      if (typeof flags.brief !== 'string') throw new Error('inject-brief requires --brief <path>');
+      if (typeof flags.task !== 'string' || !flags.task.length) throw new Error('inject-brief requires --task <id>');
+      if (typeof flags.project !== 'string' || !flags.project.length) throw new Error('inject-brief requires --project <name>');
+      if (typeof flags.kind !== 'string' || !flags.kind.length) throw new Error('inject-brief requires --kind <ship|scout>');
+      const budget = budgetFromFlags(flags);
+      const briefText = fs.readFileSync(flags.brief, 'utf8');
+      const task = extractTaskSection(briefText);
+      const query = task || briefText;
+      const querySource = hasUnresolvedPlaceholder(briefText) ? 'brief-unresolved' : (task ? 'brief-task-section' : 'brief-whole');
+      const pack = await recall({
+        registryDir: dir,
+        query,
+        querySource,
+        project: flags.project,
+        kind: flags.kind,
+        scopes: list(flags.scope),
+        memoryTypes: list(flags['memory-type']),
+        statuses: flags.status !== undefined ? list(flags.status) : ['active'],
+        budget
+      });
+      const result = injectBrief({ briefPath: flags.brief, recallPack: pack, taskId: flags.task, project: flags.project, kind: flags.kind });
+      const proofPath = typeof flags['proof-out'] === 'string' ? flags['proof-out'] : proofPathFor(flags.brief);
+      writeProof(proofPath, result.proof);
+      const out = { injected: result.injected, reason: result.reason ?? null, injectionId: result.injectionId ?? null, proofPath, injectedIds: result.proof.injectedIds, state: pack.state, retrievalMode: pack.retrievalMode };
+      if (flags.json) print(out, true);
+      else if (result.injected) console.log(`injected ${out.injectedIds.length} pointer(s) into ${flags.brief} [${pack.retrievalMode}]; proof ${proofPath}`);
+      else console.log(`not injected (${result.reason}); brief unchanged; proof ${proofPath}`);
+      // Injection is additive and non-blocking: a clean decline is still exit 0.
+      process.exitCode = 0;
+    } else if (verb === 'verify-brief') {
+      // After-the-fact verification (PR-4): re-reads the brief and its proof from
+      // disk and re-derives every hash. Detects tampering, swapped ids, forged
+      // stamps, and stale proofs.
+      if (typeof flags.brief !== 'string') throw new Error('verify-brief requires --brief <path>');
+      const proofPath = typeof flags.proof === 'string' ? flags.proof : undefined;
+      const verdict = verifyBrief({ briefPath: flags.brief, proofPath });
+      if (flags.json) print(verdict, true);
+      else {
+        console.log(`Verification: ${verdict.ok ? 'PASS' : 'FAIL'}`);
+        for (const c of verdict.checks) console.log(`  ${c.ok ? 'ok' : 'FAIL'} ${c.name}${c.detail ? ` (${c.detail})` : ''}`);
+        if (!verdict.ok) console.log(`Failures: ${verdict.failures.join(', ')}`);
+      }
+      process.exitCode = verdict.ok ? 0 : 1;
     } else if (verb === 'doctor') {
       const doctor = checkDoctor(options.root || path.resolve('.', 'memory'), process.env);
       if (flags.json) print(doctor, true);
@@ -350,7 +469,7 @@ export async function main(args, options = {}) {
       }
       process.exitCode = doctor.ok ? 0 : 1;
     } else if (verb === 'help' || !verb) {
-      console.log('Usage: mem propose|activate|revalidate|show|update|supersede|retire|quarantine|audit|project|index rebuild|snapshot|recover|doctor|retrieval build --full|retrieval doctor|retrieval clean|retrieve|migrate dry-run|migrate apply');
+      console.log('Usage: mem propose|activate|revalidate|show|update|supersede|retire|quarantine|audit|project|index rebuild|snapshot|recover|doctor|retrieval build --full|retrieval doctor|retrieval clean|retrieve|recall|inject-brief|verify-brief|migrate dry-run|migrate apply');
     } else {
       throw new Error(`unknown command: ${verb}`);
     }
