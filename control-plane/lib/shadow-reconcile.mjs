@@ -7,7 +7,7 @@ import {
 import { StateTransitionError } from './errors-s1.mjs';
 import { ControlPlaneError } from './errors.mjs';
 import { readOnlyQuery } from './cw1-readonly.mjs';
-import { recordAnnotation, annotationsTablePresent } from './cw2-annotations.mjs';
+import { annotationsTablePresent } from './cw2-annotations.mjs';
 import { runExclusive } from './internal-runtime.mjs';
 
 // `cp shadow-reconcile --ledger <path> --data-dir <path> --out <path> --captain-approved [--task <id>]`
@@ -31,38 +31,51 @@ import { runExclusive } from './internal-runtime.mjs';
 // the sanctioned domain command envelope (executeCommand), fabricating NO run, event, or
 // binding. The junk generation-1 run history is left BYTE-UNTOUCHED (not deleted): a
 // reconciled task keeps its closed `failed` gen-1 run and its `failed` terminal event; only
-// `tasks.status` advances to the ledger's expected terminal. The reconcile is "recorded as
-// such" two ways - a dedicated `reconcile_terminals` marker row (producer `reconciler`,
-// from/to status, ledger digest) AND an audit annotation per row in the shared
+// `tasks.status` advances to the ledger's expected terminal.
+//
+// ATOMIC AUDIT (QA finding 5). The reconcile is recorded "as such" INSIDE the same envelope
+// transaction as the status change: a dedicated `reconcile_terminals` marker row (producer
+// `reconciler`, from/to status, ledger digest) AND an audit annotation row in the shared
 // `shadow_annotations` table (the same cp-shadow audit surface) carrying the ledger digest.
+// Both inserts share the envelope's connection, so task status + marker + annotation + command
+// receipt + counters commit or roll back together - a crash after the mutation leaves the task
+// exactly as unreconciled as it was. (The landed cw2-annotations.recordAnnotation acquires its
+// own exclusive lock and so cannot be nested inside the envelope transaction, and it is a
+// landed module this slice must not edit; the annotation is therefore a minimal, deliberate,
+// idempotent inline INSERT matching that module's exact columns. The gate guarantees the table
+// is present.)
 //
 // NO NEW TASK-EVENT TYPE. A `completed` task_events row is impossible here (it must be
 // run-scoped and unique-per-generation, and gen-1 already holds a terminal), and there is no
 // `reconciled` event type in the ratified DDL vocabulary. Adding one would edit a landed
 // schema, which this slice does not do. The marker table + annotation ARE the auditable
-// record of the reconcile; the event log honestly still shows the original `failed` terminal.
+// record; the event log honestly still shows the original `failed` terminal.
 //
 // GATES (each refuses loudly, before ANY store write):
 //   * `--captain-approved` is REQUIRED as an explicit bare flag (the ledger is a captain-
 //     authorized administrative action; a missing/mistyped flag fails closed).
-//   * the `--ledger` file must exist, be valid JSON, carry the ledger schema, and name a
-//     non-empty, well-formed `entries[]` (task_id, terminal expected_status, evidence).
+//   * the `--ledger` file must exist, be valid JSON, carry the ledger schema, declare its
+//     `legacy_home` and `target_data_dir`, and name a non-empty, well-formed `entries[]`.
+//   * the shadow window must be currently OPEN AND CLOSABLE: `CP_SHADOW=1` must be set for
+//     this session (the operational enablement gate, closed by setting it to anything else -
+//     QA finding 1), and the target store must be a shadow participant (`shadow_annotations`
+//     present). Table presence alone is NOT treated as proof the window is open.
+//   * the approval is BOUND to the target (QA finding 3): the ledger digest covers the target
+//     store + legacy-evidence root, and execution refuses unless the resolved `--data-dir`
+//     canonical path matches the approved `target_data_dir` (and, when the ledger declares
+//     `target_home_uuid`, the store's `home_uuid`).
+//   * every entry's evidence `source_refs` must resolve to an existing file BENEATH the
+//     declared `legacy_home` (QA finding 4): a non-existent or escaping reference is refused,
+//     not merely required to be a non-empty string.
 //   * a `--task <id>` filter naming a task NOT in the ledger is refused (the ledger is the
 //     allowlist; nothing outside it is ever touched).
-//   * the shadow window must be OPEN: the target store must show shadow-mode activity (the
-//     `shadow_annotations` table present). A store the shadow writer never touched is not in
-//     a shadow window and is refused.
-//   * a row whose store status ALREADY equals its expected terminal is refused-in-place
-//     (recorded `already_matched`, no core-domain write) rather than rewritten.
-//
-// IDEMPOTENT. Each entry's command is keyed by a deterministic command-id derived from the
-// ledger digest and task id, so the command envelope replays a re-run instead of double-
-// applying, and the marker/annotation inserts are ON CONFLICT DO NOTHING. Re-running the same
-// approved ledger reports every row `replayed` and changes nothing.
+//   * a row whose store status ALREADY equals its expected terminal is REFUSED before any
+//     store write (QA finding 2) - no marker, command receipt, counter bump, or annotation.
+//     A same-command-id re-run of the SAME approved ledger still replays idempotently.
 //
 // READ-ONLY-ELSEWHERE. The verb only ever writes `tasks` (via the envelope), its own marker
-// table, and `shadow_annotations`. It never reads or writes the legacy home; the legacy
-// stores remain the operational authority (a later cutover stage flips authority, not this).
+// table, and `shadow_annotations`. Its only legacy-home access is the read-only existence
+// check of the evidence references; the legacy stores remain the operational authority.
 
 export const RECONCILE_LEDGER_SCHEMA = 'control-plane/shadow-reconcile/ledger/v1';
 export const RECONCILE_RECEIPT_SCHEMA = 'control-plane/shadow-reconcile/receipt/v1';
@@ -84,7 +97,7 @@ CREATE TABLE IF NOT EXISTS reconcile_terminals (
   task_id       TEXT NOT NULL,
   from_status   TEXT NOT NULL,
   to_status     TEXT NOT NULL,
-  disposition   TEXT NOT NULL CHECK (disposition IN ('reconciled','already_matched')),
+  disposition   TEXT NOT NULL CHECK (disposition IN ('reconciled')),
   producer      TEXT NOT NULL,
   ledger_digest TEXT NOT NULL,
   evidence_json TEXT,
@@ -92,12 +105,25 @@ CREATE TABLE IF NOT EXISTS reconcile_terminals (
 );`;
 
 // A shadow-reconcile CLI invocation was malformed at the surface, its ledger was missing/
-// invalid/unapproved, the shadow window was not open, or per-entry reconciliation errored.
-// Extends ControlPlaneError so bin/cp.mjs maps it to a typed nonzero exit like every verb.
+// invalid/unapproved, the shadow window was not open, the target/evidence binding failed, or
+// per-entry reconciliation errored/was refused. Extends ControlPlaneError so bin/cp.mjs maps
+// it to a typed nonzero exit like every verb.
 export class ReconcileError extends ControlPlaneError {
   constructor(message, detail) {
     super(message, 'shadow_reconcile');
     this.detail = detail || null;
+  }
+}
+
+// A per-entry refusal because the row already matches its expected terminal and this is NOT a
+// replay of the approved command (QA finding 2). Distinct from a genuine error so the executor
+// can report it as `refused`. Thrown from inside the envelope mutate, so the envelope rolls
+// the whole transaction back and NOTHING is written.
+class AlreadyMatchesRefusal extends StateTransitionError {
+  constructor(taskId, status) {
+    super(`task '${taskId}' already at expected terminal status '${status}'; refusing (no replay receipt for this command)`, {
+      task_id: taskId, status, already_matches: true
+    });
   }
 }
 
@@ -109,15 +135,22 @@ function nowIso() {
 // Ledger load + validation + digest
 // ---------------------------------------------------------------------------------
 
-// Deterministic digest over the ledger's reconciliation-bearing content (schema + normalized
-// entries), independent of entry order and of any incidental fields (comments, provenance).
-// This digest binds every derived command-id, so a tampered ledger produces different
-// command-ids and can never masquerade as a replay of the approved one.
+// Deterministic digest over the ledger's SECURITY-RELEVANT content: schema, the canonical
+// target store, the legacy evidence root, an optional pinned store identity, and the
+// normalized entries (order-independent). QA finding 3: the approval-bearing digest must
+// change when the target or legacy root changes, so an operator cannot present approved entry
+// content while pointing at a different store.
 export function computeLedgerDigest(doc) {
   const normalized = doc.entries
     .map((e) => ({ task_id: e.task_id, expected_status: e.expected_status, evidence: e.evidence ?? null }))
     .sort((a, b) => (a.task_id < b.task_id ? -1 : a.task_id > b.task_id ? 1 : 0));
-  return sha256hex(canonicalJson({ schema: doc.schema, entries: normalized }));
+  return sha256hex(canonicalJson({
+    schema: doc.schema,
+    legacy_home: doc.legacy_home ?? null,
+    target_data_dir: doc.target_data_dir ?? null,
+    target_home_uuid: doc.target_home_uuid ?? null,
+    entries: normalized
+  }));
 }
 
 export function loadLedger(ledgerPath) {
@@ -140,6 +173,17 @@ export function loadLedger(ledgerPath) {
     throw new ReconcileError(`--ledger is not a ${RECONCILE_LEDGER_SCHEMA} document`, {
       ledger: ledgerPath, schema: doc && doc.schema ? doc.schema : null
     });
+  }
+  // The target store and legacy evidence root are approval-bearing and REQUIRED: they bind
+  // the ledger to a specific store and a specific evidence home (QA finding 3/4).
+  if (typeof doc.target_data_dir !== 'string' || doc.target_data_dir.length === 0) {
+    throw new ReconcileError('--ledger must declare target_data_dir (the approved store the ledger authorizes)', { ledger: ledgerPath });
+  }
+  if (typeof doc.legacy_home !== 'string' || doc.legacy_home.length === 0) {
+    throw new ReconcileError('--ledger must declare legacy_home (the root the evidence references resolve beneath)', { ledger: ledgerPath });
+  }
+  if (doc.target_home_uuid !== undefined && (typeof doc.target_home_uuid !== 'string' || doc.target_home_uuid.length === 0)) {
+    throw new ReconcileError('--ledger target_home_uuid, when present, must be a non-empty string', { ledger: ledgerPath });
   }
   if (!Array.isArray(doc.entries) || doc.entries.length === 0) {
     throw new ReconcileError('--ledger has no entries[] to reconcile', { ledger: ledgerPath });
@@ -170,8 +214,51 @@ export function loadLedger(ledgerPath) {
   return { doc, digest: computeLedgerDigest(doc) };
 }
 
+// Every entry's evidence must resolve to an EXISTING file beneath the declared legacy home,
+// and (when a `#anchor` fragment is present) the anchor text must occur in that file (QA
+// finding 4). A missing, escaping, or content-less reference is refused, not merely required
+// to be a non-empty string. `io` is injectable for tests.
+export function verifyEvidenceResolves(doc, { io = nodeFs } = {}) {
+  const legacyHome = doc.legacy_home;
+  if (!io.existsSync(legacyHome) || !io.statSync(legacyHome).isDirectory()) {
+    throw new ReconcileError(`ledger legacy_home does not exist or is not a directory: ${legacyHome}`, { legacy_home: legacyHome });
+  }
+  const canonicalHome = realOf(legacyHome);
+  for (const e of doc.entries) {
+    for (const ref of e.evidence.source_refs) {
+      const hashAt = ref.indexOf('#');
+      const filePart = hashAt >= 0 ? ref.slice(0, hashAt) : ref;
+      const anchor = hashAt >= 0 ? ref.slice(hashAt + 1) : null;
+      if (filePart.length === 0) {
+        throw new ReconcileError(`evidence ref '${ref}' for '${e.task_id}' has no file part`, { task_id: e.task_id, ref });
+      }
+      const abs = path.resolve(canonicalHome, filePart);
+      const resolved = realOf(abs);
+      if (!isAtOrUnder(canonicalHome, resolved)) {
+        throw new ReconcileError(`evidence ref '${ref}' for '${e.task_id}' resolves outside the declared legacy home`, {
+          task_id: e.task_id, ref, legacy_home: canonicalHome, resolved
+        });
+      }
+      if (!io.existsSync(abs)) {
+        throw new ReconcileError(`evidence ref '${ref}' for '${e.task_id}' does not resolve to an existing file beneath the legacy home`, {
+          task_id: e.task_id, ref, legacy_home: canonicalHome
+        });
+      }
+      if (anchor !== null && anchor.length > 0) {
+        let content = null;
+        try { content = io.readFileSync(abs, 'utf8'); } catch { content = null; }
+        if (content !== null && !content.includes(anchor)) {
+          throw new ReconcileError(`evidence ref '${ref}' for '${e.task_id}': anchor '${anchor}' not found in ${filePart}`, {
+            task_id: e.task_id, ref
+          });
+        }
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------------
-// Out containment (identical discipline to shadow-diff / migrate-backfill)
+// Path canonicalization + out containment (shared discipline with shadow-diff)
 // ---------------------------------------------------------------------------------
 
 function isAtOrUnder(root, p) {
@@ -193,6 +280,19 @@ function realDirOf(p) {
 
 function realOf(p) {
   return nodeFs.existsSync(p) ? nodeFs.realpathSync(p) : path.resolve(p);
+}
+
+// Bind execution to the approved target store (QA finding 3): the resolved canonical
+// `--data-dir` must equal the approved `target_data_dir`. Refuses otherwise, so approved entry
+// content presented against a different (even same-task-id) store is rejected.
+function assertTargetBinding(dataDir, doc) {
+  const got = realOf(dataDir);
+  const want = realOf(doc.target_data_dir);
+  if (got !== want) {
+    throw new ReconcileError('refused: --data-dir does not match the approved ledger target_data_dir', {
+      data_dir: got, ledger_target_data_dir: want
+    });
+  }
 }
 
 // Refuse an --out that resolves under the store directory: a reconcile receipt must never be
@@ -231,7 +331,7 @@ function atomicWriteOwnerOnly(outPath, content) {
 }
 
 // ---------------------------------------------------------------------------------
-// Store reads (marker table load + receipt probe), through the read-only seam
+// Store reads (marker table load + receipt probe + home_uuid), through read-only seams
 // ---------------------------------------------------------------------------------
 
 export async function reconcileTerminalsTablePresent(store) {
@@ -276,6 +376,11 @@ async function commandReceiptExists(store, commandId) {
   return rows.length > 0;
 }
 
+async function readHomeUuid(store) {
+  const rows = await readOnlyQuery(store, "SELECT value FROM schema_meta WHERE key = 'home_uuid'");
+  return rows.length > 0 ? rows[0].value : null;
+}
+
 // ---------------------------------------------------------------------------------
 // The domain reconcile: advance ONE task's terminal status through the command envelope
 // ---------------------------------------------------------------------------------
@@ -283,13 +388,14 @@ async function commandReceiptExists(store, commandId) {
 // Reconcile a single task's terminal state to `expectedStatus`, WITHOUT fabricating a live
 // run identity. Goes through the sanctioned executeCommand envelope (idempotency by
 // command-id, the atomic domain-write + counter-bump + command_results bundle). The mutate
-// touches only the `tasks` row and this slice's own `reconcile_terminals` marker; runs and
-// task_events (including the junk gen-1 terminal) are never read or written, so history is
-// preserved. A row already at `expectedStatus` is recorded `already_matched` with no core
-// change.
+// touches only the `tasks` row, this slice's own `reconcile_terminals` marker, and one
+// `shadow_annotations` audit row - all in ONE transaction (QA finding 5). Runs and task_events
+// (including the junk gen-1 terminal) are never read or written, so history is preserved. A
+// row already at `expectedStatus` (and not a replay) is REFUSED before any write (QA finding
+// 2) by throwing AlreadyMatchesRefusal, which rolls the whole transaction back.
 export async function reconcileTerminal(store, {
   taskId, expectedStatus, ledgerDigest, evidence, producer = 'reconciler', commandId
-}, { now = nowIso() } = {}) {
+}, { now = nowIso(), fault } = {}) {
   if (typeof taskId !== 'string' || taskId.length === 0) {
     throw new ReconcileError('reconcileTerminal requires a task_id');
   }
@@ -300,13 +406,15 @@ export async function reconcileTerminal(store, {
     throw new ReconcileError('reconcileTerminal requires a commandId');
   }
   const evidenceJson = evidence === undefined || evidence === null ? null : JSON.stringify(evidence);
+  const digest = ledgerDigest ?? '';
+  const annotCommandId = `${CMD_PREFIX}:annot:${taskId}:${digest.slice(0, 16)}`;
   const requestHash = sha256hex(canonicalJson({
     verb: 'shadow-reconcile', task_id: taskId, expected_status: expectedStatus,
-    ledger_digest: ledgerDigest ?? null, producer, evidence: evidence ?? null
+    ledger_digest: digest, producer, evidence: evidence ?? null
   }));
 
   return executeCommand(store, {
-    verb: 'shadow-reconcile', commandId, requestHash, taskId, now,
+    verb: 'shadow-reconcile', commandId, requestHash, taskId, now, fault,
     mutate: async (conn, ctx) => {
       await conn.exec(RECONCILE_TERMINALS_DDL);
       const task = await readTask(conn, taskId);
@@ -315,23 +423,12 @@ export async function reconcileTerminal(store, {
       }
       const fromStatus = task.status;
 
-      // Refuse-in-place: a row already at its expected terminal is recorded as such and left
-      // untouched (no revision bump, no status write).
+      // Refuse before any write: a row already at its expected terminal, reached here (past
+      // the envelope's idempotent-replay pre-check), is a NEW command on an already-matching
+      // row. Throwing rolls the whole transaction back - no status write, marker, annotation,
+      // command receipt, or counter bump.
       if (fromStatus === expectedStatus) {
-        await conn.query(
-          `INSERT INTO reconcile_terminals
-             (command_id, task_id, from_status, to_status, disposition, producer, ledger_digest, evidence_json, created_at)
-             VALUES ($1,$2,$3,$4,'already_matched',$5,$6,$7,$8) ON CONFLICT (command_id) DO NOTHING`,
-          [commandId, taskId, fromStatus, expectedStatus, producer, ledgerDigest ?? '', evidenceJson, ctx.now]
-        );
-        return {
-          result: {
-            task_id: taskId, disposition: 'already_matched', from_status: fromStatus,
-            to_status: expectedStatus, status: fromStatus, revision: Number(task.revision),
-            ledger_digest: ledgerDigest ?? null
-          },
-          committedRevision: Number(task.revision), domainChanged: false
-        };
+        throw new AlreadyMatchesRefusal(taskId, fromStatus);
       }
 
       // Advance ONLY the task row. No run generation, terminal event, or binding is created:
@@ -346,13 +443,29 @@ export async function reconcileTerminal(store, {
         `INSERT INTO reconcile_terminals
            (command_id, task_id, from_status, to_status, disposition, producer, ledger_digest, evidence_json, created_at)
            VALUES ($1,$2,$3,$4,'reconciled',$5,$6,$7,$8) ON CONFLICT (command_id) DO NOTHING`,
-        [commandId, taskId, fromStatus, expectedStatus, producer, ledgerDigest ?? '', evidenceJson, ctx.now]
+        [commandId, taskId, fromStatus, expectedStatus, producer, digest, evidenceJson, ctx.now]
+      );
+      // The required per-row audit annotation, INLINE and atomic with the reconcile (QA
+      // finding 5). Same columns/idempotency as cw2-annotations.recordAnnotation; the table is
+      // guaranteed present by the shadow-window gate. Written through the envelope connection,
+      // so it commits/rolls-back with the terminal change rather than in a separate lock.
+      await conn.query(
+        `INSERT INTO shadow_annotations (command_id, task_id, action, detail_json, source, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (command_id) DO NOTHING`,
+        [
+          annotCommandId, taskId, 'reconcile-terminal',
+          JSON.stringify({
+            ledger_digest: digest, expected_status: expectedStatus, from_status: fromStatus,
+            command_id: commandId, evidence: evidence ?? null
+          }),
+          CMD_PREFIX, ctx.now
+        ]
       );
       return {
         result: {
           task_id: taskId, disposition: 'reconciled', from_status: fromStatus,
           to_status: expectedStatus, status: expectedStatus, revision: newRevision,
-          ledger_digest: ledgerDigest ?? null
+          ledger_digest: digest || null
         },
         committedRevision: newRevision, domainChanged: true
       };
@@ -382,6 +495,12 @@ export async function runShadowReconcile({
   }
 
   const { doc, digest } = loadLedger(ledgerPath);
+
+  // Bind approval to the target store (QA finding 3) and verify the evidence resolves beneath
+  // the declared legacy home (QA finding 4), both before opening the store.
+  assertTargetBinding(dataDir, doc);
+  verifyEvidenceResolves(doc);
+
   const allowed = new Map(doc.entries.map((e) => [e.task_id, e]));
   if (taskFilter !== undefined) {
     if (!allowed.has(taskFilter)) {
@@ -395,13 +514,31 @@ export async function runShadowReconcile({
   const store = PgliteLocalStore.create({ dataDir, env });
   const results = [];
   try {
-    // Shadow-window-open gate: the target store must show shadow-mode activity. A store the
-    // shadow writer never touched is not in a shadow window, so reconcile is refused.
+    // Shadow-window-open gate (QA finding 1): the window is a CURRENT, closable state, not an
+    // inference from a persistent historical table. CP_SHADOW=1 is the operational enablement
+    // gate (bin/fm-cp-shadow.sh); anything else means the window is closed. The store must
+    // additionally be a shadow participant (shadow_annotations present), which is a
+    // store-scoped sanity check - never treated as proof the window is open on its own.
+    if (env.CP_SHADOW !== '1') {
+      throw new ReconcileError(
+        'shadow window is not open: CP_SHADOW is not enabled (=1) for this session; reconcile is only sanctioned while the shadow window is open',
+        { cp_shadow: env.CP_SHADOW ?? null }
+      );
+    }
     if (!(await annotationsTablePresent(store))) {
       throw new ReconcileError(
         'shadow window is not open: the target store shows no shadow-mode activity (no shadow_annotations); reconcile is only sanctioned during the CW2+ shadow window',
         { data_dir: dataDir }
       );
+    }
+    // Bind to the store identity when the ledger pins it (QA finding 3, home_uuid).
+    if (doc.target_home_uuid !== undefined) {
+      const homeUuid = await readHomeUuid(store);
+      if (homeUuid !== doc.target_home_uuid) {
+        throw new ReconcileError('refused: target store home_uuid does not match the approved ledger target_home_uuid', {
+          store_home_uuid: homeUuid, ledger_target_home_uuid: doc.target_home_uuid
+        });
+      }
     }
 
     const toProcess = taskFilter !== undefined ? [allowed.get(taskFilter)] : doc.entries;
@@ -414,31 +551,26 @@ export async function runShadowReconcile({
           taskId: entry.task_id, expectedStatus: entry.expected_status,
           ledgerDigest: digest, evidence: entry.evidence, producer: 'reconciler', commandId
         }, { now: clock() });
-        const disposition = receiptExists ? 'replayed' : res.disposition;
-        // Audit annotation carrying the ledger digest (idempotent by command-id; separate
-        // exclusive section, so it is written after the envelope commits rather than nested).
-        await recordAnnotation(store, {
-          commandId: `${CMD_PREFIX}:annot:${entry.task_id}:${shortDigest}`,
-          taskId: entry.task_id,
-          action: 'reconcile-terminal',
-          detail: {
-            ledger_digest: digest, expected_status: entry.expected_status,
-            from_status: res.from_status, disposition, command_id: commandId,
-            evidence: entry.evidence ?? null
-          },
-          source: CMD_PREFIX,
-          now: clock()
-        });
+        // A prior committed receipt means the envelope replayed the stored result rather than
+        // re-applying (a same-ledger re-run); otherwise this was a fresh reconcile.
+        const disposition = receiptExists ? 'replayed' : 'reconciled';
         record = {
           task_id: entry.task_id, expected_status: entry.expected_status, disposition,
           from_status: res.from_status, to_status: res.to_status, revision: res.revision
         };
       } catch (err) {
-        record = {
-          task_id: entry.task_id, expected_status: entry.expected_status, disposition: 'error',
-          error: err && err.message ? err.message : String(err),
-          code: err && err.code ? err.code : null
-        };
+        if (err instanceof StateTransitionError && err.detail && err.detail.already_matches) {
+          record = {
+            task_id: entry.task_id, expected_status: entry.expected_status, disposition: 'refused',
+            reason: err.message
+          };
+        } else {
+          record = {
+            task_id: entry.task_id, expected_status: entry.expected_status, disposition: 'error',
+            error: err && err.message ? err.message : String(err),
+            code: err && err.code ? err.code : null
+          };
+        }
       }
       results.push(record);
     }
@@ -446,19 +578,21 @@ export async function runShadowReconcile({
     await store.close();
   }
 
-  const totals = { reconciled: 0, already_matched: 0, replayed: 0, error: 0 };
+  const totals = { reconciled: 0, replayed: 0, refused: 0, error: 0 };
   for (const r of results) {
     if (totals[r.disposition] !== undefined) totals[r.disposition] += 1;
   }
-  const ok = totals.error === 0;
+  const ok = totals.error === 0 && totals.refused === 0;
 
   const report = {
     schema: RECONCILE_RECEIPT_SCHEMA,
-    posture: 'administrative task-terminal reconcile of documented pre-shadow-enable divergence; no run/event/binding fabricated; gen-1 run history preserved; legacy stores untouched',
+    posture: 'administrative task-terminal reconcile of documented pre-shadow-enable divergence; no run/event/binding fabricated; gen-1 run history preserved; status+marker+annotation+receipt atomic; legacy stores untouched (evidence checked read-only)',
     ledger: path.resolve(ledgerPath),
     ledger_schema: doc.schema,
     ledger_digest: digest,
     data_dir: dataDir,
+    target_data_dir: doc.target_data_dir,
+    legacy_home: doc.legacy_home,
     captain_approved: true,
     shadow_window_open: true,
     task_filter: taskFilter ?? null,
@@ -469,7 +603,7 @@ export async function runShadowReconcile({
   atomicWriteOwnerOnly(resolvedOut, `${JSON.stringify(report, null, 2)}\n`);
 
   if (!ok) {
-    throw new ReconcileError('shadow-reconcile completed with per-entry errors; receipt written for audit', {
+    throw new ReconcileError('shadow-reconcile completed with per-entry refusals or errors; receipt written for audit', {
       out: resolvedOut, totals
     });
   }

@@ -1,17 +1,17 @@
 {
   "schema": "control-plane/shadow-reconcile/ledger/v1",
-  "reason": "SAMPLE reconcile ledger fixture (tests only). Documents pre-shadow-enable divergence: two tasks whose legacy-derived expected terminal status is `completed`, but whose store rows read `failed` after the reconciler's spawn-timeout close of a synthetic generation-1 run. NOT a real approved ledger; the real proposed ledger for the production rows lives under docs/cp-shadow-reconcile-r1/.",
+  "reason": "SAMPLE reconcile ledger fixture (syntactic; tests only). Documents pre-shadow-enable divergence: two tasks whose legacy-derived expected terminal status is `completed`, but whose store rows read `failed` after the reconciler's spawn-timeout close of a synthetic generation-1 run. NOT a real approved ledger; the real proposed ledger for the production rows lives under docs/cp-shadow-reconcile-r1/. The example paths below are placeholders - the executor's evidence-resolvability and target-binding gates verify real paths at run time.",
   "legacy_home": "/example/legacy/home",
+  "target_data_dir": "/example/legacy/home/state/control-plane/pgdata",
   "entries": [
     {
       "task_id": "sample-a",
       "expected_status": "completed",
       "evidence": {
         "source_refs": [
-          "data/backlog.md#sample-a",
-          "state/sample-a.meta"
+          "data/done-archive.md#sample-a"
         ],
-        "note": "legacy backlog Done section + merged PR; store row wrongly `failed` after synthetic gen-1 spawn-timeout close"
+        "note": "legacy done-archive closeout; store row wrongly `failed` after synthetic gen-1 spawn-timeout close"
       }
     },
     {
@@ -19,10 +19,9 @@
       "expected_status": "completed",
       "evidence": {
         "source_refs": [
-          "data/backlog.md#sample-b",
-          "state/sample-b.meta"
+          "data/backlog.md#sample-b"
         ],
-        "note": "legacy backlog Done section; store row wrongly `failed`"
+        "note": "legacy backlog Done row; store row wrongly `failed`"
       }
     }
   ]
