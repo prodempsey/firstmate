@@ -56,16 +56,16 @@
       "task_id": "cutover-w2",
       "expected_status": "completed",
       "evidence": {
-        "source_refs": ["data/cutover-w2/brief.md"],
-        "note": "durable task closeout brief; legacy disposition completed (backlog Done); store row wrongly `failed` after synthetic gen-1 spawn-timeout close"
+        "source_refs": ["data/done-archive.md#cutover-w2", "data/cutover-w2/brief.md"],
+        "note": "completion evidence: done-archive row records merged 5590f17 (4 QA rounds, production back-fill), plus the durable task brief; store row wrongly `failed` after synthetic gen-1 spawn-timeout close. If the archive row later moves, the validator refuses and the ref must be repointed before approval."
       }
     },
     {
       "task_id": "cutover-w3",
       "expected_status": "completed",
       "evidence": {
-        "source_refs": ["data/cutover-w3/brief.md"],
-        "note": "durable task closeout brief; legacy disposition completed (backlog Done); store row wrongly `failed` after synthetic gen-1 spawn-timeout close"
+        "source_refs": ["data/backlog.md#cutover-w3", "data/cutover-w3/brief.md"],
+        "note": "completion evidence: backlog Done row records merged d38376e (2 QA rounds, cockpit/CP preview live), plus the durable task brief; store row wrongly `failed` after synthetic gen-1 spawn-timeout close. If the backlog row later prunes to done-archive, the validator refuses and the ref must be repointed before approval."
       }
     }
   ]

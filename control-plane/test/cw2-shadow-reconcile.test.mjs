@@ -288,7 +288,7 @@ test('GATE: a non-terminal expected_status and missing evidence are refused at l
   );
   assert.throws(
     () => loadLedger(writeLedger([{ task_id: 'q87', expected_status: 'completed' }], { legacyHome, targetDataDir: '/d' })),
-    (e) => e instanceof ReconcileError && /source_refs/.test(e.message)
+    (e) => e instanceof ReconcileError && /requires an evidence object/.test(e.message)
   );
   assert.throws(
     () => loadLedger(writeLedger([{ task_id: 'q87', expected_status: 'completed', evidence: { source_refs: [] } }], { legacyHome, targetDataDir: '/d' })),
@@ -346,7 +346,7 @@ test('GATE (finding 2): a new ledger targeting an already-matching row is REFUSE
   const out = outPath();
   await assert.rejects(
     () => runShadowReconcile({ ledgerPath: writeLedger([entry('q87', 'completed', ['data/done-archive.md#q87'])], { legacyHome, targetDataDir: dataDir }), dataDir, outPath: out, captainApproved: true, env: SHADOW, now: NOW }),
-    (e) => e instanceof ReconcileError && /refusals or errors/.test(e.message)
+    (e) => e instanceof ReconcileError && /refused before any mutation/.test(e.message)
   );
   const receipt = readReceipt(out);
   assert.equal(receipt.totals.refused, 1);
@@ -381,15 +381,33 @@ test('IDEMPOTENT: re-running the SAME approved ledger replays and changes nothin
 });
 
 // ---------------------------------------------------------------------------------
-// Finding 3: approval bound to target store + full ledger identity
+// Finding 1 (r2): full-ledger approval identity + closed schema
+// Finding 3 (r1): approval bound to target store
 // ---------------------------------------------------------------------------------
 
-test('SECURITY (finding 3): ledger digest covers the target store and legacy root', () => {
-  const base = { schema: RECONCILE_LEDGER_SCHEMA, legacy_home: '/h/a', target_data_dir: '/d/a', entries: [entry('t')] };
+test('SECURITY (r2 finding 1): the digest identifies the FULL ledger document', () => {
+  const base = { schema: RECONCILE_LEDGER_SCHEMA, legacy_home: '/h/a', target_data_dir: '/d/a', reason: 'r', entries: [entry('t')] };
   assert.notEqual(computeLedgerDigest(base), computeLedgerDigest({ ...base, target_data_dir: '/d/b' }), 'changing the target changes the digest');
   assert.notEqual(computeLedgerDigest(base), computeLedgerDigest({ ...base, legacy_home: '/h/b' }), 'changing the legacy root changes the digest');
   assert.notEqual(computeLedgerDigest(base), computeLedgerDigest({ ...base, target_home_uuid: 'uuid' }), 'pinning a home_uuid changes the digest');
-  assert.equal(computeLedgerDigest(base), computeLedgerDigest({ ...base, reason: 'a different human note' }), 'a documentation-only reason change does not');
+  assert.notEqual(computeLedgerDigest(base), computeLedgerDigest({ ...base, reason: 'a different note' }), 'the reason is part of the approved document, so it changes the digest');
+  const noted = { ...base, entries: [{ ...entry('t'), evidence: { source_refs: ['r'], note: 'different' } }] };
+  assert.notEqual(computeLedgerDigest(base), computeLedgerDigest(noted), 'an entry note change changes the digest');
+});
+
+test('GATE (r2 finding 1): unknown top-level / entry / evidence fields are rejected (closed schema)', () => {
+  assert.throws(
+    () => loadLedger(writeRaw(JSON.stringify({ schema: RECONCILE_LEDGER_SCHEMA, legacy_home: '/h', target_data_dir: '/d', bogus: 1, entries: [entry('t')] }), 'unk-top.json')),
+    (e) => e instanceof ReconcileError && /unexpected field 'bogus'/.test(e.message)
+  );
+  assert.throws(
+    () => loadLedger(writeRaw(JSON.stringify({ schema: RECONCILE_LEDGER_SCHEMA, legacy_home: '/h', target_data_dir: '/d', entries: [{ ...entry('t'), sneaky: true }] }), 'unk-entry.json')),
+    (e) => e instanceof ReconcileError && /unexpected field 'sneaky'/.test(e.message)
+  );
+  assert.throws(
+    () => loadLedger(writeRaw(JSON.stringify({ schema: RECONCILE_LEDGER_SCHEMA, legacy_home: '/h', target_data_dir: '/d', entries: [{ task_id: 't', expected_status: 'completed', evidence: { source_refs: ['r'], extra: 1 } }] }), 'unk-ev.json')),
+    (e) => e instanceof ReconcileError && /unexpected field 'extra'/.test(e.message)
+  );
 });
 
 test('GATE (finding 3): refuses when --data-dir does not match the approved target_data_dir', async () => {
@@ -437,6 +455,18 @@ test('GATE (finding 4): an evidence ref escaping the legacy home, or a wrong anc
   );
 });
 
+test('GATE (r2 finding 3): a directory evidence target is refused (not a regular file)', async () => {
+  const { dataDir, legacyHome } = await scenario(['q87']); // legacyHome has a `data/` directory
+  await assert.rejects(
+    () => runShadowReconcile({ ledgerPath: writeLedger([entry('q87', 'completed', ['data'])], { legacyHome, targetDataDir: dataDir }), dataDir, outPath: outPath(), captainApproved: true, env: SHADOW, now: NOW }),
+    (e) => e instanceof ReconcileError && /is not a regular file/.test(e.message)
+  );
+  await assert.rejects(
+    () => runShadowReconcile({ ledgerPath: writeLedger([entry('q87', 'completed', ['data#anchor'])], { legacyHome, targetDataDir: dataDir }), dataDir, outPath: outPath(), captainApproved: true, env: SHADOW, now: NOW }),
+    (e) => e instanceof ReconcileError && /is not a regular file/.test(e.message)
+  );
+});
+
 // ---------------------------------------------------------------------------------
 // Finding 5: atomicity (crash cut)
 // ---------------------------------------------------------------------------------
@@ -472,7 +502,7 @@ test('GATE: --out resolving under the store data-dir is refused', async () => {
   );
 });
 
-test('a ledger entry naming a task absent from the store is a per-entry error; receipt is still written', async () => {
+test('BULK (r2 finding 2): a later ABSENT task refuses the WHOLE invocation with NO mutation', async () => {
   // Evidence resolves for both tasks, but only q87 exists in the store.
   const dataDir = await initStore();
   const legacyHome = mkLegacyHome(['q87', 'ghost']);
@@ -480,16 +510,47 @@ test('a ledger entry naming a task absent from the store is a per-entry error; r
   const out = outPath();
   await assert.rejects(
     () => runShadowReconcile({ ledgerPath: writeLedger([entry('q87'), entry('ghost')], { legacyHome, targetDataDir: dataDir }), dataDir, outPath: out, captainApproved: true, env: SHADOW, now: NOW }),
-    (e) => e instanceof ReconcileError && /refusals or errors/.test(e.message)
+    (e) => e instanceof ReconcileError && /refused before any mutation/.test(e.message)
   );
   const receipt = readReceipt(out);
   assert.equal(receipt.ok, false);
-  assert.equal(receipt.totals.reconciled, 1);
+  assert.equal(receipt.refused_before_mutation, true);
+  assert.equal(receipt.totals.reconciled, 0, 'nothing reconciled');
   assert.equal(receipt.totals.error, 1);
-  const ghost = receipt.entries.find((e) => e.task_id === 'ghost');
-  assert.equal(ghost.disposition, 'error');
-  assert.match(ghost.error, /unknown task/);
-  await withStore(dataDir, async (s) => assert.equal((await getTask(s, 'q87')).status, 'completed', 'the reconcilable row still landed'));
+  assert.equal(receipt.totals.skipped, 1, 'the reconcilable row is skipped, not applied');
+  assert.equal(receipt.entries.find((e) => e.task_id === 'ghost').disposition, 'error');
+  assert.equal(receipt.entries.find((e) => e.task_id === 'q87').disposition, 'skipped');
+  await withStore(dataDir, async (s) => assert.equal((await getTask(s, 'q87')).status, 'failed', 'the earlier row was NOT mutated (all-or-nothing)'));
+});
+
+test('BULK (r2 finding 2): a later ALREADY-MATCHING row refuses the whole invocation with no partial mutation', async () => {
+  const { dataDir, legacyHome } = await scenario(['q1', 'q2']);
+  // Reconcile q2 first with its own ledger.
+  await runShadowReconcile({ ledgerPath: writeLedger([entry('q2')], { legacyHome, targetDataDir: dataDir }), dataDir, outPath: outPath(), captainApproved: true, env: SHADOW, now: NOW });
+
+  const before = await withStore(dataDir, async (s) => ({
+    q1: await getTask(s, 'q1'), q2: await getTask(s, 'q2'),
+    cs: await getCoordState(s), markers: (await loadReconcileTerminals(s)).length
+  }));
+
+  // A new [q1, q2] ledger: q2 already matches and (new digest) has no receipt -> the whole
+  // invocation must refuse before q1 is touched.
+  const out = outPath();
+  await assert.rejects(
+    () => runShadowReconcile({ ledgerPath: writeLedger([entry('q1'), entry('q2')], { legacyHome, targetDataDir: dataDir }), dataDir, outPath: out, captainApproved: true, env: SHADOW, now: NOW }),
+    (e) => e instanceof ReconcileError && /refused before any mutation/.test(e.message)
+  );
+  const receipt = readReceipt(out);
+  assert.equal(receipt.refused_before_mutation, true);
+  assert.equal(receipt.entries.find((e) => e.task_id === 'q2').disposition, 'refused');
+  assert.equal(receipt.entries.find((e) => e.task_id === 'q1').disposition, 'skipped');
+
+  const afterState = await withStore(dataDir, async (s) => ({
+    q1: await getTask(s, 'q1'), q2: await getTask(s, 'q2'),
+    cs: await getCoordState(s), markers: (await loadReconcileTerminals(s)).length
+  }));
+  assert.deepEqual(afterState, before, 'q1 was NOT reconciled and no counter/marker changed');
+  assert.equal(afterState.q1.status, 'failed');
 });
 
 // ---------------------------------------------------------------------------------
