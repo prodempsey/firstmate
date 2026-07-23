@@ -27,15 +27,63 @@
 # Store location and divergence log are resolved by the tool from FM_HOME (or the
 # CP_SHADOW_DATA_DIR / CP_SHADOW_DIVERGENCE overrides); this hook passes its arguments
 # through unchanged.
+#
+# FILE GATE (FM_HOME/config/cp-shadow.env). Env-only gating is fragile: a lifecycle script
+# invoked from a non-interactive shell that never sourced the bashrc exports sees CP_SHADOW
+# unset and silently no-ops, so a whole run of lifecycle actions can go unmirrored without a
+# trace. To make enabling durable, when CP_SHADOW is UNSET in the environment this hook reads
+# the optional LOCAL config file FM_HOME/config/cp-shadow.env (gitignored class, firstmate's
+# own operational act, never shipped) for KEY=VALUE lines and exports them for the mirror:
+#   CP_SHADOW=1                 turn the shadow run on (any other value stays inert)
+#   CP_SHADOW_DATA_DIR=<path>   store override (see above)
+#   CP_ORDER_SOURCE_PATH=<path> captain-order source override for order snapshots
+#   CP_SHADOW_DIVERGENCE=<path> divergence-log override (optional)
+# Only those four keys are honoured; every other line (comments, blanks, anything malformed)
+# is ignored, and a malformed file can never fail the caller. Explicit ambient env always
+# wins: a variable already set in the environment is left untouched, and if CP_SHADOW is set
+# ambiently the file is not consulted at all. An absent file is inert exactly as before.
 set -eu
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CP_SHADOW_BIN="$ROOT/control-plane/bin/cp-shadow.mjs"
+
+# Export a config-file value only when its key is unset in the environment, so an explicit
+# ambient value always wins. Restricted to the four honoured keys by its callers.
+fm_cp_shadow_apply() { # <key> <value>
+  case "$1" in
+    CP_SHADOW)             [ -z "${CP_SHADOW+x}" ]             && export CP_SHADOW="$2" ;;
+    CP_SHADOW_DATA_DIR)    [ -z "${CP_SHADOW_DATA_DIR+x}" ]    && export CP_SHADOW_DATA_DIR="$2" ;;
+    CP_ORDER_SOURCE_PATH)  [ -z "${CP_ORDER_SOURCE_PATH+x}" ]  && export CP_ORDER_SOURCE_PATH="$2" ;;
+    CP_SHADOW_DIVERGENCE)  [ -z "${CP_SHADOW_DIVERGENCE+x}" ]  && export CP_SHADOW_DIVERGENCE="$2" ;;
+  esac
+  return 0
+}
+
+# File gate: only consulted when CP_SHADOW is entirely unset in the environment (ambient
+# CP_SHADOW, even "0" or empty, wins outright). Parse defensively - accept only the four
+# honoured KEY=VALUE lines, ignore everything else - so a malformed file never fails us.
+if [ -z "${CP_SHADOW+x}" ]; then
+  CP_SHADOW_ENV_FILE="${FM_HOME:-$ROOT}/config/cp-shadow.env"
+  if [ -f "$CP_SHADOW_ENV_FILE" ]; then
+    while IFS= read -r fm_cp_line || [ -n "$fm_cp_line" ]; do
+      case "$fm_cp_line" in
+        CP_SHADOW=*|CP_SHADOW_DATA_DIR=*|CP_ORDER_SOURCE_PATH=*|CP_SHADOW_DIVERGENCE=*)
+          fm_cp_key=${fm_cp_line%%=*}
+          fm_cp_val=${fm_cp_line#*=}
+          fm_cp_val=${fm_cp_val%$'\r'}   # tolerate a CRLF file
+          fm_cp_shadow_apply "$fm_cp_key" "$fm_cp_val"
+          ;;
+        *) : ;;
+      esac
+    done < "$CP_SHADOW_ENV_FILE"
+    unset fm_cp_line fm_cp_key fm_cp_val
+  fi
+fi
 
 # Gate: absent or any value other than exactly "1" -> silent no-op success.
 if [ "${CP_SHADOW:-0}" != "1" ]; then
   exit 0
 fi
-
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CP_SHADOW_BIN="$ROOT/control-plane/bin/cp-shadow.mjs"
 
 # Missing tool -> silent no-op. A mirror that cannot run must never fail the legacy op.
 if [ ! -f "$CP_SHADOW_BIN" ]; then

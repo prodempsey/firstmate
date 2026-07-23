@@ -138,6 +138,25 @@ A missing file, a project registered in `data/projects.md` but absent from the d
 The `data/projects.md` registry is the independent list of what must be declared, so deleting the declaration does not quietly disable verification.
 Nothing here mutates a ref, branch, or config: the verifier and the merge gate detect, refuse, and name the exact fix.
 
+## Shadow run (config/cp-shadow.env)
+
+The CW2 shadow mirror (`bin/fm-cp-shadow.sh`, wired at the lifecycle chokepoints) is inert unless `CP_SHADOW=1` is set in the environment.
+Env-only gating is fragile: a lifecycle script invoked from a non-interactive shell that never sourced the bashrc exports sees `CP_SHADOW` unset and silently no-ops, so a whole run of lifecycle actions can go unmirrored without a trace.
+`config/cp-shadow.env` (local, gitignored; enabling the shadow run is firstmate's operational act, never shipped) makes enabling durable instead of dependent on ambient env.
+When `CP_SHADOW` is UNSET in the environment, `bin/fm-cp-shadow.sh` reads this file for `KEY=VALUE` lines and exports them for the mirror invocation; when `CP_SHADOW` is set ambiently (even to `0` or empty) the file is not consulted at all.
+Only four keys are honoured, one per line:
+
+```sh
+CP_SHADOW=1                       # turn the shadow run on; any other value stays inert
+CP_SHADOW_DATA_DIR=<path>         # store override (else FM_HOME/state/control-plane/pgdata)
+CP_ORDER_SOURCE_PATH=<path>       # captain-order source override for order snapshots
+CP_SHADOW_DIVERGENCE=<path>       # divergence-log override (optional)
+```
+
+Explicit ambient env always wins per key: a variable already set in the environment is left untouched even when the file also names it.
+Every other line - comments, blanks, unknown keys, anything malformed - is ignored, and a malformed file can never fail the caller; an absent file is inert exactly as before.
+The tool resolves the same overrides from the environment (`control-plane/bin/cp-shadow.mjs --help`); this file only pre-exports them when ambient env did not.
+
 ## Captain preferences (data/captain.md)
 
 Personal preferences for one captain's fleet live locally in `data/captain.md`; it is gitignored and printed in the session-start context digest after `data/projects.md` and optional `data/secondmates.md`.
