@@ -421,3 +421,201 @@ printf '%s' "$CDUTY" | grep -qi 'lost captain requests' \
 [ "$(PATH="$SHIMDIR:$PATH" "$ORDER" health | jq '.present')" = true ] \
   || fail "the inbox was not actually readable underneath the simulated reader defect"
 pass "a crashed reader blames the reader and names the error, and never disowns the captain's orders"
+
+# === ORD-260 slice S1: the ACCOUNTED predicate, the audit surface, park/rollup, and =====
+# === machine-checkable holds. The load-bearing property is that a captain order the ======
+# === fleet stopped working is caught (unaccounted), and that queue-with-a-reason - not ===
+# === paperwork - is what accounts for it. ================================================
+
+# --- hold validation: a review condition must be machine-checkable ----------------------
+# A hold whose review_after is prose nothing can evaluate never expires, so the order it
+# parks silently disappears (the L3 loss mode). The write refuses free text; it accepts an
+# ISO date, an ISO instant, and the two typed terminal-event keys.
+HV=$(new_inbox holdvalidate)
+export FM_ORDERS_PATH="$HV"
+"$ORDER" add "h1" "h2" "h3" "h4" "h5" "h6" >/dev/null 2>&1
+"$ORDER" hold ORD-001 --reason "captain approves it" --review-after "when the captain approves" >/dev/null 2>&1 \
+  && fail "a hold on free text was accepted; it can never expire"
+"$ORDER" hold ORD-001 --reason r --review-after 2030-01-01 >/dev/null 2>&1 \
+  || fail "a hold on a plain ISO date was refused"
+"$ORDER" hold ORD-002 --reason r --review-after 2030-01-01T09:00:00Z >/dev/null 2>&1 \
+  || fail "a hold on a full ISO instant was refused"
+"$ORDER" hold ORD-003 --reason r --review-after "task:fix-login-k3:terminal" >/dev/null 2>&1 \
+  || fail "a hold on a task:<id>:terminal event key was refused"
+"$ORDER" hold ORD-004 --reason r --review-after "order:ORD-006:terminal" >/dev/null 2>&1 \
+  || fail "a hold on an order:<id>:terminal event key was refused"
+"$ORDER" hold ORD-005 --reason r --review-after "task::terminal" >/dev/null 2>&1 \
+  && fail "a hold on a malformed event key (empty id) was accepted"
+"$ORDER" hold ORD-005 --reason r --review-after "queue:x:terminal" >/dev/null 2>&1 \
+  && fail "a hold on an unknown event type was accepted as a valid key"
+# An empty review condition is still refused, by the lineage contract that owns that path.
+HERR=$("$ORDER" hold ORD-005 --reason r 2>&1) && fail "a hold with no review condition was accepted"
+printf '%s' "$HERR" | grep -q 'review-after' || fail "an empty-review hold did not name the missing condition: $HERR"
+pass "a hold's review condition must be a machine-checkable date or typed event key, never free text"
+
+# --- the ACCOUNTED predicate, branch by branch ------------------------------------------
+# audit writes a deterministic result file, so give it a temp state dir of its own and never
+# the production one. FM_ORDER_ACCOUNT_GRACE_SECS=0 removes the freshness grace so every
+# non-fresh branch is exercised directly; the fresh branch is checked separately below.
+ACC=$(new_inbox accounted)
+export FM_ORDERS_PATH="$ACC"
+ACC_STATE="$TMP_ROOT/accounted-state"
+OLD=2026-01-01T00:00:00Z   # old enough to be well past any grace
+"$ORDER" add --received-at "$OLD" \
+  "live owner" "no owner" "queued good" "queued no reason" "queued no blocker" \
+  "held future" "held past" "held order live" "held order fired" "held task" \
+  "decision" "received stale" "blocker target" >/dev/null 2>&1
+# ORD-001 dispatched with an owner and linked work -> live_owner.
+"$ORDER" dispatch ORD-001 --task task-live >/dev/null
+"$ORDER" claim ORD-001 --owner crew-live >/dev/null
+# ORD-002 dispatched but never claimed -> unaccounted (no owner).
+"$ORDER" dispatch ORD-002 --task task-orphan >/dev/null
+# ORD-003 queued WITH a recorded reason AND a blocker (ORD-012, still live) -> accounted.
+"$ORDER" queue ORD-003 --reason "waits on ORD-012" --depends-on ORD-012 >/dev/null
+# ORD-004 queued with a blocker but no reason -> unaccounted.
+"$ORDER" queue ORD-004 --depends-on ORD-012 >/dev/null
+# ORD-005 queued with a reason but no blocker -> unaccounted.
+"$ORDER" queue ORD-005 --reason "just waiting" >/dev/null
+# ORD-006 held on a future date; ORD-007 held on a past date.
+"$ORDER" hold ORD-006 --reason r --review-after 2999-01-01 >/dev/null
+"$ORDER" hold ORD-007 --reason r --review-after 2000-01-01 >/dev/null
+# ORD-008 held until ORD-012 (a still-live order) terminal -> event not fired -> accounted.
+# ORD-009 held until ORD-013 terminal, and ORD-013 is completed below -> fired -> unaccounted.
+"$ORDER" hold ORD-008 --reason r --review-after "order:ORD-012:terminal" >/dev/null
+"$ORDER" hold ORD-009 --reason r --review-after "order:ORD-013:terminal" >/dev/null
+# ORD-010 held on a task terminal event: machine-checkable, but the control plane evaluates
+# it (slice S4), so here it cannot fire and stays accounted.
+"$ORDER" hold ORD-010 --reason r --review-after "task:some-task-x9:terminal" >/dev/null
+# ORD-011 captain_decision with no board receipt -> unaccounted.
+"$ORDER" decision ORD-011 --reason "captain must pick A or B" >/dev/null
+# ORD-012 left as received (untriaged) -> unaccounted past grace, and a live event target.
+# ORD-013 is the fired-event target; complete it so ORD-009's event key has fired.
+"$ORDER" complete ORD-013 --link "local main" >/dev/null
+
+# jq's `//` treats BOTH null and false as absent, so `.field // "-"` would turn an
+# accounted=false into "-"; select over an array and tostring the first hit instead, so a
+# false reads as "false" and a missing (terminal, excluded) order reads as "-".
+audit_field() {  # <order-id> <jq-field>
+  FM_STATE_OVERRIDE="$ACC_STATE" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit --json \
+    | jq -r --arg id "$1" --arg f "$2" \
+        '[.orders[] | select(.order_id == $id) | .[$f]] | if length == 0 then "-" else (.[0] | tostring) end'
+}
+[ "$(audit_field ORD-001 basis)" = live_owner ] || fail "a dispatched order with a live owner was not accounted as live_owner"
+[ "$(audit_field ORD-002 accounted)" = false ] || fail "a dispatched order with no owner was accounted"
+[ "$(audit_field ORD-002 unaccounted_reason)" = "dispatched with no owner" ] || fail "an ownerless dispatch did not name its gap"
+[ "$(audit_field ORD-003 basis)" = queued_with_reason_and_blocker ] || fail "a queued order with a reason and a blocker was not accounted"
+[ "$(audit_field ORD-004 accounted)" = false ] || fail "a queued order with no reason was accounted"
+[ "$(audit_field ORD-005 accounted)" = false ] || fail "a queued order with no blocker was accounted"
+[ "$(audit_field ORD-005 unaccounted_reason)" = "queued with no blocker dependency" ] || fail "a blocker-less queue did not name its gap"
+[ "$(audit_field ORD-006 basis)" = held_date_future ] || fail "a hold on a future date was not accounted"
+[ "$(audit_field ORD-007 accounted)" = false ] || fail "a hold whose review date has passed was accounted"
+[ "$(audit_field ORD-008 basis)" = held_event_pending ] || fail "a hold on a live order's terminal event was not accounted"
+[ "$(audit_field ORD-009 accounted)" = false ] || fail "a hold whose order-terminal event has fired was still accounted"
+[ "$(audit_field ORD-010 basis)" = held_task_event_deferred ] || fail "a hold on a task terminal event was not deferred-accounted"
+[ "$(audit_field ORD-011 accounted)" = false ] || fail "a captain_decision with no board receipt was accounted"
+[ "$(audit_field ORD-012 accounted)" = false ] || fail "a received order past grace was accounted"
+pass "ACCOUNTED evaluates every branch: fresh/live-owner/queued/held/decision, over non-terminal orders only"
+
+# The blocker target ORD-013 completed -> terminal -> excluded from the audit entirely.
+[ "$(audit_field ORD-013 accounted)" = "-" ] \
+  || fail "a terminal (completed) order appeared in the non-terminal audit"
+pass "a terminal order is excluded from the audit; only non-terminal orders are evaluated"
+
+# The freshness grace: a brand-new order is accounted with the default 4h grace even with no
+# lineage, and the same order flips to unaccounted once the grace is zero.
+FRESH=$(new_inbox fresh)
+export FM_ORDERS_PATH="$FRESH"
+"$ORDER" add "just arrived" >/dev/null 2>&1
+[ "$(FM_STATE_OVERRIDE="$TMP_ROOT/fresh-state" "$ORDER" audit --json | jq -r '.orders[0].basis')" = fresh ] \
+  || fail "a brand-new order was not accounted as fresh under the default grace"
+[ "$(FM_STATE_OVERRIDE="$TMP_ROOT/fresh-state" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit --json | jq -r '.orders[0].accounted')" = false ] \
+  || fail "the same order stayed accounted once the grace was removed"
+pass "the freshness grace accounts a new order and releases it once the grace elapses"
+
+# A dispatched order with an owner but no linked work is a distinct gap. The CLI cannot
+# produce one (dispatch requires a link), so a raw ledger row exercises that predicate branch.
+NOLINK=$(new_inbox nolink)
+export FM_ORDERS_PATH="$NOLINK"
+"$ORDER" add "raw dispatched" >/dev/null 2>&1
+printf '{"schema":"firstmate/captain-order/v1","order_id":"ORD-001","event":"dispatch","ts":"2026-01-02T00:00:00Z","status":"dispatched","owner":"crew-x","linked_task_ids":[],"linked_scout_ids":[],"linked_bug_ids":[],"updated_at":"2026-01-02T00:00:00Z"}\n' >> "$NOLINK"
+[ "$(FM_STATE_OVERRIDE="$TMP_ROOT/nolink-state" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit --json | jq -r '.orders[0].unaccounted_reason')" = "dispatched with no linked work" ] \
+  || fail "a dispatched order with an owner but no lineage was not caught as unaccounted"
+pass "a dispatched order with an owner but no linked work is caught as unaccounted"
+
+# --- the audit result file --------------------------------------------------------------
+# The audit writes a deterministic product to state/.order-audit-last.json, the same pattern
+# as .triage-duty-last.json, so a later reader (slice S2's gate) does a cheap file read.
+AF=$(new_inbox auditfile)
+export FM_ORDERS_PATH="$AF"
+AF_STATE="$TMP_ROOT/auditfile-state"
+"$ORDER" add --received-at "$OLD" "one accounted" "one not" >/dev/null 2>&1
+"$ORDER" dispatch ORD-001 --task t >/dev/null; "$ORDER" claim ORD-001 --owner c >/dev/null
+FM_STATE_OVERRIDE="$AF_STATE" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit >/dev/null
+RESULT="$AF_STATE/.order-audit-last.json"
+[ -f "$RESULT" ] || fail "audit did not write the result file"
+[ "$(jq -r '.schema' "$RESULT")" = "fm-order-audit/v1" ] || fail "the audit result file has the wrong schema"
+[ "$(jq -r '.non_terminal' "$RESULT")" = 2 ] || fail "the audit result file miscounted non-terminal orders"
+[ "$(jq -r '.unaccounted' "$RESULT")" = 1 ] || fail "the audit result file miscounted unaccounted orders"
+[ "$(jq -r '.unaccounted_orders[0].order_id' "$RESULT")" = ORD-002 ] || fail "the audit result file did not carry the unaccounted order id"
+# The human summary names the count and the offending order.
+FM_STATE_OVERRIDE="$AF_STATE" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit | grep -q "1 of 2 non-terminal order(s) UNACCOUNTED" \
+  || fail "the audit human summary did not report the unaccounted count"
+# A fully-accounted inbox says so and reports zero.
+"$ORDER" complete ORD-002 --link "local main" >/dev/null
+FM_STATE_OVERRIDE="$AF_STATE" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit | grep -q "all 1 non-terminal order(s) accounted" \
+  || fail "a clear audit did not report all orders accounted"
+pass "audit writes a deterministic result file and prints a truthful summary"
+
+# --- park: the captain-parked batch verb ------------------------------------------------
+PK=$(new_inbox park)
+export FM_ORDERS_PATH="$PK"
+"$ORDER" add --received-at "$OLD" "park a" "park b" "park c" >/dev/null 2>&1
+"$ORDER" park 2>/dev/null && fail "park with no ids was accepted"
+"$ORDER" park ORD-001 2>/dev/null && fail "park with no --captain-ack was accepted"
+"$ORDER" park ORD-001 ORD-002 --captain-ack "captain parked 2026-07-22" >/dev/null \
+  || fail "a captain-acked batch park was refused"
+[ "$("$ORDER" show ORD-001 --json | jq -r '.status')" = captain_parked ] || fail "park did not set captain_parked"
+[ "$("$ORDER" show ORD-001 --json | jq -r '.captain_ack')" = "captain parked 2026-07-22" ] || fail "park did not record the captain receipt"
+# captain_parked is terminal: it stops asking for attention and is excluded from the audit.
+[ "$("$ORDER" show ORD-001 --json | jq -r '.actionable')" = false ] || fail "a captain_parked order still demands attention"
+[ "$("$ORDER" metrics --json | jq -r '.metrics.captain_parked')" = 2 ] || fail "metrics did not count captain_parked orders"
+PKAUDIT=$(FM_STATE_OVERRIDE="$TMP_ROOT/park-state" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit --json)
+printf '%s' "$PKAUDIT" | jq -e '.orders[] | select(.order_id == "ORD-001")' >/dev/null \
+  && fail "a captain_parked order appeared in the non-terminal audit"
+# Re-parking a terminal order is refused rather than silently rewriting its disposition; a
+# batch with one bad id still parks the good ones and exits non-zero.
+set +e
+POUT=$("$ORDER" park ORD-001 ORD-003 --captain-ack "again" 2>&1)
+PRC=$?
+set -e
+[ "$PRC" -ne 0 ] || fail "a park batch containing an already-terminal order exited zero"
+printf '%s' "$POUT" | grep -q 'already terminal' || fail "re-parking a terminal order was not refused: $POUT"
+[ "$("$ORDER" show ORD-003 --json | jq -r '.status')" = captain_parked ] || fail "the good id in a partial park batch was not parked"
+pass "park batches captain-acked parks into a terminal state and refuses to overwrite a terminal one"
+
+# --- rollup: formal supersede-into-lead -------------------------------------------------
+RU=$(new_inbox rollup)
+export FM_ORDERS_PATH="$RU"
+"$ORDER" add --received-at "$OLD" "lead" "saga 1" "saga 2" "saga 3" "other" >/dev/null 2>&1
+"$ORDER" rollup ORD-001 2>/dev/null && fail "rollup with no --absorb was accepted"
+"$ORDER" rollup ORD-001 --absorb ORD-001 2>/dev/null && fail "rollup of a lead into itself was accepted"
+"$ORDER" rollup ORD-099 --absorb ORD-002 2>/dev/null && fail "rollup into a nonexistent lead was accepted"
+"$ORDER" rollup ORD-001 --absorb ORD-002 ORD-003 ORD-004 >/dev/null \
+  || fail "a variadic rollup of three orders was refused"
+for a in ORD-002 ORD-003 ORD-004; do
+  [ "$("$ORDER" show "$a" --json | jq -r '.status')" = superseded ] || fail "$a was not superseded by the rollup"
+  [ "$("$ORDER" show "$a" --json | jq -r '.outcome_link')" = ORD-001 ] || fail "$a was not linked to the lead"
+done
+# Chains must terminate in a terminal order: a rollup that would close a supersede cycle is
+# refused (ORD-002 already supersedes into ORD-001, so ORD-001 -> ORD-002 would loop).
+"$ORDER" rollup ORD-002 --absorb ORD-001 2>/dev/null \
+  && fail "a rollup that would create a supersede cycle was accepted"
+# An already-terminal order cannot be absorbed (its disposition would be overwritten).
+"$ORDER" rollup ORD-001 --absorb ORD-002 2>/dev/null \
+  && fail "an already-superseded order was absorbed again"
+# The rolled-up saga collapses to one accountable lead thread; the absorbed orders drop out
+# of the actionable audit because superseded is terminal.
+RUAUDIT=$(FM_STATE_OVERRIDE="$TMP_ROOT/rollup-state" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit --json)
+[ "$(printf '%s' "$RUAUDIT" | jq '[.orders[] | select(.order_id == "ORD-002" or .order_id == "ORD-003")] | length')" = 0 ] \
+  || fail "an absorbed order still appears in the non-terminal audit"
+pass "rollup supersedes a saga's orders into one lead thread and refuses cycles and terminal absorbs"

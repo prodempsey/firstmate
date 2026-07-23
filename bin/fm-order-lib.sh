@@ -267,6 +267,7 @@ fm_order_health() {  # <inbox>
 #   outcome_reason why it ended
 #   hold_reason    why it is parked
 #   review_after   when a park must be revisited
+#   captain_ack    the captain's receipt for a captain_parked order
 # bin/fm-order.sh refuses a write that violates this; its `list` reimplements the check
 # in jq purely as a backstop for a row that reached the ledger some other way.
 fm_order_status_requires() {  # <status>
@@ -274,16 +275,53 @@ fm_order_status_requires() {  # <status>
     dispatched) printf 'lineage' ;;
     completed|superseded) printf 'outcome_link' ;;
     rejected) printf 'outcome_reason' ;;
+    captain_parked) printf 'captain_ack' ;;
     blocked|needs_clarification|captain_decision) printf 'hold_reason' ;;
     held) printf 'hold_reason review_after' ;;
     *) return 1 ;;
   esac
 }
 
-# True when a status is a terminal disposition of the order itself.
+# True when a status is a terminal disposition of the order itself. captain_parked is
+# terminal: the captain explicitly said park it, with a receipt, so the closed-loop audit
+# stops re-driving it (ORD-260 slice S1, report section 5.0).
 fm_order_status_terminal() {  # <status>
   case "$1" in
-    completed|superseded|rejected) return 0 ;;
+    completed|superseded|rejected|captain_parked) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# Classify a hold's --review-after condition. A machine-checkable hold is one a script can
+# evaluate on its own, which is what stops a hold from being a permanent silent mute (the
+# L3 loss mode in the ORD-237 report): free text nothing can read never expires, so the
+# order it parks disappears. Prints exactly one of:
+#   date    an ISO-8601 date or instant a clock can read (the one date parser is
+#           fm_triage_review_date_ok, shared with the fleet-triage ledger so the two can
+#           never disagree about what a review date means)
+#   event   a typed terminal-event key: task:<id>:terminal or order:<id>:terminal
+#   invalid anything else, including an empty condition or a malformed event key
+# The audit predicate (bin/fm-order.sh audit) evaluates a `date` hold against the clock and
+# an `order:<id>:terminal` hold against the ledger; a `task:<id>:terminal` hold is
+# machine-checkable but evaluated by the control plane (slice S4), not here.
+fm_order_review_after_kind() {  # <review-after>
+  local ra=$1 body
+  case "$ra" in
+    task:*:terminal|order:*:terminal)
+      # Strip the type prefix and the :terminal suffix, then require a non-empty id made
+      # only of id-safe characters - no embedded colon or whitespace - so task::terminal
+      # and task:a:b:terminal are both refused rather than passed as machine-checkable.
+      body=${ra#*:}
+      body=${body%:terminal}
+      case "$body" in
+        ''|*[!A-Za-z0-9._-]*) printf 'invalid'; return 0 ;;
+        *) printf 'event'; return 0 ;;
+      esac
+      ;;
+  esac
+  if fm_triage_review_date_ok "$ra"; then
+    printf 'date'
+  else
+    printf 'invalid'
+  fi
 }

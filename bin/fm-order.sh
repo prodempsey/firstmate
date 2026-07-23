@@ -21,6 +21,8 @@
 #   fm-order.sh ack <order-id>...                 Print the brief receipt acknowledgment.
 #   fm-order.sh digest                            Print the consolidated triaged update.
 #   fm-order.sh metrics [--json]
+#   fm-order.sh audit [--json]                    Evaluate ACCOUNTED for every non-terminal
+#                                                 order; write state/.order-audit-last.json.
 #
 #   fm-order.sh triage <id> [--title <t>] [--project <p>] [--priority <p>] [--priority-source <s>]
 #   fm-order.sh queue <id> [--depends-on <order-id>]... [--reason <note>]
@@ -29,12 +31,18 @@
 #   fm-order.sh dispatch <id> [--task <id>] [--scout <id>] [--bug <id>]
 #   fm-order.sh block <id> --reason <why> [--depends-on <order-id>]...
 #   fm-order.sh hold <id> --reason <why> --review-after <when>
+#       <when> must be machine-checkable: an ISO date/instant, or a typed event key
+#       task:<id>:terminal / order:<id>:terminal. Free text is refused.
 #   fm-order.sh clarify <id> --reason <what is unclear>
 #   fm-order.sh decision <id> --reason <the decision the captain owes>
 #   fm-order.sh supersede <id> --by <order-id> [--reason <why>]
 #   fm-order.sh duplicate <id> --of <order-id>    Shorthand for supersede with a duplicate reason.
+#   fm-order.sh rollup <lead-id> --absorb <id>... [--reason <why>]
+#                                                 Supersede a saga's orders into one lead
+#                                                 thread; chains must terminate in a terminal order.
 #   fm-order.sh reject <id> --reason <why>
 #   fm-order.sh complete <id> --link <evidence> [--reason <note>]
+#   fm-order.sh park <id>... --captain-ack <receipt>   The captain-parked batch verb.
 #
 # ACKNOWLEDGMENT FOLLOWS THE WRITE, NEVER PRECEDES IT. `add` appends, reads the row back,
 # and re-folds before it prints a single word of success. A write it cannot verify exits
@@ -42,7 +50,9 @@
 # "recorded" is the one failure this whole mechanism exists to prevent.
 #
 # STATUS AND LINEAGE. Statuses are received, triaging, queued, dispatched, blocked, held,
-# needs_clarification, captain_decision, completed, superseded, rejected. There is no
+# needs_clarification, captain_decision, completed, superseded, rejected, captain_parked.
+# The four terminal states are completed, superseded, rejected, and captain_parked; every
+# other status is non-terminal and must stay ACCOUNTED (see the audit verb). There is no
 # `acknowledged` status: an acknowledgment means only that the durable record exists.
 # bin/fm-order-lib.sh owns which fields each status requires, and this command refuses a
 # write that does not carry them - a dispatch with no linked work, a hold with no review
@@ -74,7 +84,7 @@ STALE_SECS=${FM_ORDER_STALE_SECS:-86400}
 case "$STALE_SECS" in ''|*[!0-9]*) STALE_SECS=86400 ;; esac
 
 usage() {
-  sed -n '2,58p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,71p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -259,12 +269,14 @@ list_file() {  # sets LIST_PATH
       | if $s == "dispatched" then $linked
         elif $s == "completed" or $s == "superseded" then ((.outcome_link // "") != "")
         elif $s == "rejected" then ((.outcome_reason // "") != "")
+        elif $s == "captain_parked" then ((.captain_ack // "") != "")
         elif $s == "blocked" or $s == "needs_clarification" or $s == "captain_decision"
           then ((.hold_reason // "") != "")
         elif $s == "held" then ((.hold_reason // "") != "" and (.review_after // "") != "")
         else true end;
 
-    def terminal: (.status // "received") | . == "completed" or . == "superseded" or . == "rejected";
+    def terminal: (.status // "received")
+      | . == "completed" or . == "superseded" or . == "rejected" or . == "captain_parked";
 
     ($fold | to_entries | map(.value)) as $orders
     | ($orders | map({key: .order_id, value: (.status // "received")}) | from_entries) as $status_by_id
@@ -282,7 +294,8 @@ list_file() {  # sets LIST_PATH
                  and ((.dependency_ids // []) | length) > 0
                  and (([ (.dependency_ids // [])[]
                          | $status_by_id[.] // "missing" ]
-                       | map(select(. == "completed" or . == "superseded" or . == "rejected"))
+                       | map(select(. == "completed" or . == "superseded"
+                                    or . == "rejected" or . == "captain_parked"))
                        | length) == ((.dependency_ids // []) | length))
               then "blocker_cleared" else empty end),
              (if (.status // "") == "held"
@@ -323,6 +336,7 @@ list_file() {  # sets LIST_PATH
          completed: ($all | map(select(.status == "completed")) | length),
          rejected: ($all | map(select(.status == "rejected")) | length),
          superseded: ($all | map(select(.status == "superseded")) | length),
+         captain_parked: ($all | map(select(.status == "captain_parked")) | length),
          duplicate_deliveries: ($all | map(.duplicate_delivery_count // 0) | add // 0),
          pending_chat_captures: ($pending | length),
          by_attention: ($all | map(select(.actionable) | .attention) | group_by(.)
@@ -736,6 +750,308 @@ case "$VERB" in
     fi
     exit 0
     ;;
+
+  audit)
+    # The ACCOUNTED predicate over every non-terminal order (ORD-260 slice S1, report
+    # sections 5.0/5.1-C1). An order is accounted when it is fresh (< grace), a dispatched
+    # order with a live owner and linked work, a queued/blocked order with a recorded
+    # reason AND a blocker, a held order on a machine-checkable condition that has not yet
+    # fired, or a captain_decision carrying a board receipt. Anything else past grace is an
+    # anomaly. The result is written to state/.order-audit-last.json - a deterministic
+    # script product, never conversational, the same pattern as state/.triage-duty-last.json
+    # - so a later reader (slice S2's turn-end gate) does a cheap file read, never a
+    # re-enumeration. This verb only READS the inbox; it takes no writer lock.
+    require_inbox
+    JSON=false
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --json) JSON=true; shift ;;
+        *) usage >&2; die "unknown option: $1" 2 ;;
+      esac
+    done
+    fold_file
+    NOW=$(now_ts)
+    NOW_EPOCH=$(fm_triage_epoch "$NOW" 2>/dev/null || printf 0)
+    case "$NOW_EPOCH" in ''|*[!0-9]*) NOW_EPOCH=0 ;; esac
+    GRACE=${FM_ORDER_ACCOUNT_GRACE_SECS:-14400}
+    case "$GRACE" in ''|*[!0-9]*) GRACE=14400 ;; esac
+    # The date parser (review_age) is shared with the fleet-triage ledger so the two can
+    # never disagree about what a review date means; it is prepended to this program.
+    jq -n \
+      --arg now "$NOW" \
+      --argjson now_epoch "$NOW_EPOCH" \
+      --argjson grace "$GRACE" \
+      --slurpfile foldf "$FOLD_PATH" \
+      "$FM_TRIAGE_REVIEW_AGE_JQ"'
+      def terminal($s):
+        $s == "completed" or $s == "superseded" or $s == "rejected" or $s == "captain_parked";
+      def linked($o):
+        ($o.linked_task_ids // []) + ($o.linked_scout_ids // []) + ($o.linked_bug_ids // []);
+      # Evaluate ACCOUNTED for one non-terminal order. $sbi is the status-by-id map, passed
+      # in because a top-level def cannot see a variable a later pipeline stage binds.
+      def verdict($o; $sbi):
+        ($o.status // "received") as $s
+        | (review_age($o.received_at; $now_epoch)) as $age
+        | if ($age != null and $age < $grace) then {accounted: true, basis: "fresh"}
+          elif $s == "dispatched" then
+            (if (($o.owner // "") != "") and ((linked($o)) | length > 0)
+             then {accounted: true, basis: "live_owner"}
+             elif (($o.owner // "") == "")
+             then {accounted: false, basis: "unaccounted", reason: "dispatched with no owner"}
+             else {accounted: false, basis: "unaccounted", reason: "dispatched with no linked work"}
+             end)
+          elif ($s == "queued" or $s == "blocked") then
+            # A queued/blocked order is accounted only when it records BOTH why it waits and
+            # a blocker it waits on. Queue-with-a-reason IS accounting; queue-into-silence is
+            # the paperwork loop the report calls out.
+            (($o.queue_reason // $o.hold_reason // "") as $qr
+             | (($o.dependency_ids // []) | length) as $nd
+             | if ($qr != "" and $nd > 0)
+               then {accounted: true, basis: "queued_with_reason_and_blocker"}
+               elif ($qr == "")
+               then {accounted: false, basis: "unaccounted", reason: ($s + " with no recorded reason")}
+               else {accounted: false, basis: "unaccounted", reason: ($s + " with no blocker dependency")}
+               end)
+          elif $s == "held" then
+            (($o.review_after // "") as $ra
+             | if ($ra | test("^(task|order):[A-Za-z0-9._-]+:terminal$")) then
+                 (($ra | split(":")) as $p
+                  | if $p[0] == "order" then
+                      (($sbi[$p[1]] // "missing") as $est
+                       | if terminal($est)
+                         then {accounted: false, basis: "unaccounted",
+                               reason: ("held until " + $ra + ", which has fired")}
+                         else {accounted: true, basis: "held_event_pending"} end)
+                    else
+                      # task:<id>:terminal is machine-checkable but the control plane (slice
+                      # S4) evaluates it; here it cannot fire, so it stays accounted.
+                      {accounted: true, basis: "held_task_event_deferred"} end)
+               else
+                 (review_age($ra; $now_epoch) as $r
+                  | if $r == null
+                    then {accounted: false, basis: "unaccounted",
+                          reason: "held on a non-machine-checkable condition"}
+                    elif $r < 0 then {accounted: true, basis: "held_date_future"}
+                    else {accounted: false, basis: "unaccounted", reason: "held past its review date"}
+                    end)
+               end)
+          elif $s == "captain_decision" then
+            (if (($o.board_receipt // "") != "") or (($o.captain_ack // "") != "")
+             then {accounted: true, basis: "decision_receipted"}
+             else {accounted: false, basis: "unaccounted",
+                   reason: "captain decision pending with no board receipt"} end)
+          else
+            {accounted: false, basis: "unaccounted", reason: ($s + " past grace with no accounting")}
+          end;
+
+      ($foldf[0] // {}) as $fold
+      | ($fold | to_entries | map(.value)) as $orders
+      | ($orders | map({key: .order_id, value: (.status // "received")}) | from_entries) as $sbi
+      | [ $orders[]
+          | . as $o
+          | select(terminal(.status // "received") | not)
+          | (verdict($o; $sbi)) as $v
+          | {order_id: $o.order_id,
+             status: ($o.status // "received"),
+             accounted: $v.accounted,
+             basis: $v.basis,
+             unaccounted_reason: ($v.reason // null),
+             age_seconds: ((review_age($o.received_at; $now_epoch)) // null),
+             short_title: (($o.short_title // $o.original_request // "")
+                           | gsub("[[:space:]]+"; " ") | .[0:80])} ]
+        | sort_by(.order_id) as $evaluated
+      | {schema: "fm-order-audit/v1",
+         generated_at: $now,
+         grace_seconds: $grace,
+         non_terminal: ($evaluated | length),
+         accounted: ($evaluated | map(select(.accounted)) | length),
+         unaccounted: ($evaluated | map(select(.accounted | not)) | length),
+         unaccounted_orders: ($evaluated | map(select(.accounted | not))),
+         orders: $evaluated}
+      ' > "$SCRATCH/audit.json" 2> "$SCRATCH/audit.err" \
+        || read_failed 'the folded inbox could not be evaluated for the ACCOUNTED predicate' "$SCRATCH/audit.err"
+
+    STATE_DIR="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+    if mkdir -p "$STATE_DIR" 2>/dev/null; then
+      # Atomic write: slice S2's turn-end gate reads this file and must never see a partial.
+      if cp "$SCRATCH/audit.json" "$STATE_DIR/.order-audit-last.json.tmp.$$" 2>/dev/null \
+         && mv -f "$STATE_DIR/.order-audit-last.json.tmp.$$" "$STATE_DIR/.order-audit-last.json" 2>/dev/null; then
+        :
+      else
+        rm -f "$STATE_DIR/.order-audit-last.json.tmp.$$" 2>/dev/null || true
+        printf 'fm-order: WARNING could not write %s/.order-audit-last.json (audit still printed)\n' \
+          "$STATE_DIR" >&2
+      fi
+    else
+      printf 'fm-order: WARNING could not create state dir %s (audit still printed)\n' "$STATE_DIR" >&2
+    fi
+
+    if [ "$JSON" = true ]; then
+      jq . "$SCRATCH/audit.json"
+    else
+      jq -r '
+        def dur($s): if $s == null then "?"
+                     elif $s < 3600 then (($s / 60 | floor | tostring) + "m")
+                     elif $s < 86400 then (($s / 3600 | floor | tostring) + "h")
+                     else (($s / 86400 | floor | tostring) + "d") end;
+        if .unaccounted == 0
+        then "order audit: all " + (.non_terminal | tostring) + " non-terminal order(s) accounted"
+        else ("order audit: " + (.unaccounted | tostring) + " of " + (.non_terminal | tostring)
+              + " non-terminal order(s) UNACCOUNTED"),
+             (.unaccounted_orders[]
+              | "  - " + .order_id + " [" + .status + ", " + dur(.age_seconds) + "] "
+                + .unaccounted_reason
+                + (if .short_title != "" then " - " + .short_title else "" end))
+        end' "$SCRATCH/audit.json"
+    fi
+    exit 0
+    ;;
+
+  park)
+    # The captain-parked batch verb (ORD-260 slice S1). captain_parked is a terminal state:
+    # the captain explicitly said park it, so it needs the captain's own receipt, and one
+    # ack can park a whole backfill flood. Every id is parked from the same folded snapshot
+    # under one writer lock; a terminal order is refused rather than having its disposition
+    # silently rewritten.
+    require_inbox
+    RECEIPT=''
+    PARK_IDS=()
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --captain-ack) RECEIPT=${2:?missing value for --captain-ack}; shift 2 ;;
+        -*) usage >&2; die "unknown option: $1" 2 ;;
+        *) PARK_IDS+=("$1"); shift ;;
+      esac
+    done
+    [ "${#PARK_IDS[@]}" -gt 0 ] || die 'park requires at least one order id' 2
+    [ -n "$RECEIPT" ] \
+      || die 'refused: park requires --captain-ack <receipt>; a captain park with no captain receipt is not the captain parking it' 2
+    fold_file
+    lock_or_die
+    NOW=$(now_ts)
+    PARK_FAILED=0
+    PARKED=()
+    for id in "${PARK_IDS[@]}"; do
+      cur=$(jq -c --arg id "$id" '.[$id] // empty' "$FOLD_PATH")
+      if [ -z "$cur" ]; then
+        printf 'FAILED: no such order %s\n' "$id" >&2; PARK_FAILED=1; continue
+      fi
+      st=$(printf '%s' "$cur" | jq -r '.status // "received"')
+      if fm_order_status_terminal "$st"; then
+        printf 'FAILED: %s is already terminal (%s); refusing to overwrite its disposition\n' "$id" "$st" >&2
+        PARK_FAILED=1; continue
+      fi
+      row=$(printf '%s' "$cur" | jq -c \
+        --arg schema "$FM_ORDER_SCHEMA" --arg id "$id" --arg ts "$NOW" \
+        --arg receipt "$RECEIPT" --arg by "$ACTOR" '
+        {schema: $schema, order_id: $id, event: "park", ts: $ts,
+         status: "captain_parked", captain_ack: $receipt,
+         outcome_type: "captain_parked", outcome_link: null,
+         outcome_reason: ("captain parked: " + $receipt),
+         decided_at: $ts, decided_by: $by, owner: null, claimed_at: null,
+         captain_decision_required: false, recorded_by: $by, updated_at: $ts}')
+      if append_event "$row"; then
+        PARKED+=("$id")
+        printf 'parked: %s (captain-ack: %s)\n' "$id" "$RECEIPT"
+      else
+        printf 'FAILED to record park of %s\n' "$id" >&2; PARK_FAILED=1
+      fi
+    done
+    fm_order_unlock
+    if [ "$PARK_FAILED" -ne 0 ]; then
+      printf 'fm-order: PARK FAILED for at least one order; %d parked (%s).\n' \
+        "${#PARKED[@]}" "${PARKED[*]:-none}" >&2
+      exit 1
+    fi
+    exit 0
+    ;;
+
+  rollup)
+    # Formal supersede-into-lead for a saga (ORD-260 slice S1): the codex cluster's ten
+    # orders become one accountable thread. Each absorbed order is superseded pointing at
+    # the lead. Chains must terminate in a terminal order, so a rollup that would create a
+    # supersede cycle (the lead already supersedes back into an absorbed order) is refused.
+    require_inbox
+    LEAD=${1:-}
+    [ -n "$LEAD" ] || { usage >&2; die 'rollup requires a lead order id' 2; }
+    shift
+    ABSORB=()
+    ROLLUP_REASON=''
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --absorb)
+          # Variadic: --absorb consumes every following order id until the next flag.
+          shift
+          [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ] \
+            || die 'refused: --absorb needs at least one order id' 2
+          while [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; do
+            ABSORB+=("$1"); shift
+          done
+          ;;
+        --reason) ROLLUP_REASON=${2:?missing value for --reason}; shift 2 ;;
+        -*) usage >&2; die "unknown option: $1" 2 ;;
+        *) usage >&2; die "unexpected argument: $1" 2 ;;
+      esac
+    done
+    [ "${#ABSORB[@]}" -gt 0 ] \
+      || die 'refused: rollup requires --absorb <id>...; a rollup that absorbs nothing supersedes nothing' 2
+    fold_file
+    leadrec=$(jq -c --arg id "$LEAD" '.[$id] // empty' "$FOLD_PATH")
+    [ -n "$leadrec" ] || die "no such lead order: $LEAD" 2
+    # The set of orders reachable from the lead by following supersede survivor links. If an
+    # order to be absorbed is already in it, absorbing it would close a cycle - refused.
+    SURV=$(jq -c --arg lead "$LEAD" '
+      . as $fold
+      | reduce range(0; 128) as $_ ([$lead];
+          . as $acc
+          | ($acc | map($fold[.] // {}
+                        | select((.status // "") == "superseded")
+                        | (.outcome_link // empty))) as $links
+          | ($acc + $links) | unique)' "$FOLD_PATH")
+    for a in "${ABSORB[@]}"; do
+      [ "$a" != "$LEAD" ] || die "refused: cannot roll $LEAD up into itself" 2
+      arec=$(jq -c --arg id "$a" '.[$id] // empty' "$FOLD_PATH")
+      [ -n "$arec" ] || die "no such order to absorb: $a" 2
+      ast=$(printf '%s' "$arec" | jq -r '.status // "received"')
+      if fm_order_status_terminal "$ast"; then
+        die "refused: $a is already terminal ($ast); rolling it up would overwrite its disposition" 2
+      fi
+      if printf '%s' "$SURV" | jq -e --arg a "$a" 'index($a) != null' >/dev/null 2>&1; then
+        die "refused: rolling $a up into $LEAD would create a supersede cycle ($LEAD already supersedes back into $a); chains must terminate in a terminal order" 2
+      fi
+    done
+    lock_or_die
+    NOW=$(now_ts)
+    ROLLUP_FAILED=0
+    ROLLED=()
+    for a in "${ABSORB[@]}"; do
+      cur=$(jq -c --arg id "$a" '.[$id] // empty' "$FOLD_PATH")
+      reason=${ROLLUP_REASON:-"rolled up into $LEAD"}
+      row=$(printf '%s' "$cur" | jq -c \
+        --arg schema "$FM_ORDER_SCHEMA" --arg id "$a" --arg ts "$NOW" \
+        --arg lead "$LEAD" --arg reason "$reason" --arg by "$ACTOR" '
+        {schema: $schema, order_id: $id, event: "rollup", ts: $ts,
+         status: "superseded",
+         related_order_ids: ((.related_order_ids // []) + [$lead] | unique),
+         outcome_type: "superseded", outcome_link: $lead, outcome_reason: $reason,
+         decided_at: $ts, decided_by: $by, owner: null, claimed_at: null,
+         captain_decision_required: false, recorded_by: $by, updated_at: $ts}')
+      if append_event "$row"; then
+        ROLLED+=("$a")
+        printf 'rolled up: %s -> %s\n' "$a" "$LEAD"
+      else
+        printf 'FAILED to roll up %s into %s\n' "$a" "$LEAD" >&2; ROLLUP_FAILED=1
+      fi
+    done
+    fm_order_unlock
+    if [ "$ROLLUP_FAILED" -ne 0 ]; then
+      printf 'fm-order: ROLLUP FAILED for at least one order; %d rolled up (%s).\n' \
+        "${#ROLLED[@]}" "${ROLLED[*]:-none}" >&2
+      exit 1
+    fi
+    printf 'rolled %d order(s) up into %s\n' "${#ROLLED[@]}" "$LEAD"
+    exit 0
+    ;;
 esac
 
 # --- lifecycle verbs (everything below mutates one existing order) --------------------
@@ -825,6 +1141,18 @@ case "$VERB" in
   block)
     [ -n "$REASON" ] || die 'refused: block requires --reason' 2
     ;;
+  hold)
+    # A hold's review condition must be machine-checkable, or the hold is a permanent
+    # silent mute (the L3 loss mode). An empty --review-after is left to the lineage
+    # contract below, which owns that message; here we only reject a NON-empty condition
+    # that no script can read.
+    if [ -n "$REVIEW_AFTER" ]; then
+      case "$(fm_order_review_after_kind "$REVIEW_AFTER")" in
+        date|event) : ;;
+        *) die "refused: --review-after must be an ISO date (2026-07-14 or 2026-07-14T09:00:00Z) or a typed event key (task:<id>:terminal / order:<id>:terminal), not free text: '$REVIEW_AFTER'. A hold whose condition no script can read never expires, so the order it parks disappears." 2 ;;
+      esac
+    fi
+    ;;
 esac
 
 # The lineage contract, owned by fm-order-lib.sh. This is what stops an order from being
@@ -898,6 +1226,9 @@ ROW=$(printf '%s' "$CURRENT" | jq -c \
      elif $event == "block" or $event == "clarify" or $event == "decision"
        then {hold_reason: $reason}
      else {} end)
+  # A queued order records why it waits, so the ACCOUNTED audit can tell queue-with-a-reason
+  # (accounting) from queue-into-silence (the paperwork loop). Only stored when given.
+  + (if $event == "queue" and $reason != "" then {queue_reason: $reason} else {} end)
   + (if $event == "decision" then {captain_decision_required: true} else {} end)
   # A finished order carries its own decision, and stops carrying a live claim.
   + (if $status == "completed" or $status == "superseded" or $status == "rejected"
