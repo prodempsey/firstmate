@@ -226,22 +226,34 @@ make_secondmate_linked_home_dir() {
   printf '%s\n' "$dir"
 }
 
+# The shared runners sandbox the coalesced-anomaly path: `bug` is on the developer's PATH, so
+# ANY guard evaluation that stands the gate down under loop protection (the new ORD-260 S2
+# anomaly) or hits a read error would otherwise file a real captain bug and write the shared
+# per-user cache. Point the coalesce store at a per-home temp dir and disable the bug CLI, so
+# every run_hook-based case stays hermetic. Cases that specifically exercise coalescing set
+# their own FM_FLEET_TRIAGE_BUG_CLI/FM_GUARD_ERROR_COALESCE_DIR and invoke the hook directly.
 run_hook() {
   local dir=$1 stop_active=$2 home
   home=$(cd "$dir" && pwd)
-  printf '{"stop_hook_active":%s}' "$stop_active" | CLAUDECODE=1 FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" 2>&1
+  printf '{"stop_hook_active":%s}' "$stop_active" | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$home/coalesce" FM_FLEET_TRIAGE_BUG_CLI=off \
+    bash "$dir/bin/fm-turnend-guard.sh" 2>&1
 }
 
 run_hook_codex() {
   local dir=$1 stop_active=$2 home
   home=$(cd "$dir" && pwd)
-  printf '{"stop_hook_active":%s}' "$stop_active" | FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$dir/fake-systemd" FM_SUPERVISION_HARNESS=codex FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" 2>&1
+  printf '{"stop_hook_active":%s}' "$stop_active" | FM_SUPERVISION_TEST_MODE=1 FM_CODEX_SYSTEMD_FAKE_DIR="$dir/fake-systemd" FM_SUPERVISION_HARNESS=codex FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$home/coalesce" FM_FLEET_TRIAGE_BUG_CLI=off \
+    bash "$dir/bin/fm-turnend-guard.sh" 2>&1
 }
 
 run_hook_codex_production_identity_override() {
   local dir=$1 stop_active=$2 identity=$3 home
   home=$(cd "$dir" && pwd)
-  printf '{"stop_hook_active":%s}' "$stop_active" | FM_CODEX_SYSTEMD_FAKE_DIR="$dir/fake-systemd" FM_CODEX_PRIMARY_IDENTITY="$identity" FM_SUPERVISION_HARNESS=codex FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" 2>&1
+  printf '{"stop_hook_active":%s}' "$stop_active" | FM_CODEX_SYSTEMD_FAKE_DIR="$dir/fake-systemd" FM_CODEX_PRIMARY_IDENTITY="$identity" FM_SUPERVISION_HARNESS=codex FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$home/coalesce" FM_FLEET_TRIAGE_BUG_CLI=off \
+    bash "$dir/bin/fm-turnend-guard.sh" 2>&1
 }
 
 nonexistent_pid() {
@@ -2694,6 +2706,265 @@ test_grok_hook_invokes_adapter() {
   pass ".grok primary hook: Stop hook invokes the grok adapter"
 }
 
+# --- HOOK: ORD-260 S2 - the third blocking predicate, unaccounted captain orders ----------
+#
+# The gate does a CHEAP FILE READ of state/.order-audit-last.json (the deterministic product
+# of `fm-order.sh audit`, slice S1) and blocks when it reports unaccounted > 0, exactly as
+# the needs_firstmate lane does. It NEVER re-enumerates the inbox on the turn-end path: the
+# fixtures write the audit file directly, and no fm-order.sh is even installed in the
+# scenario dir, so a block here is proof the gate READ the file rather than recomputing it.
+# All coalesced-anomaly assertions are sandboxed - a per-home temp coalesce dir plus a bug
+# stub or FM_FLEET_TRIAGE_BUG_CLI=off - so the live captain ledger is never touched.
+
+# Write the deterministic order-audit file into a home's state dir. <age-seconds> ago becomes
+# generated_at; the remaining args are the unaccounted order ids (none => zero unaccounted).
+write_order_audit() {  # <dir> <age-seconds> <grace> [<unaccounted-id>...]
+  local dir=$1 age=$2 grace=$3 now gen list count
+  shift 3
+  now=$(date -u +%s)
+  gen=$(date -u -d "@$((now - age))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+        || date -u -r "$((now - age))" +%Y-%m-%dT%H:%M:%SZ)
+  list=$(printf '%s\n' "$@" | jq -Rn '[inputs | select(length > 0)
+    | {order_id: ., status: "dispatched", accounted: false, basis: "unaccounted",
+       unaccounted_reason: "dispatched but no linked task is live"}]')
+  count=$(printf '%s' "$list" | jq 'length')
+  mkdir -p "$dir/state"
+  jq -n --arg gen "$gen" --argjson grace "$grace" --argjson u "$count" --argjson list "$list" \
+    '{schema: "fm-order-audit/v1", generated_at: $gen, grace_seconds: $grace,
+      control_plane: {available: false, tasks_checked: 0},
+      non_terminal: ($u + 1), accounted: 1, unaccounted: $u,
+      unaccounted_orders: $list, orders: $list}' > "$dir/state/.order-audit-last.json"
+}
+
+# The core case: healthy supervision, a clear crew lane, and a fresh audit reporting
+# unaccounted orders must block, name the orders, and record blocked_unaccounted_orders.
+test_hook_blocks_on_unaccounted_orders() {
+  local dir pid out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-orders-block")
+  pid=$(start_healthy_watcher "$dir")
+  write_order_audit "$dir" 60 14400 ORD-083 ORD-217
+  [ ! -e "$dir/bin/fm-order.sh" ] || fail "the fixture must not ship fm-order.sh: the gate must READ the audit file, not re-run it"
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 2 "$status" "the gate must block on unaccounted captain orders past grace"
+  assert_contains "$out" "TURN WOULD END WITH CAPTAIN ORDERS UNACCOUNTED" "the order block banner must fire"
+  assert_contains "$out" "ORD-083" "the block must name each unaccounted order"
+  assert_contains "$out" "ORD-217" "the block must name each unaccounted order"
+  assert_contains "$out" "RE-RUNNING THE AUDIT ALONE DOES NOT SATISFY" "the banner must reject a bare re-audit as discharge"
+  assert_not_contains "$out" "SUPERVISION IS OFF" "a healthy watcher must not read as down"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = blocked_unaccounted_orders ] || fail "decision must be blocked_unaccounted_orders: $log"
+  [ "$(printf '%s' "$log" | jq -r '.reason')" = unaccounted-orders ] || fail "reason must be unaccounted-orders: $log"
+  [ "$(printf '%s' "$log" | jq -r '.orders')" = 2 ] || fail "the log must record the unaccounted count: $log"
+  printf '%s' "$log" | jq -r '.order_items' | grep -q 'ORD-083' || fail "the log must carry the order digest: $log"
+  pass "fm-turnend-guard: blocks on unaccounted captain orders read from the audit file"
+}
+
+# An ABSENT audit file is not-adopted-here-yet, not a failure: the predicate does not fire,
+# silently, and never files an anomaly (S2 can ship ahead of the refresh cadence).
+test_hook_absent_order_audit_is_silent() {
+  local dir pid out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-orders-absent")
+  pid=$(start_healthy_watcher "$dir")
+  [ ! -e "$dir/state/.order-audit-last.json" ] || fail "fixture must have no audit file"
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "an absent audit file must not block or fire the predicate"
+  [ -z "$out" ] || fail "an absent audit file must stay silent: $out"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_needs_firstmate_empty ] || fail "an absent audit must log a clean permit: $log"
+  [ "$(printf '%s' "$log" | jq -r '.orders')" = 0 ] || fail "orders must be 0 with no audit file: $log"
+  [ "$(printf '%s' "$log" | jq -r '.order_audit_age')" = null ] || fail "order_audit_age must be null when the file is absent: $log"
+  pass "fm-turnend-guard: an absent order-audit file is a silent no-op, not a block or anomaly"
+}
+
+# A fresh audit reporting zero unaccounted is a healthy clear: silent permit.
+test_hook_fresh_zero_unaccounted_is_silent() {
+  local dir pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-orders-zero")
+  pid=$(start_healthy_watcher "$dir")
+  write_order_audit "$dir" 60 14400
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "zero unaccounted orders must not block"
+  [ -z "$out" ] || fail "zero unaccounted orders must stay silent: $out"
+  pass "fm-turnend-guard: a fresh audit with zero unaccounted orders permits silently"
+}
+
+# STALE (not corrupt) audit: too old to trust, so the gate fails OPEN - but a not-refreshed
+# file is a cadence gap, not a breakage, so it is logged only and NEVER files a bug. This is
+# what keeps an unwired refresh cadence from reopening the bug-per-occurrence spam class.
+test_hook_stale_order_audit_fails_open_without_anomaly() {
+  local dir home pid out status log coalesce buglog
+  dir=$(make_primary_dir "$TMP_ROOT/hook-orders-stale")
+  home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
+  buglog="$home/bug-calls.log"
+  install_bug_stub "$dir" "$buglog" >/dev/null
+  pid=$(start_healthy_watcher "$dir")
+  write_order_audit "$dir" 20000 14400 ORD-999
+  out=$(printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$dir/stubbin/bugstub" \
+    bash "$dir/bin/fm-turnend-guard.sh" 2>&1); status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "a stale audit file must fail open, never block on untrusted data"
+  [ -z "$out" ] || fail "a stale audit must stay silent (logged, not banner-loud): $out"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.order_error')" = order-audit-stale ] || fail "a stale audit must be recorded as order-audit-stale: $log"
+  [ "$(printf '%s' "$log" | jq -r '.orders')" = 0 ] || fail "a stale audit must not contribute a blocking count: $log"
+  [ ! -s "$buglog" ] || fail "a stale (not broken) audit must NOT file a bug: $(cat "$buglog")"
+  pass "fm-turnend-guard: a stale order-audit file fails open, logged but never a bug"
+}
+
+# CORRUPT audit (the writer broke): fail open, loud banner, and ONE coalesced anomaly. Two
+# evaluations file exactly one bug (fleet-wide fingerprint dedup), proving the S2 anomaly
+# rides the same anti-spam engine as the guard-error path.
+test_hook_corrupt_order_audit_fails_open_with_coalesced_anomaly() {
+  local dir home pid out status log coalesce buglog
+  dir=$(make_primary_dir "$TMP_ROOT/hook-orders-corrupt")
+  home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
+  buglog="$home/bug-calls.log"
+  install_bug_stub "$dir" "$buglog" >/dev/null
+  pid=$(start_healthy_watcher "$dir")
+  printf 'not json{\n' > "$dir/state/.order-audit-last.json"
+  out=$(printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$dir/stubbin/bugstub" \
+    bash "$dir/bin/fm-turnend-guard.sh" 2>&1); status=$?
+  expect_code 0 "$status" "a corrupt audit file must fail open, not wedge the primary"
+  assert_contains "$out" "CAPTAIN-ORDER ACCOUNTING FILE COULD NOT BE TRUSTED" "a corrupt audit must be loud"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.order_error')" = order-audit-unreadable ] || fail "a corrupt audit must record order-audit-unreadable: $log"
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_guard_error ] || fail "a corrupt audit with nothing else blocking is a guard_error permit: $log"
+  # Second evaluation: the same fingerprint must coalesce into the one already-filed bug.
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$dir/stubbin/bugstub" \
+    bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  stop_watcher "$pid"
+  [ "$(grep -c 'order-audit-last.json' "$buglog" 2>/dev/null)" -eq 1 ] \
+    || fail "a corrupt audit must file exactly one coalesced bug across two evaluations: $(cat "$buglog" 2>/dev/null)"
+  pass "fm-turnend-guard: a corrupt order-audit file fails open with one coalesced anomaly"
+}
+
+# Unattended crew work AND unaccounted orders together: both banners fire, the reason names
+# both axes, and needs_firstmate takes decision-label precedence.
+test_hook_blocks_on_nf_and_orders_together() {
+  local dir pid out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-orders-both")
+  pid=$(start_healthy_watcher "$dir")
+  write_nf_signal "$dir" ship-z1 'done: ready in branch fm/ship-z1'
+  write_order_audit "$dir" 60 14400 ORD-601
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 2 "$status" "both unattended work and unaccounted orders must block"
+  assert_contains "$out" "TURN WOULD END WITH FINISHED WORK UNATTENDED" "the nf banner must fire"
+  assert_contains "$out" "TURN WOULD END WITH CAPTAIN ORDERS UNACCOUNTED" "the order banner must fire alongside it"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = blocked_needs_firstmate ] || fail "needs_firstmate takes decision-label precedence: $log"
+  [ "$(printf '%s' "$log" | jq -r '.reason')" = 'unattended-needs-firstmate+unaccounted-orders' ] || fail "the reason must name both axes: $log"
+  pass "fm-turnend-guard: unattended work and unaccounted orders block together, both named"
+}
+
+# Discharge is by a real accounting act reflected in a FRESH audit, not by re-running the
+# audit over the same state: a refreshed audit showing the order accounted clears the block.
+test_hook_order_block_clears_after_a_fresh_audit() {
+  local dir pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-orders-clear")
+  pid=$(start_healthy_watcher "$dir")
+  write_order_audit "$dir" 60 14400 ORD-701
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "the order must block first"
+  write_order_audit "$dir" 5 14400
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "a fresh audit showing the order accounted must clear the block"
+  [ -z "$out" ] || fail "the cleared gate must be silent: $out"
+  pass "fm-turnend-guard: a fresh audit reflecting a real accounting act discharges the order block"
+}
+
+# Loop protection on an order block: the second stop is permitted (never wedge the primary),
+# but recorded as a no-progress stand-down, queues a durable check wake naming the order, and
+# files ONE coalesced stand-down anomaly - the structural fix for the guard-error-spam class.
+test_hook_order_loop_guard_permits_and_signals_standdown() {
+  local dir home pid out status log coalesce buglog
+  dir=$(make_primary_dir "$TMP_ROOT/hook-orders-loop")
+  home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
+  buglog="$home/bug-calls.log"
+  install_bug_stub "$dir" "$buglog" >/dev/null
+  pid=$(start_healthy_watcher "$dir")
+  write_order_audit "$dir" 60 14400 ORD-511
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$dir/stubbin/bugstub" \
+    bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  out=$(printf '{"stop_hook_active":true}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$dir/stubbin/bugstub" \
+    bash "$dir/bin/fm-turnend-guard.sh" 2>&1); status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "the loop-guarded second stop must be permitted"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_loop_protection_without_progress ] || fail "the stand-down must be recorded honestly: $log"
+  grep -q "	check	turnend-guard	" "$dir/state/.wake-queue" 2>/dev/null || fail "a no-progress order permit must queue a durable check wake"
+  grep -q "ORD-511" "$dir/state/.wake-queue" || fail "the queued wake must name the unaccounted order"
+  [ "$(grep -c 'stood the' "$buglog" 2>/dev/null)" -eq 1 ] || fail "a no-progress stand-down must file exactly one coalesced anomaly: $(cat "$buglog" 2>/dev/null)"
+  pass "fm-turnend-guard: a loop-guarded order stand-down permits, queues a wake, and files one coalesced anomaly"
+}
+
+# Under loop protection, a SHRINKING unaccounted-order set is real progress: the block-id set
+# recorded the order ids (order:<id> prefixed), and a refreshed audit dropping one is scored
+# allowed_after_valid_progress rather than a stand-down.
+test_hook_order_progress_shrinks_the_block_set() {
+  local dir pid out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-orders-progress")
+  pid=$(start_healthy_watcher "$dir")
+  write_order_audit "$dir" 60 14400 ORD-801 ORD-802
+  run_hook "$dir" false >/dev/null 2>&1
+  write_order_audit "$dir" 5 14400 ORD-801
+  out=$(run_hook "$dir" true); status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "the loop-guarded stop is permitted"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_after_valid_progress ] || fail "a shrunk order block set must record real progress: $log"
+  pass "fm-turnend-guard: a shrinking unaccounted-order set is scored as valid progress under loop protection"
+}
+
+# Away mode stands the order gate down exactly as it does the nf gate: no block, no banner,
+# but the swept count is still logged so a stand-down can never silently lose the orders.
+test_hook_order_gate_stands_down_under_afk() {
+  local dir pid out status log
+  dir=$(make_primary_dir "$TMP_ROOT/hook-orders-afk")
+  pid=$(start_healthy_watcher "$dir")
+  write_order_audit "$dir" 60 14400 ORD-901
+  : > "$dir/state/.afk"
+  out=$(run_hook "$dir" false); status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "away mode stands the order gate down, exactly as it does for nf"
+  assert_not_contains "$out" "CAPTAIN ORDERS UNACCOUNTED" "a stood-down order gate must not print the block banner"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_afk_owner ] || fail "the afk stand-down must be recorded: $log"
+  [ "$(printf '%s' "$log" | jq -r '.orders')" = 1 ] || fail "the swept order count must still be logged under stand-down: $log"
+  pass "fm-turnend-guard: away mode stands the unaccounted-order gate down but still logs the swept count"
+}
+
+# The anti-evasion reporter must see the new axis: the order block is counted, and a permit
+# granted while orders were outstanding counts against the acceptance metric.
+test_metrics_counts_order_block_and_permit() {
+  local dir home pid out
+  dir=$(make_primary_dir "$TMP_ROOT/hook-orders-metrics")
+  home=$(cd "$dir" && pwd)
+  pid=$(start_healthy_watcher "$dir")
+  write_order_audit "$dir" 60 14400 ORD-111
+  run_hook "$dir" false >/dev/null 2>&1
+  run_hook "$dir" true  >/dev/null 2>&1
+  out=$(FM_HOME="$home" bash "$dir/bin/fm-turnend-metrics.sh" --json)
+  stop_watcher "$pid"
+  [ "$(printf '%s' "$out" | jq -r '.cumulative.blocked_unaccounted_orders')" -eq 1 ] \
+    || fail "metrics must count the order block: $out"
+  [ "$(printf '%s' "$out" | jq -r '.cumulative.permits_with_unattended_work')" -ge 1 ] \
+    || fail "a permit while orders were outstanding must count against the gate: $out"
+  pass "fm-turnend-metrics: the order block and an order-outstanding permit are both counted"
+}
+
 test_predicate_healthy_no_inflight
 test_predicate_unhealthy_no_beacon
 test_predicate_unhealthy_stale_beacon
@@ -2791,3 +3062,14 @@ test_pi_extension_forces_followup
 test_pi_extension_injects_once_per_logical_agent_run
 test_pi_extension_retries_after_followup_delivery_failure
 test_grok_hook_invokes_adapter
+test_hook_blocks_on_unaccounted_orders
+test_hook_absent_order_audit_is_silent
+test_hook_fresh_zero_unaccounted_is_silent
+test_hook_stale_order_audit_fails_open_without_anomaly
+test_hook_corrupt_order_audit_fails_open_with_coalesced_anomaly
+test_hook_blocks_on_nf_and_orders_together
+test_hook_order_block_clears_after_a_fresh_audit
+test_hook_order_loop_guard_permits_and_signals_standdown
+test_hook_order_progress_shrinks_the_block_set
+test_hook_order_gate_stands_down_under_afk
+test_metrics_counts_order_block_and_permit

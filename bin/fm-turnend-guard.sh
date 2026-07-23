@@ -4,11 +4,13 @@
 # is guarded exactly like the main primary; only child crew/scout worktrees are
 # exempt (see the scoping block below and docs/turnend-guard.md).
 #
-# It blocks a turn end for either of two independent reasons: supervision is off (tasks in
-# flight, no live watcher), or finished crew work is still unattended (the needs_firstmate
-# lane is non-empty, read live from local task state at the moment of evaluation). See "the
-# actual predicate" below for why the second one exists and why it is scoped to that one
-# lane. Every primary evaluation - permitted or blocked - is recorded in the decision log
+# It blocks a turn end for any of three independent reasons: supervision is off (tasks in
+# flight, no live watcher); finished crew work is still unattended (the needs_firstmate lane
+# is non-empty, read live from local task state at the moment of evaluation); or captain
+# orders are unaccounted past grace (ORD-260 slice S2 - a cheap read of the deterministic
+# audit file state/.order-audit-last.json written by `fm-order.sh audit`, never a
+# re-enumeration). See "the actual predicate" below for why each exists and how each is
+# bounded. Every primary evaluation - permitted or blocked - is recorded in the decision log
 # at state/.turnend-guard.log (see "decision log" below).
 #
 # WHAT DISCHARGES THE UNATTENDED-WORK GATE (ORD-060 section 2). Only real lifecycle
@@ -366,7 +368,13 @@ guard_error_lock_failure_fallback() {  # <slug> <dir> <component> <detail> <reas
 # replaced. The coalescing window advances ONLY on a CONFIRMED successful bug filing; a
 # failed bug CLI leaves the signal eligible for a bounded retry rather than muting it for
 # the whole window.
-signal_guard_error_bug() {  # <component> <detail>
+# Generalized (ORD-260 S2): the coalescing ENGINE is fingerprint-agnostic. <slug-source>
+# derives the dedup fingerprint, <body> is the filed bug's human text, and the optional
+# <occ-detail> is appended to each occurrence line. signal_guard_error_bug (guard-state read
+# failures), signal_order_audit_anomaly, and signal_standdown_anomaly are thin wrappers, so
+# every coalesced signal shares this one anti-spam mechanism - the structural fix for the
+# bug-per-occurrence class (guard-error-spam-j6).
+signal_coalesced_bug() {  # <slug-source> <body> [<occ-detail>]
   local cli slug dir rec lock occ window retry now caller k v
   local count first last_bug last_attempt bug_id new_id occ_dropped lines max keep drop
   local window_ok in_failure_backoff flock_wait
@@ -449,8 +457,15 @@ signal_guard_error_bug() {  # <component> <detail>
     fi
 
     # Rotate before appending the current occurrence. Because rotation and append share one
-    # flock, no concurrent append can target an old inode that is about to be replaced.
-    lines=$(wc -l < "$occ" 2>/dev/null || printf 0)
+    # flock, no concurrent append can target an old inode that is about to be replaced. Guard
+    # the file-existence check first: a bare `< "$occ"` on a not-yet-created occurrence file
+    # leaks a shell redirection error past `2>/dev/null` (the redirect is attempted before it
+    # applies), which the first coalesced signal in a home would otherwise print to stderr.
+    if [ -f "$occ" ]; then
+      lines=$(wc -l < "$occ" 2>/dev/null || printf 0)
+    else
+      lines=0
+    fi
     lines=${lines//[!0-9]/}
     [ -n "$lines" ] || lines=0
     max=${FM_GUARD_ERROR_OCC_MAX:-1000}
@@ -467,7 +482,9 @@ signal_guard_error_bug() {  # <component> <detail>
       fi
     fi
 
-    if printf '%s\tpid=%s\t%s\n' "$now" "$$" "$caller" >> "$occ" 2>/dev/null; then
+    occ_field=$caller
+    [ -n "${3:-}" ] && occ_field=$(printf '%s\t%s' "$caller" "$3")
+    if printf '%s\tpid=%s\t%s\n' "$now" "$$" "$occ_field" >> "$occ" 2>/dev/null; then
       lines=$((lines + 1))
     fi
     count=$((occ_dropped + lines))
@@ -481,7 +498,7 @@ signal_guard_error_bug() {  # <component> <detail>
     { [ "$last_attempt" -gt "$last_bug" ] && [ "$((now - last_attempt))" -lt "$retry" ]; } && in_failure_backoff=1
     if [ -n "$cli" ] && [ "$cli" != off ] && [ "$window_ok" -eq 1 ] && [ "$in_failure_backoff" -eq 0 ]; then
       last_attempt=$now
-      new_id=$("$cli" record "turn-end guard could not inspect fleet state ($1): $2. The unattended-work gate is failing open until this is repaired. Caller: $caller. Coalesced per failure fingerprint ($slug): every occurrence is serialized under flock into $occ (aggregated, count=$count) and repeat occurrences update the shared record ($rec) instead of filing new bugs; see state/.turnend-guard.log for guard_error decisions." \
+      new_id=$("$cli" record "$2 Caller: $caller. Coalesced per failure fingerprint ($slug): every occurrence is serialized under flock into $occ (aggregated, count=$count) and repeat occurrences update the shared record ($rec) instead of filing new bugs; see state/.turnend-guard.log for the guard's decision records." \
         --quiet 2>/dev/null) || new_id=''
       if [ -n "$new_id" ]; then
         bug_id=$new_id
@@ -510,6 +527,35 @@ signal_guard_error_bug() {  # <component> <detail>
   return 0
 }
 
+# Guard-state read-failure signal (the original caller): a fail-open guard error on the
+# turn-end path. The fingerprint is the failed component, so distinct failures stay distinct.
+signal_guard_error_bug() {  # <component> <detail>
+  signal_coalesced_bug "$1" \
+    "turn-end guard could not inspect fleet state ($1): $2. The unattended-work gate is failing open until this is repaired." \
+    "component=$1"
+}
+
+# Order-audit read-failure signal (ORD-260 S2): the deterministic order-accounting file
+# state/.order-audit-last.json was present but could not be trusted (unparseable, wrong
+# schema, or a count that disagrees with its own list), so the third predicate fails open.
+# A stale-but-valid file is a refresh-cadence gap, NOT a breakage, and is logged only - it
+# never reaches this signal, so an unwired refresh cadence can never spam the bug ledger.
+signal_order_audit_anomaly() {  # <reason>
+  signal_coalesced_bug "order-audit-$1" \
+    "turn-end guard could not trust the captain-order accounting file state/.order-audit-last.json ($1): the unaccounted-orders predicate is failing open until a valid \`fm-order.sh audit\` refreshes it." \
+    "reason=$1"
+}
+
+# No-progress stand-down signal (ORD-260 S2, report section 5.1-C4): the harness loop guard
+# forced a permit while unattended work or an unaccounted order remained. ONE coalesced,
+# occurrence-counted anomaly - never a bug per turn - so a repeated enforcement stand-down is
+# durably visible without reopening the bug-per-occurrence spam class this slice subsumes.
+signal_standdown_anomaly() {  # <reason-text>
+  signal_coalesced_bug turnend-standdown-no-progress \
+    "turn-end guard stood the unattended-work / unaccounted-order gate down under loop protection without discharging work: $1. The harness loop guard forbids blocking a turn twice, so this is an enforcement stand-down, not a compliant permit." \
+    "nf=$nf orders=$orders ids=${combined_digest:-none}"
+}
+
 guard_error_banner() {  # <component> <detail>
   {
     printf '●%s\n' "$rule"
@@ -520,6 +566,20 @@ guard_error_banner() {  # <component> <detail>
     printf '●  is recorded as guard_error, not as a compliant permit. Repair the component;\n'
     printf '●  a durable bug signal will be attempted if the bug CLI is available.\n'
     printf '●  Any coalescing-lock failure is reported explicitly below.\n'
+    printf '●%s\n' "$rule"
+  } >&2
+}
+
+# ORD-260 S2: the order-accounting file was present but untrustworthy (corrupt/malformed).
+# The unaccounted-orders predicate fails open, loudly, and raises one coalesced anomaly.
+order_error_banner() {  # <reason> <detail>
+  {
+    printf '●%s\n' "$rule"
+    printf '●  TURN-END GUARD: CAPTAIN-ORDER ACCOUNTING FILE COULD NOT BE TRUSTED\n'
+    printf '●  Problem: %s\n' "$1"
+    printf '●  %s\n' "$2"
+    printf '●  The unaccounted-orders gate is FAILING OPEN for this turn. Refresh it with a\n'
+    printf '●  valid run of bin/fm-order.sh audit; a durable bug signal will be attempted.\n'
     printf '●%s\n' "$rule"
   } >&2
 }
@@ -557,7 +617,7 @@ if ! STOP_HOOK_ACTIVE=$(printf '%s' "$PAYLOAD" | jq -r '.stop_hook_active // fal
 fi
 
 # --- the actual predicate ----------------------------------------------------
-# TWO INDEPENDENT REASONS TO BLOCK, and either one alone is enough.
+# THREE INDEPENDENT REASONS TO BLOCK, and any one alone is enough.
 #
 #   1. SUPERVISION IS OFF - tasks in flight with no live watcher. The original predicate,
 #      unchanged below.
@@ -566,6 +626,11 @@ fi
 #      evaluation, never from a cached summary of them. A cache reflects the last duty
 #      pass, not the present: it would miss work that finished since, and hold the turn
 #      hostage for work already discharged.
+#   3. CAPTAIN ORDERS UNACCOUNTED PAST GRACE (ORD-260 slice S2) - the deterministic audit
+#      file state/.order-audit-last.json reports unaccounted > 0. This is a CHEAP FILE READ
+#      of a script product (`fm-order.sh audit`, slice S1), NEVER a re-enumeration on the
+#      turn-end path. It fails open on an absent/stale/corrupt file (see the order read
+#      above), and enforces only a fresh, valid one.
 #
 # Why (2) exists. Before it, arming the watcher was a complete and sufficient way to end any
 # turn, no matter how much finished-but-unhandled work was piled up, because supervision
@@ -576,8 +641,17 @@ fi
 # rule against ending a turn with supervision off was enforced; the rule against ending a
 # turn with the fleet's work undone was a printf. This closes that asymmetry.
 #
-# Why ONLY the needs_firstmate lane, and not all actionable items. That lane is bounded by
-# the number of live tasks, it cannot be flooded by an audit backfill, and it is
+# Why (3) exists, and why it is FLOOD-PROOF. Captain orders had the same asymmetry: an order
+# dispatched then orphaned (crew died, or finished without closing the order) was surfaced by
+# banners but compelled by nothing (report section 0). The gate demands ACCOUNTING, not
+# completion: an order is discharged by linking live work, queuing it with a reason, a
+# machine-checkable hold, a board-confirmed park/decision, or a terminal outcome with
+# evidence - all cheap, all legitimate - so even 100 orders can be honestly accounted in
+# bounded time (queue them with reasons; that IS accounting, and it is true), and a backfill
+# flood gets the `fm-order.sh park --captain-ack` batch verb (one ack accounts the batch).
+#
+# Why (2) is scoped to ONLY the needs_firstmate lane, not all actionable items. That lane is
+# bounded by the number of live tasks, it cannot be flooded by an audit backfill, and it is
 # level-triggered off state/<id>.meta plus state/<id>.status - so it is discharged by LANDING
 # or TEARING DOWN the work, never by paperwork. Gating on the full actionable set would let a
 # backfill flood wedge the primary, which is exactly the liability a future session would
@@ -675,6 +749,104 @@ if [ "$nf" -gt 0 ]; then
   [ "$nf" -gt "$LOG_IDS" ] && nf_digest="$nf_digest,+$((nf - LOG_IDS)) more"
 fi
 
+# --- UNACCOUNTED CAPTAIN ORDERS: the third blocking predicate --------------------------
+# ORD-260 slice S2, report section 5.1-C4. A CHEAP FILE READ of the deterministic audit
+# product state/.order-audit-last.json (written by `fm-order.sh audit`, slice S1) - NEVER a
+# re-enumeration of the inbox on the turn-end path. The audit already accounts every order
+# younger than its accounting grace via its `fresh` branch, so the file's `unaccounted`
+# count IS unaccounted_orders_past_grace, and `unaccounted > 0` blocks exactly as
+# needs_firstmate does. Discharge is by REAL accounting acts (link live work, queue with a
+# reason and blocker, machine-checkable hold, board-confirmed park/decision, or a terminal
+# outcome with evidence) FOLLOWED BY a fresh `fm-order.sh audit`; re-running the audit alone
+# never discharges, because the predicate is over the orders, not over the file.
+#
+# FAIL OPEN, inheriting the guard's discipline:
+#   - absent          -> the audit is not wired in this home (S2 can ship ahead of the
+#                        refresh cadence); the predicate does not fire. No block, no anomaly.
+#   - stale           -> a not-refreshed file is a refresh-cadence gap, not a breakage:
+#                        fail open, log order_error, but NO bug (that would reopen the very
+#                        bug-per-occurrence spam this slice removes for an unwired cadence).
+#   - unreadable/malformed/count-mismatch -> the writer produced an untrustworthy file: fail
+#                        open, loud banner, and ONE coalesced anomaly (the design's
+#                        fail-open-with-coalesced-anomaly discipline).
+#   - present, parseable, fresh -> ENFORCE.
+ORDER_AUDIT="${FM_ORDER_AUDIT_FILE:-$STATE/.order-audit-last.json}"
+orders=0
+order_ids=''
+order_error=''
+order_audit_age=''   # empty => file absent (predicate did not fire); else integer seconds
+if [ -f "$ORDER_AUDIT" ]; then
+  now_epoch=$(date -u +%s 2>/dev/null || printf 0)
+  case "$now_epoch" in ''|*[!0-9]*) now_epoch=0 ;; esac
+  # One jq pass validates the schema, converts generated_at to an age, and cross-checks that
+  # the file's own unaccounted count equals its unaccounted_orders length. It emits either
+  # "OK<TAB>age<TAB>count<TAB>grace" or "ERR<TAB>reason"; a jq non-zero exit (unparseable
+  # JSON) is caught by the `||` and treated as unreadable.
+  order_meta=$(jq -r --argjson now "$now_epoch" '
+    if (.schema // "") != "fm-order-audit/v1" then "ERR\tbad-schema"
+    else ((.generated_at // "") | (try fromdateiso8601 catch null)) as $gen
+      | if $gen == null then "ERR\tbad-timestamp"
+        else (.unaccounted // null) as $u
+          | ((.unaccounted_orders // []) | length) as $len
+          | ((.grace_seconds // 14400) | if type == "number" then . else 14400 end) as $grace
+          | if ($u | type) != "number" then "ERR\tno-count"
+            elif $u != $len then "ERR\tcount-mismatch"
+            else "OK\t" + (($now - $gen) | tostring) + "\t" + ($u | tostring) + "\t" + ($grace | tostring)
+            end
+        end
+    end' "$ORDER_AUDIT" 2>/dev/null) || order_meta='ERR	unreadable'
+  order_kind=${order_meta%%$'\t'*}
+  order_rest=${order_meta#*$'\t'}
+  if [ "$order_kind" = OK ]; then
+    o_age=${order_rest%%$'\t'*}; order_rest=${order_rest#*$'\t'}
+    o_count=${order_rest%%$'\t'*}; o_grace=${order_rest#*$'\t'}
+    case "$o_age" in ''|*[!0-9-]*) o_age=0 ;; esac
+    case "$o_count" in ''|*[!0-9]*) o_count=0 ;; esac
+    case "$o_grace" in ''|*[!0-9]*) o_grace=14400 ;; esac
+    order_audit_age=$o_age
+    # Staleness bound: the audit's own accounting grace, overridable. An audit older than
+    # this is too stale to enforce on; younger is trusted (a blocking episode's own discharge
+    # act - re-running audit - keeps the file fresh, so a within-window file is authoritative).
+    order_max_age=${FM_TURNEND_ORDER_AUDIT_MAX_AGE:-$o_grace}
+    case "$order_max_age" in ''|*[!0-9]*) order_max_age=$o_grace ;; esac
+    if [ "$o_age" -gt "$order_max_age" ]; then
+      order_error='order-audit-stale'
+    else
+      orders=$o_count
+      if [ "$orders" -gt 0 ]; then
+        order_ids=$(jq -r '(.unaccounted_orders // [])[] | .order_id // empty' "$ORDER_AUDIT" 2>/dev/null || true)
+        # If the id list cannot be read despite a valid count, the file is untrustworthy.
+        [ -z "$order_ids" ] && { orders=0; order_error='order-audit-unreadable'; }
+      fi
+    fi
+  else
+    order_error="order-audit-${order_rest:-unreadable}"
+  fi
+fi
+case "$orders" in ''|*[!0-9]*) orders=0 ;; esac
+
+# Bounded order-id digest for the block message and decision log.
+order_digest=''
+if [ "$orders" -gt 0 ]; then
+  order_digest=$(printf '%s\n' "$order_ids" | head -n "$LOG_IDS" | paste -sd, -)
+  [ "$orders" -gt "$LOG_IDS" ] && order_digest="$order_digest,+$((orders - LOG_IDS)) more"
+fi
+
+# The combined id set the loop-guard progress check and the block-id record stand on: nf
+# crew ids plus unaccounted order ids prefixed `order:` so the two namespaces never collide.
+if [ -n "$order_ids" ]; then
+  order_prefixed=$(printf '%s\n' "$order_ids" | sed 's/^/order:/')
+else
+  order_prefixed=''
+fi
+combined_ids=$(printf '%s\n' "$nf_ids" "$order_prefixed" | grep . || true)
+combined_digest=''
+if [ -n "$combined_ids" ]; then
+  combined_count=$(printf '%s\n' "$combined_ids" | grep -c .)
+  combined_digest=$(printf '%s\n' "$combined_ids" | head -n "$LOG_IDS" | paste -sd, -)
+  [ "$combined_count" -gt "$LOG_IDS" ] && combined_digest="$combined_digest,+$((combined_count - LOG_IDS)) more"
+fi
+
 watcher_desc=$FM_SUP_HEALTH_STATE
 [ "$FM_SUP_IN_FLIGHT" -eq 0 ] && watcher_desc=no-tasks-in-flight
 
@@ -717,10 +889,16 @@ watcher_desc=$FM_SUP_HEALTH_STATE
 # beacon_age says it in one line.
 # Best-effort: a log that cannot be written must never change the decision or wedge the turn.
 log_decision() {  # <decision> <reason>
-  local line beacon_age
+  local line beacon_age order_age
   beacon_age=${FM_WATCHER_DIAG_BEACON_AGE:-}
   case "$beacon_age" in
     ''|*[!0-9]*) beacon_age=null ;;
+  esac
+  # order_audit_age is the deterministic age of state/.order-audit-last.json, or null when
+  # the file is absent (the order predicate simply did not fire this evaluation).
+  order_age=${order_audit_age:-}
+  case "$order_age" in
+    ''|*[!0-9-]*) order_age=null ;;
   esac
   line=$(jq -cn \
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -730,6 +908,10 @@ log_decision() {  # <decision> <reason>
     --arg nf_items "$nf_digest" \
     --arg nf_gate "$nf_gate" \
     --arg nf_error "$nf_error" \
+    --argjson orders "$orders" \
+    --arg order_items "$order_digest" \
+    --arg order_error "$order_error" \
+    --argjson order_audit_age "$order_age" \
     --arg decision "$1" \
     --arg reason "$2" \
     --argjson beacon_age "$beacon_age" \
@@ -751,6 +933,8 @@ log_decision() {  # <decision> <reason>
     --argjson loop_protection "$([ "$STOP_HOOK_ACTIVE" = true ] && echo true || echo false)" \
     '{ts: $ts, watcher: $watcher, in_flight: $in_flight, needs_firstmate: $nf,
       nf_items: $nf_items, nf_gate: $nf_gate, nf_error: $nf_error,
+      orders: $orders, order_items: $order_items, order_error: $order_error,
+      order_audit_age: $order_audit_age,
       decision: $decision, reason: $reason, loop_protection: $loop_protection,
       beacon_age: $beacon_age, lock_pid: $lock_pid, lock_pid_alive: $lock_pid_alive,
       identity_match: $identity_match, home_match: $home_match, path_match: $path_match,
@@ -802,8 +986,62 @@ duty_off_banner() {
 }
 
 # --- classify the permitted outcomes ------------------------------------------
-# Everything below either exits 0 with an honest decision record, or falls through to the
-# block at the bottom.
+# THREE independent reasons to block, any one enough: supervision off (blind), unattended
+# finished crew work (nf), and unaccounted captain orders past grace (orders). nf and orders
+# each fail OPEN on a read error - their count is 0 and their *_error names the failure - so
+# a read error never blocks, but it never masks the watcher axis either. Both work axes
+# enforce only while nf_gate == on: afk and the duty kill switch stand BOTH down, exactly as
+# they always did for nf. Everything below exits 0 with an honest record, or falls through to
+# the block at the bottom.
+
+nf_blocking=0
+[ "$nf" -gt 0 ] && [ "$nf_gate" = on ] && nf_blocking=1
+order_blocking=0
+[ "$orders" -gt 0 ] && [ "$nf_gate" = on ] && order_blocking=1
+work=$((nf + orders))
+any_read_error=0
+{ [ -n "$nf_error" ] || [ -n "$order_error" ]; } && any_read_error=1
+
+# The reason string for an allowed_guard_error permit, naming whichever axis (or both) could
+# not be read while the gate was enforcing.
+read_error_reason() {
+  if [ -n "$nf_error" ] && [ -n "$order_error" ]; then
+    printf 'lane: %s; orders: %s' "$nf_error" "$order_error"
+  elif [ -n "$nf_error" ]; then
+    printf '%s' "$nf_error"
+  else
+    printf '%s' "$order_error"
+  fi
+}
+
+# Raise the durable, coalesced signal for whichever axis could not be read - but ONLY while
+# the gate is enforcing (a stand-down owns its own escalation). Each axis keys its own
+# fingerprint. A STALE order file is a refresh-cadence gap, not a breakage, so it is logged
+# but never signalled here.
+signal_read_errors() {
+  [ "$nf_gate" = on ] || return 0
+  [ -n "$nf_error" ] && signal_guard_error_bug "$nf_error" 'needs_firstmate lane read failed on the turn-end path'
+  case "$order_error" in
+    ''|order-audit-stale) : ;;
+    *) signal_order_audit_anomaly "$order_error" ;;
+  esac
+  return 0
+}
+
+# The order-audit banner, printed only for a genuine breakage (never for a stale file).
+order_error_banner_if_broken() {  # <detail>
+  case "$order_error" in
+    ''|order-audit-stale) return 0 ;;
+    *) order_error_banner "$order_error" "$1" ;;
+  esac
+}
+
+# One coalesced anomaly per no-progress stand-down, plus its honest decision record. This is
+# what makes an enforcement stand-down durably visible without a bug per occurrence.
+record_standdown_no_progress() {  # <reason-text>
+  signal_standdown_anomaly "$1"
+  log_decision allowed_loop_protection_without_progress "$1"
+}
 
 if [ "$nf_gate" = duty-off ]; then
   duty_off_banner
@@ -812,21 +1050,22 @@ fi
 if [ "$STOP_HOOK_ACTIVE" = true ]; then
   # Loop protection: never block twice in one turn (see the header). The permit is
   # unconditional; the CLASSIFICATION is not (ORD-059 section 1): compliance requires the
-  # lane empty or the blocked id set to have shrunk, and a stand-down or error is recorded
-  # as itself.
+  # work axes empty or the blocked id set to have shrunk, and a stand-down or error is
+  # recorded as itself.
   case "$nf_gate" in
     afk) log_decision allowed_afk_owner 'away mode owns supervision'; exit 0 ;;
     duty-off) log_decision allowed_duty_disabled 'FM_TRIAGE_DUTY=off kill switch engaged'; exit 0 ;;
   esac
-  if [ -n "$nf_error" ]; then
-    guard_error_banner "$nf_error" 'the loop-guarded stop is permitted, but the lane state is unknown.'
-    log_decision allowed_guard_error "$nf_error"
-    signal_guard_error_bug "$nf_error" 'needs_firstmate lane read failed on the turn-end path'
+  if [ "$any_read_error" -eq 1 ]; then
+    [ -n "$nf_error" ] && guard_error_banner "$nf_error" 'the loop-guarded stop is permitted, but the lane state is unknown.'
+    order_error_banner_if_broken 'the loop-guarded stop is permitted, but the order-accounting state is unknown.'
+    signal_read_errors
+    log_decision allowed_guard_error "$(read_error_reason)"
     exit 0
   fi
-  if [ "$nf" -eq 0 ]; then
+  if [ "$work" -eq 0 ]; then
     if [ "$blind" -eq 1 ]; then
-      log_decision allowed_loop_protection_without_progress 'loop protection forced the permit; the watcher is still down'
+      record_standdown_no_progress 'loop protection forced the permit; the watcher is still down'
     else
       mark_healthy
       log_decision allowed_needs_firstmate_empty 'lane empty, supervision healthy'
@@ -837,7 +1076,7 @@ if [ "$STOP_HOOK_ACTIVE" = true ]; then
   if [ -f "$BLOCK_IDS_FILE" ]; then
     while IFS= read -r prior_id; do
       [ -n "$prior_id" ] || continue
-      if ! printf '%s\n' "$nf_ids" | grep -qxF -- "$prior_id"; then
+      if ! printf '%s\n' "$combined_ids" | grep -qxF -- "$prior_id"; then
         progress=1
         break
       fi
@@ -847,28 +1086,29 @@ if [ "$STOP_HOOK_ACTIVE" = true ]; then
     rm -f "$BLOCK_IDS_FILE" 2>/dev/null || true
     log_decision allowed_after_valid_progress 'the unattended id set shrank since the blocked attempt'
   else
-    # The turn is ending with unresolved terminal work and only recursion protection let it
-    # (the hook contract forbids a second block; a wedged primary is worse). The limitation
-    # is not hidden: beyond the honest decision record, queue one durable check wake so
-    # bin/fm-wake-drain.sh puts the unresolved items at the FRONT of the next primary turn.
+    # The turn is ending with unresolved terminal work or unaccounted orders and only
+    # recursion protection let it (the hook contract forbids a second block; a wedged primary
+    # is worse). The limitation is not hidden: queue one durable check wake so
+    # bin/fm-wake-drain.sh puts the unresolved items at the FRONT of the next primary turn,
+    # then record the stand-down with its one coalesced anomaly.
     # Deduped: one pending record at a time, or a stuck pile would flood the queue.
     if command -v fm_wake_append >/dev/null 2>&1 \
       && ! grep -q "	check	turnend-guard	" "$STATE/.wake-queue" 2>/dev/null; then
       fm_wake_append check turnend-guard \
-        "turn ended with unresolved terminal work under loop protection: $nf_digest - handle these before any new work" \
+        "turn ended with unresolved terminal work or unaccounted orders under loop protection: $combined_digest - handle these before any new work" \
         >/dev/null 2>&1 || true
     fi
-    log_decision allowed_loop_protection_without_progress 'loop protection forced the permit; no unattended item was discharged'
+    record_standdown_no_progress 'loop protection forced the permit; no unattended item or unaccounted order was discharged'
   fi
   exit 0
 fi
 
-# First stop attempt of the turn. Stand-downs and read failures on the unattended-work axis
-# never mask the independent watcher predicate below.
+# First stop attempt of the turn. Stand-downs and read failures on the work axes never mask
+# the independent watcher predicate below, so all of this is gated on blind == 0.
 if [ "$blind" -eq 0 ]; then
   case "$nf_gate" in
     afk)
-      if [ "$nf" -gt 0 ] || [ -n "$nf_error" ]; then
+      if [ "$work" -gt 0 ] || [ "$any_read_error" -eq 1 ]; then
         log_decision allowed_afk_owner 'away mode owns supervision'
       else
         log_decision allowed_needs_firstmate_empty 'lane empty, supervision healthy (away mode)'
@@ -876,7 +1116,7 @@ if [ "$blind" -eq 0 ]; then
       exit 0
       ;;
     duty-off)
-      if [ "$nf" -gt 0 ] || [ -n "$nf_error" ]; then
+      if [ "$work" -gt 0 ] || [ "$any_read_error" -eq 1 ]; then
         log_decision allowed_duty_disabled 'FM_TRIAGE_DUTY=off kill switch engaged'
       else
         log_decision allowed_needs_firstmate_empty 'lane empty, supervision healthy (kill switch engaged)'
@@ -884,15 +1124,18 @@ if [ "$blind" -eq 0 ]; then
       exit 0
       ;;
   esac
-  if [ -n "$nf_error" ]; then
-    guard_error_banner "$nf_error" 'this turn end is permitted fail-open; the lane state is unknown.'
-    log_decision allowed_guard_error "$nf_error"
-    signal_guard_error_bug "$nf_error" 'needs_firstmate lane read failed on the turn-end path'
-    exit 0
-  fi
-  if [ "$nf" -eq 0 ]; then
-    mark_healthy
-    log_decision allowed_needs_firstmate_empty 'lane empty, supervision healthy'
+  # Gate is on. With neither work axis blocking and the watcher healthy, the turn may end -
+  # as a fail-open guard_error permit if a read failed, otherwise a clean empty-lane permit.
+  if [ "$nf_blocking" -eq 0 ] && [ "$order_blocking" -eq 0 ]; then
+    if [ "$any_read_error" -eq 1 ]; then
+      [ -n "$nf_error" ] && guard_error_banner "$nf_error" 'this turn end is permitted fail-open; the lane state is unknown.'
+      order_error_banner_if_broken 'this turn end is permitted fail-open; the order-accounting state is unknown.'
+      signal_read_errors
+      log_decision allowed_guard_error "$(read_error_reason)"
+    else
+      mark_healthy
+      log_decision allowed_needs_firstmate_empty 'lane empty, supervision healthy'
+    fi
     exit 0
   fi
 fi
@@ -903,9 +1146,12 @@ afk=0
 x_mode=0
 [ -f "$CONFIG/x-mode.env" ] && x_mode=1
 block_reason=''
+add_block_reason() {  # <token>
+  if [ -z "$block_reason" ]; then block_reason=$1; else block_reason="$block_reason+$1"; fi
+}
 
 if [ "$blind" -eq 1 ]; then
-  block_reason='watcher-down'
+  add_block_reason watcher-down
   REASON=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --harness "$HARNESS" --afk "$afk" --x-mode "$x_mode" --repair-line 2>/dev/null \
     || printf '%s\n' 'tasks in flight, no live watcher - resume supervision according to the session-start operating block before ending the turn')
   {
@@ -930,14 +1176,8 @@ if [ "$blind" -eq 1 ]; then
   } >&2
 fi
 
-nf_blocking=0
-if [ "$nf" -gt 0 ] && [ "$nf_gate" = on ]; then
-  nf_blocking=1
-  if [ -z "$block_reason" ]; then
-    block_reason=unattended-needs-firstmate
-  else
-    block_reason="$block_reason+unattended-needs-firstmate"
-  fi
+if [ "$nf_blocking" -eq 1 ]; then
+  add_block_reason unattended-needs-firstmate
   {
     printf '●%s\n' "$rule"
     printf '●  TURN WOULD END WITH FINISHED WORK UNATTENDED\n'
@@ -960,23 +1200,62 @@ if [ "$nf" -gt 0 ] && [ "$nf_gate" = on ]; then
   } >&2
 fi
 
-# A lane-read failure alongside a watcher block is not a permit, but it must still be
-# loud and still raise the durable signal: the watcher repair below would otherwise hide
-# a dead gate behind a healthy-looking block.
-if [ -n "$nf_error" ] && [ "$nf_gate" = on ]; then
-  guard_error_banner "$nf_error" 'this turn end is blocked for the watcher; the lane state is unknown.'
-  signal_guard_error_bug "$nf_error" 'needs_firstmate lane read failed on the turn-end path'
+# The third block reason (ORD-260 S2): captain orders past the accounting grace with no live
+# owner, no machine-checkable hold, and no board-confirmed decision. Re-running the audit is
+# not discharge; only a real accounting act followed by a fresh audit clears an order.
+if [ "$order_blocking" -eq 1 ]; then
+  add_block_reason unaccounted-orders
+  {
+    printf '●%s\n' "$rule"
+    printf '●  TURN WOULD END WITH CAPTAIN ORDERS UNACCOUNTED\n'
+    printf '●  %s captain order(s) are past the accounting grace with no live owner, no\n' "$orders"
+    printf '●  machine-checkable hold, and no board-confirmed decision:\n'
+    printf '%s\n' "$order_ids" | head -n "$SHOW_IDS" | sed 's/^/●    /'
+    [ "$orders" -gt "$SHOW_IDS" ] && printf '●    ... and %s more\n' "$((orders - SHOW_IDS))"
+    printf '●  RE-RUNNING THE AUDIT ALONE DOES NOT SATISFY THIS CONDITION. An order leaves\n'
+    printf '●  this list only when it is genuinely accounted - linked to live work, queued\n'
+    printf '●  with a recorded reason and blocker, held on a machine-checkable condition,\n'
+    printf '●  parked or decided with a board-confirmed receipt, or completed or rejected\n'
+    printf '●  with evidence - and a fresh audit then records it:\n'
+    printf '●    bin/fm-order.sh show <id> --history            why this order is unaccounted\n'
+    printf '●    bin/fm-order.sh park <id>... --captain-ack <r> captain-parked batch (one ack)\n'
+    printf '●    bin/fm-order.sh rollup <lead> --absorb <id>... fold a saga into one thread\n'
+    printf '●    bin/fm-order.sh audit                          re-evaluate accounting now\n'
+    printf '●%s\n' "$rule"
+  } >&2
+fi
+
+# A read failure alongside a block is not a permit, but it must still be loud and still raise
+# the durable signal on each broken axis: the block below would otherwise hide a dead gate
+# behind a healthy-looking block. A stale order file is logged only, never signalled.
+if [ "$nf_gate" = on ]; then
+  if [ -n "$nf_error" ]; then
+    guard_error_banner "$nf_error" 'this turn end is blocked; the lane state is unknown.'
+    signal_guard_error_bug "$nf_error" 'needs_firstmate lane read failed on the turn-end path'
+  fi
+  case "$order_error" in
+    ''|order-audit-stale) : ;;
+    *)
+      order_error_banner "$order_error" 'this turn end is blocked; the order-accounting state is unknown.'
+      signal_order_audit_anomaly "$order_error"
+      ;;
+  esac
 fi
 
 # Record the id set this block stands on, so the loop-guarded second attempt can tell real
-# progress from an unchanged pile. A watcher-only block records an empty set.
-if [ "$nf_blocking" -eq 1 ]; then
-  printf '%s\n' "$nf_ids" > "$BLOCK_IDS_FILE" 2>/dev/null || true
+# progress from an unchanged pile. A watcher-only block records an empty set; a work block
+# records the combined crew+order id set.
+if [ "$nf_blocking" -eq 1 ] || [ "$order_blocking" -eq 1 ]; then
+  printf '%s\n' "$combined_ids" > "$BLOCK_IDS_FILE" 2>/dev/null || true
 else
   : > "$BLOCK_IDS_FILE" 2>/dev/null || true
 fi
+# Decision label precedence: needs_firstmate, then unaccounted orders, then watcher-only. The
+# block_reason string still names every axis that fired.
 if [ "$nf_blocking" -eq 1 ]; then
   log_decision blocked_needs_firstmate "$block_reason"
+elif [ "$order_blocking" -eq 1 ]; then
+  log_decision blocked_unaccounted_orders "$block_reason"
 else
   log_decision blocked_watcher_down "$block_reason"
 fi

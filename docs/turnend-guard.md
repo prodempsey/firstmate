@@ -31,6 +31,25 @@ Gating on all actionable items would make the guard a flood-wedge liability the 
 The acceptance metric is captain-set and binary: **zero permitted turn ends while unattended Needs FirstMate work exists.**
 The decision log below is what makes that metric measurable.
 
+## Gap Closed: captain orders unaccounted past grace
+
+The guard blocks on a third, independent condition (ORD-260 slice S2): **the deterministic order-audit file reports unaccounted orders past grace.**
+
+Captain orders had the same asymmetry the finished-work gate closed: an order dispatched and then orphaned - the crew died, or it finished without ever closing the order - was surfaced by banners and compelled by nothing, so a session could end cleanly leaving captain requests silently dropped (`data/davy-jones-scout-s1/report.md` section 0).
+The gate reads `state/.order-audit-last.json`, the deterministic product `fm-order.sh audit` writes (slice S1, which evaluates the ACCOUNTED predicate over every non-terminal order and accounts every order younger than its grace via the `fresh` branch).
+So the file's `unaccounted` count is exactly `unaccounted_orders_past_grace`, and `unaccounted > 0` blocks the turn end exactly as the `needs_firstmate` lane does.
+This is a **cheap file read on the turn-end path, never a re-enumeration** of the inbox; the sweep cost stays a single small `jq` over a bounded file.
+
+The gate demands **accounting, not completion**, which is what makes it flood-proof: an order is discharged by linking live work, queuing it with a recorded reason and blocker, a machine-checkable hold, a board-confirmed park or decision, or a terminal outcome with evidence - all cheap, all legitimate - so even a hundred orders can be honestly accounted in bounded time, and a backfill flood gets the `fm-order.sh park --captain-ack` batch verb (one captain ack accounts the batch).
+Re-running the audit is **not** discharge: the predicate is over the orders, so an order leaves the list only when a real accounting act is followed by a fresh `fm-order.sh audit`.
+
+The read fails open, inheriting the guard's discipline:
+
+- **absent** file - the audit is not wired in this home (S2 can ship ahead of the refresh cadence); the predicate does not fire, silently, and files no anomaly.
+- **stale** (older than the audit's own `grace_seconds`, or `FM_TURNEND_ORDER_AUDIT_MAX_AGE`) - a not-refreshed file is a cadence gap, not a breakage: the gate fails open, records `order-audit-stale` in the decision log, and files **no** bug, so an unwired refresh cadence can never reopen the bug-per-occurrence spam class.
+- **unreadable, malformed, or count-mismatched** - the writer produced an untrustworthy file: the gate fails open, prints a loud banner, and raises **one coalesced anomaly** (the same fail-open-with-coalesced-anomaly discipline the guard-error path uses).
+- **present, parseable, fresh** - the gate enforces.
+
 ## Shared Predicate
 
 The guard first scopes itself to the real primary home, and it identifies that home **positively**, from what a firstmate home is.
@@ -49,8 +68,8 @@ The linked-worktree exemption is also FAIL-CLOSED and git-binary-independent: a 
 This closes the fail-OPEN gap the git-based check alone carried - a transient `git rev-parse` failure under concurrent fan-in left `GIT_TOP` empty, skipped the exclusion, and let a crew worktree run the primary sweep and fail open, a source of ORD-231's guard-error spam (`data/turnend-failopen-x6/report.md` section 6.5); a genuinely marked secondmate home is still force-included ahead of this check.
 The same fail-armed rule governs the lock: only a provably foreign live holder stands the guard down, while an absent, stale, or unreadable lock leaves it armed, so an unreadable lock can never become a second silent way for the gate not to exist.
 
-For an in-scope primary home it evaluates two independent conditions, and blocks when either holds.
-It exits silently when neither does, so the healthy path stays completely quiet.
+For an in-scope primary home it evaluates three independent conditions, and blocks when any holds.
+It exits silently when none does, so the healthy path stays completely quiet.
 
 **Supervision continuity is off.**
 It counts in-flight work from `state/*.meta`.
@@ -75,6 +94,11 @@ It deliberately does NOT read `state/.triage-duty-last.json`, the duty pass's vo
 A non-empty lane blocks, whether or not any task is in flight and whether or not the watcher is healthy.
 The sweep's cost is bounded by the number of live tasks, so the turn-end path stays proportional to the fleet, never to any audit backlog.
 When it blocks, the message lists the unattended item ids (bounded) and states plainly that re-arming the watcher does not satisfy the condition.
+
+**Captain orders are unaccounted past grace.**
+It reads `state/.order-audit-last.json` - the deterministic product of `fm-order.sh audit` - as a cheap bounded `jq`, never a re-enumeration, and blocks when that file reports `unaccounted > 0`.
+The full contract, including the four fail-open outcomes (absent, stale, corrupt, fresh) and why the gate demands accounting rather than completion, is in "Gap Closed: captain orders unaccounted past grace" above.
+When it blocks, the message lists the unaccounted order ids (bounded) and states that re-running the audit alone does not discharge them; both work axes are stood down together by away mode and the duty kill switch, exactly as the `needs_firstmate` lane is.
 
 **What discharges the gate, and what deliberately does not.**
 The gate is discharged only by real lifecycle changes: landing the work and tearing the task down (its meta/status leave `state/` - this covers merged ships, scout reports durably captured then torn down, and safe returns); the crew's status moving off a terminal verb (a steer to `paused:`, a `resolved:` follow-up after an answered decision, a relaunch); a genuine terminal disposition - `resolved` or `rejected` recorded with valid lineage against the item's current evidence; or a captain decision verifiably transferred to the captain's still-visible Needs You column - a `captain_batch` outcome whose hand-off is confirmed by the fingerprint-bound receipt `bin/fm-nf-ack.sh --to-captain` writes only after the Bridge reads the card back.
@@ -101,7 +125,7 @@ Both stand-downs are logged as their own decisions, never as compliant permits.
 
 ## Decision Log
 
-Every primary turn-end evaluation - permitted or blocked - appends one JSON line to `state/.turnend-guard.log`: timestamp, watcher status, normalized supervision health and reason, supervision harness, in-flight count, `needs_firstmate` count, a bounded item-id digest, the `nf_gate` state, the read-error component (`nf_error`), the decision, the reason, whether loop protection was active, and caller identity (`fm_root`, `state_dir`, `cwd`, `hook_source`, `host`, `pid`) so any decision - a guard_error especially - is traceable to its originating process (ORD-231).
+Every primary turn-end evaluation - permitted or blocked - appends one JSON line to `state/.turnend-guard.log`: timestamp, watcher status, normalized supervision health and reason, supervision harness, in-flight count, `needs_firstmate` count, a bounded item-id digest, the `nf_gate` state, the read-error component (`nf_error`), the unaccounted-order count (`orders`) with its bounded digest (`order_items`), the order read-error (`order_error`) and the audit file's age (`order_audit_age`, null when the file is absent), the decision, the reason, whether loop protection was active, and caller identity (`fm_root`, `state_dir`, `cwd`, `hook_source`, `host`, `pid`) so any decision - a guard_error especially - is traceable to its originating process (ORD-231).
 The log carries ids, counts, and decisions only - never transcript content.
 It is best-effort (a log that cannot be written never changes the decision or wedges the turn) and size-capped (`FM_TURNEND_LOG_MAX`, default 2000 lines, trimmed to half when exceeded).
 `FM_TURNEND_LOG` overrides the path.
@@ -120,21 +144,22 @@ The decision taxonomy (outcome names per ORD-060), and what counts toward the ac
 
 - `allowed_needs_firstmate_empty` - the lane was genuinely empty and the watcher healthy. Compliant.
 - `allowed_after_valid_progress` - a loop-guarded stop after real progress: the id set recorded at the block (`state/.turnend-guard-block-ids`) actually shrank because work was discharged. Compliant.
-- `blocked_needs_firstmate` - refused (exit 2) with unattended work named; the reason records when the watcher was down too.
+- `blocked_needs_firstmate` - refused (exit 2) with unattended work named; the reason records when the watcher was down or orders were unaccounted too.
+- `blocked_unaccounted_orders` - refused (exit 2) for unaccounted captain orders when no unattended crew work also blocked (needs_firstmate takes the decision label when both fire); the reason still names every axis.
 - `blocked_watcher_down` - refused (exit 2) for the watcher alone.
-- `allowed_loop_protection_without_progress` - permitted ONLY because hook recursion protection forbids a second block in one turn; the unattended set did not shrink. NOT a compliant permit.
+- `allowed_loop_protection_without_progress` - permitted ONLY because hook recursion protection forbids a second block in one turn; the unattended crew and unaccounted-order set did not shrink. NOT a compliant permit. Every no-progress stand-down also raises ONE coalesced anomaly (fingerprint `turnend-standdown-no-progress`, occurrence-counted through the same fleet-wide store as the guard-error signal), so a repeated stand-down is a single durable signal, never a bug per turn - the structural fix for the bug-per-occurrence class (`guard-error-spam-j6`).
 - `allowed_afk_owner` / `allowed_duty_disabled` - permitted because away mode or the kill switch stands the gate down. NOT compliant permits.
 - `allowed_guard_error` - permitted because the guard could not inspect state. NOT a compliant permit.
 
 **The second stop attempt, exactly.**
 The Claude Stop-hook contract forbids blocking when `stop_hook_active=true`: a hook that blocks its own forced continuation recurses, and an agent that cannot make progress would be wedged in an un-endable session.
-So the second stop IS allowed - and the honest record plus a bounded fallback is what prevents "do nothing and exit" from being free: the permit is logged as `allowed_loop_protection_without_progress` (never compliant), and the guard queues one durable `check` wake (`turnend-guard` key, deduped to one pending record) through the same `state/.wake-queue` every turn drains FIRST, so the unresolved items are forced to the front of the next primary turn.
+So the second stop IS allowed - and the honest record plus a bounded fallback is what prevents "do nothing and exit" from being free: the permit is logged as `allowed_loop_protection_without_progress` (never compliant), one coalesced `turnend-standdown-no-progress` anomaly is filed, and the guard queues one durable `check` wake (`turnend-guard` key, deduped to one pending record) naming the unresolved crew signals and unaccounted orders through the same `state/.wake-queue` every turn drains FIRST, so the unresolved items are forced to the front of the next primary turn.
 The unchanged unattended item does remain after the turn ends - that is the documented, bounded limitation of a non-recursive hook - but it remains VISIBLY: counted in the log, queued as the next turn's first work, and re-blocked at that turn's first stop attempt.
 
 ## Anti-Evasion Metrics
 
 `bin/fm-turnend-metrics.sh [--json]` is the read-only reporter over the decision log and the live lane.
-Cumulative panel: every decision outcome counted by name, plus `permits_with_unattended_work` - permitted turn ends recorded while the lane counted more than zero, the direct complement of the acceptance metric.
+Cumulative panel: every decision outcome counted by name (including `blocked_unaccounted_orders`), plus `permits_with_unattended_work` - permitted turn ends recorded while the `needs_firstmate` lane OR the unaccounted-order count was more than zero, the direct complement of the acceptance metric.
 Live panel: `unattended` (items holding the gate now), `paper_parked` (items whose terminal signal remains while a non-discharging disposition sits on them - the evasion signature: holds, successors, unconfirmed captain batches, bare claims), and `discharged_pending_teardown` (genuinely dispositioned items whose signal awaits normal closeout).
 A drift of `paper_parked` upward while blocks go down is the gate being evaded, not obeyed - watch for another eight-holds-in-137-seconds burst.
 
@@ -254,5 +279,6 @@ No Herdr command was issued and no fleet state was touched; the experiment wrote
 ## Tests
 
 `tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping in both a git-checkout home and a non-git rebaselined home (including a secondmate's own home being guarded like the main primary while its child worktrees stay exempt), the linked-worktree exemption under a non-empty lane, session-lock ownership (armed when absent, stale, or ours; inert and non-mutating under a live foreign holder), `FM_HOME` and `FM_STATE_OVERRIDE` precedence, Pi logical-run latch behavior for no-tool and multi-tool runs, fail-open behavior without `jq`, tracked hook registration for all five harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
+It also covers the third predicate (ORD-260 S2): blocking on unaccounted captain orders read from the audit file, the four fail-open outcomes (absent is silent, stale fails open without a bug, corrupt fails open with one coalesced anomaly, fresh enforces), the combined crew-plus-order block and progress accounting under loop protection, the away-mode stand-down, and the coalesced no-progress stand-down anomaly - all hermetic, with a sandboxed coalesce store and bug CLI so the live captain ledger is never touched.
 The default behavior suite does not invoke live language-model harnesses.
 `FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh` opts into the isolated interactive Pi regression recorded above.

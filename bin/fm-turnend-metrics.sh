@@ -51,6 +51,7 @@ CUM=$(jq -Rn '
   | def n($d): [$rows[] | select(.decision == $d)] | length;
   {evaluations: ($rows | length),
    blocked_needs_firstmate: n("blocked_needs_firstmate"),
+   blocked_unaccounted_orders: n("blocked_unaccounted_orders"),
    blocked_watcher_down: n("blocked_watcher_down"),
    allowed_needs_firstmate_empty: n("allowed_needs_firstmate_empty"),
    allowed_after_valid_progress: n("allowed_after_valid_progress"),
@@ -59,10 +60,11 @@ CUM=$(jq -Rn '
    allowed_duty_disabled: n("allowed_duty_disabled"),
    allowed_afk_owner: n("allowed_afk_owner"),
    permits_with_unattended_work:
-     ([$rows[] | select((.decision | startswith("allowed")) and ((.needs_firstmate // 0) > 0))]
+     ([$rows[] | select((.decision | startswith("allowed"))
+                        and ((((.needs_firstmate // 0) + (.orders // 0))) > 0))]
       | length)}
 ' < "$LOG" 2>/dev/null) || CUM=''
-[ -n "$CUM" ] || CUM='{"evaluations":0,"blocked_needs_firstmate":0,"blocked_watcher_down":0,"allowed_needs_firstmate_empty":0,"allowed_after_valid_progress":0,"allowed_loop_protection_without_progress":0,"allowed_guard_error":0,"allowed_duty_disabled":0,"allowed_afk_owner":0,"permits_with_unattended_work":0}'
+[ -n "$CUM" ] || CUM='{"evaluations":0,"blocked_needs_firstmate":0,"blocked_unaccounted_orders":0,"blocked_watcher_down":0,"allowed_needs_firstmate_empty":0,"allowed_after_valid_progress":0,"allowed_loop_protection_without_progress":0,"allowed_guard_error":0,"allowed_duty_disabled":0,"allowed_afk_owner":0,"permits_with_unattended_work":0}'
 
 # --- live panel, classified from source ---------------------------------------
 live_unattended=0
@@ -120,6 +122,7 @@ else
     "cumulative (decision log):",
     ("  evaluations:                      " + (.cumulative.evaluations | tostring)),
     ("  blocked (needs_firstmate):        " + (.cumulative.blocked_needs_firstmate | tostring)),
+    ("  blocked (unaccounted orders):     " + (.cumulative.blocked_unaccounted_orders | tostring)),
     ("  blocked (watcher only):           " + (.cumulative.blocked_watcher_down | tostring)),
     ("  allowed: lane empty:              " + (.cumulative.allowed_needs_firstmate_empty | tostring)),
     ("  allowed: after valid progress:    " + (.cumulative.allowed_after_valid_progress | tostring)),
