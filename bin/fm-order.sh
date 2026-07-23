@@ -1101,16 +1101,15 @@ case "$VERB" in
     # linked work just finished). The block header names the two other accounting acts - roll a
     # saga's threads into one lead, or re-queue with a reason - for when the order is not simply
     # done. --evidence, when the caller passes it (a PR URL, a report path, the local trunk),
-    # fills in --link so the printed command is copy-paste ready.
+    # fills in --link so the printed command is copy-paste ready. The evidence is a real value
+    # that can contain whitespace, an apostrophe (a valid path component), or a shell
+    # metacharacter, so it is shell-quoted with printf %q - never a naive single-quote wrap,
+    # which broke on evidence like "it's local main" (unbalanced quote) and could even turn the
+    # advertised command into shell expansion. %q leaves a clean token (a URL, a SHA, a
+    # plain path) unquoted and escapes only what actually needs it, so the printed line always
+    # parses and delivers the exact evidence as one argument.
     LINK_ARG='<evidence>'
-    if [ -n "$EVIDENCE" ]; then
-      # Single-quote for display when the evidence carries whitespace (e.g. "local main"),
-      # so the printed command stays copy-paste correct rather than splitting into two args.
-      case "$EVIDENCE" in
-        *[[:space:]]*) LINK_ARG="'$EVIDENCE'" ;;
-        *) LINK_ARG=$EVIDENCE ;;
-      esac
-    fi
+    [ -n "$EVIDENCE" ] && printf -v LINK_ARG '%q' "$EVIDENCE"
     RULE='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
     {
       printf '●%s\n' "$RULE"

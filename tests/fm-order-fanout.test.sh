@@ -18,6 +18,15 @@ set -u
 
 command -v jq >/dev/null 2>&1 || { echo "ok - fm-order-fanout: skipped (no jq)"; exit 0; }
 
+# fm-order.sh write verbs (add/dispatch/complete/fanout) are primary-only, and firstmate
+# development tasks run inside a disposable crewmate worktree whose .fm-crew-role marker makes
+# the role resolver report "crewmate". Apply the repository's sanctioned audited override here
+# so this suite is self-running in that environment; a clean CI checkout has no marker and is
+# already primary, so the override is a harmless no-op there. Every fixture write and closeout
+# subprocess in this file inherits it.
+export FM_ROLE_OVERRIDE=primary
+export FM_ROLE_OVERRIDE_REASON="ORD-260 S3 fan-out test fixtures inside a disposable worktree"
+
 # shellcheck disable=SC2153 # ROOT is provided by tests/lib.sh.
 ORDER="$ROOT/bin/fm-order.sh"
 TMP_ROOT=$(fm_test_tmproot fm-order-fanout)
@@ -114,17 +123,45 @@ JSON=$(order fanout shared-task-e6 --json 2>/dev/null)
   || fail "fanout --json did not list both linked orders sorted by id"
 pass "fanout --json emits schema, task id, count, and the sorted linked orders"
 
-# --- A7: --evidence makes the printed closing command copy-paste ready, and quotes spaces ---
+# --- A7: the printed closing command is ALWAYS a valid shell command that delivers the exact
+# evidence as one argument - a clean token stays readable, and whitespace, an apostrophe, or a
+# shell metacharacter is shell-quoted, never left to break the command or (worse) expand.
+# This is the qa-dj-s3-q103 regression: a naive single-quote wrap rendered "it's local main"
+# as an unbalanced quote, so the advertised close command did not parse. ---
 fresh_home a7
 order add "Ship it." >/dev/null
 order dispatch ORD-001 --task evi-task-f7 >/dev/null
+# a clean token (URL/SHA/plain path) is printed unquoted, so the command stays readable.
 order fanout evi-task-f7 --evidence "https://github.com/o/r/pull/9" --no-audit 2>&1 \
   | grep -F 'complete ORD-001 --link https://github.com/o/r/pull/9' >/dev/null \
-  || fail "fanout did not fill --evidence into the printed closing command"
-order fanout evi-task-f7 --evidence "local main" --no-audit 2>&1 \
-  | grep -F "complete ORD-001 --link 'local main'" >/dev/null \
-  || fail "fanout did not single-quote whitespace-bearing evidence in the printed command"
-pass "fanout fills --evidence into the closing command and quotes evidence with whitespace"
+  || fail "fanout did not print a clean evidence token unquoted in the closing command"
+# render_link extracts the evidence portion of the printed close command for <evidence>.
+render_link() {  # <evidence> -> the "complete ... --link X" tail as printed
+  order fanout evi-task-f7 --evidence "$1" --no-audit 2>&1 \
+    | grep -oE 'complete ORD-001 --link .*$'
+}
+# The single-quoted cases are literal metacharacter test data on purpose - the whole point is
+# that fanout must NOT let them expand - so SC2016 (no expansion in single quotes) is expected.
+# shellcheck disable=SC2016
+for ev in \
+  "local main" \
+  "it's local main" \
+  "data/it's a report/report.md" \
+  'oops; rm -rf /' \
+  'has$var and `backticks`' \
+  "quote'and\$meta;chars"; do
+  line=$(render_link "$ev")
+  [ -n "$line" ] || fail "fanout printed no closing command for evidence [$ev]"
+  # The printed command must PARSE as valid shell...
+  if ! bash -n <<<"$line" 2>/dev/null; then
+    fail "the printed closing command does not parse for evidence [$ev]: $line"
+  fi
+  # ...and deliver the exact evidence as a single argument, with no expansion.
+  got=$(eval "set -- ${line#complete ORD-001 --link }; printf '%s' \"\$1\"")
+  [ "$got" = "$ev" ] \
+    || fail "the printed closing command did not deliver the exact evidence for [$ev]: got [$got]"
+done
+pass "the printed closing command always parses and delivers the exact evidence, through whitespace, apostrophes, and shell metacharacters"
 
 # --- A8: fanout refreshes the order audit, so the gate has current truth (unless --no-audit) ---
 fresh_home a8
