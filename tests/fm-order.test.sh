@@ -468,7 +468,8 @@ OLD=2026-01-01T00:00:00Z   # old enough to be well past any grace
   "live owner" "no owner" "queued good" "queued no reason" "queued no blocker" \
   "held future" "held past" "held order live" "held order fired" "held task" \
   "decision" "received stale" "blocker target" >/dev/null 2>&1
-# ORD-001 dispatched with an owner and linked work; no control plane -> live_owner_unverified.
+# ORD-001 dispatched with an owner and linked work; no control plane means liveness is
+# unverifiable, so it FAILS CLOSED to unaccounted (paperwork is never proof of live work).
 "$ORDER" dispatch ORD-001 --task task-live >/dev/null
 "$ORDER" claim ORD-001 --owner crew-live >/dev/null
 # ORD-002 dispatched but never claimed -> unaccounted (no owner, no live task).
@@ -487,7 +488,7 @@ OLD=2026-01-01T00:00:00Z   # old enough to be well past any grace
 "$ORDER" hold ORD-008 --reason r --review-after "order:ORD-012:terminal" >/dev/null
 "$ORDER" hold ORD-009 --reason r --review-after "order:ORD-013:terminal" >/dev/null
 # ORD-010 held on a task terminal event: machine-checkable, but with no control plane reachable
-# it cannot be evaluated here -> held_task_event_unverified (accounted, but flagged unverified).
+# it cannot be evaluated, so it FAILS CLOSED to unaccounted rather than assume it has not fired.
 "$ORDER" hold ORD-010 --reason r --review-after "task:some-task-x9:terminal" >/dev/null
 # ORD-011 captain_decision with no board receipt -> unaccounted.
 "$ORDER" decision ORD-011 --reason "captain must pick A or B" >/dev/null
@@ -506,7 +507,11 @@ audit_field() {  # <order-id> <jq-field>
 # With no control plane, the audit records that fact rather than silently pretending to verify.
 [ "$(FM_STATE_OVERRIDE="$ACC_STATE" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit --json | jq -r '.control_plane.available')" = false ] \
   || fail "the audit claimed a control plane was reachable when none was"
-[ "$(audit_field ORD-001 basis)" = live_owner_unverified ] || fail "a dispatched order without a reachable control plane was not flagged live_owner_unverified"
+# The live-work and task-terminal-hold branches require control-plane truth: with none
+# reachable they fail closed to unaccounted rather than trust ledger paperwork.
+[ "$(audit_field ORD-001 accounted)" = false ] || fail "a dispatched order was accounted from paperwork alone with no control plane"
+[ "$(audit_field ORD-001 unaccounted_reason)" = "control plane unavailable; linked task state unverified" ] \
+  || fail "an unverifiable dispatched order did not name the control-plane gap"
 [ "$(audit_field ORD-002 accounted)" = false ] || fail "a dispatched order with no owner and no live task was accounted"
 [ "$(audit_field ORD-003 basis)" = queued_with_reason_and_blocker ] || fail "a queued order with a reason and a blocker was not accounted"
 [ "$(audit_field ORD-004 accounted)" = false ] || fail "a queued order with no reason was accounted"
@@ -516,10 +521,12 @@ audit_field() {  # <order-id> <jq-field>
 [ "$(audit_field ORD-007 accounted)" = false ] || fail "a hold whose review date has passed was accounted"
 [ "$(audit_field ORD-008 basis)" = held_event_pending ] || fail "a hold on a live order's terminal event was not accounted"
 [ "$(audit_field ORD-009 accounted)" = false ] || fail "a hold whose order-terminal event has fired was still accounted"
-[ "$(audit_field ORD-010 basis)" = held_task_event_unverified ] || fail "a task-terminal hold with no control plane was not flagged unverified"
+[ "$(audit_field ORD-010 accounted)" = false ] || fail "a task-terminal hold with no control plane was accounted unverified"
+[ "$(audit_field ORD-010 unaccounted_reason)" = "control plane unavailable; task-terminal hold unverified" ] \
+  || fail "an unverifiable task-terminal hold did not name the control-plane gap"
 [ "$(audit_field ORD-011 accounted)" = false ] || fail "a captain_decision with no board receipt was accounted"
 [ "$(audit_field ORD-012 accounted)" = false ] || fail "a received order past grace was accounted"
-pass "ACCOUNTED evaluates every branch with no control plane: fresh/unverified-live/queued/held/decision"
+pass "ACCOUNTED with no control plane accounts only what it can verify: fresh/queued/held-by-date/order-event, and fails closed on unverifiable live-work and task holds"
 
 # The blocker target ORD-013 completed -> terminal -> excluded from the audit entirely.
 [ "$(audit_field ORD-013 accounted)" = "-" ] \
@@ -554,7 +561,9 @@ AF=$(new_inbox auditfile)
 export FM_ORDERS_PATH="$AF"
 AF_STATE="$TMP_ROOT/auditfile-state"
 "$ORDER" add --received-at "$OLD" "one accounted" "one not" >/dev/null 2>&1
-"$ORDER" dispatch ORD-001 --task t >/dev/null; "$ORDER" claim ORD-001 --owner c >/dev/null
+# Account ORD-001 through a branch that needs no control plane (queued with reason + blocker),
+# so this file-shape test is independent of control-plane availability. ORD-002 stays received.
+"$ORDER" queue ORD-001 --reason "waits on an upstream item" --depends-on ORD-900 >/dev/null
 FM_STATE_OVERRIDE="$AF_STATE" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit >/dev/null
 RESULT="$AF_STATE/.order-audit-last.json"
 [ -f "$RESULT" ] || fail "audit did not write the result file"
@@ -659,7 +668,7 @@ export FM_ORDERS_PATH="$DEC2"
 printf '{"schema":"firstmate/captain-order/v1","order_id":"ORD-001","event":"decision","ts":"2026-01-02T00:00:00Z","received_at":"2026-01-01T00:00:00Z","status":"captain_decision","captain_ack":"park receipt","board_receipt":null,"hold_reason":"different decision needed","updated_at":"2026-01-02T00:00:00Z"}\n' >> "$DEC2"
 D2A=$(FM_STATE_OVERRIDE="$TMP_ROOT/dec2-state" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit --json \
       | jq -r '.orders[] | select(.order_id == "ORD-001") | "\(.accounted) \(.unaccounted_reason)"')
-[ "$D2A" = "false captain decision pending with no board receipt" ] \
+[ "$D2A" = "false captain decision pending with no confirmed board receipt" ] \
   || fail "a captain_decision carrying only a park receipt was accounted: $D2A"
 pass "a park receipt never satisfies a captain decision, and a terminal order cannot be rewritten"
 
@@ -753,3 +762,59 @@ if command -v node >/dev/null 2>&1 && [ -f "$CP_BIN" ] \
 else
   pass "SKIPPED: control-plane task-truth check needs a runnable control plane (node + PGlite store)"
 fi
+
+# === QA round 2 regressions (report qa-dj-s1r2-q96) =====================================
+
+# --- Finding 1 (r2): the predicate fails CLOSED when task truth cannot be read ----------
+# The exact QA reproduction: an old dispatched order with an owner, a linked task that does
+# not exist, and an intentionally unavailable control-plane store. Unknown liveness is not
+# proof of live work, so the order must be unaccounted - never live_owner_unverified.
+FC=$(new_inbox failclosed)
+export FM_ORDERS_PATH="$FC"
+export FM_ORDER_CP_DATA_DIR="$TMP_ROOT/failclosed-no-store"   # a path that is not a store
+"$ORDER" add --received-at "$OLD" "dispatched into the void" >/dev/null 2>&1
+"$ORDER" dispatch ORD-001 --task task-that-does-not-exist >/dev/null
+"$ORDER" claim ORD-001 --owner some-owner >/dev/null
+FCJ=$(FM_STATE_OVERRIDE="$TMP_ROOT/failclosed-state" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit --json)
+[ "$(printf '%s' "$FCJ" | jq -r '.control_plane.available')" = false ] \
+  || fail "the fail-closed test unexpectedly found a reachable control plane"
+FCA=$(printf '%s' "$FCJ" | jq -r '.orders[] | select(.order_id == "ORD-001") | "\(.accounted) \(.basis)"')
+[ "$FCA" = "false unaccounted" ] \
+  || fail "a dispatched order with an owner and a link was accounted with no control plane to verify it: $FCA"
+# And the counts a downstream reader consumes reflect it: not a single order is accounted.
+[ "$(printf '%s' "$FCJ" | jq -r '.accounted')" = 0 ] || fail "the audit counted unverifiable work as accounted"
+[ "$(printf '%s' "$FCJ" | jq -r '.unaccounted')" = 1 ] || fail "the audit did not count the unverifiable order as unaccounted"
+unset FM_ORDER_CP_DATA_DIR
+pass "with no control plane, unverifiable live-work fails closed to unaccounted, boolean and count alike"
+
+# --- Finding 2 (r2): a board receipt must be fingerprint-bound to the current decision ---
+# A bare nonempty board_receipt does NOT account a decision; only a receipt whose stored
+# fingerprint equals the current decision fingerprint (order id + decision text) does, and any
+# change to the decision invalidates it - through the supported `decision` verb and the
+# fingerprint check alike.
+FPB=$(new_inbox fpreceipt)
+export FM_ORDERS_PATH="$FPB"
+US=$(printf '\037')
+# (a) A stale bare-string board receipt with no fingerprint is unaccounted.
+"$ORDER" add "bare receipt" >/dev/null 2>&1
+printf '{"schema":"firstmate/captain-order/v1","order_id":"ORD-001","event":"decision","ts":"2026-01-02T00:00:00Z","received_at":"2026-01-01T00:00:00Z","status":"captain_decision","board_receipt":"receipt-for-decision-A","hold_reason":"decision A","updated_at":"2026-01-02T00:00:00Z"}\n' >> "$FPB"
+BARE=$(FM_STATE_OVERRIDE="$TMP_ROOT/fpb-state" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit --json \
+       | jq -r '.orders[] | select(.order_id == "ORD-001") | .accounted')
+[ "$BARE" = false ] || fail "a captain_decision with a nonempty but unfingerprinted board_receipt was accounted"
+# (b) A receipt whose fingerprint matches the current decision IS accounted.
+FPB2=$(new_inbox fpreceipt2)
+export FM_ORDERS_PATH="$FPB2"
+"$ORDER" add "bound receipt" >/dev/null 2>&1
+jq -cn --arg fp "ORD-001${US}decision A" \
+  '{schema:"firstmate/captain-order/v1",order_id:"ORD-001",event:"decision",ts:"2026-01-02T00:00:00Z",received_at:"2026-01-01T00:00:00Z",status:"captain_decision",board_receipt:"confirmed",board_receipt_fingerprint:$fp,hold_reason:"decision A",updated_at:"2026-01-02T00:00:00Z"}' >> "$FPB2"
+BOUND=$(FM_STATE_OVERRIDE="$TMP_ROOT/fpb2-state" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit --json \
+        | jq -r '.orders[] | select(.order_id == "ORD-001") | "\(.accounted) \(.basis)"')
+[ "$BOUND" = "true decision_receipted" ] || fail "a fingerprint-bound board receipt was not accounted: $BOUND"
+# (c) Changing the decision through the supported verb invalidates the receipt.
+"$ORDER" decision ORD-001 --reason "decision B - a different decision" >/dev/null
+[ "$("$ORDER" show ORD-001 --json | jq -r '.board_receipt')" = null ] \
+  || fail "changing the decision did not clear the carried-forward board receipt"
+CHG=$(FM_STATE_OVERRIDE="$TMP_ROOT/fpb2-state" FM_ORDER_ACCOUNT_GRACE_SECS=0 "$ORDER" audit --json \
+      | jq -r '.orders[] | select(.order_id == "ORD-001") | .accounted')
+[ "$CHG" = false ] || fail "a decision that changed still accounted a receipt bound to the old decision"
+pass "a board receipt accounts a decision only while fingerprint-bound to it; changing the decision invalidates it"

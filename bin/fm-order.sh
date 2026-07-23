@@ -793,11 +793,16 @@ case "$VERB" in
     # is queued with a recorded reason AND a blocker; is held on a machine-checkable
     # condition that has not fired (an ISO date, an order:<id>:terminal event read from the
     # ledger, or a task:<id>:terminal event read from the control plane); or is a
-    # captain_decision carrying a validated board receipt. Anything else past grace is an
-    # anomaly. The result is written to state/.order-audit-last.json - a deterministic script
-    # product, the same pattern as state/.triage-duty-last.json - so a later reader (slice
-    # S2's turn-end gate) does a cheap file read, never a re-enumeration. This verb only READS
-    # the inbox and the control-plane task heads; it takes no writer lock and mutates nothing.
+    # captain_decision carrying a board receipt fingerprint-bound to its current decision.
+    # The predicate FAILS CLOSED: unknown liveness is never proof of live work, so when no
+    # control plane is reachable the live-work and task-terminal-hold branches simply do not
+    # fire, and the order is unaccounted unless another branch (fresh, queued, held-by-date,
+    # order-event, ...) accounts it without needing the control plane. Anything else past
+    # grace is an anomaly. The result is written to state/.order-audit-last.json - a
+    # deterministic script product, the same pattern as state/.triage-duty-last.json - so a
+    # later reader (slice S2's turn-end gate) does a cheap file read, never a re-enumeration.
+    # This verb only READS the inbox and the control-plane task heads; it takes no writer lock
+    # and mutates nothing.
     require_inbox
     JSON=false
     while [ "$#" -gt 0 ]; do
@@ -818,9 +823,9 @@ case "$VERB" in
     # non-terminal order - as linked work, or as a task:<id>:terminal hold condition - is
     # looked up once via `cp task-head`. A task the control plane reports in a non-terminal
     # status is live; terminal, missing, or unreadable is not. When no control plane is
-    # reachable (node/cp absent, or no initialized store), CP_AVAILABLE stays false and the
-    # live-work branch falls back to the ledger heuristic, flagged live_owner_unverified so
-    # the un-checked state is never mistaken for verified liveness. ------------------------
+    # reachable (node/cp absent, or no initialized store), CP_AVAILABLE stays false, no task
+    # is treated as live, and the live-work and task-terminal-hold branches fail closed rather
+    # than accept ledger paperwork as proof of live work. ---------------------------------
     ALL_TASK_IDS=$(jq -r '
       def terminal($s): $s=="completed" or $s=="superseded" or $s=="rejected" or $s=="captain_parked";
       ([ .[] | select(terminal(.status // "received") | not) | (.linked_task_ids // [])[] ]
@@ -878,18 +883,16 @@ case "$VERB" in
         | (review_age($o.received_at; $now_epoch)) as $age
         | if ($age != null and $age < $grace) then {accounted: true, basis: "fresh"}
           # Live-work branch, applied to EVERY non-terminal order regardless of its status.
+          # Satisfied ONLY by control-plane-verified liveness: unknown state is never proof
+          # of a non-terminal state, so when no control plane is reachable this branch cannot
+          # fire and the order falls to its status branch and, ultimately, to unaccounted.
           elif has_live_task($o) then {accounted: true, basis: "live_owner"}
-          # Fallback ONLY when no control plane was reachable: a dispatched order with an
-          # owner and linked work is presumed live, but flagged so it is never mistaken for
-          # a control-plane-verified reading.
-          elif ($cp_available | not) and $s == "dispatched"
-               and (($o.owner // "") != "") and ((linked_tasks($o)) | length > 0)
-            then {accounted: true, basis: "live_owner_unverified"}
           elif $s == "dispatched" then
             (if ((linked_tasks($o)) | length) == 0
              then {accounted: false, basis: "unaccounted", reason: "dispatched with no linked work"}
-             elif (($o.owner // "") == "")
-             then {accounted: false, basis: "unaccounted", reason: "dispatched with no owner and no live linked task"}
+             elif ($cp_available | not)
+             then {accounted: false, basis: "unaccounted",
+                   reason: "control plane unavailable; linked task state unverified"}
              else {accounted: false, basis: "unaccounted", reason: "dispatched but no linked task is live"}
              end)
           # Only `queued` gets the queue-with-a-reason exception (the authority grants it to
@@ -916,10 +919,13 @@ case "$VERB" in
                          else {accounted: true, basis: "held_event_pending"} end)
                     else
                       # task:<id>:terminal - evaluate against the same control-plane truth as
-                      # the live-work branch. Fired when the task is terminal or gone; pending
-                      # while it is live; unverified (still accounted) when no CP was reachable.
+                      # the live-work branch. Pending only while the control plane confirms the
+                      # task is live; fired when it is terminal or gone; and - because unknown
+                      # state is not proof the hold has not fired - unaccounted when no control
+                      # plane is reachable to check it.
                       ($p[1] as $tid
-                       | if ($cp_available | not) then {accounted: true, basis: "held_task_event_unverified"}
+                       | if ($cp_available | not) then {accounted: false, basis: "unaccounted",
+                             reason: "control plane unavailable; task-terminal hold unverified"}
                          elif ($task_live[$tid] == true) then {accounted: true, basis: "held_task_event_pending"}
                          else {accounted: false, basis: "unaccounted",
                                reason: ("held until " + $ra + ", which has fired")} end) end)
@@ -933,12 +939,19 @@ case "$VERB" in
                     end)
                end)
           elif $s == "captain_decision" then
-            # ONLY a validated board receipt accounts a captain decision. A park receipt
-            # (captain_ack) is not a decision receipt and must never substitute for one.
-            (if (($o.board_receipt // "") != "")
-             then {accounted: true, basis: "decision_receipted"}
-             else {accounted: false, basis: "unaccounted",
-                   reason: "captain decision pending with no board receipt"} end)
+            # A captain decision is accounted ONLY by a board receipt that is fingerprint-bound
+            # to THIS decision'"'"'s current state. The fingerprint is deterministic (order id +
+            # the decision text), so a receipt confirmed for one decision cannot satisfy a
+            # different one, and any lifecycle event that changes the decision text invalidates
+            # the old receipt on its own. A bare/absent fingerprint never matches. No slice-S1
+            # writer produces such a receipt (the board-confirmed path is slice S5), so every S1
+            # decision is unaccounted - the binding is enforced now so S5'"'"'s receipt cannot be
+            # accepted stale. captain_ack (a park receipt) is never a decision receipt.
+            (($o.order_id + "" + ($o.hold_reason // "")) as $fp
+             | if (($o.board_receipt // "") != "") and (($o.board_receipt_fingerprint // "") == $fp)
+               then {accounted: true, basis: "decision_receipted"}
+               else {accounted: false, basis: "unaccounted",
+                     reason: "captain decision pending with no confirmed board receipt"} end)
           else
             {accounted: false, basis: "unaccounted", reason: ($s + " past grace with no accounting")}
           end;
@@ -1335,7 +1348,13 @@ ROW=$(printf '%s' "$CURRENT" | jq -c \
   # A queued order records why it waits, so the ACCOUNTED audit can tell queue-with-a-reason
   # (accounting) from queue-into-silence (the paperwork loop). Only stored when given.
   + (if $event == "queue" and $reason != "" then {queue_reason: $reason} else {} end)
-  + (if $event == "decision" then {captain_decision_required: true} else {} end)
+  # Recording (or changing) a captain decision invalidates any board receipt carried in the
+  # fold: a receipt confirmed for an earlier decision must never satisfy a new one. The audit
+  # also rejects a fingerprint mismatch, so this is belt-and-suspenders, but it keeps a stale
+  # receipt from surviving the very event that changes the decision.
+  + (if $event == "decision"
+     then {captain_decision_required: true, board_receipt: null, board_receipt_fingerprint: null}
+     else {} end)
   # A finished order carries its own decision, and stops carrying a live claim.
   + (if $status == "completed" or $status == "superseded" or $status == "rejected"
      then {outcome_type: $status, outcome_link: (if $link == "" then null else $link end),
