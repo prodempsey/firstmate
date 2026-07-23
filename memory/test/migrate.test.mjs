@@ -123,6 +123,27 @@ test('dry-run performs ZERO writes to the canonical registry', async () => {
   }
 });
 
+test('F2 end-to-end: a symlinked-to-secret source is refused; the written artifacts carry no secret', () => {
+  const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'mem-outer-'));
+  scratch.add(outer);
+  fs.writeFileSync(path.join(outer, '.env.production'),
+    '# env\n\n## 2026-07-23 — Credential\n\nDATABASE_URL=postgres://admin:ULTRA_SECRET@db/prod\n');
+  const corpus = mkCorpus({ 'data/keep.txt': 'x' });
+  fs.symlinkSync(path.join(outer, '.env.production'), path.join(corpus, 'data', 'learnings.md'));
+  const out = mkOut();
+
+  const result = runDryRun(corpus, out);
+  assert.equal(result.counts.total, 0, 'no candidate extracted from a refused source');
+  assert.equal(result.refusals.length, 1);
+  assert.match(result.refusals[0].reason, /symlink/i);
+
+  // Neither durable artifact contains the secret.
+  assert.ok(!fs.readFileSync(result.proposalFile, 'utf8').includes('ULTRA_SECRET'), 'proposal file carries no secret');
+  const report = fs.readFileSync(result.reportFile, 'utf8');
+  assert.ok(!report.includes('ULTRA_SECRET'), 'report carries no secret');
+  assert.match(report, /Refused sources/, 'report surfaces the refusal');
+});
+
 test('dry-run works with no registry present at all (corpus-only operation)', () => {
   const corpus = mkCorpus(CORPUS);
   const out = mkOut();

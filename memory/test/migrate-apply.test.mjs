@@ -5,7 +5,7 @@ import path from 'node:path';
 import test, { afterEach } from 'node:test';
 import { registryPaths } from '../lib/paths.mjs';
 import { foldRegistry } from '../lib/registry.mjs';
-import { applyMigration, runDryRun } from '../lib/migrate.mjs';
+import { applyMigration, computeDigest, runDryRun } from '../lib/migrate.mjs';
 import { cleanTracked, tmpRegistry } from './helpers.mjs';
 
 const scratch = new Set();
@@ -176,6 +176,75 @@ test('re-applying the same approved proposal is a no-op (idempotent)', async () 
   assert.ok(second.proposed.every((p) => p.skipped), 'every propose was skipped on re-run');
   assert.ok(second.activated.every((a) => a.skipped), 'every activate was skipped on re-run');
   assert.ok(registryBytes(registry).equals(afterFirst), 'registry bytes unchanged by the idempotent re-apply');
+});
+
+// ---- F1: the approval digest binds the WHOLE canonicalized proposal ----------
+
+// Every candidate/source field one at a time: mutating it while keeping the stored
+// digest and the original approval must be refused with a byte-identical (empty)
+// registry. This proves the digest covers the complete document, not a projection.
+const FIELD_MUTATIONS = [
+  ['summary', (p) => { p.proposals[0].summary += ' TAMPER'; }],
+  ['body', (p) => { p.proposals[0].body += ' TAMPER'; }],
+  ['memoryType', (p) => { p.proposals[0].memoryType = p.proposals[0].memoryType === 'factual' ? 'procedural' : 'factual'; }],
+  ['scope', (p) => { p.proposals[0].scope = 'project'; }],
+  ['projects', (p) => { p.proposals[0].projects = ['evil']; }],
+  ['taskKinds', (p) => { p.proposals[0].taskKinds = ['evil']; }],
+  ['keywords', (p) => { p.proposals[0].keywords = ['evil']; }],
+  ['aliases', (p) => { p.proposals[0].aliases = ['evil']; }],
+  ['entities', (p) => { p.proposals[0].entities = ['evil']; }],
+  ['commands', (p) => { p.proposals[0].commands = ['evil']; }],
+  ['failureModes', (p) => { p.proposals[0].failureModes = ['evil']; }],
+  ['relatedTerms', (p) => { p.proposals[0].relatedTerms = ['evil']; }],
+  ['confidence', (p) => { p.proposals[0].confidence = 'guarded'; }],
+  ['validFrom', (p) => { p.proposals[0].validFrom = '2000-01-01T00:00:00.000Z'; }],
+  ['disposition', (p) => { p.proposals[0].disposition = 'active'; }],
+  ['dispositionReason', (p) => { p.proposals[0].dispositionReason = 'forged reason'; }],
+  ['supersededBy', (p) => { p.proposals[0].supersededBy = 'MEM-9999'; }],
+  ['activationNominee', (p) => { p.proposals[0].activationNominee = true; }],
+  ['contentDigest', (p) => { p.proposals[0].contentDigest = '0'.repeat(64); }],
+  ['proposalId', (p) => { p.proposals[0].proposalId = 'MIG-000000000000'; }],
+  ['provenance.path', (p) => { p.proposals[0].provenance.path = 'data/evil.md'; }],
+  ['provenance.anchor', (p) => { p.proposals[0].provenance.anchor = 'evil-anchor'; }],
+  ['provenance.lineStart', (p) => { p.proposals[0].provenance.lineStart = 999; }],
+  ['evidence', (p) => { p.proposals[0].evidence = [{ type: 'x', ref: 'y' }]; }],
+  ['counts', (p) => { p.counts.total = 999; }],
+  ['source.sha256', (p) => { p.sources.find((s) => s.key === 'learnings').sha256 = 'f'.repeat(64); }],
+  ['source.reason', (p) => { p.sources[0].reason = 'forged'; }]
+];
+
+for (const [name, mutate] of FIELD_MUTATIONS) {
+  test(`F1: mutating candidate/source field '${name}' invalidates the prior approval (no write)`, async () => {
+    const { proposalFile, proposal, digest } = makeProposal();
+    const clone = JSON.parse(JSON.stringify(proposal));
+    mutate(clone);
+    fs.writeFileSync(proposalFile, JSON.stringify(clone, null, 2));
+    const registry = tmpRegistry();
+    await assert.rejects(
+      () => applyMigration(registry, { proposalFile, approvedDigest: digest }),
+      /stored digest does not match its content|does not match this proposal/,
+      `mutation of ${name} must be refused`
+    );
+    assert.equal(registryBytes(registry).length, 0, `${name}: registry must be byte-identical (empty)`);
+  });
+}
+
+test('F1: an internally-inconsistent candidate contentDigest is refused even when re-digested and re-approved', async () => {
+  const { proposalFile, proposal } = makeProposal();
+  const clone = JSON.parse(JSON.stringify(proposal));
+  // Tamper the contentDigest, then RE-COMPUTE the top-level digest so the stored/approved
+  // digest are internally consistent — the whole-doc gate would pass. The dedicated
+  // contentDigest-consistency gate must still catch it.
+  clone.proposals[0].contentDigest = '0'.repeat(64);
+  const rehashed = computeDigest(clone);
+  clone.digest = rehashed;
+  fs.writeFileSync(proposalFile, JSON.stringify(clone, null, 2));
+  const registry = tmpRegistry();
+  await assert.rejects(
+    () => applyMigration(registry, { proposalFile, approvedDigest: rehashed }),
+    /contentDigest is inconsistent with its content/
+  );
+  assert.equal(registryBytes(registry).length, 0);
 });
 
 test('apply with an empty activation set proposes all candidates and activates nothing', async () => {

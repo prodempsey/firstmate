@@ -92,43 +92,28 @@ function proposalIdFor(proposal) {
   return `MIG-${sha256(key).slice(0, 12)}`;
 }
 
-// The digest-stable projection of the whole proposal: everything that determines
-// what the apply path would write, and the full source enumeration (with per-file
-// hashes so a survey-file change also moves the digest). Deliberately EXCLUDES the
-// volatile `generatedAt` stamp, the absolute `corpusRoot`, and provenance line
-// numbers, so the digest depends only on content and is machine-independent.
-function digestBody(proposal) {
-  return {
-    schema: proposal.schema,
-    parserVersion: proposal.parserVersion,
-    toolVersion: proposal.toolVersion,
-    sources: proposal.sources.map((s) => ({
-      key: s.key,
-      policy: s.policy,
-      path: s.path,
-      exists: s.exists,
-      itemCount: s.itemCount,
-      fileCount: s.fileCount ?? null,
-      sha256: s.sha256 ?? null,
-      files: (s.files || []).map((f) => ({ path: f.path, sections: f.sections, sha256: f.sha256 }))
-    })),
-    proposals: proposal.proposals.map((p) => ({
-      proposalId: p.proposalId,
-      disposition: p.disposition,
-      supersededBy: p.supersededBy,
-      activationNominee: p.activationNominee,
-      provenance: { source: p.provenance.source, path: p.provenance.path, anchor: p.provenance.anchor },
-      evidence: p.evidence,
-      // The FULL record content the apply path would write — not the stored
-      // contentDigest — so any tamper to summary/body/metadata moves the digest and
-      // invalidates a prior approval, even if the (stale) contentDigest was not updated.
-      content: recordContent(p)
-    }))
-  };
+// The volatile / non-portable top-level keys excluded from the approval digest: the
+// wall-clock stamp, the absolute corpus root (so the digest is machine-independent),
+// and the self-referential digest field itself.
+const NON_DIGEST_KEYS = new Set(['generatedAt', 'corpusRoot', 'digest']);
+
+// The canonical approval payload: the ENTIRE proposal document minus the volatile
+// keys above. Binding the whole document — every candidate field and every
+// source-review field, not a hand-picked projection — is what makes the approval
+// exact: any tamper to any bound field (including a candidate's stored contentDigest,
+// disposition, provenance, surveyed headings, or a source hash) changes the digest
+// and invalidates a prior approval (QA finding F1).
+function canonicalProposalDoc(proposal) {
+  const out = {};
+  for (const [key, value] of Object.entries(proposal)) {
+    if (NON_DIGEST_KEYS.has(key)) continue;
+    out[key] = value;
+  }
+  return out;
 }
 
 export function computeDigest(proposal) {
-  return sha256(stableJson(digestBody(proposal)));
+  return sha256(stableJson(canonicalProposalDoc(proposal)));
 }
 
 // Build the in-memory proposal object from a corpus root. Pure aside from the corpus
@@ -163,9 +148,15 @@ export function buildProposal(corpusRoot, options = {}) {
   return proposal;
 }
 
-function pad(text, width) {
-  const t = String(text);
-  return t.length >= width ? t : t + ' '.repeat(width - t.length);
+// Flatten every refused path (file sources and glob sources) into one list, so the
+// report and the CLI can surface them prominently. A refused source is never read.
+export function collectRefusals(sources) {
+  const out = [];
+  for (const s of sources || []) {
+    if (s.refused && s.refusedReason) out.push({ path: s.path, reason: s.refusedReason });
+    for (const f of s.refusedFiles || []) out.push({ path: f.path, reason: f.reason });
+  }
+  return out;
 }
 
 // Render the captain-facing migration report. This is the human proposal surface:
@@ -187,12 +178,24 @@ export function renderReport(proposal, options = {}) {
   lines.push('> **Activation is the captain\'s decision** — see "Applying an approved activation set" below.');
   lines.push('');
 
+  const refusals = collectRefusals(proposal.sources);
+  if (refusals.length) {
+    lines.push('## ⚠ Refused sources (not read)');
+    lines.push('');
+    lines.push('These declared corpus paths were REFUSED before any read — a symlink, a path');
+    lines.push('escaping the corpus root, or a secret-class file. Their content was never copied');
+    lines.push('into any candidate. Investigate before trusting the corpus:');
+    lines.push('');
+    for (const r of refusals) lines.push(`- \`${r.path}\` — ${r.reason}`);
+    lines.push('');
+  }
+
   lines.push('## Corpus sources considered');
   lines.push('');
   lines.push(`| Source | Policy | Path | Present | Items | Note |`);
   lines.push(`| --- | --- | --- | --- | --- | --- |`);
   for (const s of proposal.sources) {
-    const present = s.exists ? 'yes' : 'no';
+    const present = s.refused ? 'REFUSED' : (s.exists ? 'yes' : 'no');
     const items = s.policy === 'extract' ? `${s.itemCount} extracted` : `${s.itemCount} surveyed`;
     lines.push(`| ${s.label} (\`${s.key}\`) | ${s.policy} | \`${s.path}\` | ${present} | ${items} | ${s.reason} |`);
   }
@@ -281,13 +284,15 @@ export function runDryRun(corpusRoot, outDir, options = {}) {
   const report = renderReport(proposal, { proposalFile: paths.proposal });
   atomicWriteFile(paths.proposal, `${JSON.stringify(proposal, null, 2)}\n`);
   atomicWriteFile(paths.report, `${report}\n`);
+  const refusals = collectRefusals(proposal.sources);
   return {
     ok: true,
     digest: proposal.digest,
     proposalFile: paths.proposal,
     reportFile: paths.report,
     counts: proposal.counts,
-    sources: proposal.sources.map((s) => ({ key: s.key, policy: s.policy, exists: s.exists, itemCount: s.itemCount }))
+    refusals,
+    sources: proposal.sources.map((s) => ({ key: s.key, policy: s.policy, exists: s.exists, refused: Boolean(s.refused), itemCount: s.itemCount }))
   };
 }
 
@@ -340,6 +345,17 @@ export async function applyMigration(registryDir, options = {}) {
   }
   if (approvedDigest !== recomputed) {
     throw new Error(`--captain-approved digest does not match this proposal (expected ${recomputed})`);
+  }
+
+  // Every candidate's stored contentDigest must equal the hash of its own content.
+  // The whole-document digest above already binds contentDigest, so a lone mutation
+  // is caught there; this is the explicit internal-consistency gate QA asked for, and
+  // it fails closed before any write so an inconsistent artifact is never applied.
+  for (const p of proposal.proposals) {
+    const expected = contentHash(recordContent(p));
+    if (p.contentDigest !== expected) {
+      throw new Error(`proposal candidate ${p.proposalId} contentDigest is inconsistent with its content`);
+    }
   }
 
   const byId = new Map(proposal.proposals.map((p) => [p.proposalId, p]));

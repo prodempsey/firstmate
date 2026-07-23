@@ -300,7 +300,11 @@ export async function main(args, options = {}) {
           console.log(`Report: ${result.reportFile}`);
           console.log(`Digest: ${result.digest}`);
           console.log(`Proposed records: ${result.counts.total}`);
-          for (const s of result.sources) console.log(`  ${s.key} [${s.policy}]: ${s.exists ? `${s.itemCount} item(s)` : 'absent'}`);
+          for (const s of result.sources) console.log(`  ${s.key} [${s.policy}]: ${s.refused ? 'REFUSED (not read)' : (s.exists ? `${s.itemCount} item(s)` : 'absent')}`);
+          if (result.refusals.length) {
+            console.log(`WARNING: ${result.refusals.length} source path(s) refused before reading (symlink / escapes root / secret-class):`);
+            for (const r of result.refusals) console.log(`  REFUSED ${r.path} — ${r.reason}`);
+          }
           console.log('Activation is the captain\'s decision; review the report, then run mem migrate apply --captain-approved <digest>.');
         }
         process.exitCode = 0;

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test, { afterEach } from 'node:test';
-import { CORPUS_SOURCES, enumerateCorpus } from '../lib/migrate-sources.mjs';
+import { CORPUS_SOURCES, enumerateCorpus, isSecretClassName } from '../lib/migrate-sources.mjs';
 
 // Corpus fixtures live in disposable temp dirs; never a real fleet home.
 const corpora = new Set();
@@ -143,4 +143,74 @@ test('a missing corpus yields present-marked-false sources and zero proposals (n
     assert.equal(s.exists, false);
     assert.equal(s.itemCount, 0);
   }
+});
+
+// ---- F2: secret-safe source enumeration -------------------------------------
+
+test('isSecretClassName flags .env-class, key/credential/token files and passes ordinary corpus names', () => {
+  for (const bad of ['.env', '.env.production', '.env.local', 'prod.env', 'app.env',
+    'id_rsa', 'id_ed25519', '.npmrc', '.netrc', '.pgpass', 'credentials',
+    'server.key', 'cert.pem', 'store.p12', 'db-password.txt', 'api_token.json', 'my-secret.yml']) {
+    assert.equal(isSecretClassName(bad), true, `${bad} must be secret-class`);
+  }
+  for (const ok of ['learnings.md', 'captain.md', 'report.md', 'AGENTS.md', 'notes.txt', 'readme.md']) {
+    assert.equal(isSecretClassName(ok), false, `${ok} must not be secret-class`);
+  }
+});
+
+test('F2: a learnings.md symlinked to an .env file OUTSIDE the corpus is refused and never read', () => {
+  const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'mem-outer-'));
+  corpora.add(outer);
+  fs.writeFileSync(path.join(outer, '.env.production'),
+    '# env\n\n## 2026-07-23 — Credential\n\nDATABASE_URL=postgres://admin:ULTRA_SECRET@db/prod\n');
+  const root = mkCorpus({ 'data/keep.txt': 'x' });
+  fs.symlinkSync(path.join(outer, '.env.production'), path.join(root, 'data', 'learnings.md'));
+
+  const { sources, proposals } = enumerateCorpus(root);
+  assert.equal(proposals.length, 0, 'no candidate produced from a symlinked source');
+  const learnings = sources.find((s) => s.key === 'learnings');
+  assert.equal(learnings.refused, true);
+  assert.match(learnings.refusedReason, /symlink/i);
+  assert.equal(learnings.sha256, undefined, 'refused source was never hashed/read');
+  // The secret must appear nowhere in the enumeration output.
+  assert.ok(!JSON.stringify(sources).includes('ULTRA_SECRET'));
+  assert.ok(!JSON.stringify(proposals).includes('ULTRA_SECRET'));
+});
+
+test('F2: a symlinked SURVEY file (report.md -> secret) is refused and recorded, not read', () => {
+  const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'mem-outer-'));
+  corpora.add(outer);
+  fs.writeFileSync(path.join(outer, 'creds'), 'TOKEN=ULTRA_SECRET\n');
+  const root = mkCorpus({ 'data/learnings.md': '# L\n\n## 2026-07-01 — Only\n\nbody\n', 'data/scout-x1/placeholder': 'x' });
+  fs.symlinkSync(path.join(outer, 'creds'), path.join(root, 'data', 'scout-x1', 'report.md'));
+
+  const { sources } = enumerateCorpus(root);
+  const reports = sources.find((s) => s.key === 'reports');
+  assert.equal(reports.refused, true);
+  assert.equal(reports.fileCount, 0, 'the symlinked report was not accepted as a match');
+  assert.ok(reports.refusedFiles.some((f) => /report\.md/.test(f.path)));
+  assert.ok(!JSON.stringify(sources).includes('ULTRA_SECRET'));
+});
+
+test('F2: a symlink whose target ESCAPES the corpus root is refused (containment)', () => {
+  const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'mem-outer-'));
+  corpora.add(outer);
+  fs.writeFileSync(path.join(outer, 'ordinary.md'), '# outside\n\n## 2026-07-01 — Escaped\n\nbody\n');
+  const root = mkCorpus({ 'data/keep.txt': 'x' });
+  // Even a non-secret target is refused: it is a symlink and it leaves the root.
+  fs.symlinkSync(path.join(outer, 'ordinary.md'), path.join(root, 'data', 'learnings.md'));
+  const { sources, proposals } = enumerateCorpus(root);
+  assert.equal(proposals.length, 0);
+  assert.equal(sources.find((s) => s.key === 'learnings').refused, true);
+});
+
+test('F2: a symlinked project directory is refused wholesale', () => {
+  const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'mem-outer-'));
+  corpora.add(outer);
+  const root = mkCorpus({ 'data/learnings.md': '# L\n\n## 2026-07-01 — Only\n\nbody\n' });
+  fs.symlinkSync(outer, path.join(root, 'projects'));
+  const { sources } = enumerateCorpus(root);
+  const agents = sources.find((s) => s.key === 'project-agents');
+  assert.equal(agents.refused, true);
+  assert.match(agents.refusedFiles[0].reason, /symlink/i);
 });

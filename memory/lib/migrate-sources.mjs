@@ -68,6 +68,41 @@ export const CORPUS_SOURCES = [
   }
 ];
 
+// Secret-class filenames that must never be read into a candidate, even when
+// reached through an allowed-looking declared source path. Checked against both the
+// declared path components and the realpath basename of whatever is actually opened.
+export function isSecretClassName(name) {
+  const n = String(name).toLowerCase();
+  if (n === '.env' || /^\.env(\..+)?$/.test(n) || /\.env$/.test(n)) return true;
+  if (/\.(pem|key|p12|pfx|keystore|jks|ppk|asc|gpg)$/.test(n)) return true;
+  if (/(^|[._-])(secret|secrets|credential|credentials|password|passwd|token|apikey)([._-]|$)/.test(n)) return true;
+  return ['.npmrc', '.netrc', '.pgpass', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'credentials'].includes(n);
+}
+
+// Fail-closed path guard for a single corpus file. Given the final component's own
+// lstat (NOT a symlink-following stat), it refuses — before any read — a symlinked
+// source, a secret-class declared component, a non-regular file, a path that resolves
+// outside the corpus root, or a realpath whose basename is secret-class (the disguised
+// symlink-to-.env case). Returns { ok, reason, realPath }.
+function classifyPath(abs, declaredRel, corpusRootReal, lst) {
+  for (const part of declaredRel.split(/[\\/]/)) {
+    if (part && isSecretClassName(part)) return { ok: false, reason: `secret-class path component '${part}'` };
+  }
+  if (lst.isSymbolicLink()) return { ok: false, reason: 'symlinked source refused' };
+  if (!lst.isFile()) return { ok: false, reason: 'not a regular file' };
+  let realPath;
+  try {
+    realPath = fs.realpathSync(abs);
+  } catch {
+    return { ok: false, reason: 'unresolvable realpath' };
+  }
+  if (realPath !== corpusRootReal && !realPath.startsWith(corpusRootReal + path.sep)) {
+    return { ok: false, reason: 'resolves outside the corpus root' };
+  }
+  if (isSecretClassName(path.basename(realPath))) return { ok: false, reason: `secret-class file '${path.basename(realPath)}'` };
+  return { ok: true, realPath };
+}
+
 const STOPWORDS = new Set([
   'the', 'and', 'for', 'with', 'this', 'that', 'then', 'than', 'must', 'not', 'now',
   'does', 'into', 'from', 'have', 'has', 'was', 'are', 'its', 'but', 'all', 'any',
@@ -262,42 +297,81 @@ function firstHeadings(text, cap = 25) {
   return out;
 }
 
-function resolveFileSource(source, corpusRoot) {
-  const abs = path.join(corpusRoot, source.rel);
-  const exists = fs.existsSync(abs) && fs.statSync(abs).isFile();
-  return { abs, rel: source.rel, exists };
+function resolveFileSource(source, corpusRootReal) {
+  const abs = path.join(corpusRootReal, source.rel);
+  let lst;
+  try {
+    lst = fs.lstatSync(abs);
+  } catch {
+    return { abs, rel: source.rel, exists: false };
+  }
+  const guard = classifyPath(abs, source.rel, corpusRootReal, lst);
+  if (!guard.ok) return { abs, rel: source.rel, exists: true, refused: true, reason: guard.reason };
+  return { abs, rel: source.rel, exists: true };
 }
 
 // Resolve a `glob` survey source (dir/*/child): enumerate immediate subdirectories
-// of `dir` that contain `child`.
-function resolveGlobSource(source, corpusRoot) {
-  const baseAbs = path.join(corpusRoot, source.dir);
+// of `dir` that contain `child`, guarding each candidate file. Refused candidates are
+// recorded (never silently dropped) so a symlink-to-secret attempt is surfaced, not
+// hidden. Returns { matches, refused }.
+function resolveGlobSource(source, corpusRootReal) {
+  const baseAbs = path.join(corpusRootReal, source.dir);
   const matches = [];
-  if (fs.existsSync(baseAbs) && fs.statSync(baseAbs).isDirectory()) {
-    for (const entry of fs.readdirSync(baseAbs).sort()) {
-      const childAbs = path.join(baseAbs, entry, source.child);
-      if (fs.existsSync(childAbs) && fs.statSync(childAbs).isFile()) {
-        matches.push({ abs: childAbs, rel: path.join(source.dir, entry, source.child) });
-      }
-    }
+  const refused = [];
+  let baseLst;
+  try {
+    baseLst = fs.lstatSync(baseAbs);
+  } catch {
+    return { matches, refused };
   }
-  return matches;
+  if (baseLst.isSymbolicLink()) {
+    refused.push({ path: source.dir, reason: 'symlinked source directory refused' });
+    return { matches, refused };
+  }
+  if (!baseLst.isDirectory()) return { matches, refused };
+  for (const entry of fs.readdirSync(baseAbs).sort()) {
+    const childRel = path.join(source.dir, entry, source.child);
+    const childAbs = path.join(baseAbs, entry, source.child);
+    let lst;
+    try {
+      lst = fs.lstatSync(childAbs);
+    } catch {
+      continue; // no such child under this subdirectory; not an anomaly
+    }
+    const guard = classifyPath(childAbs, childRel, corpusRootReal, lst);
+    if (!guard.ok) {
+      refused.push({ path: childRel, reason: guard.reason });
+      continue;
+    }
+    matches.push({ abs: childAbs, rel: childRel });
+  }
+  return { matches, refused };
 }
 
 // Enumerate every corpus source under `corpusRoot`, parse the extract sources into
 // proposals, and return { sources, proposals }. `sources` is the full enumeration
-// (extract AND survey) so the report proves the whole corpus was considered.
-// Proposals carry corpus-RELATIVE provenance paths, so the resulting proposal digest
-// is machine-independent (it depends only on content, not on an absolute checkout
-// path). Deterministic: sources are processed in table order and proposals in file
-// order.
+// (extract AND survey), including any REFUSED paths, so the report proves the whole
+// corpus was considered and surfaces secret-class / symlink refusals rather than
+// silently dropping them. A refused source is NEVER read. Proposals carry
+// corpus-RELATIVE provenance paths, so the resulting proposal digest is
+// machine-independent. Deterministic: sources are processed in table order and
+// proposals in file order.
 export function enumerateCorpus(corpusRoot) {
+  // Resolve the corpus root once so per-file containment checks compare against the
+  // real root. A missing root means every child lstat fails and no file is read.
+  let corpusRootReal;
+  try {
+    corpusRootReal = fs.realpathSync(corpusRoot);
+  } catch {
+    corpusRootReal = path.resolve(corpusRoot);
+  }
+
   const sources = [];
   const proposals = [];
 
   for (const source of CORPUS_SOURCES) {
     if (source.kind === 'file') {
-      const resolved = resolveFileSource(source, corpusRoot);
+      const resolved = resolveFileSource(source, corpusRootReal);
       const record = {
         key: source.key,
         policy: source.policy,
@@ -305,10 +379,12 @@ export function enumerateCorpus(corpusRoot) {
         reason: source.reason,
         path: resolved.rel,
         exists: resolved.exists,
+        refused: Boolean(resolved.refused),
+        refusedReason: resolved.reason || null,
         itemCount: 0,
         surveyedHeadings: []
       };
-      if (resolved.exists) {
+      if (resolved.exists && !resolved.refused) {
         const text = fs.readFileSync(resolved.abs, 'utf8');
         record.sha256 = sha256(text);
         if (source.policy === 'extract') {
@@ -323,7 +399,7 @@ export function enumerateCorpus(corpusRoot) {
       }
       sources.push(record);
     } else if (source.kind === 'glob') {
-      const matches = resolveGlobSource(source, corpusRoot);
+      const { matches, refused } = resolveGlobSource(source, corpusRootReal);
       const files = [];
       let itemCount = 0;
       for (const match of matches) {
@@ -339,6 +415,8 @@ export function enumerateCorpus(corpusRoot) {
         reason: source.reason,
         path: `${source.dir}/*/${source.child}`,
         exists: files.length > 0,
+        refused: refused.length > 0,
+        refusedFiles: refused,
         fileCount: files.length,
         itemCount,
         files
