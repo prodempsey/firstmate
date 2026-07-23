@@ -234,6 +234,12 @@ echo "merged $BRANCH into canonical trunk $TRUNK_BRANCH ($before -> $after) in $
 # moment the work lands. It can clear a blocker or resolve a bug before teardown runs.
 "$SCRIPT_DIR/fm-triage-duty.sh" ship-complete --detail "$ID landed on local $TRUNK_BRANCH in $TRUNK_ABS." || true
 
+# Completion fan-out (ORD-260 slice S3): the local merge is this task's only closeout, so
+# surface the non-terminal captain orders still pointing at it with each one's closing
+# command, and refresh the order audit so the turn-end gate refuses quiet until each is
+# completed, rolled up, or re-queued. Non-blocking - the merge has already landed.
+"$SCRIPT_DIR/fm-order.sh" fanout "$ID" --evidence "$after_full" || true
+
 # Post-merge state, reported not repaired: the serving lineage is now behind trunk
 # until it is redeployed, which is the tolerable direction of the invariant.
 "$TRUNK_CHECK" "$NAME" >/dev/null || true

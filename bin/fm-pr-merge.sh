@@ -107,3 +107,9 @@ fi
 # blocker or resolve a bug well before the matching teardown runs. Prompt the triage
 # duty on the merge itself, not only on closeout.
 "$SCRIPT_DIR/fm-triage-duty.sh" ship-complete --detail "$ID landed: $URL" || true
+
+# Completion fan-out (ORD-260 slice S3): a merge is a closeout, so surface the non-terminal
+# captain orders still pointing at this task with each one's closing command, and refresh the
+# order audit so the turn-end gate refuses quiet until each is completed, rolled up, or
+# re-queued. Non-blocking - a fan-out hiccup must never undo a merge that already landed.
+"$SCRIPT_DIR/fm-order.sh" fanout "$ID" --evidence "$URL" || true

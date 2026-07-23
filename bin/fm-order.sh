@@ -23,6 +23,11 @@
 #   fm-order.sh metrics [--json]
 #   fm-order.sh audit [--json]                    Evaluate ACCOUNTED for every non-terminal
 #                                                 order; write state/.order-audit-last.json.
+#   fm-order.sh fanout <task-id> [--json] [--evidence <ref>] [--no-audit]
+#                                                 At a closeout (teardown/merge), list the
+#                                                 non-terminal orders linked to <task-id>, print
+#                                                 each order's one-line closing command, and
+#                                                 refresh the audit so the gate stays honest.
 #
 #   fm-order.sh triage <id> [--title <t>] [--project <p>] [--priority <p>] [--priority-source <s>]
 #   fm-order.sh queue <id> [--depends-on <order-id>]... [--reason <note>]
@@ -1018,6 +1023,116 @@ case "$VERB" in
     fi
     if [ "$AUDIT_WRITE_OK" -ne 1 ]; then
       die "could not atomically publish the audit result to $STATE_DIR/.order-audit-last.json; any previous result file is untouched. A later reader must not consume a stale audit as fresh." 1
+    fi
+    exit 0
+    ;;
+
+  fanout)
+    # Completion fan-out at a closeout chokepoint (ORD-260 slice S3, report section 5.1-C6).
+    # When a task closes (teardown, PR merge, local merge), enumerate the specific non-terminal
+    # orders whose links point at that task and print each by id with its one-line closing
+    # command, so task-done fans out to order-closed at the moment of closeout - the missing
+    # chokepoint that produced the Memory-PR-1 cluster (14 finished tasks whose orders were
+    # never closed). This READS the inbox to follow the reverse edge (an order's
+    # linked_task_ids / linked_scout_ids -> a task); the forward edge (a task's order_ref) is
+    # an ORD-228 control-plane field this slice deliberately does not touch. After surfacing
+    # linked orders it refreshes the audit so the turn-end gate (slice S2) refuses quiet until
+    # each order is completed, rolled up, or re-queued - a chokepoint with teeth, not one more
+    # advisory banner the corpus proves gets ignored. Non-blocking for its callers: it is
+    # invoked with `|| true` at closeout, so a known task id always exits 0 whether it found
+    # linked orders, found none, or could not refresh the audit.
+    TASK_ID=''
+    JSON=false
+    DO_AUDIT=true
+    EVIDENCE=''
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --json) JSON=true; shift ;;
+        --no-audit) DO_AUDIT=false; shift ;;
+        --evidence) EVIDENCE=${2:?missing value for --evidence}; shift 2 ;;
+        -*) usage >&2; die "unknown option: $1" 2 ;;
+        *) [ -z "$TASK_ID" ] || { usage >&2; die 'fanout takes exactly one task id' 2; }
+           TASK_ID=$1; shift ;;
+      esac
+    done
+    [ -n "$TASK_ID" ] || { usage >&2; die 'fanout requires a task id' 2; }
+    # fanout is called unconditionally at every closeout, including in homes that never took a
+    # captain order. Unlike the reader verbs - where a missing inbox is a dangerous ambiguity -
+    # a missing inbox here means unambiguously "no order can point at this task", so it is a
+    # silent no-op rather than a die that would fire on every teardown in an order-less home.
+    if [ ! -f "$INBOX" ]; then
+      if [ "$JSON" = true ]; then
+        jq -cn --arg tid "$TASK_ID" '{schema: "fm-order-fanout/v1", task_id: $tid, count: 0, orders: []}'
+      fi
+      exit 0
+    fi
+    fold_file
+
+    # Non-terminal orders whose linked_task_ids or linked_scout_ids include TASK_ID. A
+    # captain_parked order is terminal (the audit's own def), so it is excluded here too: a
+    # closeout owes nothing to an order the captain already parked.
+    LINKED=$(jq -c --arg tid "$TASK_ID" '
+      def terminal($s):
+        $s == "completed" or $s == "superseded" or $s == "rejected" or $s == "captain_parked";
+      [ (. | to_entries | map(.value))[]
+        | select(terminal(.status // "received") | not)
+        | select(((.linked_task_ids // []) + (.linked_scout_ids // [])) | index($tid))
+        | {order_id: .order_id,
+           status: (.status // "received"),
+           short_title: (((.short_title // .original_request // "")
+                          | gsub("[[:space:]]+"; " ") | .[0:80]))} ]
+      | sort_by(.order_id)' "$FOLD_PATH" 2> "$SCRATCH/fanout.err") \
+      || read_failed 'the folded inbox could not be scanned for orders linked to the closing task' "$SCRATCH/fanout.err"
+
+    COUNT=$(printf '%s' "$LINKED" | jq 'length')
+    case "$COUNT" in ''|*[!0-9]*) COUNT=0 ;; esac
+
+    if [ "$JSON" = true ]; then
+      printf '%s' "$LINKED" \
+        | jq --arg tid "$TASK_ID" '{schema: "fm-order-fanout/v1", task_id: $tid, count: length, orders: .}'
+      exit 0
+    fi
+
+    # Silent when nothing points at the closing task - a closeout with no linked order owes no
+    # fan-out, exactly as a clean triage pass or a clean bootstrap section prints nothing.
+    [ "$COUNT" -gt 0 ] || exit 0
+
+    # The concrete per-order closing command is `complete`, the common case at a closeout (the
+    # linked work just finished). The block header names the two other accounting acts - roll a
+    # saga's threads into one lead, or re-queue with a reason - for when the order is not simply
+    # done. --evidence, when the caller passes it (a PR URL, a report path, the local trunk),
+    # fills in --link so the printed command is copy-paste ready.
+    LINK_ARG='<evidence>'
+    if [ -n "$EVIDENCE" ]; then
+      # Single-quote for display when the evidence carries whitespace (e.g. "local main"),
+      # so the printed command stays copy-paste correct rather than splitting into two args.
+      case "$EVIDENCE" in
+        *[[:space:]]*) LINK_ARG="'$EVIDENCE'" ;;
+        *) LINK_ARG=$EVIDENCE ;;
+      esac
+    fi
+    RULE='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+    {
+      printf '●%s\n' "$RULE"
+      printf '●  CAPTAIN ORDER FAN-OUT - %d order(s) linked to the closing task %s\n' "$COUNT" "$TASK_ID"
+      printf '●  The work just closed out. Each order below still points at it and is NOT yet\n'
+      printf '●  accounted. Close each one now: complete it (command shown), roll it into a lead\n'
+      printf '●  (bin/fm-order.sh rollup <lead> --absorb <id>), or re-queue it with a reason\n'
+      printf '●  (bin/fm-order.sh queue <id> --reason <why>). The order audit refuses quiet until\n'
+      printf '●  every one is closed, so this cannot be silently skipped.\n'
+      printf '%s' "$LINKED" | jq -r --arg link "$LINK_ARG" '
+        .[] | "\(.order_id) [\(.status)]" + (if .short_title != "" then " - " + .short_title else "" end)
+              + "\n    close: bin/fm-order.sh complete " + .order_id + " --link " + $link' \
+        | sed 's/^/●  /'
+      printf '●%s\n' "$RULE"
+    } >&2
+
+    # Refresh the audit so the gate sees these now-unaccounted orders at the next turn end,
+    # not only at the next session start. Best-effort: a failed refresh must never break the
+    # closeout that called us, and the audit's own atomic tmp+mv leaves any prior result
+    # untouched on failure. Skippable with --no-audit for a pure enumeration (tests, previews).
+    if [ "$DO_AUDIT" = true ]; then
+      "$SCRIPT_DIR/fm-order.sh" audit >/dev/null 2>&1 || true
     fi
     exit 0
     ;;

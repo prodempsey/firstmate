@@ -1267,3 +1267,17 @@ backlog_refresh_reminder
 triage_trigger=teardown
 [ "$KIND" = scout ] && triage_trigger=scout-complete
 "$SCRIPT_DIR/fm-triage-duty.sh" "$triage_trigger" --detail "$ID torn down." || true
+
+# Completion fan-out (ORD-260 slice S3, report section 5.1-C6): teardown is the task leaving
+# the fleet, and the missing chokepoint that produced the Memory-PR-1 cluster - finished tasks
+# whose captain orders were never closed. Surface the non-terminal orders still linked to this
+# task with each one's closing command, and refresh the order audit so the turn-end gate refuses
+# quiet until each is completed, rolled up, or re-queued. The evidence a `complete` would cite is
+# the scout's report, else the ship's recorded PR URL, else the landed SHA (CLOSE_EVIDENCE). All
+# vars are still in scope; the meta was already removed above but fan-out needs only the task id
+# and the inbox. Non-blocking - teardown has already succeeded by here.
+fanout_evidence=$CLOSE_EVIDENCE
+[ "$KIND" != scout ] && [ -n "$PR_URL" ] && fanout_evidence=$PR_URL
+fanout_args=(fanout "$ID")
+[ -n "$fanout_evidence" ] && fanout_args+=(--evidence "$fanout_evidence")
+"$SCRIPT_DIR/fm-order.sh" "${fanout_args[@]}" || true
