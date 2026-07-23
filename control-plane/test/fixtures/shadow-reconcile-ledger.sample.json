@@ -1,0 +1,29 @@
+{
+  "schema": "control-plane/shadow-reconcile/ledger/v1",
+  "reason": "SAMPLE reconcile ledger fixture (tests only). Documents pre-shadow-enable divergence: two tasks whose legacy-derived expected terminal status is `completed`, but whose store rows read `failed` after the reconciler's spawn-timeout close of a synthetic generation-1 run. NOT a real approved ledger; the real proposed ledger for the production rows lives under docs/cp-shadow-reconcile-r1/.",
+  "legacy_home": "/example/legacy/home",
+  "entries": [
+    {
+      "task_id": "sample-a",
+      "expected_status": "completed",
+      "evidence": {
+        "source_refs": [
+          "data/backlog.md#sample-a",
+          "state/sample-a.meta"
+        ],
+        "note": "legacy backlog Done section + merged PR; store row wrongly `failed` after synthetic gen-1 spawn-timeout close"
+      }
+    },
+    {
+      "task_id": "sample-b",
+      "expected_status": "completed",
+      "evidence": {
+        "source_refs": [
+          "data/backlog.md#sample-b",
+          "state/sample-b.meta"
+        ],
+        "note": "legacy backlog Done section; store row wrongly `failed`"
+      }
+    }
+  ]
+}

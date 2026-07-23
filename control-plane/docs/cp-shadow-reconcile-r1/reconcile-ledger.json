@@ -1,0 +1,72 @@
+{
+  "schema": "control-plane/shadow-reconcile/ledger/v1",
+  "reason": "PROPOSED (UNAPPROVED) reconcile ledger for the 8 documented pre-shadow-enable divergent rows in the production store (/home/prode/fleet/control-plane/pgdata). Each task's legacy-derived expected terminal status is `completed`, but its store row is `failed` after the reconciler's spawn-timeout close of a synthetic generation-1 run (audit annotations from cp-shadow are already on each row). The S3 identity-binding guard correctly refuses hand-authored completions, so this administrative reconcile ledger is the sanctioned path. firstmate/captain must review the evidence source_refs against the legacy home and place+approve this ledger before it is run with `cp shadow-reconcile --captain-approved`. Do NOT run against the production store without that approval.",
+  "legacy_home": "/home/prode/fleet/firstmate-runtime",
+  "target_data_dir": "/home/prode/fleet/control-plane/pgdata",
+  "entries": [
+    {
+      "task_id": "qa-cw2-q87",
+      "expected_status": "completed",
+      "evidence": {
+        "source_refs": ["data/backlog.md#qa-cw2-q87", "state/qa-cw2-q87.meta"],
+        "note": "legacy Done/merged; store row `failed` after synthetic gen-1 spawn-timeout close"
+      }
+    },
+    {
+      "task_id": "qa-cw2r2-q88",
+      "expected_status": "completed",
+      "evidence": {
+        "source_refs": ["data/backlog.md#qa-cw2r2-q88", "state/qa-cw2r2-q88.meta"],
+        "note": "legacy Done/merged; store row `failed` after synthetic gen-1 spawn-timeout close"
+      }
+    },
+    {
+      "task_id": "qa-cw2r3-q89",
+      "expected_status": "completed",
+      "evidence": {
+        "source_refs": ["data/backlog.md#qa-cw2r3-q89", "state/qa-cw2r3-q89.meta"],
+        "note": "legacy Done/merged; store row `failed` after synthetic gen-1 spawn-timeout close"
+      }
+    },
+    {
+      "task_id": "qa-cw2r4-q90",
+      "expected_status": "completed",
+      "evidence": {
+        "source_refs": ["data/backlog.md#qa-cw2r4-q90", "state/qa-cw2r4-q90.meta"],
+        "note": "legacy Done/merged; store row `failed` after synthetic gen-1 spawn-timeout close"
+      }
+    },
+    {
+      "task_id": "qa-cw3-q91",
+      "expected_status": "completed",
+      "evidence": {
+        "source_refs": ["data/backlog.md#qa-cw3-q91", "state/qa-cw3-q91.meta"],
+        "note": "legacy Done/merged; store row `failed` after synthetic gen-1 spawn-timeout close"
+      }
+    },
+    {
+      "task_id": "qa-cw3r2-q92",
+      "expected_status": "completed",
+      "evidence": {
+        "source_refs": ["data/backlog.md#qa-cw3r2-q92", "state/qa-cw3r2-q92.meta"],
+        "note": "legacy Done/merged; store row `failed` after synthetic gen-1 spawn-timeout close"
+      }
+    },
+    {
+      "task_id": "cutover-w2",
+      "expected_status": "completed",
+      "evidence": {
+        "source_refs": ["data/backlog.md#cutover-w2", "state/cutover-w2.meta"],
+        "note": "legacy Done/merged; store row `failed` after synthetic gen-1 spawn-timeout close"
+      }
+    },
+    {
+      "task_id": "cutover-w3",
+      "expected_status": "completed",
+      "evidence": {
+        "source_refs": ["data/backlog.md#cutover-w3", "state/cutover-w3.meta"],
+        "note": "legacy Done/merged; store row `failed` after synthetic gen-1 spawn-timeout close"
+      }
+    }
+  ]
+}
