@@ -999,13 +999,26 @@ nf_blocking=0
 order_blocking=0
 [ "$orders" -gt 0 ] && [ "$nf_gate" = on ] && order_blocking=1
 work=$((nf + orders))
-any_read_error=0
-{ [ -n "$nf_error" ] || [ -n "$order_error" ]; } && any_read_error=1
 
-# The reason string for an allowed_guard_error permit, naming whichever axis (or both) could
-# not be read while the gate was enforcing.
+# order-audit-stale is BENIGN metadata - a refresh-cadence gap, not a broken read. It is
+# recorded in order_error for observability, but it must NEVER drive control flow: an honest
+# stale audit that flipped the evaluation into allowed_guard_error would MASK a known
+# no-progress stand-down (its coalesced anomaly and its durable wake) and weaken the
+# progress-aware loop guard (QA qa-dj-s2-q104). Only a genuinely unreadable/malformed/
+# count-mismatched file is a broken read.
+order_broken=0
+case "$order_error" in ''|order-audit-stale) : ;; *) order_broken=1 ;; esac
+# A GENUINE read failure on either axis. This selects the fail-open allowed_guard_error path,
+# but ONLY when no readable axis (known work or watcher-down) determines the outcome first -
+# it signals and announces, it never masks a stand-down.
+read_broken=0
+{ [ -n "$nf_error" ] || [ "$order_broken" -eq 1 ]; } && read_broken=1
+
+# The reason string for an allowed_guard_error permit, naming whichever axis GENUINELY could
+# not be read (a stale audit is never named as a read failure here). Only called when
+# read_broken == 1, so at least one genuinely-broken axis is present.
 read_error_reason() {
-  if [ -n "$nf_error" ] && [ -n "$order_error" ]; then
+  if [ -n "$nf_error" ] && [ "$order_broken" -eq 1 ]; then
     printf 'lane: %s; orders: %s' "$nf_error" "$order_error"
   elif [ -n "$nf_error" ]; then
     printf '%s' "$nf_error"
@@ -1014,26 +1027,29 @@ read_error_reason() {
   fi
 }
 
-# Raise the durable, coalesced signal for whichever axis could not be read - but ONLY while
-# the gate is enforcing (a stand-down owns its own escalation). Each axis keys its own
-# fingerprint. A STALE order file is a refresh-cadence gap, not a breakage, so it is logged
-# but never signalled here.
+# Raise the durable, coalesced signal for whichever axis GENUINELY could not be read - but
+# ONLY while the gate is enforcing (a stand-down owns its own escalation). Each axis keys its
+# own fingerprint. A STALE order file is a refresh-cadence gap, not a breakage, so it is
+# logged but never signalled here.
 signal_read_errors() {
   [ "$nf_gate" = on ] || return 0
   [ -n "$nf_error" ] && signal_guard_error_bug "$nf_error" 'needs_firstmate lane read failed on the turn-end path'
-  case "$order_error" in
-    ''|order-audit-stale) : ;;
-    *) signal_order_audit_anomaly "$order_error" ;;
-  esac
+  [ "$order_broken" -eq 1 ] && signal_order_audit_anomaly "$order_error"
   return 0
 }
 
 # The order-audit banner, printed only for a genuine breakage (never for a stale file).
 order_error_banner_if_broken() {  # <detail>
-  case "$order_error" in
-    ''|order-audit-stale) return 0 ;;
-    *) order_error_banner "$order_error" "$1" ;;
-  esac
+  [ "$order_broken" -eq 1 ] && order_error_banner "$order_error" "$1"
+  return 0
+}
+
+# Announce every GENUINELY-broken axis (loud banners) without deciding the outcome. Used
+# wherever a read failure must be surfaced alongside - not instead of - the real decision.
+announce_read_errors() {  # <nf-detail> <order-detail>
+  [ -n "$nf_error" ] && guard_error_banner "$nf_error" "$1"
+  order_error_banner_if_broken "$2"
+  return 0
 }
 
 # One coalesced anomaly per no-progress stand-down, plus its honest decision record. This is
@@ -1056,16 +1072,21 @@ if [ "$STOP_HOOK_ACTIVE" = true ]; then
     afk) log_decision allowed_afk_owner 'away mode owns supervision'; exit 0 ;;
     duty-off) log_decision allowed_duty_disabled 'FM_TRIAGE_DUTY=off kill switch engaged'; exit 0 ;;
   esac
-  if [ "$any_read_error" -eq 1 ]; then
-    [ -n "$nf_error" ] && guard_error_banner "$nf_error" 'the loop-guarded stop is permitted, but the lane state is unknown.'
-    order_error_banner_if_broken 'the loop-guarded stop is permitted, but the order-accounting state is unknown.'
+  # A GENUINE read failure is announced and signalled, but it does NOT decide the outcome: a
+  # known no-progress stand-down (from the READABLE axes - unchanged work, or the watcher
+  # still down) must still be recorded with its coalesced anomaly and durable wake, never
+  # swallowed by an independent audit failure (QA qa-dj-s2-q104).
+  if [ "$read_broken" -eq 1 ]; then
+    announce_read_errors 'the loop-guarded stop is permitted, but the lane state is unknown.' \
+                         'the loop-guarded stop is permitted, but the order-accounting state is unknown.'
     signal_read_errors
-    log_decision allowed_guard_error "$(read_error_reason)"
-    exit 0
   fi
   if [ "$work" -eq 0 ]; then
     if [ "$blind" -eq 1 ]; then
       record_standdown_no_progress 'loop protection forced the permit; the watcher is still down'
+    elif [ "$read_broken" -eq 1 ]; then
+      # Nothing readable compels a stand-down, but a genuine read failed: fail-open guard_error.
+      log_decision allowed_guard_error "$(read_error_reason)"
     else
       mark_healthy
       log_decision allowed_needs_firstmate_empty 'lane empty, supervision healthy'
@@ -1108,7 +1129,7 @@ fi
 if [ "$blind" -eq 0 ]; then
   case "$nf_gate" in
     afk)
-      if [ "$work" -gt 0 ] || [ "$any_read_error" -eq 1 ]; then
+      if [ "$work" -gt 0 ] || [ "$read_broken" -eq 1 ]; then
         log_decision allowed_afk_owner 'away mode owns supervision'
       else
         log_decision allowed_needs_firstmate_empty 'lane empty, supervision healthy (away mode)'
@@ -1116,7 +1137,7 @@ if [ "$blind" -eq 0 ]; then
       exit 0
       ;;
     duty-off)
-      if [ "$work" -gt 0 ] || [ "$any_read_error" -eq 1 ]; then
+      if [ "$work" -gt 0 ] || [ "$read_broken" -eq 1 ]; then
         log_decision allowed_duty_disabled 'FM_TRIAGE_DUTY=off kill switch engaged'
       else
         log_decision allowed_needs_firstmate_empty 'lane empty, supervision healthy (kill switch engaged)'
@@ -1124,12 +1145,13 @@ if [ "$blind" -eq 0 ]; then
       exit 0
       ;;
   esac
-  # Gate is on. With neither work axis blocking and the watcher healthy, the turn may end -
-  # as a fail-open guard_error permit if a read failed, otherwise a clean empty-lane permit.
+  # Gate is on. With neither work axis blocking and the watcher healthy, the turn may end - as
+  # a fail-open guard_error permit only if a GENUINE read failed (a stale audit is benign and
+  # permits cleanly), otherwise a clean empty-lane permit.
   if [ "$nf_blocking" -eq 0 ] && [ "$order_blocking" -eq 0 ]; then
-    if [ "$any_read_error" -eq 1 ]; then
-      [ -n "$nf_error" ] && guard_error_banner "$nf_error" 'this turn end is permitted fail-open; the lane state is unknown.'
-      order_error_banner_if_broken 'this turn end is permitted fail-open; the order-accounting state is unknown.'
+    if [ "$read_broken" -eq 1 ]; then
+      announce_read_errors 'this turn end is permitted fail-open; the lane state is unknown.' \
+                           'this turn end is permitted fail-open; the order-accounting state is unknown.'
       signal_read_errors
       log_decision allowed_guard_error "$(read_error_reason)"
     else

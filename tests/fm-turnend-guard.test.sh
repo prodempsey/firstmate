@@ -2812,8 +2812,11 @@ test_hook_stale_order_audit_fails_open_without_anomaly() {
   log=$(last_guard_log "$dir")
   [ "$(printf '%s' "$log" | jq -r '.order_error')" = order-audit-stale ] || fail "a stale audit must be recorded as order-audit-stale: $log"
   [ "$(printf '%s' "$log" | jq -r '.orders')" = 0 ] || fail "a stale audit must not contribute a blocking count: $log"
+  # QA qa-dj-s2-q104: a stale audit is BENIGN metadata, not a broken read, so alone with a
+  # healthy watcher and a clear lane it must permit cleanly - NOT as allowed_guard_error.
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_needs_firstmate_empty ] || fail "a stale audit alone must permit cleanly, not as allowed_guard_error: $log"
   [ ! -s "$buglog" ] || fail "a stale (not broken) audit must NOT file a bug: $(cat "$buglog")"
-  pass "fm-turnend-guard: a stale order-audit file fails open, logged but never a bug"
+  pass "fm-turnend-guard: a stale order-audit file fails open as a clean permit, logged but never a bug"
 }
 
 # CORRUPT audit (the writer broke): fail open, loud banner, and ONE coalesced anomaly. Two
@@ -2965,6 +2968,108 @@ test_metrics_counts_order_block_and_permit() {
   pass "fm-turnend-metrics: the order block and an order-outstanding permit are both counted"
 }
 
+# --- QA qa-dj-s2-q104: a stale (benign) audit must NOT mask a known no-progress stand-down --
+#
+# The blocking finding: order-audit-stale was folded into the control-flow read-error boolean,
+# so a stale audit on a loop-guarded second stop forced allowed_guard_error and swallowed the
+# required turnend-standdown-no-progress anomaly and the durable check wake. These cases pin
+# the precedence: a stale audit is observability-only, and a GENUINE audit failure is signalled
+# but never masks a no-progress stand-down determined from the readable axes.
+
+# Case 1: stale audit + an unchanged needs_firstmate signal on the second stop. The known
+# no-progress crew stand-down must survive: allowed_loop_protection_without_progress, one
+# coalesced stand-down anomaly, and one durable check wake naming the crew signal.
+test_hook_stale_audit_does_not_mask_nf_standdown() {
+  local dir home pid log coalesce buglog
+  dir=$(make_primary_dir "$TMP_ROOT/hook-orders-stalemask-nf")
+  home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
+  buglog="$home/bug-calls.log"
+  install_bug_stub "$dir" "$buglog" >/dev/null
+  pid=$(start_healthy_watcher "$dir")
+  write_nf_signal "$dir" ship-qa1 'done: ready in branch fm/ship-qa1'
+  write_order_audit "$dir" 20000 14400
+  # First stop: blocks on the crew signal (the stale audit is benign and non-blocking).
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$dir/stubbin/bugstub" \
+    bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  # Second stop under loop protection, nothing discharged.
+  printf '{"stop_hook_active":true}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$dir/stubbin/bugstub" \
+    bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  local status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "the loop-guarded second stop must be permitted"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_loop_protection_without_progress ] \
+    || fail "a stale audit must not mask the known unchanged nf stand-down: $log"
+  [ "$(printf '%s' "$log" | jq -r '.order_error')" = order-audit-stale ] || fail "the stale audit must still be recorded for observability: $log"
+  grep -q "	check	turnend-guard	" "$dir/state/.wake-queue" 2>/dev/null || fail "the known no-progress stand-down must still queue its durable wake"
+  grep -q "ship-qa1" "$dir/state/.wake-queue" || fail "the queued wake must name the unchanged crew signal"
+  [ "$(grep -c 'stood the' "$buglog" 2>/dev/null)" -eq 1 ] || fail "the stand-down must still file exactly one coalesced anomaly: $(cat "$buglog" 2>/dev/null)"
+  pass "fm-turnend-guard: a stale audit does not mask a known unchanged needs_firstmate stand-down"
+}
+
+# Case 2: stale audit + the watcher still down on the second stop. The watcher-only
+# no-progress stand-down must survive the stale audit, exactly as for the nf lane.
+test_hook_stale_audit_does_not_mask_watcher_standdown() {
+  local dir home log coalesce buglog
+  dir=$(make_primary_dir "$TMP_ROOT/hook-orders-stalemask-watcher")
+  home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
+  buglog="$home/bug-calls.log"
+  install_bug_stub "$dir" "$buglog" >/dev/null
+  : > "$dir/state/task1.meta"   # in flight, but no watcher -> supervision is off (blind)
+  write_order_audit "$dir" 20000 14400
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$dir/stubbin/bugstub" \
+    bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1   # blocks: watcher down
+  printf '{"stop_hook_active":true}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$dir/stubbin/bugstub" \
+    bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  local status=$?
+  expect_code 0 "$status" "the loop-guarded second stop must be permitted even with the watcher down"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_loop_protection_without_progress ] \
+    || fail "a stale audit must not mask the watcher-down stand-down: $log"
+  [ "$(grep -c 'stood the' "$buglog" 2>/dev/null)" -eq 1 ] || fail "the watcher-down stand-down must still file exactly one coalesced anomaly: $(cat "$buglog" 2>/dev/null)"
+  pass "fm-turnend-guard: a stale audit does not mask a watcher-down no-progress stand-down"
+}
+
+# Case 4: a GENUINELY corrupt audit alongside an unchanged needs_firstmate signal on the
+# second stop. Precedence must be explicit: the known no-progress crew stand-down is recorded
+# (allowed_loop_protection_without_progress + wake + one stand-down anomaly) AND the
+# independent audit failure is signalled as its own coalesced anomaly - neither masks the
+# other, so a known no-progress can never disappear behind an audit failure.
+test_hook_corrupt_audit_does_not_mask_nf_standdown() {
+  local dir home pid log coalesce buglog
+  dir=$(make_primary_dir "$TMP_ROOT/hook-orders-corruptmask-nf")
+  home=$(cd "$dir" && pwd)
+  coalesce="$dir/coalesce"
+  buglog="$home/bug-calls.log"
+  install_bug_stub "$dir" "$buglog" >/dev/null
+  pid=$(start_healthy_watcher "$dir")
+  write_nf_signal "$dir" ship-qa4 'done: ready in branch fm/ship-qa4'
+  printf 'not json{\n' > "$dir/state/.order-audit-last.json"
+  printf '{"stop_hook_active":false}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$dir/stubbin/bugstub" \
+    bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  printf '{"stop_hook_active":true}' | CLAUDECODE=1 FM_HOME="$home" \
+    FM_GUARD_ERROR_COALESCE_DIR="$coalesce" FM_FLEET_TRIAGE_BUG_CLI="$dir/stubbin/bugstub" \
+    bash "$dir/bin/fm-turnend-guard.sh" >/dev/null 2>&1
+  local status=$?
+  stop_watcher "$pid"
+  expect_code 0 "$status" "the loop-guarded second stop must be permitted"
+  log=$(last_guard_log "$dir")
+  [ "$(printf '%s' "$log" | jq -r '.decision')" = allowed_loop_protection_without_progress ] \
+    || fail "a corrupt audit must not mask the known unchanged nf stand-down: $log"
+  [ "$(printf '%s' "$log" | jq -r '.order_error')" = order-audit-unreadable ] || fail "the corrupt audit must still be recorded: $log"
+  grep -q "ship-qa4" "$dir/state/.wake-queue" || fail "the known no-progress stand-down must queue its wake naming the crew signal"
+  [ "$(grep -c 'stood the' "$buglog" 2>/dev/null)" -eq 1 ] || fail "the stand-down anomaly must be filed exactly once: $(cat "$buglog" 2>/dev/null)"
+  [ "$(grep -c 'order-audit-last.json' "$buglog" 2>/dev/null)" -eq 1 ] || fail "the independent audit failure must be signalled once (coalesced) alongside the stand-down: $(cat "$buglog" 2>/dev/null)"
+  pass "fm-turnend-guard: a corrupt audit and a known nf stand-down each file their own anomaly; neither masks the other"
+}
+
 test_predicate_healthy_no_inflight
 test_predicate_unhealthy_no_beacon
 test_predicate_unhealthy_stale_beacon
@@ -3073,3 +3178,6 @@ test_hook_order_loop_guard_permits_and_signals_standdown
 test_hook_order_progress_shrinks_the_block_set
 test_hook_order_gate_stands_down_under_afk
 test_metrics_counts_order_block_and_permit
+test_hook_stale_audit_does_not_mask_nf_standdown
+test_hook_stale_audit_does_not_mask_watcher_standdown
+test_hook_corrupt_audit_does_not_mask_nf_standdown
