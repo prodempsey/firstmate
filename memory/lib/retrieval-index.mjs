@@ -270,6 +270,17 @@ export async function inspectRetrievalIndex(registryDir, canonical) {
   if (manifest.buildStatus !== 'built' || manifest.validation?.ok !== true) return corrupt('generation was never validated for publication');
   const mw = manifest.canonicalWatermark || {};
 
+  // The published pointer's own advertised watermark and count must match the
+  // manifest they point at: a forged current.json watermark/count is corrupt, not
+  // current, even when the manifest and DB are internally consistent (R2-F1).
+  const cw = current.canonicalWatermark || {};
+  if (Number(cw.seq) !== Number(mw.seq) || (cw.eventId ?? null) !== (mw.eventId ?? null) || cw.registryHash !== mw.registryHash) {
+    return corrupt('current pointer watermark != manifest watermark');
+  }
+  if (Number(current.recordCount) !== Number(manifest.recordCount)) {
+    return corrupt('current pointer recordCount != manifest recordCount');
+  }
+
   const PGlite = await loadPGlite();
   if (!PGlite) return corrupt('pglite not loadable to verify generation');
   let inspected;

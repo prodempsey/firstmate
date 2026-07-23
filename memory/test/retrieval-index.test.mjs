@@ -136,6 +136,12 @@ test('partial detection: indexed id set is a subset of the verified active proje
   manifest.memoryIds = ['MEM-0001'];
   manifest.records = manifest.records.filter((r) => r.id === 'MEM-0001');
   fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  // Keep the current pointer consistent with the edited manifest (its watermark is
+  // unchanged, only the count) so the check under test is the vs-live id-set drift,
+  // not the pointer/manifest count guard.
+  const cur = JSON.parse(fs.readFileSync(rp.current, 'utf8'));
+  cur.recordCount = 1;
+  fs.writeFileSync(rp.current, `${JSON.stringify(cur, null, 2)}\n`);
 
   const status = await inspectRetrievalIndex(dir, await captureCanonical(dir));
   assert.equal(status.status, 'partial');
@@ -218,6 +224,28 @@ test('corrupt: current.json generationId does not match the manifest', async () 
   const rp = retrievalPaths(dir);
   const cur = JSON.parse(fs.readFileSync(rp.current, 'utf8'));
   fs.writeFileSync(rp.current, `${JSON.stringify({ ...cur, generationId: 'forged-generation-id' }, null, 2)}\n`);
+  assert.equal((await inspectRetrievalIndex(dir, await captureCanonical(dir))).status, 'corrupt');
+});
+
+test('corrupt: forged current-pointer watermark does not match the manifest', async () => {
+  const dir = tmpRegistry();
+  await seedActive(dir, CORPUS);
+  await buildRetrievalIndex(dir);
+  const rp = retrievalPaths(dir);
+  const cur = JSON.parse(fs.readFileSync(rp.current, 'utf8'));
+  cur.canonicalWatermark = { seq: 999, eventId: 'FORGED', registryHash: 'FORGED' };
+  fs.writeFileSync(rp.current, `${JSON.stringify(cur, null, 2)}\n`);
+  assert.equal((await inspectRetrievalIndex(dir, await captureCanonical(dir))).status, 'corrupt');
+});
+
+test('corrupt: forged current-pointer recordCount does not match the manifest', async () => {
+  const dir = tmpRegistry();
+  await seedActive(dir, CORPUS);
+  await buildRetrievalIndex(dir);
+  const rp = retrievalPaths(dir);
+  const cur = JSON.parse(fs.readFileSync(rp.current, 'utf8'));
+  cur.recordCount = 999;
+  fs.writeFileSync(rp.current, `${JSON.stringify(cur, null, 2)}\n`);
   assert.equal((await inspectRetrievalIndex(dir, await captureCanonical(dir))).status, 'corrupt');
 });
 

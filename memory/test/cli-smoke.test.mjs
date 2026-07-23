@@ -196,10 +196,20 @@ test('retrieve enforces the documented argument contract (F5)', () => {
   // Required filters.
   assert.match(errOf(['--query', 'watcher', '--kind', 'ship']), /--project/);
   assert.match(errOf(['--query', 'watcher', '--project', 'firstmate']), /--kind/);
-  // Numeric and temporal validation.
+  // Numeric validation.
   assert.match(errOf(['--query', 'watcher', '--project', 'firstmate', '--kind', 'ship', '--top', '0']), /positive integer/);
   assert.match(errOf(['--query', 'watcher', '--project', 'firstmate', '--kind', 'ship', '--top', 'abc']), /positive integer/);
-  assert.match(errOf(['--query', 'watcher', '--project', 'firstmate', '--kind', 'ship', '--as-of', 'not-a-date']), /ISO-8601/);
+  // Strict ISO-8601 --as-of: a bare year, a US-style date, a calendar-rollover date,
+  // and a date without a time are all rejected; a full timestamp is accepted.
+  const asOf = (v) => ['--query', 'watcher', '--project', 'firstmate', '--kind', 'ship', '--as-of', v];
+  assert.match(errOf(asOf('not-a-date')), /ISO-8601/);
+  assert.match(errOf(asOf('2026')), /ISO-8601/);
+  assert.match(errOf(asOf('12/25/2026')), /ISO-8601/);
+  assert.match(errOf(asOf('2026-02-30T00:00:00Z')), /ISO-8601/); // calendar rollover rejected
+  assert.match(errOf(asOf('2026-07-23')), /ISO-8601/); // missing time
+  const okAsOf = runMemIn(dir, ['retrieve', ...asOf('2026-07-23T00:00:00Z'), '--json']);
+  assert.equal(okAsOf.status, 0, okAsOf.stderr);
+  assert.equal(JSON.parse(okAsOf.stdout).telemetry.filters.asOf, '2026-07-23T00:00:00.000Z'); // normalized to UTC
 });
 
 test('retrieve returns failed (exit 1) when canonical is unverified, without falling back', () => {

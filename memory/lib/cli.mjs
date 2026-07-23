@@ -125,6 +125,26 @@ function retrievalQuery(flags) {
   return fs.readFileSync(0, 'utf8');
 }
 
+// Strict ISO-8601 timestamp: full calendar date, a time (at least HH:MM), and an
+// explicit timezone (Z or ±HH:MM). Date.parse alone is too permissive — it accepts a
+// bare year ("2026"), US-style dates, and silently ROLLS OVER invalid calendar days
+// ("2026-02-30" -> Mar 2). So the shape is regex-gated, the Y-M-D must round-trip
+// through a UTC date (rejecting rollover), and Date.parse must accept the whole
+// string (rejecting invalid time components). Accepted values are normalized to a
+// canonical UTC instant so downstream comparison never depends on the input offset.
+const ISO_8601 = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?([Zz]|[+-]\d{2}:\d{2})$/;
+function parseIso8601(value) {
+  if (typeof value !== 'string') return null;
+  const m = ISO_8601.exec(value);
+  if (!m) return null;
+  const [, year, month, day] = m;
+  const cal = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+  if (cal.getUTCFullYear() !== Number(year) || cal.getUTCMonth() !== Number(month) - 1 || cal.getUTCDate() !== Number(day)) return null;
+  const ms = Date.parse(value);
+  if (Number.isNaN(ms)) return null;
+  return new Date(ms).toISOString();
+}
+
 // Validate the required retrieval filters and optional numeric/temporal flags,
 // rejecting bad input instead of silently defaulting (F5).
 function retrievalOptions(flags) {
@@ -137,8 +157,8 @@ function retrievalOptions(flags) {
   }
   let asOf;
   if (flags['as-of'] !== undefined) {
-    if (typeof flags['as-of'] !== 'string' || Number.isNaN(Date.parse(flags['as-of']))) throw new Error('--as-of requires an ISO-8601 timestamp');
-    asOf = flags['as-of'];
+    asOf = parseIso8601(flags['as-of']);
+    if (!asOf) throw new Error('--as-of requires an ISO-8601 timestamp (e.g. 2026-07-23T00:00:00Z)');
   }
   return { project: flags.project, kind: flags.kind, top, asOf };
 }
