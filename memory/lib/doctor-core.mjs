@@ -74,7 +74,11 @@ export function assembleDoctor(parts) {
     embeddingProvider: parts.embeddingProvider,
     registry: parts.registry,
     snapshots: parts.snapshots || { health: null, outstanding: [], issues: [], reason: null },
-    activeIndex: parts.activeIndex
+    activeIndex: parts.activeIndex,
+    // Derived retrieval index readiness is INFORMATIONAL: a missing/stale derived
+    // index never fails doctor, because retrieval degrades to lexical fallback when
+    // canonical is healthy. Kept in the stable schema so every doctor mode reports it.
+    retrieval: parts.retrieval || { status: 'unknown', generationId: null, retrievalReadiness: null, reason: null }
   };
 }
 

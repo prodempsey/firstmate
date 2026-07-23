@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import { registryPaths } from '../lib/paths.mjs';
-import { runMemIn, tmpRegistry } from './helpers.mjs';
+import { cleanTracked, runMemIn, tmpRegistry } from './helpers.mjs';
+
+// The retrieval CLI smokes build derived PGlite generations; reclaim them per test.
+afterEach(cleanTracked);
 
 test('CLI fixture smoke exercises PR-1 verbs on an isolated registry with valid transitions only', () => {
   const dir = tmpRegistry();
@@ -121,6 +124,74 @@ test('summary-only CLI update preserves omitted fields', () => {
   assert.deepEqual(record.keywords, ['k1']);
   assert.equal(record.confidence, 'observed');
   assert.equal(record.riskClass, 'critical');
+});
+
+// PR-2 retrieval CLI contracts. build/doctor/clean/retrieve return stable JSON on
+// success and the `{ ok: false, error }` envelope on failure, exit non-zero on
+// error, and never touch canonical state.
+function seedActiveViaCli(dir, id, summary, extra = []) {
+  const propose = runMemIn(dir, ['propose', '--summary', summary, ...extra, '--json']);
+  assert.equal(propose.status, 0, propose.stderr);
+  const memId = JSON.parse(propose.stdout).memId;
+  const activate = runMemIn(dir, ['activate', memId, '--evidence', 'test:cli', '--validation', `auth-${memId}`, '--json']);
+  assert.equal(activate.status, 0, activate.stderr);
+  return memId;
+}
+
+test('retrieval build/doctor/retrieve/clean expose stable JSON success contracts', () => {
+  const dir = tmpRegistry();
+  seedActiveViaCli(dir, 'MEM-0001', 'stale watcher leaves idle done crew', ['--keyword', 'watcher', '--project', 'firstmate', '--kind', 'ship']);
+
+  const build = runMemIn(dir, ['retrieval', 'build', '--full', '--json']);
+  assert.equal(build.status, 0, build.stderr);
+  const buildOut = JSON.parse(build.stdout);
+  assert.equal(buildOut.ok, true);
+  assert.equal(buildOut.mode, 'pglite-fts');
+  assert.match(buildOut.generationId, /^fts-/);
+
+  const rdoctor = runMemIn(dir, ['retrieval', 'doctor', '--json']);
+  assert.equal(rdoctor.status, 0, rdoctor.stderr);
+  const rd = JSON.parse(rdoctor.stdout);
+  assert.equal(rd.canonical.ok, true);
+  assert.equal(rd.derived.status, 'current');
+  assert.equal(rd.retrievalReadiness, 'pglite-fts');
+
+  const retrieve = runMemIn(dir, ['retrieve', '--query', 'stale watcher', '--project', 'firstmate', '--kind', 'ship', '--json']);
+  assert.equal(retrieve.status, 0, retrieve.stderr);
+  const ret = JSON.parse(retrieve.stdout);
+  assert.equal(ret.ok, true);
+  assert.equal(ret.retrievalMode, 'pglite-fts');
+  assert.deepEqual(ret.selected.map((s) => s.id), ['MEM-0001']);
+  assert.equal(ret.telemetry.schema, 'kraken-memory/retrieval-telemetry/v1');
+
+  const clean = runMemIn(dir, ['retrieval', 'clean', '--json']);
+  assert.equal(clean.status, 0, clean.stderr);
+  assert.equal(JSON.parse(clean.stdout).kept, buildOut.generationId);
+});
+
+test('retrieval CLI failure contracts: missing --full and missing query are JSON errors, exit non-zero', () => {
+  const dir = tmpRegistry();
+  const noFull = runMemIn(dir, ['retrieval', 'build', '--json']);
+  assert.equal(noFull.status, 1);
+  assert.equal(JSON.parse(noFull.stdout).ok, false);
+  assert.match(JSON.parse(noFull.stdout).error, /--full/);
+
+  const noQuery = runMemIn(dir, ['retrieve', '--project', 'firstmate', '--kind', 'ship', '--json']);
+  assert.equal(noQuery.status, 1);
+  assert.equal(JSON.parse(noQuery.stdout).ok, false);
+  assert.match(JSON.parse(noQuery.stdout).error, /--query|--stdin/);
+});
+
+test('retrieve returns failed (exit 1) when canonical is unverified, without falling back', () => {
+  const dir = tmpRegistry();
+  seedActiveViaCli(dir, 'MEM-0001', 'watcher note', ['--keyword', 'watcher', '--project', 'firstmate', '--kind', 'ship']);
+  runMemIn(dir, ['retrieval', 'build', '--full', '--json']);
+  fs.writeFileSync(registryPaths(dir).registry, '{bad');
+  const r = runMemIn(dir, ['retrieve', '--query', 'watcher', '--project', 'firstmate', '--kind', 'ship', '--json']);
+  assert.equal(r.status, 1);
+  const parsed = JSON.parse(r.stdout);
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.retrievalMode, 'failed');
 });
 
 test('canonical non-mutating fixture creates an empty index without production records', () => {

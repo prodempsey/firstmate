@@ -52,12 +52,13 @@ function fallbackDoctor(json) {
     canonicalCheckout: { path: path.join(process.env.HOME || '', 'fleet', 'firstmate-runtime'), source: 'HOME' },
     packageLock: packageLockStatus(lock, pkg, lockPath),
     requiredDependencies: dependencyStatus(),
-    pglite: { available: false, required: false, status: 'not installed for current milestone' },
-    vectorExtension: { available: false, required: false, status: 'not installed for current milestone' },
+    pglite: { available: false, required: false, status: 'not installed (dependencies missing)' },
+    vectorExtension: { available: false, required: false, status: 'not installed (vectors deferred to PR-2b)' },
     embeddingProvider: { configured: Boolean(process.env.MEM_EMBEDDING_KEY || process.env.OPENAI_API_KEY), required: false, status: 'optional' },
     registry: { path: process.env.MEM_REGISTRY_DIR || path.join(process.env.HOME || '', 'fleet', 'state', 'memory'), status: 'unknown', health: null, reason },
     snapshots: { health: null, outstanding: [], issues: [], path: null, reason },
-    activeIndex: { status: 'unknown', watermark: null, reason }
+    activeIndex: { status: 'unknown', watermark: null, reason },
+    retrieval: { status: 'unknown', generationId: null, retrievalReadiness: null, reason }
   });
   if (json) {
     console.log(JSON.stringify(payload, null, 2));
@@ -68,11 +69,12 @@ function fallbackDoctor(json) {
     console.log(`Package lock: ${payload.packageLock.present ? (payload.packageLock.current ? 'current' : 'not current') : `missing, fix: cd ${root} && npm install --package-lock-only`}`);
     const dep = payload.requiredDependencies;
     console.log(dep.ok ? 'Required dependencies: available' : `Required dependencies: missing ${[...dep.missing, ...dep.mismatched].join(', ')}; fix: cd ${root} && npm ci`);
-    console.log('PGlite: not installed for current milestone');
-    console.log('Vector extension: not installed for current milestone');
+    console.log('PGlite: not installed (dependencies missing)');
+    console.log('Vector extension: not installed (vectors deferred to PR-2b)');
     console.log(`Embedding provider: ${payload.embeddingProvider.configured ? 'configured' : 'not configured (optional)'}`);
     console.log(`Registry: ${payload.registry.status} (${payload.registry.reason})`);
     console.log(`Active-memory index: ${payload.activeIndex.status}`);
+    console.log(`Retrieval index: ${payload.retrieval.status}`);
   }
   process.exitCode = payload.ok ? 0 : 1;
 }

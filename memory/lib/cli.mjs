@@ -1,7 +1,10 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { appendRegistryEvent, auditRegistry, buildActiveIndex, foldRegistry, recoverRegistry, snapshotRegistry } from './registry.mjs';
 import { checkDoctor } from './doctor.mjs';
 import { registryDir, registryPaths } from './paths.mjs';
+import { buildRetrievalIndex, captureCanonical, cleanRetrievalIndex, inspectRetrievalIndex } from './retrieval-index.mjs';
+import { retrieveMemory } from './retrieve.mjs';
 
 function parseArgs(args) {
   const out = { _: [] };
@@ -107,6 +110,15 @@ function validation(flags) {
   return out;
 }
 
+// Resolve the retrieval query text from exactly one of --query, --query-file, or
+// --stdin. Fails closed when none is supplied so an empty retrieve is explicit.
+function retrievalQuery(flags) {
+  if (typeof flags.query === 'string') return flags.query;
+  if (typeof flags['query-file'] === 'string') return fs.readFileSync(flags['query-file'], 'utf8');
+  if (flags.stdin) return fs.readFileSync(0, 'utf8');
+  throw new Error('retrieve requires --query, --query-file, or --stdin');
+}
+
 function print(value, json = false) {
   if (json) console.log(JSON.stringify(value, null, 2));
   else if (typeof value === 'string') console.log(value);
@@ -177,6 +189,54 @@ export async function main(args, options = {}) {
       print(snapshotRegistry(dir), flags.json);
     } else if (verb === 'recover') {
       print(await recoverRegistry(dir), flags.json);
+    } else if (verb === 'retrieval') {
+      // Derived retrieval index lifecycle. Additive PR-2 surface; wired into no
+      // workflow, brief, spawn, or UI. build/doctor/clean only.
+      const sub = flags._[1];
+      if (sub === 'build') {
+        if (!flags.full) throw new Error('retrieval build requires --full (incremental build is not in PR-2)');
+        const result = await buildRetrievalIndex(dir);
+        print(result, flags.json);
+        process.exitCode = result.ok ? 0 : 1;
+      } else if (sub === 'doctor') {
+        const canonical = await captureCanonical(dir);
+        const derived = await inspectRetrievalIndex(dir, canonical);
+        const readiness = !canonical.ok ? 'failed' : (derived.status === 'current' ? 'pglite-fts' : 'lexical-fallback');
+        const report = {
+          canonical: { ok: canonical.ok, reason: canonical.reason, watermark: canonical.watermark },
+          derived: { status: derived.status, reason: derived.reason, generationId: derived.generationId },
+          retrievalReadiness: readiness
+        };
+        if (flags.json) print(report, true);
+        else {
+          console.log(`Canonical: ${canonical.ok ? 'verified' : `failed (${canonical.reason})`}`);
+          console.log(`Derived index: ${derived.status}${derived.reason ? ` (${derived.reason})` : ''}`);
+          console.log(`Retrieval readiness: ${readiness}`);
+        }
+        process.exitCode = canonical.ok ? 0 : 1;
+      } else if (sub === 'clean') {
+        print(cleanRetrievalIndex(dir), flags.json);
+      } else {
+        throw new Error('usage: mem retrieval build --full | retrieval doctor | retrieval clean');
+      }
+    } else if (verb === 'retrieve') {
+      const scopes = list(flags.scope);
+      const result = await retrieveMemory({
+        registryDir: dir,
+        query: retrievalQuery(flags),
+        project: typeof flags.project === 'string' ? flags.project : null,
+        kind: typeof flags.kind === 'string' ? flags.kind : null,
+        scopes,
+        top: flags.top !== undefined ? Number(flags.top) : undefined,
+        asOf: typeof flags['as-of'] === 'string' ? flags['as-of'] : undefined
+      });
+      if (flags.json) print(result, true);
+      else {
+        console.log(`Mode: ${result.retrievalMode}${result.fallbackReason ? ` (${result.fallbackReason})` : ''}`);
+        console.log(`Selected: ${result.selected.length}`);
+        for (const rec of result.selected) console.log(`  ${rec.id} [score ${rec.score}] ${rec.summary}`);
+      }
+      process.exitCode = result.ok ? 0 : 1;
     } else if (verb === 'doctor') {
       const doctor = checkDoctor(options.root || path.resolve('.', 'memory'), process.env);
       if (flags.json) print(doctor, true);
@@ -192,10 +252,11 @@ export async function main(args, options = {}) {
         console.log(`Registry: ${doctor.registry.status} (${doctor.registry.path})`);
         console.log(`Snapshots: ${doctor.snapshots.health || 'unknown'}`);
         console.log(`Active-memory index: ${doctor.activeIndex.status}`);
+        console.log(`Retrieval index: ${doctor.retrieval.status} (readiness: ${doctor.retrieval.retrievalReadiness})`);
       }
       process.exitCode = doctor.ok ? 0 : 1;
     } else if (verb === 'help' || !verb) {
-      console.log('Usage: mem propose|activate|revalidate|show|update|supersede|retire|quarantine|audit|project|index rebuild|snapshot|recover|doctor');
+      console.log('Usage: mem propose|activate|revalidate|show|update|supersede|retire|quarantine|audit|project|index rebuild|snapshot|recover|doctor|retrieval build --full|retrieval doctor|retrieval clean|retrieve');
     } else {
       throw new Error(`unknown command: ${verb}`);
     }

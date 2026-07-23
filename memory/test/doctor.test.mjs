@@ -50,7 +50,10 @@ test('mem doctor and --json report required PR-1 probes', () => {
   const human = runMemIn(dir, ['doctor']);
   assert.equal(human.status, 0, human.stderr);
   assert.match(human.stdout, /Memory CLI: available/);
-  assert.match(human.stdout, /PGlite: not installed for current milestone/);
+  // PR-2 installs PGlite as a real dependency, so doctor now reports it available
+  // rather than the PR-1 placeholder text.
+  assert.match(human.stdout, /PGlite: available/);
+  assert.match(human.stdout, /Retrieval index: (missing|present)/);
   assert.match(human.stdout, /Embedding provider: not configured/);
   const json = runMemIn(dir, ['doctor', '--json']);
   assert.equal(json.status, 0, json.stderr);
