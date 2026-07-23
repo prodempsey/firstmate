@@ -144,17 +144,23 @@ The CW2 shadow mirror (`bin/fm-cp-shadow.sh`, wired at the lifecycle chokepoints
 Env-only gating is fragile: a lifecycle script invoked from a non-interactive shell that never sourced the bashrc exports sees `CP_SHADOW` unset and silently no-ops, so a whole run of lifecycle actions can go unmirrored without a trace.
 `config/cp-shadow.env` (local, gitignored; enabling the shadow run is firstmate's operational act, never shipped) makes enabling durable instead of dependent on ambient env.
 When `CP_SHADOW` is UNSET in the environment, `bin/fm-cp-shadow.sh` reads this file for `KEY=VALUE` lines and exports them for the mirror invocation; when `CP_SHADOW` is set ambiently (even to `0` or empty) the file is not consulted at all.
-Only four keys are honoured, one per line:
+Only four keys are honoured, one `KEY=VALUE` per line.
+The parser is deliberately literal - the whole right-hand side is the value, with no shell evaluation and no inline-comment trimming - so an explanatory comment must be its own line, and `CP_SHADOW=1 # note` would make the value `1 # note` and stay inert:
 
 ```sh
-CP_SHADOW=1                       # turn the shadow run on; any other value stays inert
-CP_SHADOW_DATA_DIR=<path>         # store override (else FM_HOME/state/control-plane/pgdata)
-CP_ORDER_SOURCE_PATH=<path>       # captain-order source override for order snapshots
-CP_SHADOW_DIVERGENCE=<path>       # divergence-log override (optional)
+# turn the shadow run on; any other value stays inert
+CP_SHADOW=1
+# store override (else FM_HOME/state/control-plane/pgdata)
+CP_SHADOW_DATA_DIR=<path>
+# captain-order source override for order snapshots
+CP_ORDER_SOURCE_PATH=<path>
+# divergence-log override (optional)
+CP_SHADOW_DIVERGENCE=<path>
 ```
 
+A line whose first characters are not one of those four `KEY=` prefixes is ignored, so a `#`-prefixed comment line, a blank line, or an unknown key is simply skipped.
 Explicit ambient env always wins per key: a variable already set in the environment is left untouched even when the file also names it.
-Every other line - comments, blanks, unknown keys, anything malformed - is ignored, and a malformed file can never fail the caller; an absent file is inert exactly as before.
+A malformed or unreadable file can never fail the caller; an absent file is inert exactly as before.
 The tool resolves the same overrides from the environment (`control-plane/bin/cp-shadow.mjs --help`); this file only pre-exports them when ambient env did not.
 
 ## Captain preferences (data/captain.md)

@@ -193,9 +193,80 @@ test_malformed_plus_valid_still_enables() {
   pass_line "malformed lines around a valid CP_SHADOW=1 -> mirror fires, first value wins"
 }
 
+# --- unreadable file never fails the caller (QA qa-csg-q110 finding 1) ------------
+test_unreadable_file_never_fails() {
+  local home marker rc
+  home=$(make_home unreadable)
+  marker="$TMP_ROOT/unreadable/marker"
+  # An existing but unreadable gate file must be treated as inert, not fail the hook under
+  # set -e. This is the exact regression QA reproduced: an open failure escaping to exit 1.
+  printf 'CP_SHADOW=1\n' > "$home/config/cp-shadow.env"
+  chmod 000 "$home/config/cp-shadow.env"
+  if [ -r "$home/config/cp-shadow.env" ]; then
+    # Running as root (or a permissive filesystem) can still read a mode-000 file, so the
+    # unreadable path cannot be exercised here. Do not assert a behaviour we cannot create.
+    chmod 700 "$home/config/cp-shadow.env"
+    pass_line "unreadable-file case SKIPPED (file still readable; likely running as root)"
+    return 0
+  fi
+  env -u CP_SHADOW -u CP_SHADOW_DATA_DIR -u CP_ORDER_SOURCE_PATH -u CP_SHADOW_DIVERGENCE \
+    PATH="$FAKEBIN:$PATH" FM_HOME="$home" CP_SHADOW_TEST_MARKER="$marker" \
+    "$HOOK" status --task t7 --status working
+  rc=$?
+  chmod 700 "$home/config/cp-shadow.env"   # restore so temp cleanup can remove it
+  expect_code 0 "$rc" "an unreadable gate file must never fail the caller (must exit 0)"
+  assert_no_marker "$marker" "an unreadable gate file must stay inert, launching no mirror"
+  pass_line "unreadable gate file -> inert, exit 0 (never fails the caller)"
+}
+
+# --- comment lines ignored; the documented separate-line form works ---------------
+test_comment_lines_and_documented_form() {
+  local home marker rc
+  home=$(make_home comments)
+  marker="$TMP_ROOT/comments/marker"
+  # Mirrors the docs/configuration.md example verbatim: explanatory comments on their own
+  # lines, keys on their own lines. The comments must be skipped and the gate must enable.
+  cat > "$home/config/cp-shadow.env" <<EOF
+# turn the shadow run on; any other value stays inert
+CP_SHADOW=1
+# store override (else FM_HOME/state/control-plane/pgdata)
+CP_SHADOW_DATA_DIR=$home/store/pgdata
+
+# a blank line above and an unknown key below are both skipped
+SOMETHING_ELSE=ignored
+EOF
+  env -u CP_SHADOW -u CP_SHADOW_DATA_DIR -u CP_ORDER_SOURCE_PATH -u CP_SHADOW_DIVERGENCE \
+    PATH="$FAKEBIN:$PATH" FM_HOME="$home" CP_SHADOW_TEST_MARKER="$marker" \
+    "$HOOK" status --task t8 --status working
+  rc=$?
+  expect_code 0 "$rc" "documented comment-line form hook must exit 0"
+  wait_for_marker "$marker" || fail "the documented separate-line comment form must enable the mirror"
+  assert_grep "CP_SHADOW=1" "$marker" "CP_SHADOW=1 on its own line must be honoured past the comment lines"
+  assert_grep "CP_SHADOW_DATA_DIR=$home/store/pgdata" "$marker" "a key after a comment line must still be read"
+  pass_line "documented separate-line comment form -> mirror fires, comments/blank/unknown skipped"
+}
+
+# A CP_SHADOW mention that is ONLY inside a comment must NOT enable the mirror.
+test_commented_out_gate_stays_inert() {
+  local home marker rc
+  home=$(make_home commentedout)
+  marker="$TMP_ROOT/commentedout/marker"
+  printf '# CP_SHADOW=1 (documentation, not an enable)\n' > "$home/config/cp-shadow.env"
+  env -u CP_SHADOW -u CP_SHADOW_DATA_DIR -u CP_ORDER_SOURCE_PATH -u CP_SHADOW_DIVERGENCE \
+    PATH="$FAKEBIN:$PATH" FM_HOME="$home" CP_SHADOW_TEST_MARKER="$marker" \
+    "$HOOK" status --task t9 --status working
+  rc=$?
+  expect_code 0 "$rc" "commented-out gate hook must exit 0"
+  assert_no_marker "$marker" "a #-commented CP_SHADOW line must not enable the mirror"
+  pass_line "commented-out CP_SHADOW=1 -> ignored, inert"
+}
+
 test_gated_off_inert
 test_file_gated_on
 test_ambient_off_suppresses_file
 test_ambient_value_wins_per_key
 test_malformed_file_never_fails
 test_malformed_plus_valid_still_enables
+test_unreadable_file_never_fails
+test_comment_lines_and_documented_form
+test_commented_out_gate_stays_inert

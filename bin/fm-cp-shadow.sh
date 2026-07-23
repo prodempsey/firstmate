@@ -38,10 +38,14 @@
 #   CP_SHADOW_DATA_DIR=<path>   store override (see above)
 #   CP_ORDER_SOURCE_PATH=<path> captain-order source override for order snapshots
 #   CP_SHADOW_DIVERGENCE=<path> divergence-log override (optional)
-# Only those four keys are honoured; every other line (comments, blanks, anything malformed)
-# is ignored, and a malformed file can never fail the caller. Explicit ambient env always
-# wins: a variable already set in the environment is left untouched, and if CP_SHADOW is set
-# ambiently the file is not consulted at all. An absent file is inert exactly as before.
+# Only those four keys are honoured, and the value is the LITERAL rest of the line: no shell
+# evaluation and no inline-comment trimming, so a comment must be its own line (CP_SHADOW=1
+# with a trailing "# note" would set the value to "1 # note" and stay inert). Every other line
+# - a #-comment, a blank, an unknown key, anything malformed - is ignored, and a malformed OR
+# UNREADABLE file can never fail the caller (an open error is treated as inert, exit 0).
+# Explicit ambient env always wins: a variable already set in the environment is left
+# untouched, and if CP_SHADOW is set ambiently the file is not consulted at all. An absent
+# file is inert exactly as before.
 set -eu
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -65,6 +69,13 @@ fm_cp_shadow_apply() { # <key> <value>
 if [ -z "${CP_SHADOW+x}" ]; then
   CP_SHADOW_ENV_FILE="${FM_HOME:-$ROOT}/config/cp-shadow.env"
   if [ -f "$CP_SHADOW_ENV_FILE" ]; then
+    # Slurp with a masked read: an unreadable or otherwise unopenable file yields empty
+    # content and a clean exit, never a set -e abort mid-hook. Reading the content once here
+    # (rather than redirecting the loop straight from the file) also closes the TOCTOU window
+    # between the -f test and the open, and iterating a here-string can never fail to open.
+    # tr drops any NUL bytes so a pathological file cannot spill a "ignored null byte" warning
+    # onto the caller's stderr; the cat masks the open error so an unreadable file stays inert.
+    fm_cp_content=$(cat "$CP_SHADOW_ENV_FILE" 2>/dev/null | tr -d '\000') || fm_cp_content=""
     while IFS= read -r fm_cp_line || [ -n "$fm_cp_line" ]; do
       case "$fm_cp_line" in
         CP_SHADOW=*|CP_SHADOW_DATA_DIR=*|CP_ORDER_SOURCE_PATH=*|CP_SHADOW_DIVERGENCE=*)
@@ -75,8 +86,8 @@ if [ -z "${CP_SHADOW+x}" ]; then
           ;;
         *) : ;;
       esac
-    done < "$CP_SHADOW_ENV_FILE"
-    unset fm_cp_line fm_cp_key fm_cp_val
+    done <<< "$fm_cp_content"
+    unset fm_cp_content fm_cp_line fm_cp_key fm_cp_val
   fi
 fi
 
