@@ -6,6 +6,8 @@ import test from 'node:test';
 import { buildRetrievalIndex, retrievalPaths } from '../lib/retrieval-index.mjs';
 import { RETRIEVAL_MODES, RETRIEVAL_TELEMETRY_SCHEMA, buildTsquery, retrieveMemory } from '../lib/retrieve.mjs';
 import { afterEach } from 'node:test';
+import { readCurrent } from '../lib/retrieval-index.mjs';
+import { loadPGlite } from '../lib/retrieval-pglite.mjs';
 import { registryDir } from '../lib/paths.mjs';
 import { cleanTracked, seedActive, tmpRegistry } from './helpers.mjs';
 
@@ -129,6 +131,43 @@ test('pglite-fts and lexical-fallback select the same set and order for the same
   assert.equal(lex.retrievalMode, 'lexical-fallback');
   assert.deepEqual(fts.selected.map((s) => s.id), lex.selected.map((s) => s.id));
   assert.deepEqual(fts.selected.map((s) => s.score), lex.selected.map((s) => s.score));
+});
+
+test('pglite-fts gates selection to the FTS match set: a record the FTS index did not return is not selected', async () => {
+  // MEM-0002's only signal is the curated keyword "wm". The JS lexical layer expands
+  // "wm" -> "watermark", but the FTS *document* is indexed from raw field text, so a
+  // "watermark" query does NOT FTS-match MEM-0002. In pglite-fts mode it must NOT be
+  // selected (FTS is the candidate generator); lexical fallback, which scans the full
+  // projection with abbreviation expansion, MAY select it. This is the F1 boundary.
+  const dir = tmpRegistry();
+  await seedActive(dir, [
+    { id: 'MEM-0001', summary: 'unrelated note', keywords: ['unrelated'], projects: ['*'], taskKinds: ['*'] },
+    { id: 'MEM-0002', summary: 'abbrev only', keywords: ['wm'], projects: ['*'], taskKinds: ['*'] }
+  ]);
+  await buildRetrievalIndex(dir);
+  const fts = await retrieveMemory({ registryDir: dir, query: 'watermark', project: 'firstmate', kind: 'ship' });
+  assert.equal(fts.retrievalMode, 'pglite-fts');
+  assert.equal(fts.selected.find((s) => s.id === 'MEM-0002'), undefined, 'not an FTS candidate -> not selected in pglite-fts');
+  assert.equal(fts.candidateDiagnostics.find((d) => d.id === 'MEM-0002').ftsMatched, false);
+
+  fs.rmSync(retrievalPaths(dir).current, { force: true });
+  const lex = await retrieveMemory({ registryDir: dir, query: 'watermark', project: 'firstmate', kind: 'ship' });
+  assert.equal(lex.retrievalMode, 'lexical-fallback');
+  assert.deepEqual(lex.selected.map((s) => s.id), ['MEM-0002'], 'fallback scans the full projection with abbreviation expansion');
+});
+
+test('an internally inconsistent FTS surface is treated as corrupt and forces lexical-fallback, not a false pglite-fts', async () => {
+  const dir = await built();
+  const gen = readCurrent(dir).generationId;
+  const dataDir = `${retrievalPaths(dir).generations}/${gen}/pglite`;
+  const PGlite = await loadPGlite();
+  const db = await PGlite.create({ dataDir });
+  await db.query("UPDATE memory_fts SET document = to_tsvector('simple', '')"); // empty every FTS document
+  await db.close();
+  const r = await retrieveMemory({ registryDir: dir, query: 'stale watcher', project: 'firstmate', kind: 'ship' });
+  assert.equal(r.retrievalMode, 'lexical-fallback');
+  assert.match(r.fallbackReason, /pglite-corrupt/);
+  assert.deepEqual(r.selected.map((s) => s.id), ['MEM-0001']);
 });
 
 test('telemetry carries the complete canonical watermark, filters, counts, and query hash', async () => {

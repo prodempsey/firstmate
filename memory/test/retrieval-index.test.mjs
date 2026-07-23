@@ -155,7 +155,7 @@ test('clean removes abandoned generations but never the published current one', 
   // Its presence never displaces current: inspect still reports current.
   assert.equal((await inspectRetrievalIndex(dir, await captureCanonical(dir))).status, 'current');
 
-  const cleaned = cleanRetrievalIndex(dir);
+  const cleaned = await cleanRetrievalIndex(dir);
   assert.deepEqual(cleaned.removed, ['fts-scratch-abandoned']);
   assert.equal(cleaned.kept, built.generationId);
   assert.equal(fs.existsSync(scratch), false, 'abandoned generation removed');
@@ -174,4 +174,104 @@ test('build fails (not fallback) when canonical active index is unverified', asy
   assert.equal(result.ok, false);
   assert.equal(result.mode, 'failed');
   assert.match(result.reason, /active-index/);
+});
+
+// F3: the derived index must be sourced from the verified active-index ARTIFACT, not
+// a fresh registry fold. verifyActiveIndex is order-independent, so an artifact whose
+// records are reordered still verifies `current`; captureCanonical must then reflect
+// the artifact's order, proving it reads memory-index.json rather than activeRecords(fold).
+test('captureCanonical consumes the active-index artifact, not a fresh registry fold', async () => {
+  const dir = tmpRegistry();
+  await seedActive(dir, CORPUS);
+  const indexPath = retrievalPaths(dir).registry.index;
+  const idx = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+  const reversed = { ...idx, records: [...idx.records].reverse() };
+  fs.writeFileSync(indexPath, `${JSON.stringify(reversed, null, 2)}\n`);
+  const captured = await captureCanonical(dir);
+  assert.equal(captured.ok, true);
+  assert.deepEqual(captured.records.map((r) => r.id), reversed.records.map((r) => r.id));
+  assert.deepEqual(captured.records, reversed.records);
+});
+
+// F2: identity/watermark/normalizer/meta/FTS corruptions must all classify as corrupt
+// so a reader never trusts a generation that is not provably the validated one.
+async function openGenDb(dir, generationId) {
+  const PGlite = await loadPGlite();
+  return { PGlite, dataDir: path.join(retrievalPaths(dir).generations, generationId, 'pglite') };
+}
+
+test('corrupt: forged PGlite retrieval_meta.registryHash', async () => {
+  const dir = tmpRegistry();
+  await seedActive(dir, CORPUS);
+  const built = await buildRetrievalIndex(dir);
+  const { PGlite, dataDir } = await openGenDb(dir, built.generationId);
+  const db = await PGlite.create({ dataDir });
+  await db.query("UPDATE retrieval_meta SET value = 'FORGED' WHERE key = 'registryHash'");
+  await db.close();
+  assert.equal((await inspectRetrievalIndex(dir, await captureCanonical(dir))).status, 'corrupt');
+});
+
+test('corrupt: current.json generationId does not match the manifest', async () => {
+  const dir = tmpRegistry();
+  await seedActive(dir, CORPUS);
+  await buildRetrievalIndex(dir);
+  const rp = retrievalPaths(dir);
+  const cur = JSON.parse(fs.readFileSync(rp.current, 'utf8'));
+  fs.writeFileSync(rp.current, `${JSON.stringify({ ...cur, generationId: 'forged-generation-id' }, null, 2)}\n`);
+  assert.equal((await inspectRetrievalIndex(dir, await captureCanonical(dir))).status, 'corrupt');
+});
+
+test('corrupt: manifest normalizer version differs from the running normalizer', async () => {
+  const dir = tmpRegistry();
+  await seedActive(dir, CORPUS);
+  const built = await buildRetrievalIndex(dir);
+  const manifestPath = path.join(retrievalPaths(dir).generations, built.generationId, 'manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.normalizerVersion = 'forged-normalizer/v999';
+  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  assert.equal((await inspectRetrievalIndex(dir, await captureCanonical(dir))).status, 'corrupt');
+});
+
+test('corrupt: FTS documents emptied so they no longer cover the search text', async () => {
+  const dir = tmpRegistry();
+  await seedActive(dir, CORPUS);
+  const built = await buildRetrievalIndex(dir);
+  const { PGlite, dataDir } = await openGenDb(dir, built.generationId);
+  const db = await PGlite.create({ dataDir });
+  await db.query("UPDATE memory_fts SET document = to_tsvector('simple', '')");
+  await db.close();
+  assert.equal((await inspectRetrievalIndex(dir, await captureCanonical(dir))).status, 'corrupt');
+});
+
+test('corrupt: current.generationDir escaping the generations root is rejected', async () => {
+  const dir = tmpRegistry();
+  await seedActive(dir, CORPUS);
+  await buildRetrievalIndex(dir);
+  const rp = retrievalPaths(dir);
+  const cur = JSON.parse(fs.readFileSync(rp.current, 'utf8'));
+  fs.writeFileSync(rp.current, `${JSON.stringify({ ...cur, generationDir: '../../../../etc' }, null, 2)}\n`);
+  assert.equal((await inspectRetrievalIndex(dir, await captureCanonical(dir))).status, 'corrupt');
+});
+
+// F4: builds serialize on the build lock, so concurrent builders cannot publish a
+// stale generation over a newer one, and clean cannot delete an in-use generation.
+test('concurrent builds serialize and leave a single valid published generation', async () => {
+  const dir = tmpRegistry();
+  await seedActive(dir, CORPUS);
+  const [a, b] = await Promise.all([buildRetrievalIndex(dir), buildRetrievalIndex(dir)]);
+  assert.equal(a.ok, true);
+  assert.equal(b.ok, true);
+  const current = readCurrent(dir);
+  assert.ok([a.generationId, b.generationId].includes(current.generationId));
+  assert.equal((await inspectRetrievalIndex(dir, await captureCanonical(dir))).status, 'current');
+});
+
+test('concurrent build + clean never corrupts the published generation', async () => {
+  const dir = tmpRegistry();
+  await seedActive(dir, CORPUS);
+  await buildRetrievalIndex(dir);
+  const [built] = await Promise.all([buildRetrievalIndex(dir), cleanRetrievalIndex(dir)]);
+  assert.equal(built.ok, true);
+  const status = await inspectRetrievalIndex(dir, await captureCanonical(dir));
+  assert.equal(status.status, 'current');
 });

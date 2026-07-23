@@ -129,20 +129,40 @@ export async function buildGenerationDb(PGlite, dataDir, records, generation, me
   }
 }
 
-// Open a published generation read-only-ish and return { rowCount, contentHashes,
-// meta } for corruption/partial detection. Throws if the DB cannot be opened or
-// the expected schema is absent — the caller treats a throw as `pglite-corrupt`.
+// Open a published generation and return the facts the inspector needs to prove
+// the queried index actually corresponds to the verified active projection:
+// { rowCount, ftsCount, contentHashes, meta, ftsMismatchCount, missingFtsCount }.
+// `ftsMismatchCount` counts rows whose stored tsvector does not equal a fresh
+// to_tsvector of the row's search_text (catches an emptied/forged FTS surface);
+// `missingFtsCount` counts docs with no FTS row. Throws if the DB cannot be opened
+// or the expected schema is absent — the caller treats a throw as `pglite-corrupt`.
 export async function inspectGenerationDb(PGlite, dataDir) {
   const db = await PGlite.create({ dataDir });
   try {
     const docs = await db.query('SELECT mem_id, content_hash FROM memory_docs ORDER BY mem_id');
     const fts = await db.query('SELECT count(*)::int AS n FROM memory_fts');
     const metaRows = await db.query('SELECT key, value FROM retrieval_meta');
+    // FTS surface must be internally consistent with the stored search_text: a
+    // silently emptied/forged document is a corrupt generation, not a healthy one.
+    const mismatch = await db.query(
+      `SELECT count(*)::int AS n FROM memory_fts f JOIN memory_docs d ON d.mem_id = f.mem_id
+        WHERE f.document IS DISTINCT FROM to_tsvector('${TS_CONFIG}', d.search_text)`
+    );
+    const missing = await db.query(
+      'SELECT count(*)::int AS n FROM memory_docs d LEFT JOIN memory_fts f ON f.mem_id = d.mem_id WHERE f.mem_id IS NULL'
+    );
     const contentHashes = new Map();
     for (const row of docs.rows) contentHashes.set(row.mem_id, row.content_hash);
     const meta = {};
     for (const row of metaRows.rows) meta[row.key] = row.value;
-    return { rowCount: docs.rows.length, ftsCount: fts.rows[0].n, contentHashes, meta };
+    return {
+      rowCount: docs.rows.length,
+      ftsCount: fts.rows[0].n,
+      contentHashes,
+      meta,
+      ftsMismatchCount: mismatch.rows[0].n,
+      missingFtsCount: missing.rows[0].n
+    };
   } finally {
     await db.close();
   }

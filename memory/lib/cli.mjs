@@ -110,13 +110,37 @@ function validation(flags) {
   return out;
 }
 
-// Resolve the retrieval query text from exactly one of --query, --query-file, or
-// --stdin. Fails closed when none is supplied so an empty retrieve is explicit.
+// Resolve the retrieval query text from EXACTLY ONE of --query, --query-file, or
+// --stdin. Zero sources or more than one source is a hard error, so the documented
+// "exactly one input" contract is enforced rather than silently prioritized (F5).
 function retrievalQuery(flags) {
-  if (typeof flags.query === 'string') return flags.query;
-  if (typeof flags['query-file'] === 'string') return fs.readFileSync(flags['query-file'], 'utf8');
-  if (flags.stdin) return fs.readFileSync(0, 'utf8');
-  throw new Error('retrieve requires --query, --query-file, or --stdin');
+  const present = [];
+  if (typeof flags.query === 'string') present.push('query');
+  if (typeof flags['query-file'] === 'string') present.push('query-file');
+  if (flags.stdin) present.push('stdin');
+  if (present.length === 0) throw new Error('retrieve requires exactly one of --query, --query-file, or --stdin');
+  if (present.length > 1) throw new Error(`retrieve accepts exactly one query source, got: ${present.map((p) => `--${p}`).join(', ')}`);
+  if (present[0] === 'query') return flags.query;
+  if (present[0] === 'query-file') return fs.readFileSync(flags['query-file'], 'utf8');
+  return fs.readFileSync(0, 'utf8');
+}
+
+// Validate the required retrieval filters and optional numeric/temporal flags,
+// rejecting bad input instead of silently defaulting (F5).
+function retrievalOptions(flags) {
+  if (typeof flags.project !== 'string' || flags.project.length === 0) throw new Error('retrieve requires --project <name>');
+  if (typeof flags.kind !== 'string' || flags.kind.length === 0) throw new Error('retrieve requires --kind <name>');
+  let top;
+  if (flags.top !== undefined) {
+    top = Number(flags.top);
+    if (!Number.isInteger(top) || top <= 0) throw new Error('--top requires a positive integer');
+  }
+  let asOf;
+  if (flags['as-of'] !== undefined) {
+    if (typeof flags['as-of'] !== 'string' || Number.isNaN(Date.parse(flags['as-of']))) throw new Error('--as-of requires an ISO-8601 timestamp');
+    asOf = flags['as-of'];
+  }
+  return { project: flags.project, kind: flags.kind, top, asOf };
 }
 
 function print(value, json = false) {
@@ -215,20 +239,23 @@ export async function main(args, options = {}) {
         }
         process.exitCode = canonical.ok ? 0 : 1;
       } else if (sub === 'clean') {
-        print(cleanRetrievalIndex(dir), flags.json);
+        print(await cleanRetrievalIndex(dir), flags.json);
       } else {
         throw new Error('usage: mem retrieval build --full | retrieval doctor | retrieval clean');
       }
     } else if (verb === 'retrieve') {
-      const scopes = list(flags.scope);
+      // Resolve and validate the query source and filters BEFORE any work, so a bad
+      // argument contract fails closed with a JSON error and never runs a retrieval.
+      const query = retrievalQuery(flags);
+      const opts = retrievalOptions(flags);
       const result = await retrieveMemory({
         registryDir: dir,
-        query: retrievalQuery(flags),
-        project: typeof flags.project === 'string' ? flags.project : null,
-        kind: typeof flags.kind === 'string' ? flags.kind : null,
-        scopes,
-        top: flags.top !== undefined ? Number(flags.top) : undefined,
-        asOf: typeof flags['as-of'] === 'string' ? flags['as-of'] : undefined
+        query,
+        project: opts.project,
+        kind: opts.kind,
+        scopes: list(flags.scope),
+        top: opts.top,
+        asOf: opts.asOf
       });
       if (flags.json) print(result, true);
       else {

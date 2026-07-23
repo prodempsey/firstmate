@@ -182,6 +182,26 @@ test('retrieval CLI failure contracts: missing --full and missing query are JSON
   assert.match(JSON.parse(noQuery.stdout).error, /--query|--stdin/);
 });
 
+test('retrieve enforces the documented argument contract (F5)', () => {
+  const dir = tmpRegistry();
+  seedActiveViaCli(dir, 'MEM-0001', 'watcher note', ['--keyword', 'watcher', '--project', 'firstmate', '--kind', 'ship']);
+  runMemIn(dir, ['retrieval', 'build', '--full', '--json']);
+  const errOf = (args) => {
+    const r = runMemIn(dir, ['retrieve', ...args, '--json']);
+    assert.equal(r.status, 1, `expected exit 1 for ${args.join(' ')}`);
+    return JSON.parse(r.stdout).error;
+  };
+  // Two query sources is rejected, not silently prioritized.
+  assert.match(errOf(['--query', 'a', '--stdin', '--project', 'firstmate', '--kind', 'ship']), /exactly one query source/);
+  // Required filters.
+  assert.match(errOf(['--query', 'watcher', '--kind', 'ship']), /--project/);
+  assert.match(errOf(['--query', 'watcher', '--project', 'firstmate']), /--kind/);
+  // Numeric and temporal validation.
+  assert.match(errOf(['--query', 'watcher', '--project', 'firstmate', '--kind', 'ship', '--top', '0']), /positive integer/);
+  assert.match(errOf(['--query', 'watcher', '--project', 'firstmate', '--kind', 'ship', '--top', 'abc']), /positive integer/);
+  assert.match(errOf(['--query', 'watcher', '--project', 'firstmate', '--kind', 'ship', '--as-of', 'not-a-date']), /ISO-8601/);
+});
+
 test('retrieve returns failed (exit 1) when canonical is unverified, without falling back', () => {
   const dir = tmpRegistry();
   seedActiveViaCli(dir, 'MEM-0001', 'watcher note', ['--keyword', 'watcher', '--project', 'firstmate', '--kind', 'ship']);

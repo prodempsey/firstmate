@@ -113,18 +113,20 @@ function compareIsoDesc(a, b) {
   return 0;
 }
 
-// Build the OR-of-lexemes tsquery from the normalized query terms. Only purely
-// alphanumeric lexemes are used (dashed compounds contribute via their already-
-// split subtokens), and each is sanitized to [a-z0-9], so the string is always
-// safe for to_tsquery('simple', ...).
+// Build the OR-of-lexemes tsquery from the normalized query terms. Only terms that
+// are ALREADY purely alphanumeric are used as lexemes; dashed/underscored compounds
+// are skipped because their split subtokens are already present in the term bag, so
+// no lexeme is ever synthesized by stripping separators (which would produce junk
+// like "exactsha"). Every emitted lexeme matches [a-z0-9]+, so the joined string is
+// always safe for to_tsquery('simple', ...).
 export function buildTsquery(terms) {
   const lexemes = [];
   const seen = new Set();
   for (const t of terms) {
-    const clean = String(t).replace(/[^a-z0-9]/g, '');
-    if (clean && !seen.has(clean)) {
-      seen.add(clean);
-      lexemes.push(clean);
+    const term = String(t);
+    if (/^[a-z0-9]+$/.test(term) && !seen.has(term)) {
+      seen.add(term);
+      lexemes.push(term);
     }
   }
   return lexemes.join(' | ');
@@ -210,9 +212,11 @@ export async function retrieveMemory(options = {}) {
     else passing.push(record);
   }
 
-  // 4. In pglite-fts mode, exercise the derived index (ts_rank telemetry + a
-  //    matched flag per candidate). FTS never gates selection; the JS lexical
-  //    layer below is authoritative and deterministic.
+  // 4. In pglite-fts mode, query the verified derived index. The returned ID set is
+  //    the CANDIDATE GENERATOR: only records the FTS index returned may be selected
+  //    (F1). A record absent from the FTS match set is never selected while the mode
+  //    claims pglite-fts. In lexical-fallback mode there is no FTS gate and the JS
+  //    lexical layer scans the full verified projection.
   const tQuery = Date.now();
   const ftsRankById = new Map();
   if (mode === 'pglite-fts') {
@@ -237,24 +241,30 @@ export async function retrieveMemory(options = {}) {
     }
   }
   const queryMs = Date.now() - tQuery;
+  const ftsGated = mode === 'pglite-fts';
 
-  // 5. Deterministic lexical scoring + eligibility over the filtered set.
+  // 5. Deterministic lexical scoring + eligibility. In pglite-fts mode the candidate
+  //    pool is exactly the FTS match set (∩ filtered); in lexical-fallback it is the
+  //    full filtered set. Records excluded by the FTS gate are not candidates and are
+  //    reported in candidateDiagnostics (ftsMatched: false), never selected.
   const tRank = Date.now();
   const candidates = [];
   for (const record of passing) {
+    const inFts = ftsRankById.has(record.id);
     const scored = scoreRecord(record, q);
     candidates.push({
       record,
       score: scored.score,
       matchedTermCount: scored.matchedTermCount,
       evidence: scored.evidence,
-      ftsRank: ftsRankById.has(record.id) ? ftsRankById.get(record.id) : null,
-      ftsMatched: ftsRankById.has(record.id)
+      ftsRank: inFts ? ftsRankById.get(record.id) : null,
+      ftsMatched: inFts
     });
   }
 
+  const pool = ftsGated ? candidates.filter((c) => c.ftsMatched) : candidates;
   const eligible = [];
-  for (const cand of candidates) {
+  for (const cand of pool) {
     if (cand.score === 0) {
       rejected.push({ id: cand.record.id, reason: 'score-0' });
     } else if (!isEligible(cand.evidence, cand.matchedTermCount)) {
@@ -285,7 +295,7 @@ export async function retrieveMemory(options = {}) {
     ftsRank: c.ftsRank
   }));
 
-  const counts = { eligible: eligible.length, candidates: candidates.length, selected: selected.length, rejected: rejected.length };
+  const counts = { eligible: eligible.length, candidates: pool.length, selected: selected.length, rejected: rejected.length };
 
   return {
     ok: true,
