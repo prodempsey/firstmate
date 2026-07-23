@@ -2,9 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { appendRegistryEvent, auditRegistry, buildActiveIndex, foldRegistry, recoverRegistry, snapshotRegistry } from './registry.mjs';
 import { checkDoctor } from './doctor.mjs';
-import { registryDir, registryPaths } from './paths.mjs';
+import { canonicalCheckout, registryDir, registryPaths } from './paths.mjs';
 import { buildRetrievalIndex, captureCanonical, cleanRetrievalIndex, inspectRetrievalIndex } from './retrieval-index.mjs';
 import { retrieveMemory } from './retrieve.mjs';
+import { DEFAULT_MAX_ACTIVATION, applyMigration, migrationPaths, runDryRun } from './migrate.mjs';
 
 function parseArgs(args) {
   const out = { _: [] };
@@ -284,6 +285,48 @@ export async function main(args, options = {}) {
         for (const rec of result.selected) console.log(`  ${rec.id} [score ${rec.score}] ${rec.summary}`);
       }
       process.exitCode = result.ok ? 0 : 1;
+    } else if (verb === 'migrate') {
+      // Conservative migration. `dry-run` scans the corpus and writes a proposal +
+      // report with ZERO registry writes; `apply` is the captain-gated activation
+      // path that consumes the exact proposal digest.
+      const sub = flags._[1];
+      if (sub === 'dry-run') {
+        const corpusRoot = typeof flags['corpus-root'] === 'string' ? flags['corpus-root'] : canonicalCheckout(process.env);
+        const outDir = typeof flags['out-dir'] === 'string' ? flags['out-dir'] : migrationPaths(path.join(dir, 'migration')).dir;
+        const result = runDryRun(corpusRoot, outDir);
+        if (flags.json) print(result, true);
+        else {
+          console.log(`Proposal: ${result.proposalFile}`);
+          console.log(`Report: ${result.reportFile}`);
+          console.log(`Digest: ${result.digest}`);
+          console.log(`Proposed records: ${result.counts.total}`);
+          for (const s of result.sources) console.log(`  ${s.key} [${s.policy}]: ${s.exists ? `${s.itemCount} item(s)` : 'absent'}`);
+          console.log('Activation is the captain\'s decision; review the report, then run mem migrate apply --captain-approved <digest>.');
+        }
+        process.exitCode = 0;
+      } else if (sub === 'apply') {
+        let maxActivation = DEFAULT_MAX_ACTIVATION;
+        if (flags['max-activation'] !== undefined) {
+          maxActivation = Number(flags['max-activation']);
+          if (!Number.isInteger(maxActivation) || maxActivation < 0) throw new Error('--max-activation requires a non-negative integer');
+        }
+        const result = await applyMigration(dir, {
+          proposalFile: typeof flags.proposal === 'string' ? flags.proposal : undefined,
+          approvedDigest: typeof flags['captain-approved'] === 'string' ? flags['captain-approved'] : (flags['captain-approved'] === true ? '' : undefined),
+          activate: list(flags.activate).filter((v) => typeof v === 'string'),
+          maxActivation
+        });
+        if (flags.json) print(result, true);
+        else {
+          console.log(`Applied proposal digest ${result.digest}`);
+          console.log(`Proposed: ${result.proposedCount} (${result.proposed.filter((p) => p.skipped).length} already present)`);
+          console.log(`Activated: ${result.activatedCount} (${result.activated.filter((a) => a.skipped).length} already present)`);
+          for (const a of result.activated) console.log(`  active ${a.memId} <- ${a.proposalId}`);
+        }
+        process.exitCode = 0;
+      } else {
+        throw new Error('usage: mem migrate dry-run [--corpus-root <dir>] [--out-dir <dir>] | migrate apply --proposal <file> --captain-approved <digest> [--activate <id> ...]');
+      }
     } else if (verb === 'doctor') {
       const doctor = checkDoctor(options.root || path.resolve('.', 'memory'), process.env);
       if (flags.json) print(doctor, true);
@@ -303,7 +346,7 @@ export async function main(args, options = {}) {
       }
       process.exitCode = doctor.ok ? 0 : 1;
     } else if (verb === 'help' || !verb) {
-      console.log('Usage: mem propose|activate|revalidate|show|update|supersede|retire|quarantine|audit|project|index rebuild|snapshot|recover|doctor|retrieval build --full|retrieval doctor|retrieval clean|retrieve');
+      console.log('Usage: mem propose|activate|revalidate|show|update|supersede|retire|quarantine|audit|project|index rebuild|snapshot|recover|doctor|retrieval build --full|retrieval doctor|retrieval clean|retrieve|migrate dry-run|migrate apply');
     } else {
       throw new Error(`unknown command: ${verb}`);
     }

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test, { afterEach } from 'node:test';
 import { registryPaths } from '../lib/paths.mjs';
 import { cleanTracked, runMemIn, tmpRegistry } from './helpers.mjs';
@@ -222,6 +224,47 @@ test('retrieve returns failed (exit 1) when canonical is unverified, without fal
   const parsed = JSON.parse(r.stdout);
   assert.equal(parsed.ok, false);
   assert.equal(parsed.retrievalMode, 'failed');
+});
+
+// PR-3 migration CLI smoke: dry-run scans a fixture corpus, writes proposal + report
+// with ZERO registry writes, and the digest-gated apply activates only the named
+// candidate. Uses an isolated corpus + registry; never the production registry.
+test('migrate dry-run then digest-gated apply activates only the captain-named record', () => {
+  const dir = tmpRegistry();
+  const corpus = fs.mkdtempSync(path.join(os.tmpdir(), 'mem-cli-corpus-'));
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'mem-cli-out-'));
+  fs.mkdirSync(path.join(corpus, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(corpus, 'data', 'learnings.md'),
+    '# L\n\n## 2026-07-14 — Store full verbatim prompts\n\n**Rule:** `bin/fm-order.sh add` everything.\n\n## 2026-07-10 — Gone [SUPERSEDED, DO NOT FOLLOW]\n\nold.\n');
+
+  const dry = runMemIn(dir, ['migrate', 'dry-run', '--corpus-root', corpus, '--out-dir', out, '--json']);
+  assert.equal(dry.status, 0, dry.stderr);
+  const dryOut = JSON.parse(dry.stdout);
+  assert.equal(dryOut.counts.total, 2);
+  assert.ok(fs.existsSync(dryOut.reportFile));
+  // Dry-run wrote nothing to the registry.
+  assert.equal(fs.existsSync(registryPaths(dir).registry), false);
+
+  const proposal = JSON.parse(fs.readFileSync(dryOut.proposalFile, 'utf8'));
+  const candidate = proposal.proposals.find((p) => p.disposition === 'candidate');
+
+  // Wrong digest is refused with a JSON error and exit 1; still no registry.
+  const wrong = runMemIn(dir, ['migrate', 'apply', '--proposal', dryOut.proposalFile, '--captain-approved', 'nope', '--json']);
+  assert.equal(wrong.status, 1);
+  assert.equal(JSON.parse(wrong.stdout).ok, false);
+  assert.equal(fs.existsSync(registryPaths(dir).registry), false);
+
+  const apply = runMemIn(dir, ['migrate', 'apply', '--proposal', dryOut.proposalFile, '--captain-approved', dryOut.digest, '--activate', candidate.proposalId, '--json']);
+  assert.equal(apply.status, 0, apply.stderr);
+  const applyOut = JSON.parse(apply.stdout);
+  assert.equal(applyOut.activatedCount, 1);
+
+  const audit = JSON.parse(runMemIn(dir, ['audit', '--json']).stdout);
+  assert.equal(audit.records.total, 2);
+  assert.equal(audit.records.active, 1);
+
+  fs.rmSync(corpus, { recursive: true, force: true });
+  fs.rmSync(out, { recursive: true, force: true });
 });
 
 test('canonical non-mutating fixture creates an empty index without production records', () => {
