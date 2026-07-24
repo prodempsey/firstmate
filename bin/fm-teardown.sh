@@ -1259,6 +1259,31 @@ if [ "$KIND" = ship ]; then
 else
   "$SCRIPT_DIR/fm-cp-shadow.sh" teardown --task "$ID" || true
 fi
+
+# ORD-274 Compounding Fleet stage A: postmortem capture at closeout. Distill this finished task's
+# report/closeout evidence into a STRUCTURED POSTMORTEM memory CANDIDATE (what worked, what failed,
+# sharp edges, closure evidence, and task/SHA/PR/report provenance under source_type=task-postmortem).
+# Teardown is the ONE universal closeout every ship and scout task passes through exactly once, with
+# the richest evidence in scope, which is why the single chokepoint lives here rather than in the
+# merge helpers. The hook is inert unless FM_POSTMORTEM_STOW=1, proposes only (never auto-activates,
+# so curated activation policy stands), backgrounds the write, and always exits 0 - it can never
+# block or fail teardown. Secondmate retirement is a supervisor teardown, not task work, so skip it.
+if [ "$KIND" != secondmate ]; then
+  pm_report="$DATA/$ID/report.md"
+  [ -f "$pm_report" ] || pm_report=
+  pm_brief="$DATA/$ID/brief.md"
+  [ -f "$pm_brief" ] || pm_brief=
+  # A ship closeout's evidence is the landed SHA; a scout's is the report path (not a SHA).
+  pm_sha=
+  if [ "$KIND" != scout ]; then pm_sha=$CLOSE_EVIDENCE; fi
+  pm_args=(--task "$ID" --kind "$KIND" --mode "${MODE:-}" --outcome "$CLOSE_DISPOSITION" --evidence "$CLOSE_EVIDENCE")
+  if [ -n "$PROJ" ]; then pm_args+=(--project "$(basename "$PROJ")"); fi
+  if [ -n "$pm_report" ]; then pm_args+=(--report "$pm_report"); fi
+  if [ -n "$pm_brief" ]; then pm_args+=(--brief "$pm_brief"); fi
+  if [ -n "$pm_sha" ]; then pm_args+=(--sha "$pm_sha"); fi
+  if [ -n "$PR_URL" ]; then pm_args+=(--pr "$PR_URL"); fi
+  "$SCRIPT_DIR/fm-postmortem-stow.sh" "${pm_args[@]}" || true
+fi
 backlog_refresh_reminder
 # Closeout is the highest-value triage trigger: a torn-down task can clear a blocker,
 # leave a scout report needing a successor, or resolve a bug, and none of that surfaces

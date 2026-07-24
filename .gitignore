@@ -19,3 +19,4 @@ config/cmux-socket-password
 config/wedge-alarm
 config/canonical-trunk.json
 config/cp-shadow.env
+config/postmortem-stow.env

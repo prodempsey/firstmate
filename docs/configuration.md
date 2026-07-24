@@ -163,6 +163,33 @@ Explicit ambient env always wins per key: a variable already set in the environm
 A malformed or unreadable file can never fail the caller; an absent file is inert exactly as before.
 The tool resolves the same overrides from the environment (`control-plane/bin/cp-shadow.mjs --help`); this file only pre-exports them when ambient env did not.
 
+## Postmortem capture (config/postmortem-stow.env)
+
+The postmortem-capture hook (`bin/fm-postmortem-stow.sh`, wired at the universal task closeout in `bin/fm-teardown.sh`) distills each finished ship/scout task into a structured postmortem memory record - what worked, what failed, sharp edges, closure evidence, and task/SHA/PR/report provenance under `source_type=task-postmortem` - via `mem propose`.
+It is inert unless `FM_POSTMORTEM_STOW=1` is set in the environment.
+Enabling it is firstmate's operational act (the Compounding Fleet program's write half), never shipped on by default, and the same inert-until-opted-in posture as the shadow run and spawn-time memory injection.
+The record lands as a CANDIDATE only: the hook never auto-activates, so activation policy stays curated (a candidate is inert to governed recall until a captain-authorized `mem activate`).
+The write is backgrounded and detached and the hook always exits 0, so a slow, wedged, or unavailable memory write can never block or fail a closeout; a missing memory CLI is a silent no-op.
+
+Env-only gating is fragile for the same reason the shadow run's is: a closeout invoked from a non-interactive shell that never sourced a bashrc sees `FM_POSTMORTEM_STOW` unset and silently no-ops.
+`config/postmortem-stow.env` (local, gitignored, never shipped) makes enabling durable.
+When `FM_POSTMORTEM_STOW` is UNSET in the environment, `bin/fm-postmortem-stow.sh` reads this file for `KEY=VALUE` lines and exports them; when `FM_POSTMORTEM_STOW` is set ambiently (even to `0` or empty) the file is not consulted at all.
+Only three keys are honoured, one `KEY=VALUE` per line, with the same deliberately-literal parser as `config/cp-shadow.env` (the whole right-hand side is the value; a comment must be its own line):
+
+```sh
+# turn postmortem capture on; any other value stays inert
+FM_POSTMORTEM_STOW=1
+# registry override (else the memory package's canonical registry location)
+MEM_REGISTRY_DIR=<path>
+# memory CLI override (else node <root>/memory/bin/mem.mjs)
+MEM_CLI=<command>
+```
+
+A line whose first characters are not one of those three `KEY=` prefixes is ignored, so a `#`-comment, a blank line, or an unknown key is simply skipped.
+Explicit ambient env always wins per key.
+A malformed or unreadable file can never fail the caller; an absent file is inert.
+Left unset, `MEM_REGISTRY_DIR` defers to the memory package's canonical registry location, so postmortems land in the same governed registry as every other record.
+
 ## Captain preferences (data/captain.md)
 
 Personal preferences for one captain's fleet live locally in `data/captain.md`; it is gitignored and printed in the session-start context digest after `data/projects.md` and optional `data/secondmates.md`.
