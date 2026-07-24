@@ -33,6 +33,7 @@ The shared no-mistakes gate refusal used by `fm-spawn.sh`, `fm-send.sh`, and `fm
 | `fm-brief.sh`            | Scaffold ship, scout, secondmate-charter, and Herdr-lab briefs                       |
 | `fm-herdr-lab.sh`        | Provision and guardedly operate an isolated, never-default Herdr lab session         |
 | `fm-ensure-agents-md.sh` | Ensure a project's real `AGENTS.md`, its `CLAUDE.md` symlink, and the canonical self-governance section |
+| `fm-failure-class.sh`    | Sanctioned append-only writer and registry-register flow for the failure-class ledger (docs/failure-classes/) |
 | `fm-order.sh`            | Record, read, and disposition captain orders; the only sanctioned writer of the captain order inbox (docs/captain-orders.md) |
 | `fm-order-duty.sh`       | Warn when a captain chat capture is undrained, an order still needs action, or the inbox is corrupt |
 | `fm-order-capture-hook.sh` | Spool a captain chat message to disk at prompt submission, before firstmate takes a turn |
