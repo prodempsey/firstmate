@@ -395,10 +395,10 @@ run_one() {
   ok=${ok:-0}; notok=${notok:-0}; skip=${skip:-0}
   TOTAL_OK=$((TOTAL_OK + ok)); TOTAL_NOTOK=$((TOTAL_NOTOK + notok)); TOTAL_SKIP=$((TOTAL_SKIP + skip))
   printf '%s\n' "$label" >> "$EXECUTED_FILE"
-  jq -nc --arg label "$label" --arg rc "$rc" --arg ok "$ok" --arg notok "$notok" \
+  jq -nc --arg suite_label "$label" --arg rc "$rc" --arg ok "$ok" --arg notok "$notok" \
     --arg skip "$skip" --arg timedout "$timedout" \
     --rawfile tail <(tail -c 4000 "$tout") \
-    '{suite:$label,exit:($rc|tonumber),timed_out:($timedout=="yes"),
+    '{suite:$suite_label,exit:($rc|tonumber),timed_out:($timedout=="yes"),
       ok:($ok|tonumber),not_ok:($notok|tonumber),skip:($skip|tonumber),
       transcript_tail:$tail}' >> "$SUITE_JSONL"
   if [ "$timedout" = yes ]; then
@@ -525,8 +525,8 @@ if [ -n "$BASE_SHA" ] && [ -n "$ACTUAL_SHA" ]; then
   fi
 fi
 emit_gate base_currency "$base_status" "$(jq -nc \
-  --arg src "$BASE_SOURCE" --arg label "$BASE_LABEL" --arg sha "$BASE_SHA" --arg rel "$BASE_RELATION" \
-  '{source:$src,base_branch:(if $label=="" then null else $label end),
+  --arg src "$BASE_SOURCE" --arg base_label "$BASE_LABEL" --arg sha "$BASE_SHA" --arg rel "$BASE_RELATION" \
+  '{source:$src,base_branch:(if $base_label=="" then null else $base_label end),
     base_sha:(if $sha=="" then null else $sha end),relation:$rel}')"
 
 # ============================================================================
