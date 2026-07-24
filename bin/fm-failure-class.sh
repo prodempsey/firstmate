@@ -38,7 +38,18 @@
 #        [--confidence unverified|observed|reproduced|guarded] [--keyword <kw> ...]
 #   fm-failure-class.sh ensure --id <FC-NNN> ...   # idempotent-additive add (skip if present)
 #   fm-failure-class.sh bump <id> --provenance <type>:<ref>[:<note>] [--note <text>]
+#   fm-failure-class.sh refinements [--json]   # classes at/over the refinement threshold, with provenance
 #   fm-failure-class.sh register [--id <FC-NNN> ...] [--live] [--gate <ref>] [--json]
+#
+# Stage E - captain-gated self-refinement (Compounding Fleet, ORD-274). When a
+# `bump` (occurrence event) pushes a class's DERIVED occurrence count across the
+# refinement threshold, the bump prints a bordered REFINEMENT DUE banner naming the
+# class, its invariant, and the instruction to draft a brief-template / QA-checklist
+# amendment for CAPTAIN approval - the same pull-based stderr banner idiom as
+# fm-triage-duty.sh: it never blocks the bump and the verb still exits 0. The banner
+# fires exactly ONCE, on the crossing bump; later bumps of an already-over class stay
+# silent. The `refinements` verb lists every class at/over threshold with its full
+# provenance, so a draft has its citations ready.
 #
 # register sets a distinct, typed `sourceType=failure-class` (mem propose
 # --source-type) on every registered record so curation can filter failure classes
@@ -52,6 +63,9 @@
 #   FM_FC_LEDGER    ledger path override (default docs/failure-classes/ledger.jsonl).
 #   MEM_CLI         memory CLI command override (default: node <root>/memory/bin/mem.mjs).
 #   MEM_REGISTRY_DIR  registry `register --live` targets (default: memory package default).
+#   FM_FC_REFINE_THRESHOLD  occurrence count at/above which a class is DUE for a
+#                   captain-gated process amendment (default 3). A value that is not a
+#                   positive integer falls back to the default.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -59,6 +73,8 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 LEDGER="${FM_FC_LEDGER:-$FM_ROOT/docs/failure-classes/ledger.jsonl}"
 SCHEMA="kraken-failure-class/ledger-event/v1"
 MARKER_KEYWORD="failure-class"
+REFINE_THRESHOLD_DEFAULT=3
+REFINE_RULE='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
 die() { echo "fm-failure-class: $*" >&2; exit 1; }
@@ -139,6 +155,46 @@ prov_json() {
 append_event() { # <compact-json-object>
   mkdir -p "$(dirname "$LEDGER")"
   printf '%s\n' "$1" >> "$LEDGER"
+}
+
+# ---- stage E: captain-gated refinement ------------------------------------
+# The occurrence count at/above which a class is DUE for a captain-gated process
+# amendment. Configurable per repo conventions via the FM_FC_REFINE_THRESHOLD env
+# knob (like FM_FC_LEDGER above); a value that is not a positive integer falls back
+# to the default rather than disabling the ratchet.
+refine_threshold() {
+  local t=${FM_FC_REFINE_THRESHOLD:-$REFINE_THRESHOLD_DEFAULT}
+  case "$t" in
+    ''|*[!0-9]*) t=$REFINE_THRESHOLD_DEFAULT ;;
+  esac
+  [ "$t" -ge 1 ] 2>/dev/null || t=$REFINE_THRESHOLD_DEFAULT
+  printf '%s' "$t"
+}
+
+# Print the bordered REFINEMENT DUE banner for a class that just crossed the
+# threshold. Same pull-based stderr idiom as fm-triage-duty.sh: it names the class,
+# its invariant, and the instruction to draft a process amendment for CAPTAIN
+# approval, and lists the provenance so the draft's citations are ready. It writes
+# only to stderr and returns 0, so it never blocks or fails the bump.
+emit_refinement_banner() { # <record-json> <count> <threshold>
+  local rec=$1 count=$2 threshold=$3 id name inv provlist
+  id=$(printf '%s' "$rec" | jq -r .id)
+  name=$(printf '%s' "$rec" | jq -r .name)
+  inv=$(printf '%s' "$rec" | jq -r .invariant)
+  provlist=$(printf '%s' "$rec" | jq -r '.provenance[] | "[\(.type)] \(.ref)\(if .note then " - \(.note)" else "" end)"')
+  {
+    printf '●%s\n' "$REFINE_RULE"
+    printf '●  REFINEMENT DUE - %s: %s\n' "$id" "$name"
+    printf '●  Occurrence count %s crossed the refinement threshold (%s). This class\n' "$count" "$threshold"
+    printf '●  keeps recurring, so the lesson should graduate from recall into the process.\n'
+    printf '●  invariant: %s\n' "$inv"
+    printf '●  Draft an amendment to the brief template or QA checklist that bakes the\n'
+    printf '●  invariant above into the process, and put it on the board for CAPTAIN\n'
+    printf '●  approval - do not amend the process unasked.\n'
+    printf '●  Provenance (cite these in the draft; the refinements verb lists all):\n'
+    printf '%s\n' "$provlist" | sed 's/^/●    - /'
+    printf '●%s\n' "$REFINE_RULE"
+  } >&2
 }
 
 # ---- verbs ----------------------------------------------------------------
@@ -311,9 +367,48 @@ cmd_bump() {
   fold_or_die | jq -e --arg id "$id" 'any(.[]; .id==$id)' >/dev/null \
     || die "cannot bump unknown class id: $id (define it with add first)"
   append_event "$event"
-  local count; count=$(fold_or_die | jq --arg id "$id" '.[] | select(.id==$id) | .occurrence_count')
+  # Read the post-append record inside the same serialized generation so the count -
+  # and therefore the crossing test - reflects exactly this bump, never a stale read.
+  local rec; rec=$(fold_or_die | jq -c --arg id "$id" '.[] | select(.id==$id)')
   unlock_ledger
+  local count; count=$(printf '%s' "$rec" | jq '.occurrence_count')
   echo "bumped $id -> occurrence_count=$count"
+  # Stage E: fire the captain-gated refinement banner exactly on the bump that CROSSES
+  # the threshold (prev < threshold <= count). Because each bump appends exactly one
+  # provenance, prev == count-1, so a class already at/over threshold never re-fires on
+  # subsequent bumps. Pull-based, stderr-only, never blocks: the bump still exits 0.
+  local threshold; threshold=$(refine_threshold)
+  if [ "$((count - 1))" -lt "$threshold" ] && [ "$count" -ge "$threshold" ]; then
+    emit_refinement_banner "$rec" "$count" "$threshold"
+  fi
+}
+
+# refinements: list every class whose derived occurrence count is at/over the
+# refinement threshold, each with its full provenance, so a captain-gated process
+# amendment can be drafted with its citations ready. Read-only: it folds the ledger
+# and prints, mutating nothing.
+cmd_refinements() {
+  local json=0; [ "${1:-}" = "--json" ] && json=1
+  local threshold; threshold=$(refine_threshold)
+  local due
+  due=$(fold_or_die | jq -c --argjson t "$threshold" '[ .[] | select(.occurrence_count >= $t) ]')
+  if [ "$json" = 1 ]; then
+    printf '%s\n' "$due" | jq --argjson t "$threshold" '{threshold:$t, classes:.}'
+    return 0
+  fi
+  local n; n=$(printf '%s\n' "$due" | jq 'length')
+  if [ "$n" = 0 ]; then
+    echo "no classes at/over the refinement threshold ($threshold)"
+    return 0
+  fi
+  echo "Classes DUE for captain-gated refinement (occurrence_count >= $threshold):"
+  echo
+  printf '%s\n' "$due" | jq -r '.[] |
+    "\(.id) - \(.name)  [occurrences: \(.occurrence_count)]",
+    "  invariant: \(.invariant)",
+    "  provenance:",
+    (.provenance[] | "    - [\(.type)] \(.ref)\(if .note then "  - \(.note)" else "" end)"),
+    ""'
 }
 
 # register: distil the folded ledger into the LIVE memory registry via the
@@ -410,6 +505,7 @@ main() {
     add) cmd_add "$@" ;;
     ensure) cmd_ensure "$@" ;;
     bump) cmd_bump "$@" ;;
+    refinements) cmd_refinements "$@" ;;
     register) cmd_register "$@" ;;
     -h|--help|help) usage ;;
     *) die "unknown verb '$verb' (try --help)" ;;

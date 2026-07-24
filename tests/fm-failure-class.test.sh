@@ -173,4 +173,80 @@ after_hash=$(cksum "$RS" | awk '{print $1}')
 if [ "$before_hash" = "$after_hash" ]; then
   pass "seed --check writes nothing to the target ledger"; else fail "seed --check mutated the ledger"; fi
 
+# --- stage E: captain-gated refinement banner + refinements verb ------------
+# The bump (occurrence) path fires a bordered REFINEMENT DUE banner on stderr ONLY on
+# the bump that crosses the threshold, exactly once, and never blocks the bump. The
+# threshold is configurable via FM_FC_REFINE_THRESHOLD. The refinements verb lists
+# every class at/over threshold with its provenance so a draft's citations are ready.
+E="$TMP_ROOT/refine.jsonl"
+FM_FC_LEDGER="$E" "$FC" add --id FC-100 \
+  --name "Auth positive proof" \
+  --invariant "authority = positive proof, fail closed" \
+  --fix "prove conformance to a closed schema" \
+  --cue "a growing ladder of per-property checks" \
+  --provenance "ruling:data/x/design-ruling.md#1:seed" >/dev/null
+
+# Bump to count 2 (below the default threshold of 3): NO banner.
+below_err=$(FM_FC_LEDGER="$E" "$FC" bump FC-100 --provenance "qa:data/qa-a/report.md#1:occ2" 2>&1 >/dev/null)
+assert_not_contains "$below_err" "REFINEMENT DUE" "no refinement banner below the threshold"
+
+# Bump to count 3 (crosses the default threshold of 3): banner fires EXACTLY once, on stderr.
+FM_FC_LEDGER="$E" "$FC" bump FC-100 --provenance "qa:data/qa-b/report.md#2:occ3" 2>"$TMP_ROOT/cross.err" >"$TMP_ROOT/cross.out"
+cross_err=$(cat "$TMP_ROOT/cross.err")
+cross_count=$(grep -c 'REFINEMENT DUE' "$TMP_ROOT/cross.err" || true)
+if [ "$cross_count" = 1 ]; then
+  pass "crossing bump fires the REFINEMENT DUE banner exactly once"
+else fail "crossing bump fired the banner $cross_count times (want 1)"; fi
+# The banner is stderr-only: stdout still carries just the ordinary bump line.
+assert_not_contains "$(cat "$TMP_ROOT/cross.out")" "REFINEMENT DUE" "the banner goes to stderr, not stdout"
+# Banner content: the class id, its invariant, and the captain-approval instruction.
+assert_contains "$cross_err" "FC-100" "banner names the class id"
+assert_contains "$cross_err" "authority = positive proof, fail closed" "banner names the invariant"
+assert_contains "$cross_err" "CAPTAIN" "banner instructs to draft an amendment for CAPTAIN approval"
+assert_contains "$cross_err" "data/qa-b/report.md#2" "banner lists the provenance for the draft's citations"
+
+# The crossing bump still exits 0: the banner is pull-based and never blocks.
+FM_FC_LEDGER="$E" "$FC" bump FC-100 --provenance "qa:data/qa-x/report.md#9:extra" >/dev/null 2>&1
+expect_code 0 $? "the bump exits 0 even when it fires the refinement banner"
+
+# Now at count 5 (already well over threshold): further bumps stay silent - fires ONCE per crossing.
+over_err=$(FM_FC_LEDGER="$E" "$FC" bump FC-100 --provenance "qa:data/qa-c/report.md#3:occ6" 2>&1 >/dev/null)
+assert_not_contains "$over_err" "REFINEMENT DUE" "an already-over class does not re-fire the banner on later bumps"
+
+# Configurable threshold: FM_FC_REFINE_THRESHOLD lowers the crossing point.
+E2="$TMP_ROOT/refine-thr.jsonl"
+FM_FC_LEDGER="$E2" "$FC" add --id FC-101 --name low --invariant "keep it closed" --fix f --cue c \
+  --provenance "ruling:data/y#1" >/dev/null
+thr_err=$(FM_FC_REFINE_THRESHOLD=2 FM_FC_LEDGER="$E2" "$FC" bump FC-101 --provenance "qa:data/y#2" 2>&1 >/dev/null)
+assert_contains "$thr_err" "REFINEMENT DUE" "a configured threshold of 2 fires on the second occurrence"
+assert_contains "$thr_err" "threshold (2)" "banner reports the configured threshold"
+
+# refinements verb: lists only classes at/over threshold, with provenance.
+ref=$(FM_FC_LEDGER="$E" "$FC" refinements)
+assert_contains "$ref" "FC-100" "refinements lists the over-threshold class"
+assert_contains "$ref" "data/qa-b/report.md#2" "refinements includes the class's provenance"
+# A below-threshold class is absent from the default-threshold listing.
+E3="$TMP_ROOT/refine-mixed.jsonl"
+FM_FC_LEDGER="$E3" "$FC" add --id FC-200 --name over --invariant i --fix f --cue c --provenance "r:r#1" >/dev/null
+FM_FC_LEDGER="$E3" "$FC" bump FC-200 --provenance "q:q#1" >/dev/null 2>&1
+FM_FC_LEDGER="$E3" "$FC" bump FC-200 --provenance "q:q#2" >/dev/null 2>&1
+FM_FC_LEDGER="$E3" "$FC" add --id FC-201 --name under --invariant i --fix f --cue c --provenance "r:r#2" >/dev/null
+ref_json=$(FM_FC_LEDGER="$E3" "$FC" refinements --json)
+if printf '%s' "$ref_json" | jq -e '.threshold == 3 and ([.classes[].id] == ["FC-200"])' >/dev/null; then
+  pass "refinements --json returns only over-threshold classes with the active threshold"
+else fail "refinements --json listing/threshold incorrect: $ref_json"; fi
+# refinements respects the configured threshold too.
+ref_json2=$(FM_FC_REFINE_THRESHOLD=2 FM_FC_LEDGER="$E3" "$FC" refinements --json)
+if printf '%s' "$ref_json2" | jq -e '.threshold == 2 and ([.classes[].id] | sort == ["FC-200"])' >/dev/null; then
+  pass "refinements honors the configured threshold"
+else fail "refinements ignored the configured threshold: $ref_json2"; fi
+# An empty over-threshold set is a clean, non-error message.
+E4="$TMP_ROOT/refine-empty.jsonl"
+FM_FC_LEDGER="$E4" "$FC" add --id FC-300 --name lone --invariant i --fix f --cue c --provenance "r:r#1" >/dev/null
+empty=$(FM_FC_LEDGER="$E4" "$FC" refinements)
+assert_contains "$empty" "no classes at/over the refinement threshold" "refinements reports an empty set cleanly"
+# A non-positive-integer threshold falls back to the default rather than disabling the ratchet.
+if FM_FC_REFINE_THRESHOLD=bogus FM_FC_LEDGER="$E4" "$FC" refinements --json | jq -e '.threshold == 3' >/dev/null; then
+  pass "an invalid FM_FC_REFINE_THRESHOLD falls back to the default"; else fail "invalid threshold did not fall back to default"; fi
+
 pass "fm-failure-class: all checks passed"
