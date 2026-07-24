@@ -9,10 +9,23 @@
 # per item, coalesced into ONE banner in the fm-triage-duty idiom.
 #
 # Usage:
-#   fm-reconciler.sh [report]        Run the pass and print the coalesced proposal banner.
-#   fm-reconciler.sh --json          The same pass as a machine-readable proposals object.
-#   fm-reconciler.sh check           Bounded-cadence one-line wake for the watcher check lane.
+#   fm-reconciler.sh [report]        Run the full pass and print the coalesced proposal banner.
+#   fm-reconciler.sh --json          The same full pass as a machine-readable proposals object.
+#   fm-reconciler.sh check           The watcher check lane: an O(small), always-in-budget read.
+#   fm-reconciler.sh refresh         Recompute and publish the cached summary (runs detached).
 #   fm-reconciler.sh install         Install the persistent state/reconciler.check.sh shim.
+#
+# THE WATCHER CHECK LANE IS BOUNDED BY CONSTRUCTION (FC-006). The full pass scans the inbox
+# and runs one control-plane task-head read per referenced task, which is O(inbox) and must
+# never run on the watcher's slow-check critical path - at hundreds of linked orders it would
+# exceed FM_CHECK_TIMEOUT and be killed. So `check` NEVER runs that scan: it reads the cached
+# summary (state/.reconciler-last.json) the last full pass wrote - a single small file read,
+# always in budget regardless of inbox size - emits the one wake line if it is actionable,
+# and at a bounded cadence (FM_RECONCILER_CHECK_INTERVAL, default 900s) kicks off ONE fully
+# detached `refresh` to recompute that cache for next time. `report`/`--json` stay synchronous
+# full passes for explicit invocation. A slightly stale cache can at worst cost one extra
+# wake; it can never cause a false closure, because closure is always a human/firstmate act
+# on the fresh full pass, and every proposal the cache holds was itself FC-002-disciplined.
 #
 # THE FOUR CLOSURE CHECKS (each an evidence bar of its own):
 #   order audit (S1)      the umbrella ACCOUNTED count, refreshed fresh this pass so the
@@ -65,7 +78,7 @@ case "$CHECK_INTERVAL" in ''|*[!0-9]*) CHECK_INTERVAL=900 ;; esac
 RULE='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 
 usage() {
-  sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,57p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # --- argument parse -----------------------------------------------------------------
@@ -75,7 +88,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --json) JSON=true; shift ;;
-    report|check|install)
+    report|check|install|refresh)
       MODE=$1; shift ;;
     -*) printf 'fm-reconciler: unknown flag: %s\n' "$1" >&2; exit 2 ;;
     *)  printf 'fm-reconciler: unknown argument: %s\n' "$1" >&2; exit 2 ;;
@@ -93,6 +106,33 @@ age_of() {  # seconds since mtime, or a large number when missing
   m=$(_stat_mtime "$1") || { printf '999999'; return; }
   [ -n "$m" ] || { printf '999999'; return; }
   printf '%s' "$(( $(date +%s) - m ))"
+}
+
+# The check lane reads this cached summary instead of recomputing, so it is O(small) and
+# always finishes inside the watcher's FM_CHECK_TIMEOUT no matter how large the inbox is.
+# The heavy full pass (report/--json/refresh) writes it. Atomic tmp+mv leaves any prior
+# cache intact on failure, the same discipline as state/.order-audit-last.json.
+CACHE="$STATE/.reconciler-last.json"
+write_cache() {  # <result-json>
+  mkdir -p "$STATE" 2>/dev/null || return 0
+  local tmp="$STATE/.reconciler-last.json.tmp.$$"
+  if printf '%s\n' "$1" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$CACHE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  else
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+}
+
+# The one wake line, derived from a result object on stdin. Emits nothing when not actionable.
+wake_line_from() {
+  jq -r '
+    if (.counts.actionable // 0) > 0 then
+      "reconciler: " + (.counts.actionable|tostring) + " closure proposal(s) - "
+      + (.counts.order_complete|tostring) + " order-complete, "
+      + (.counts.dead_linkage|tostring) + " dead-linkage, "
+      + (.counts.expired_hold|tostring) + " expired-hold"
+      + " (run bin/fm-reconciler.sh for the proposals and their one-line closing commands)"
+    else empty end'
 }
 
 # ------------------------------------------------------------------------------------
@@ -127,24 +167,29 @@ EOF
 fi
 
 # ------------------------------------------------------------------------------------
-# Role gate. report/--json/install are primary duties (the S1 audit they invoke is a
-# primary-only verb). check runs inside the watcher, which is the primary's supervision,
-# so a non-primary check exits silently rather than erroring the watcher's check lane.
+# Role gate. report/--json/refresh are primary duties (they read the inbox + control plane
+# and, for report/--json, invoke the primary-only S1 audit). check and the detached refresh
+# run inside the watcher (the primary's supervision), so a non-primary invocation exits
+# silently rather than erroring the watcher's check lane.
 # ------------------------------------------------------------------------------------
 fm_role_context >/dev/null
 ROLE=${FM_ROLE_RESULT:-unknown}
 if [ "$ROLE" != primary ]; then
-  if [ "$MODE" = check ]; then
-    exit 0
-  fi
-  printf 'error: fm-reconciler.sh %s refused - role could not be proven primary (%s).\n' \
-    "$MODE" "${FM_ROLE_REASON:-unknown}" >&2
-  exit 2
+  case "$MODE" in
+    check|refresh) exit 0 ;;
+    *)
+      printf 'error: fm-reconciler.sh %s refused - role could not be proven primary (%s).\n' \
+        "$MODE" "${FM_ROLE_REASON:-unknown}" >&2
+      exit 2 ;;
+  esac
 fi
 
 # ------------------------------------------------------------------------------------
-# check: bounded cadence. Skip silently until the cooldown elapses; otherwise run the
-# pass and emit one wake line iff there are actionable proposals.
+# CHECK: the watcher's slow-check lane. This path must be O(small) and always finish inside
+# FM_CHECK_TIMEOUT, so it NEVER runs the heavy inbox+control-plane scan. Instead it reads the
+# cached summary the last full pass wrote and, at a bounded cadence, kicks off ONE detached
+# refresh to recompute that cache for next time. The refresh is fully detached, so a large
+# inbox can never delay this check (FC-006: no unbounded work on the watcher's critical path).
 # ------------------------------------------------------------------------------------
 if [ "$MODE" = check ]; then
   mkdir -p "$STATE" 2>/dev/null || true
@@ -152,33 +197,77 @@ if [ "$MODE" = check ]; then
   if [ -e "$marker" ] && [ "$(age_of "$marker")" -lt "$CHECK_INTERVAL" ]; then
     exit 0
   fi
+  # Wake from the cached summary (a single small file read + jq). The cache was written by a
+  # prior full pass that already applied FC-002; this only counts proposals to nudge
+  # firstmate, who then runs the fresh full pass to see them - so a slightly stale cache can
+  # at worst produce one extra wake, never a false closure.
+  if [ -f "$CACHE" ]; then
+    wake_line_from < "$CACHE" 2>/dev/null || true
+  fi
+  # Recompute the cache for next time, fully detached so it cannot delay this check. The
+  # subshell isolates the launch (a spawn failure cannot escape to the watcher), mirroring
+  # bin/fm-cp-shadow.sh. FM_RECONCILER_NO_REFRESH suppresses the spawn (tests, and a caller
+  # that only wants to read the cache).
+  if [ -z "${FM_RECONCILER_NO_REFRESH:-}" ]; then
+    ( "$SCRIPT_DIR/fm-reconciler.sh" refresh >/dev/null 2>&1 & ) || true
+  fi
+  touch "$marker" 2>/dev/null || true
+  exit 0
+fi
+
+# ------------------------------------------------------------------------------------
+# HEAVY PATH (report / --json / refresh). refresh is the detached recompute; it takes a
+# single-holder lock so overlapping refreshes cannot pile up, and a stale lock (a refresh
+# that died) is stolen after FM_RECONCILER_REFRESH_MAX seconds so the cache never wedges.
+# ------------------------------------------------------------------------------------
+REFRESH_LOCK=''
+if [ "$MODE" = refresh ]; then
+  mkdir -p "$STATE" 2>/dev/null || true
+  REFRESH_LOCK="$STATE/.reconciler-refresh.lock"
+  REFRESH_MAX=${FM_RECONCILER_REFRESH_MAX:-600}
+  case "$REFRESH_MAX" in ''|*[!0-9]*) REFRESH_MAX=600 ;; esac
+  if [ -d "$REFRESH_LOCK" ] && [ "$(age_of "$REFRESH_LOCK")" -ge "$REFRESH_MAX" ]; then
+    rmdir "$REFRESH_LOCK" 2>/dev/null || rm -rf "$REFRESH_LOCK" 2>/dev/null || true
+  fi
+  if ! mkdir "$REFRESH_LOCK" 2>/dev/null; then
+    exit 0   # another refresh is already recomputing the cache
+  fi
 fi
 
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/fm-reconciler.XXXXXX") || {
+  [ -n "$REFRESH_LOCK" ] && rmdir "$REFRESH_LOCK" 2>/dev/null
   printf 'fm-reconciler: could not create scratch dir\n' >&2
   exit 1
 }
 # shellcheck disable=SC2317,SC2329 # Invoked by the EXIT trap below.
-cleanup() { rm -rf "$SCRATCH"; }
+cleanup() {
+  rm -rf "$SCRATCH"
+  [ -n "$REFRESH_LOCK" ] && { rmdir "$REFRESH_LOCK" 2>/dev/null || rm -rf "$REFRESH_LOCK" 2>/dev/null || true; }
+}
 trap cleanup EXIT
 
 INBOX=$(fm_order_inbox_path "$FM_HOME")
 
-# A missing inbox is unambiguous here: no order can be waiting on anything, so there is
-# nothing to reconcile. Report all-clear rather than fail (this pass runs on every wake and
-# from the watcher, including in homes that never took a captain order).
+# A missing inbox is unambiguous: no order can be waiting on anything, so there is nothing to
+# reconcile. Write an all-clear cache and report all-clear rather than fail (this pass runs
+# in homes that never took a captain order).
 if [ ! -f "$INBOX" ]; then
-  [ "$MODE" = check ] && { touch "$STATE/.reconciler-check-last" 2>/dev/null || true; exit 0; }
-  if [ "$JSON" = true ]; then
-    jq -cn --arg ts "$(fm_triage_now)" \
-      '{schema:"fm-reconciler/v1", generated_at:$ts, inbox_present:false,
-        control_plane:{available:false, tasks_checked:0},
-        audit:{ran:false}, counts:{order_complete:0,dead_linkage:0,expired_hold:0,
-        residual:0,actionable:0}, proposals:[], residual:[]}'
-  else
-    printf 'reconciler: all clear - no captain order inbox at this home, nothing to reconcile\n'
-  fi
-  exit 0
+  RESULT=$(jq -cn --arg ts "$(fm_triage_now)" \
+    '{schema:"fm-reconciler/v1", generated_at:$ts, inbox_present:false,
+      control_plane:{available:false, tasks_checked:0},
+      audit:{ran:false}, counts:{order_complete:0,dead_linkage:0,expired_hold:0,
+      residual:0,actionable:0}, proposals:[], residual:[]}')
+  write_cache "$RESULT"
+  case "$MODE" in
+    refresh) exit 0 ;;
+    *)
+      if [ "$JSON" = true ]; then
+        printf '%s\n' "$RESULT"
+      else
+        printf 'reconciler: all clear - no captain order inbox at this home, nothing to reconcile\n'
+      fi
+      exit 0 ;;
+  esac
 fi
 
 # --- fold the inbox (authoritative current state per order) -------------------------
@@ -193,9 +282,12 @@ NOW_EPOCH=$(fm_triage_epoch "$NOW" 2>/dev/null || printf 0)
 case "$NOW_EPOCH" in ''|*[!0-9]*) NOW_EPOCH=0 ;; esac
 
 # --- run the S1 order audit fresh (the umbrella check + a fresh authoritative snapshot) --
+# Only report/--json need the audit's ACCOUNTED umbrella line; the detached refresh writes
+# the cache the check lane reads, which needs only the proposal counts below, so refresh
+# skips the audit's per-task control-plane scan (halving its process launches).
 AUDIT_RAN=false
 AUDIT_JSON='{}'
-if AUDIT_OUT=$("$SCRIPT_DIR/fm-order.sh" audit --json 2>"$SCRATCH/audit.err"); then
+if [ "$MODE" != refresh ] && AUDIT_OUT=$("$SCRIPT_DIR/fm-order.sh" audit --json 2>"$SCRATCH/audit.err"); then
   if printf '%s' "$AUDIT_OUT" | jq -e '.schema == "fm-order-audit/v1"' >/dev/null 2>&1; then
     AUDIT_RAN=true
     AUDIT_JSON=$AUDIT_OUT
@@ -235,22 +327,36 @@ if [ -n "$REFERENCED_TASKS" ]; then
     #   gone    = failed|cancelled|anomaly|archived|cleaned  -> terminal, but NOT completed
     #   missing = task not found                         -> the linkage is dead (vanished)
     #   live    = any other status                       -> the order is legitimately open
-    TASK_CLASS=$(
-      for tid in $REFERENCED_TASKS; do
-        head=$(node "$CP_CLI" task-head --data-dir "$CP_DATA_DIR" "$tid" 2>"$SCRATCH/th.err" || true)
-        if printf '%s' "$head" | grep -q 'task not found'; then
-          printf '%s\tmissing\n' "$tid"; continue
-        fi
-        st=$(printf '%s' "$head" | jq -r '.status // ""' 2>/dev/null || true)
-        case "$st" in
-          '') printf '%s\tunknown\n' "$tid" ;;
-          completed) printf '%s\tdone\n' "$tid" ;;
-          failed|cancelled|anomaly|archived|cleaned) printf '%s\tgone\n' "$tid" ;;
-          *) printf '%s\tlive\n' "$tid" ;;
-        esac
-      done | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}'
-    )
-    CP_CHECKED=$(printf '%s' "$REFERENCED_TASKS" | grep -c . || true)
+    # The reads run at a BOUNDED concurrency (FM_RECONCILER_CP_CONCURRENCY, default 16) via
+    # xargs -P, so one control-plane process launch per referenced task is capped in flight
+    # instead of paid strictly sequentially. This never runs on the watcher's check lane (the
+    # check reads the cache); it is the full/refresh pass, whose runtime is off the critical
+    # path - but the cap still keeps the process pressure the QA finding flagged bounded.
+    CP_CONCURRENCY=${FM_RECONCILER_CP_CONCURRENCY:-16}
+    case "$CP_CONCURRENCY" in ''|*[!0-9]*|0) CP_CONCURRENCY=16 ;; esac
+    WORKER="$SCRATCH/cp-read.sh"
+    cat > "$WORKER" <<'WEOF'
+#!/usr/bin/env bash
+# One control-plane task-head read, classified. CP_CLI/CP_DATA_DIR come from the environment.
+tid=$1
+head=$(node "$CP_CLI" task-head --data-dir "$CP_DATA_DIR" "$tid" 2>/dev/null || true)
+case "$head" in
+  *'task not found'*) printf '%s\tmissing\n' "$tid"; exit 0 ;;
+esac
+st=$(printf '%s' "$head" | jq -r '.status // ""' 2>/dev/null || true)
+case "$st" in
+  '') printf '%s\tunknown\n' "$tid" ;;
+  completed) printf '%s\tdone\n' "$tid" ;;
+  failed|cancelled|anomaly|archived|cleaned) printf '%s\tgone\n' "$tid" ;;
+  *) printf '%s\tlive\n' "$tid" ;;
+esac
+WEOF
+    chmod +x "$WORKER"
+    export CP_CLI CP_DATA_DIR
+    TASK_CLASS=$(printf '%s\n' "$REFERENCED_TASKS" \
+      | xargs -P "$CP_CONCURRENCY" -I{} "$WORKER" {} \
+      | jq -Rn '[inputs | split("\t") | select(length == 2) | {(.[0]): .[1]}] | add // {}')
+    CP_CHECKED=$(printf '%s\n' "$REFERENCED_TASKS" | grep -c . || true)
   fi
 fi
 
@@ -390,19 +496,13 @@ RESULT=$(printf '%s' "$PROPOSALS" | jq \
 ACTIONABLE=$(printf '%s' "$RESULT" | jq -r '.counts.actionable')
 case "$ACTIONABLE" in ''|*[!0-9]*) ACTIONABLE=0 ;; esac
 
+# Publish the fresh result to the cache the check lane reads (every full pass refreshes it).
+write_cache "$RESULT"
+
 # ------------------------------------------------------------------------------------
-# check mode: one terse wake line iff actionable, then stamp the cadence marker.
+# refresh: the detached recompute - it exists only to update the cache above, no output.
 # ------------------------------------------------------------------------------------
-if [ "$MODE" = check ]; then
-  touch "$STATE/.reconciler-check-last" 2>/dev/null || true
-  if [ "$ACTIONABLE" -gt 0 ]; then
-    printf '%s' "$RESULT" | jq -r '
-      "reconciler: " + (.counts.actionable|tostring) + " closure proposal(s) - "
-      + (.counts.order_complete|tostring) + " order-complete, "
-      + (.counts.dead_linkage|tostring) + " dead-linkage, "
-      + (.counts.expired_hold|tostring) + " expired-hold"
-      + " (run bin/fm-reconciler.sh for the proposals and their one-line closing commands)"'
-  fi
+if [ "$MODE" = refresh ]; then
   exit 0
 fi
 

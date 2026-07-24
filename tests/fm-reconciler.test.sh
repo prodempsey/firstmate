@@ -86,6 +86,19 @@ order_cp() {
     FM_ORDER_CP_CLI="$FAKE_CP" FM_ORDER_CP_DATA_DIR="$HOME_DIR/cpdata" \
     FAKE_CP_TASKS="$FAKE_CP_TASKS" "$ORDER" "$@"
 }
+# The check lane reads a cached summary a prior full pass wrote; it never recomputes. So a
+# check-lane test first `warm`s the cache (a synchronous full pass) and then runs the check
+# with FM_RECONCILER_NO_REFRESH=1, which suppresses the detached background refresh so the
+# assertion is deterministic and leaves no lingering process. FM_RECONCILER_CHECK_INTERVAL
+# is set high so the cadence gate is controlled explicitly per test.
+warm() { with_cp refresh; }
+check_only() {
+  FM_ORDERS_PATH="$INBOX" FM_STATE_OVERRIDE="$STATE" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_ORDER_ACCOUNT_GRACE_SECS=0 FM_RECONCILER_NO_REFRESH=1 \
+    FM_RECONCILER_CHECK_INTERVAL="${FM_RECONCILER_CHECK_INTERVAL:-3600}" \
+    FM_ORDER_CP_CLI="$FAKE_CP" FM_ORDER_CP_DATA_DIR="$HOME_DIR/cpdata" \
+    FAKE_CP_TASKS="$FAKE_CP_TASKS" "$RECON" check
+}
 
 # ============================================================================
 # Part A - the completion fan-out sweep (order-complete)
@@ -209,7 +222,8 @@ order dispatch ORD-001 --task task-done >/dev/null
 BEFORE=$(cksum < "$INBOX")
 with_cp report >/dev/null
 with_cp --json >/dev/null
-with_cp check >/dev/null
+with_cp refresh >/dev/null
+check_only >/dev/null
 AFTER=$(cksum < "$INBOX")
 [ "$BEFORE" = "$AFTER" ] || fail "the reconciler mutated the order inbox; it must only propose"
 [ "$(FM_ORDERS_PATH="$INBOX" FM_STATE_OVERRIDE="$STATE" FM_ROOT_OVERRIDE="$ROOT" "$ORDER" show ORD-001 --json | jq -r '.status')" = dispatched ] \
@@ -227,39 +241,44 @@ P2=$(with_cp --json | jq -S '.proposals | map(del(.evidence))')
 [ "$P1" = "$P2" ] || fail "two identical reconciler passes produced different proposals"
 pass "the pass is idempotent - identical input yields identical proposals"
 
-# --- D3: the check lane emits a wake line only when there are actionable proposals ---
+# --- D3: the check lane emits a wake line (from the cache) only when actionable ---
 fresh_home d3
 export FAKE_CP_TASKS='{"task-done":"completed"}'
 order add "Actionable" >/dev/null
 order dispatch ORD-001 --task task-done >/dev/null
-LINE=$(with_cp check)
+warm >/dev/null                              # populate the cached summary
+LINE=$(check_only)
 printf '%s\n' "$LINE" | grep -F 'reconciler:' >/dev/null \
-  || fail "the check lane did not emit a wake line when a proposal was actionable"
+  || fail "the check lane did not emit a wake line when the cached summary was actionable"
 printf '%s\n' "$LINE" | grep -F 'closure proposal' >/dev/null \
   || fail "the check wake line did not summarize the closure proposals"
-# A clean home (no actionable proposals) emits nothing on the check lane. Use a fresh state
-# dir so the cadence marker from the run above does not suppress the second run.
+# A clean home (no actionable proposals) emits nothing on the check lane.
 fresh_home d3b
 export FAKE_CP_TASKS='{"task-live":"running"}'
 order add "Not actionable" >/dev/null
 order dispatch ORD-001 --task task-live >/dev/null
-OUT=$(with_cp check)
-[ -z "$OUT" ] || fail "the check lane emitted output when there was nothing actionable: $OUT"
-pass "the check lane wakes only on actionable proposals and is silent otherwise"
+warm >/dev/null
+OUT=$(check_only)
+[ -z "$OUT" ] || fail "the check lane emitted output when the cache was not actionable: $OUT"
+# Before any full pass has run, the check lane has no cache to read: it is silent, never an
+# error, and never scans the inbox itself.
+fresh_home d3c
+export FAKE_CP_TASKS='{"task-done":"completed"}'
+order add "Actionable but no cache yet" >/dev/null
+order dispatch ORD-001 --task task-done >/dev/null
+COLD=$(check_only); RC=$?
+[ "$RC" -eq 0 ] || fail "a check with no cache exited non-zero ($RC)"
+[ -z "$COLD" ] || fail "a check with no cache yet emitted a wake line: $COLD"
+pass "the check lane wakes only on an actionable cached summary, and is silent with none"
 
 # --- D4: the check lane is cadence-bounded - a second immediate run is suppressed ---
 fresh_home d4
 export FAKE_CP_TASKS='{"task-done":"completed"}'
 order add "Actionable" >/dev/null
 order dispatch ORD-001 --task task-done >/dev/null
-FIRST=$(FM_ORDERS_PATH="$INBOX" FM_STATE_OVERRIDE="$STATE" FM_ROOT_OVERRIDE="$ROOT" \
-  FM_ORDER_ACCOUNT_GRACE_SECS=0 FM_RECONCILER_CHECK_INTERVAL=3600 \
-  FM_ORDER_CP_CLI="$FAKE_CP" FM_ORDER_CP_DATA_DIR="$HOME_DIR/cpdata" FAKE_CP_TASKS="$FAKE_CP_TASKS" \
-  "$RECON" check)
-SECOND=$(FM_ORDERS_PATH="$INBOX" FM_STATE_OVERRIDE="$STATE" FM_ROOT_OVERRIDE="$ROOT" \
-  FM_ORDER_ACCOUNT_GRACE_SECS=0 FM_RECONCILER_CHECK_INTERVAL=3600 \
-  FM_ORDER_CP_CLI="$FAKE_CP" FM_ORDER_CP_DATA_DIR="$HOME_DIR/cpdata" FAKE_CP_TASKS="$FAKE_CP_TASKS" \
-  "$RECON" check)
+warm >/dev/null
+FIRST=$(FM_RECONCILER_CHECK_INTERVAL=3600 check_only)
+SECOND=$(FM_RECONCILER_CHECK_INTERVAL=3600 check_only)
 [ -n "$FIRST" ] || fail "the first check run produced no wake line"
 [ -z "$SECOND" ] || fail "a second check within the cadence window was not suppressed: $SECOND"
 pass "the check lane is cadence-bounded - a second run inside the window is silent"
@@ -285,7 +304,8 @@ fresh_home d6
 OUT=$(FM_ORDERS_PATH="$INBOX" FM_STATE_OVERRIDE="$STATE" FM_ROOT_OVERRIDE="$ROOT" "$RECON" report)
 printf '%s\n' "$OUT" | grep -F 'all clear' >/dev/null \
   || fail "a home with no inbox did not report all-clear"
-CHECK=$(FM_ORDERS_PATH="$INBOX" FM_STATE_OVERRIDE="$STATE" FM_ROOT_OVERRIDE="$ROOT" "$RECON" check)
+CHECK=$(FM_ORDERS_PATH="$INBOX" FM_STATE_OVERRIDE="$STATE" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_RECONCILER_NO_REFRESH=1 "$RECON" check)
 [ -z "$CHECK" ] || fail "a home with no inbox produced a check wake line: $CHECK"
 pass "a home with no captain order inbox is all-clear and silent, never an error"
 
@@ -304,5 +324,70 @@ printf '%s\n' "$OUT" | grep -F 'DEAD LINKAGE' >/dev/null || fail "the banner omi
 printf '%s\n' "$OUT" | grep -F 'EXPIRED HOLD' >/dev/null || fail "the banner omitted the expired-hold section"
 printf '%s\n' "$OUT" | grep -F 'Proposals only' >/dev/null || fail "the banner omitted the proposals-only contract line"
 pass "all four closure checks coalesce into one banner with per-item closing commands"
+
+# ============================================================================
+# Part E - the watcher check lane is bounded (FC-006): a large linked inbox
+# ============================================================================
+# The delivered state/reconciler.check.sh runs in the watcher's slow-check lane, whose
+# contract requires completion before FM_CHECK_TIMEOUT. A prior version scanned the whole
+# inbox (one control-plane process per linked task) on every check and was killed at a few
+# hundred orders. This pins that the check lane reads only the cached summary and returns
+# well inside budget on a large, many-unique-task inbox, emitting exactly one wake line.
+
+fresh_home e1
+# A fake control plane that reports every task completed (probe ids still "not found").
+CP_ALL="$TMP_ROOT/fake-cp-all.mjs"
+cat > "$CP_ALL" <<'JS'
+const a = process.argv.slice(2); const tid = a[a.length - 1];
+if (tid.indexOf('__fm') === 0) { process.stdout.write(JSON.stringify({ error: `task not found: ${tid}` }) + '\n'); process.exit(1); }
+process.stdout.write(JSON.stringify({ task_id: tid, status: 'completed' }) + '\n'); process.exit(0);
+JS
+# Generate a large inbox: 400 dispatched orders, each linking one DISTINCT task.
+N=400
+{
+  i=1
+  while [ "$i" -le "$N" ]; do
+    oid=$(printf 'ORD-%04d' "$i"); tid=$(printf 'task-%04d' "$i")
+    printf '{"schema":"firstmate/captain-order/v1","order_id":"%s","event":"add","ts":"2026-07-24T00:00:00Z","status":"received","original_request":"r%d","short_title":"r%d","received_at":"2026-07-24T00:00:00Z"}\n' "$oid" "$i" "$i"
+    printf '{"schema":"firstmate/captain-order/v1","order_id":"%s","event":"dispatch","ts":"2026-07-24T00:00:01Z","status":"dispatched","linked_task_ids":["%s"],"owner":"fm"}\n' "$oid" "$tid"
+    i=$((i + 1))
+  done
+} > "$INBOX"
+
+# The fixture is genuinely large with enough unique task ids to exercise the old bound.
+ORDER_N=$(grep -c '"event":"add"' "$INBOX")
+UNIQUE_TASKS=$(grep -o 'task-[0-9]\{4\}' "$INBOX" | sort -u | wc -l | tr -d ' ')
+[ "$ORDER_N" -ge 400 ] || fail "the large fixture is not large enough ($ORDER_N orders, want >=400)"
+[ "$UNIQUE_TASKS" -ge 400 ] || fail "the large fixture lacks enough unique task ids ($UNIQUE_TASKS, want >=400)"
+
+# Budget from the watcher contract; default to the documented 30s if unset.
+BUDGET=${FM_CHECK_TIMEOUT:-30}
+
+# Warm the cached summary once via a full pass (allowed to be slow - it is off the watcher's
+# critical path). Then the check lane must read that cache and return well inside budget.
+FM_ORDERS_PATH="$INBOX" FM_STATE_OVERRIDE="$STATE" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_ORDER_ACCOUNT_GRACE_SECS=0 FM_ORDER_CP_CLI="$CP_ALL" FM_ORDER_CP_DATA_DIR="$HOME_DIR/cpdata" \
+  "$RECON" refresh
+[ -f "$STATE/.reconciler-last.json" ] || fail "the full pass did not write the cached summary"
+[ "$(jq -r '.counts.actionable' "$STATE/.reconciler-last.json")" -ge 400 ] \
+  || fail "the warm cache did not classify the large inbox as actionable"
+
+# The check lane under the real budget: exit 0, exactly one wake line, comfortably in time.
+# (This is the regression: the pre-fix scan launched ~one control-plane process per linked
+# task on this path and exceeded the budget; the cached read is O(small) and cannot.)
+CHECK_OUT="$HOME_DIR/check.out"
+if timeout "$BUDGET" env FM_ORDERS_PATH="$INBOX" FM_STATE_OVERRIDE="$STATE" FM_ROOT_OVERRIDE="$ROOT" \
+     FM_RECONCILER_NO_REFRESH=1 FM_RECONCILER_CHECK_INTERVAL=3600 \
+     FM_ORDER_CP_CLI="$CP_ALL" FM_ORDER_CP_DATA_DIR="$HOME_DIR/cpdata" \
+     "$RECON" check > "$CHECK_OUT" 2>/dev/null; then
+  :
+else
+  fail "the check lane did not finish within the ${BUDGET}s watcher budget on a $ORDER_N-order inbox (exit $?)"
+fi
+LINES=$(grep -c . "$CHECK_OUT")
+[ "$LINES" -eq 1 ] || fail "the check lane did not emit exactly one wake line on a large inbox (emitted $LINES)"
+grep -F 'reconciler:' "$CHECK_OUT" >/dev/null \
+  || fail "the check lane's single line was not the reconciler wake line"
+pass "the check lane finishes within FM_CHECK_TIMEOUT on a large ($ORDER_N-order, $UNIQUE_TASKS-task) inbox and emits one wake line"
 
 echo "ok - fm-reconciler: all reconciler behavior tests passed"
