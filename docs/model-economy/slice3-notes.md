@@ -116,6 +116,25 @@ paths).
    that establishes a sidecar, an artifact mutation, a re-run that must remove it,
    and a later valid run that re-establishes it.
 
+### Round 6 (q124) — the invalidation is itself proven
+
+The round-5 pre-validation removal suppressed its own unlink error with `|| true`,
+so if the unlink was refused (read-only directory, immutable file) a stale
+attestation persisted silently while the run returned failure — the same
+stale-authority class one level deeper. Now the invalidation is proven: after the
+removal attempt the validator checks the sidecar is actually gone, and if it
+remains it refuses loudly with `PROFILE_SIDECAR_INVALIDATION_FAILED` (exit 1)
+BEFORE any validation runs — it cannot guarantee no stale attestation, so cleanup
+failure is itself fail-closed. Symmetrically, a successful matrix whose attestation
+cannot be written is a clean `PROFILE_SIDECAR_WRITE_FAILED` refusal (no traceback,
+no partial temp file), not a silent gap. Fixtures (skipped only under root, which
+bypasses directory permissions): a read-only manifest dir that denies unlink of a
+pre-existing sidecar, and a read-only dir that denies the fresh write.
+
+(The full-repo behavior suite's primary-only failures QA notes are the durable
+crewmate-role guard refusing spawn/teardown/merge/etc. in a crewmate worktree —
+not an S3 regression, and not bypassable from here.)
+
 ## T.2 runtime probes — EXPLICIT deferral (QA qa-me-s3-q119 finding 2)
 
 §T.2 lists two RUNTIME probes in its "Runtime probe (harmless)" column, and

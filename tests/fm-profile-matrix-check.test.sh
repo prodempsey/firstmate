@@ -520,6 +520,55 @@ test_preexisting_sidecar_invalidated_on_failure() {
   pass "a failed validation invalidates any pre-existing attestation sidecar"
 }
 
+test_sidecar_invalidation_failure_refuses() {
+  # The invalidation must itself be PROVEN: if the pre-existing sidecar cannot be
+  # removed (read-only directory here), the validator must refuse loudly rather
+  # than proceed and silently leave the stale attestation. Root bypasses
+  # directory permissions, so skip there — the refusal cannot be provoked.
+  if [ "$(id -u)" = "0" ]; then
+    pass "sidecar-invalidation-failure refusal (skipped: running as root cannot be denied unlink)"
+    return
+  fi
+  fresh
+  local mdir="$SB/mdir"
+  mkdir -p "$mdir"
+  cp "$MANIFEST_SRC" "$mdir/manifest.json"
+  # establish a valid sidecar while the dir is writable
+  "$V" --manifest "$mdir/manifest.json" --agents-dir "$D" --schemas-dir "$SDIR" --write-sidecar --quiet
+  assert_present "$mdir/manifest.fingerprint" "a valid run first establishes the sidecar"
+  # invalidate the matrix, then deny unlink by making the manifest dir read-only
+  sed -i 's/^permissionMode: default$/permissionMode: [default]/' "$D/opus-high.md"
+  chmod 0555 "$mdir"
+  OUT=$("$V" --manifest "$mdir/manifest.json" --agents-dir "$D" --schemas-dir "$SDIR" --write-sidecar --quiet 2>&1); RC=$?
+  chmod 0755 "$mdir"   # restore BEFORE asserting so cleanup always succeeds
+  expect_code 1 "$RC" "an unlink-refused invalidation must fail closed"
+  assert_contains "$OUT" "PROFILE_SIDECAR_INVALIDATION_FAILED" "a proven-failed invalidation refuses with its own code"
+  # It must refuse at the invalidation step, before validation runs at all.
+  assert_not_contains "$OUT" "PROFILE_FRONTMATTER_SCHEMA_INVALID" "the refusal precedes validation, not after it"
+  pass "a sidecar that cannot be invalidated makes the validator refuse (no silent stale authority)"
+}
+
+test_sidecar_write_failure_refuses() {
+  # Symmetric hygiene: a successful matrix whose attestation cannot be written
+  # (read-only dir, no pre-existing sidecar) is a clean typed refusal, never a
+  # traceback or a partial write. Root bypasses directory permissions, so skip.
+  if [ "$(id -u)" = "0" ]; then
+    pass "sidecar-write-failure refusal (skipped: running as root cannot be denied write)"
+    return
+  fi
+  fresh
+  local mdir="$SB/mdir"
+  mkdir -p "$mdir"
+  cp "$MANIFEST_SRC" "$mdir/manifest.json"
+  chmod 0555 "$mdir"
+  OUT=$("$V" --manifest "$mdir/manifest.json" --agents-dir "$D" --schemas-dir "$SDIR" --write-sidecar --quiet 2>&1); RC=$?
+  chmod 0755 "$mdir"
+  expect_code 1 "$RC" "an unwritable sidecar on an otherwise-valid matrix must fail closed"
+  assert_contains "$OUT" "PROFILE_SIDECAR_WRITE_FAILED" "an unwritable attestation refuses with its own code"
+  assert_absent "$mdir/manifest.fingerprint.tmp" "no partial temp sidecar is left behind"
+  pass "an attestation that cannot be written makes the validator refuse cleanly"
+}
+
 # --- usage ------------------------------------------------------------------
 
 test_unknown_flag_is_usage_error() {
@@ -558,6 +607,8 @@ test_bindings_type_and_agreement_rejected
 test_fingerprint_pin_and_sidecar
 test_sidecar_not_written_on_failure
 test_preexisting_sidecar_invalidated_on_failure
+test_sidecar_invalidation_failure_refuses
+test_sidecar_write_failure_refuses
 test_unknown_flag_is_usage_error
 
 pass "fm-profile-matrix-check: all authority-pattern cases passed"

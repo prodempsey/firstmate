@@ -43,7 +43,8 @@
 #   PROFILE_MANIFEST_INCONSISTENT | PROFILE_PROHIBITED_PRESENT | PROFILE_FILE_MISSING |
 #   PROFILE_FILE_UNKNOWN | PROFILE_FRONTMATTER_INVALID | PROFILE_FRONTMATTER_DUPLICATE_KEY |
 #   PROFILE_FRONTMATTER_SCHEMA_INVALID | PROFILE_PROJECTION_MISMATCH |
-#   PROFILE_BINDINGS_MISMATCH | PROFILE_FINGERPRINT_MISMATCH
+#   PROFILE_BINDINGS_MISMATCH | PROFILE_FINGERPRINT_MISMATCH |
+#   PROFILE_SIDECAR_INVALIDATION_FAILED | PROFILE_SIDECAR_WRITE_FAILED
 # Exit 2: usage error.
 #
 # The semantic fingerprint (MATRIX_FINGERPRINT) is sha256 over the canonical
@@ -101,8 +102,21 @@ if [ -n "$want" ]; then echo "fm-profile-matrix-check: --$want requires a value"
 # failed run never leaves a valid-looking sidecar standing beside a now-invalid
 # matrix. The fresh attestation is re-created only after the whole pass succeeds
 # (inside the python pass, temp file + atomic rename). Remove-first / write-last.
+#
+# The invalidation itself must be PROVEN, never assumed: if the unlink is refused
+# (read-only directory, immutable file, ...) the old attestation would silently
+# persist, so removal failure is itself fail-closed - refuse loudly rather than
+# proceed under a still-present, now-unverifiable attestation.
 if [ "$WRITE_SIDECAR" = "1" ]; then
-  rm -f "${MANIFEST%.json}.fingerprint" 2>/dev/null || true
+  SIDECAR="${MANIFEST%.json}.fingerprint"
+  if [ -e "$SIDECAR" ]; then
+    rm -f "$SIDECAR" 2>/dev/null || true
+    if [ -e "$SIDECAR" ]; then
+      echo "PROFILE_SIDECAR_INVALIDATION_FAILED" >&2
+      echo "fm-profile-matrix-check: could not invalidate the pre-existing attestation sidecar $SIDECAR before validation; refusing rather than risk leaving stale authority" >&2
+      exit 1
+    fi
+  fi
 fi
 
 # Hard prerequisite: the strict validation engine must be present. Absence is
@@ -409,12 +423,21 @@ if BINDINGS:
 # --- provenance attestation: written ONLY after the full pass proves the matrix
 # (Finding 3): a failed validation must never leave a valid-looking sidecar.
 # Written via a temp file + atomic rename, mirroring bin/fm-bindings-validate.sh.
+# A write that cannot complete is a clean typed refusal, never a traceback and
+# never a partially-written attestation.
 if WRITE_SIDECAR:
     side = (MANIFEST[:-5] if MANIFEST.endswith(".json") else MANIFEST) + ".fingerprint"
     tmp = side + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(fingerprint + "\n")
-    os.replace(tmp, side)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(fingerprint + "\n")
+        os.replace(tmp, side)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        die("PROFILE_SIDECAR_WRITE_FAILED", "could not write attestation sidecar %s: %s" % (side, e))
 
 if not QUIET:
     sys.stdout.write("PROFILES_OK=%d\n" % count)
