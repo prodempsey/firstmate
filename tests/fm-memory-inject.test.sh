@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# Memory PR-4 spawn-time injection. Two layers:
-#   * the fm-memory-inject.sh wrapper contract (opt-in gate, fail-open, real
-#     injection against a fixture registry), and
-#   * the fm-spawn.sh integration (injection is inert by default, injects when
-#     enabled, and NEVER fails a spawn), reusing the govern-gate fakebin pattern.
+# Memory PR-4 spawn-time injection + Compounding Fleet stage B dispatch recall.
+# Three layers:
+#   * the fm-memory-inject.sh wrapper contract (default ON, config/env disable,
+#     fail-open, a portable spawn-safe deadline, real injection against a fixture),
+#   * the fm-spawn.sh integration (recall runs on every ship/scout dispatch, injects
+#     when the registry has relevant memory, stays inert when it does not, and NEVER
+#     fails a spawn), reusing the govern-gate fakebin pattern, and
+#   * the failure-class recall wiring: a dispatch whose brief text matches a failure
+#     class's detection cues yields a bounded pack containing that class, cited.
 # Every registry used here is an isolated fixture; the production registry is never
-# read or written (MEM_REGISTRY_DIR is always pinned to a temp dir).
+# read or written (MEM_REGISTRY_DIR is always pinned to a temp dir). tests/lib.sh
+# pins FM_MEMORY_INJECT=0 suite-wide, so this suite must explicitly opt in: it either
+# UNSETS it (env -u) to exercise the intrinsic default-on, or forces it on/off.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -14,6 +20,7 @@ set -u
 INJECT="$ROOT/bin/fm-memory-inject.sh"
 SPAWN="$ROOT/bin/fm-spawn.sh"
 MEMBIN="$ROOT/memory/bin/mem.mjs"
+FAILCLASS="$ROOT/bin/fm-failure-class.sh"
 TMP_ROOT=$(fm_test_tmproot fm-memory-inject)
 
 if ! command -v node >/dev/null 2>&1; then
@@ -38,20 +45,48 @@ seed_registry() {  # <registry-dir>
   ' "$reg"
 }
 
+# Seed a fixture registry with real failure classes from the committed ledger,
+# through the sanctioned register flow (mem propose | mem activate). This is the
+# actual dispatch-recall corpus, not a synthetic stand-in.
+seed_failure_classes() {  # <registry-dir> <FC-id>...
+  local reg=$1; shift
+  mkdir -p "$reg"
+  local -a ids=()
+  local fc; for fc in "$@"; do ids+=(--id "$fc"); done
+  MEM_REGISTRY_DIR="$reg" "$FAILCLASS" register "${ids[@]}" --live --gate "test:cf-recall-b1" >/dev/null
+}
+
 FINAL_BRIEF=$'# Task\nFix the stale watcher and the worktree isolation problem.\n\n# Setup\ndetails\n'
 
-# --- wrapper: opt-in gate ---------------------------------------------------
-test_wrapper_disabled_by_default() {
-  local d="$TMP_ROOT/wd"; mkdir -p "$d/config"
+# A brief whose # Task text matches failure class FC-004's detection cues (a
+# validation check that fails open to success when a prerequisite tool is missing).
+FC_BRIEF=$'# Task\nThe profile validator skips its duplicate-key check when python3 is missing, so a missing prerequisite tool makes it warn and fall open to success instead of refusing.\n\n# Setup\ndetails\n'
+
+# --- wrapper: enablement gate -----------------------------------------------
+test_wrapper_default_on_injects() {
+  local d="$TMP_ROOT/def"; mkdir -p "$d/config"
+  local brief="$d/brief.md"; printf '%s' "$FINAL_BRIEF" > "$brief"
+  local reg="$d/registry"; seed_registry "$reg"
+  local out status
+  out=$(env -u FM_MEMORY_INJECT FM_HOME="$d" MEM_REGISTRY_DIR="$reg" "$INJECT" --task t1 --brief "$brief" --project firstmate --kind ship); status=$?
+  expect_code 0 "$status" "wrapper must exit 0 on default-on injection"
+  assert_grep '## Fleet memory' "$brief" "recall runs by DEFAULT (no env, no config): the pointer block must be injected"
+  assert_grep 'MEM-0001' "$brief" "an active memory pointer must appear"
+  assert_grep 'mem show MEM-0001' "$brief" "pointer must carry the show command (pointer-only)"
+  assert_present "$d/memory-proof.json" "a spawn-time proof must be written"
+  pass "wrapper injects by default: recall at every dispatch"
+}
+
+test_wrapper_config_disable_off() {
+  local d="$TMP_ROOT/cd"; mkdir -p "$d/config"
+  printf 'off\n' > "$d/config/memory-inject.enabled"   # the only way to opt a home out
   local brief="$d/brief.md"; printf '%s' "$FINAL_BRIEF" > "$brief"
   local reg="$d/registry"; seed_registry "$reg"
   local before; before=$(cat "$brief")
-  local out status
-  out=$(FM_HOME="$d" MEM_REGISTRY_DIR="$reg" "$INJECT" --task t1 --brief "$brief" --project firstmate --kind ship); status=$?
-  expect_code 0 "$status" "wrapper must exit 0 when disabled"
-  [ "$(cat "$brief")" = "$before" ] || fail "brief must be unchanged when injection is disabled by default"
-  assert_absent "$d/memory-proof.json" "no proof is written when disabled"
-  pass "wrapper is inert (no injection, no proof) by default"
+  env -u FM_MEMORY_INJECT FM_HOME="$d" MEM_REGISTRY_DIR="$reg" "$INJECT" --task t1 --brief "$brief" --project firstmate --kind ship >/dev/null
+  [ "$(cat "$brief")" = "$before" ] || fail "a config disable token must force injection off"
+  assert_absent "$d/memory-proof.json" "no proof is written when disabled by config"
+  pass "config/memory-inject.enabled disable token forces injection off"
 }
 
 test_wrapper_env_disable_wins() {
@@ -65,7 +100,6 @@ test_wrapper_env_disable_wins() {
   pass "explicit FM_MEMORY_INJECT=0 overrides an enabling config file"
 }
 
-# --- wrapper: enabled real injection ----------------------------------------
 test_wrapper_env_enable_injects() {
   local d="$TMP_ROOT/ee"; mkdir -p "$d/config"
   local brief="$d/brief.md"; printf '%s' "$FINAL_BRIEF" > "$brief"
@@ -75,34 +109,23 @@ test_wrapper_env_enable_injects() {
   expect_code 0 "$status" "wrapper must exit 0 on successful injection"
   assert_grep '## Fleet memory' "$brief" "the pointer block must be injected when enabled"
   assert_grep 'MEM-0001' "$brief" "an active memory pointer must appear"
-  assert_grep 'mem show MEM-0001' "$brief" "pointer must carry the show command (pointer-only)"
   assert_present "$d/memory-proof.json" "a spawn-time proof must be written"
   assert_grep '"injected": true' "$d/memory-proof.json" "the proof must record a real injection"
   # After-the-fact verification passes on the injected artifact.
   MEM_REGISTRY_DIR="$reg" node "$MEMBIN" verify-brief --brief "$brief" >/dev/null 2>&1 || fail "verify-brief must pass on the injected brief"
-  pass "FM_MEMORY_INJECT=1 injects a pointer block + proof that verifies"
+  pass "explicit FM_MEMORY_INJECT=1 injects a pointer block + proof that verifies"
 }
 
-test_wrapper_config_enable_injects() {
-  local d="$TMP_ROOT/ce"; mkdir -p "$d/config"
-  printf 'true\n' > "$d/config/memory-inject.enabled"
-  local brief="$d/brief.md"; printf '%s' "$FINAL_BRIEF" > "$brief"
-  local reg="$d/registry"; seed_registry "$reg"
-  FM_HOME="$d" MEM_REGISTRY_DIR="$reg" "$INJECT" --task t1 --brief "$brief" --project firstmate --kind ship >/dev/null
-  assert_grep '## Fleet memory' "$brief" "config-enabled injection must inject"
-  pass "config/memory-inject.enabled turns injection on"
-}
-
-# --- wrapper: fail-open -------------------------------------------------------
+# --- wrapper: fail-open (inert when registry empty/unavailable) --------------
 test_wrapper_failopen_absent_registry() {
   local d="$TMP_ROOT/fo"; mkdir -p "$d/config"
   local brief="$d/brief.md"; printf '%s' "$FINAL_BRIEF" > "$brief"
   local before; before=$(cat "$brief")
   local status
-  FM_MEMORY_INJECT=1 FM_HOME="$d" MEM_REGISTRY_DIR="$d/nope" "$INJECT" --task t1 --brief "$brief" --project firstmate --kind ship >/dev/null; status=$?
+  env -u FM_MEMORY_INJECT FM_HOME="$d" MEM_REGISTRY_DIR="$d/nope" "$INJECT" --task t1 --brief "$brief" --project firstmate --kind ship >/dev/null; status=$?
   expect_code 0 "$status" "wrapper must never fail even with an absent registry"
-  [ "$(cat "$brief")" = "$before" ] || fail "brief must be unchanged on recall failure (fail-open to no-injection)"
-  pass "an absent registry fails open: exit 0, brief unchanged"
+  [ "$(cat "$brief")" = "$before" ] || fail "brief must be unchanged when the registry is unavailable (fail-open to no-injection)"
+  pass "default-on + an unavailable registry fails open: exit 0, brief unchanged"
 }
 
 test_wrapper_no_cli_noop() {
@@ -111,10 +134,30 @@ test_wrapper_no_cli_noop() {
   local before; before=$(cat "$brief")
   local status
   # MEM_CLI points at a non-existent command -> the wrapper's run is non-fatal.
-  FM_MEMORY_INJECT=1 MEM_CLI="$d/no-such-mem-binary" FM_HOME="$d" "$INJECT" --task t1 --brief "$brief" --project firstmate --kind ship >/dev/null 2>&1; status=$?
+  env -u FM_MEMORY_INJECT MEM_CLI="$d/no-such-mem-binary" FM_HOME="$d" "$INJECT" --task t1 --brief "$brief" --project firstmate --kind ship >/dev/null 2>&1; status=$?
   expect_code 0 "$status" "wrapper must exit 0 even when the CLI cannot run"
   [ "$(cat "$brief")" = "$before" ] || fail "brief must be unchanged when the CLI cannot run"
   pass "a broken/missing memory CLI is a silent no-op (fail-open)"
+}
+
+# --- wrapper: portable spawn-safe deadline (FC-006) --------------------------
+test_wrapper_deadline_failopen() {
+  local d="$TMP_ROOT/deadline"; mkdir -p "$d/config"
+  local brief="$d/brief.md"; printf '%s' "$FINAL_BRIEF" > "$brief"
+  local before; before=$(cat "$brief")
+  # A CLI that would hang far past the deadline; the wrapper must kill it and
+  # fail open to no-injection without blocking the (simulated) spawn.
+  local slow="$d/slow-mem"
+  printf '#!/usr/bin/env bash\nexec sleep 30\n' > "$slow"; chmod +x "$slow"
+  local start status
+  start=$SECONDS
+  env -u FM_MEMORY_INJECT FM_MEMORY_INJECT_TIMEOUT=1 MEM_CLI="$slow" FM_HOME="$d" \
+    "$INJECT" --task t1 --brief "$brief" --project firstmate --kind ship >/dev/null 2>&1; status=$?
+  local elapsed=$((SECONDS - start))
+  expect_code 0 "$status" "the deadline path must still exit 0 (never fail the spawn)"
+  [ "$elapsed" -lt 8 ] || fail "the deadline must bound the call (elapsed ${elapsed}s should be well under the 30s child)"
+  [ "$(cat "$brief")" = "$before" ] || fail "brief must be unchanged when the recall call is killed by the deadline"
+  pass "a hung memory CLI is bounded by the portable deadline: fail-open, brief unchanged, spawn never blocked"
 }
 
 # --- fm-spawn integration (fakebin) -----------------------------------------
@@ -147,8 +190,10 @@ SH
   printf '%s\n' "$fakebin"
 }
 
-spawn_case() {  # <name> <id> ; echoes home|proj|wt|fakebin|launchlog|reg|id
-  local name=$1 id=$2 dir home proj wt fakebin launchlog reg
+# build_home <name> <id> <brief-content> -> echoes home|proj|wt|fakebin|launchlog|reg|id
+# (the registry is created but NOT seeded; each caller seeds it as it needs).
+build_home() {
+  local name=$1 id=$2 brief=$3 dir home proj wt fakebin launchlog reg
   dir="$TMP_ROOT/$name"; home="$dir/home"; proj="$dir/project"; wt="$dir/.treehouse/1/wt"
   launchlog="$dir/launch.log"; reg="$dir/registry"
   fakebin=$(make_fakebin "$dir/fake")
@@ -156,19 +201,21 @@ spawn_case() {  # <name> <id> ; echoes home|proj|wt|fakebin|launchlog|reg|id
   printf 'claude\n' > "$home/config/crew-harness"
   fm_git_worktree "$proj" "$wt" "wt-$name"
   touch "$home/state/.last-watcher-beat"
-  seed_registry "$reg"
-  printf '%s' "$FINAL_BRIEF" > "$home/data/$id/brief.md"
+  printf '%s' "$brief" > "$home/data/$id/brief.md"
   printf '%s|%s|%s|%s|%s|%s|%s\n' "$home" "$proj" "$wt" "$fakebin" "$launchlog" "$reg" "$id"
 }
 
 run_spawn() {  # <home> <proj> <wt> <fakebin> <launchlog> <id> [env KEY=VAL ...]
   local home=$1 proj=$2 wt=$3 fakebin=$4 launchlog=$5 id=$6; shift 6
   : > "$launchlog"
+  # env -u FM_MEMORY_INJECT drops tests/lib.sh's suite-wide OFF pin so the spawn
+  # exercises the INTRINSIC default (recall on); a caller can still re-add
+  # FM_MEMORY_INJECT=1 via "$@" for the explicit-enable cases.
   # FM_ROLE_OVERRIDE=primary: this suite targets injection, not the dispatch role
   # guard (that is fm-govern-spawn-gate's job), so it forces the primary role via the
   # documented audited override. That keeps the test runnable both as the primary and
   # from inside a crew worktree (e.g. a crewmate verifying its own change).
-  env FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+  env -u FM_MEMORY_INJECT FM_ROOT_OVERRIDE='' FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
     FM_DATA_OVERRIDE="$home/data" FM_PROJECTS_OVERRIDE="$home/projects" \
     FM_CONFIG_OVERRIDE="$home/config" FM_ROLE_OVERRIDE=primary FM_ROLE_OVERRIDE_REASON=fm-memory-inject-test \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" \
@@ -176,47 +223,50 @@ run_spawn() {  # <home> <proj> <wt> <fakebin> <launchlog> <id> [env KEY=VAL ...]
     "$@" "$SPAWN" "$id" "$proj" 2>&1
 }
 
-test_spawn_inert_by_default() {
-  local rec home proj wt fakebin launchlog reg id out status before
-  rec=$(spawn_case spawn-default ship-default-1)
+test_spawn_injects_by_default() {
+  local rec home proj wt fakebin launchlog reg id out status
+  rec=$(build_home spawn-default ship-default-1 "$FINAL_BRIEF")
   IFS='|' read -r home proj wt fakebin launchlog reg id <<EOF
 $rec
 EOF
-  before=$(cat "$home/data/$id/brief.md")
+  seed_registry "$reg"
   out=$(run_spawn "$home" "$proj" "$wt" "$fakebin" "$launchlog" "$id" MEM_REGISTRY_DIR="$reg"); status=$?
   expect_code 0 "$status" "a normal ship spawn must succeed"
   assert_contains "$out" "spawned $id" "spawn must report success"
-  [ "$(cat "$home/data/$id/brief.md")" = "$before" ] || fail "brief must be unchanged: injection is opt-in and OFF by default"
-  assert_absent "$home/data/$id/memory-proof.json" "no proof sidecar when injection is disabled by default"
-  pass "fm-spawn: memory injection is inert by default (brief byte-identical)"
-}
-
-test_spawn_injects_when_enabled() {
-  local rec home proj wt fakebin launchlog reg id out status
-  rec=$(spawn_case spawn-enabled ship-enabled-1)
-  IFS='|' read -r home proj wt fakebin launchlog reg id <<EOF
-$rec
-EOF
-  out=$(run_spawn "$home" "$proj" "$wt" "$fakebin" "$launchlog" "$id" MEM_REGISTRY_DIR="$reg" FM_MEMORY_INJECT=1); status=$?
-  expect_code 0 "$status" "an enabled-injection ship spawn must still succeed"
-  assert_contains "$out" "spawned $id" "spawn must report success even with injection on"
-  assert_grep '## Fleet memory' "$home/data/$id/brief.md" "the brief must carry the injected pointer block"
+  assert_grep '## Fleet memory' "$home/data/$id/brief.md" "recall runs on every dispatch: the brief must carry the injected pointer block"
   assert_grep 'MEM-0001' "$home/data/$id/brief.md" "the injected pointer must reference the active memory"
   assert_present "$home/data/$id/memory-proof.json" "a spawn-time proof must be written"
   # The launch command reads the brief at runtime (`cat <brief>`), so the crew sees
   # the injected block; assert the launch references that exact brief path.
   assert_grep "$home/data/$id/brief.md" "$launchlog" "the launch command must read the injected brief"
-  pass "fm-spawn: injection wires into the launched brief when enabled, spawn still succeeds"
+  pass "fm-spawn: injection wires into every dispatch's brief by default, spawn still succeeds"
+}
+
+test_spawn_inert_when_registry_absent() {
+  local rec home proj wt fakebin launchlog reg id out status before
+  rec=$(build_home spawn-inert ship-inert-1 "$FINAL_BRIEF")
+  IFS='|' read -r home proj wt fakebin launchlog reg id <<EOF
+$rec
+EOF
+  before=$(cat "$home/data/$id/brief.md")
+  # Default-on, but the registry is absent: recall fails open -> no injection, and
+  # the spawn still succeeds. This is the contract's "inert when registry unavailable".
+  out=$(run_spawn "$home" "$proj" "$wt" "$fakebin" "$launchlog" "$id" MEM_REGISTRY_DIR="$home/absent"); status=$?
+  expect_code 0 "$status" "a spawn against an unavailable registry must succeed"
+  assert_contains "$out" "spawned $id" "spawn must report success"
+  [ "$(cat "$home/data/$id/brief.md")" = "$before" ] || fail "brief must be unchanged when the registry is unavailable"
+  assert_not_contains "$(cat "$home/data/$id/brief.md")" "## Fleet memory" "no memory block when the registry is unavailable"
+  pass "fm-spawn: default-on is inert when the registry is empty/unavailable (fail-open, no injection)"
 }
 
 test_spawn_failopen_does_not_break_spawn() {
   local rec home proj wt fakebin launchlog reg id out status
-  rec=$(spawn_case spawn-failopen ship-failopen-1)
+  rec=$(build_home spawn-failopen ship-failopen-1 "$FINAL_BRIEF")
   IFS='|' read -r home proj wt fakebin launchlog reg id <<EOF
 $rec
 EOF
-  # Enabled, but point at an absent registry: recall fails -> no injection, but the
-  # spawn must still succeed (fail-open, never fail-wrong, never break dispatch).
+  # Explicitly enabled, pointed at an absent registry: recall fails -> no injection,
+  # but the spawn must still succeed (fail-open, never fail-wrong, never break dispatch).
   out=$(run_spawn "$home" "$proj" "$wt" "$fakebin" "$launchlog" "$id" MEM_REGISTRY_DIR="$home/absent" FM_MEMORY_INJECT=1); status=$?
   expect_code 0 "$status" "a recall failure must not break the spawn"
   assert_contains "$out" "spawned $id" "spawn must succeed despite recall failure"
@@ -224,14 +274,38 @@ EOF
   pass "fm-spawn: a recall failure fails open (no injection) without breaking dispatch"
 }
 
-test_wrapper_disabled_by_default
+# --- dispatch recall of a failure class (Compounding Fleet stage B) ----------
+test_spawn_failure_class_recall() {
+  local rec home proj wt fakebin launchlog reg id out status
+  rec=$(build_home spawn-fc ship-fc-1 "$FC_BRIEF")
+  IFS='|' read -r home proj wt fakebin launchlog reg id <<EOF
+$rec
+EOF
+  # The real dispatch-recall corpus: failure classes registered from the committed
+  # ledger. FC-004 is "fail-open on a missing prerequisite tool"; FC-006 is a
+  # distinct class seeded alongside it to show the RIGHT class surfaces.
+  seed_failure_classes "$reg" FC-004 FC-006
+  out=$(run_spawn "$home" "$proj" "$wt" "$fakebin" "$launchlog" "$id" MEM_REGISTRY_DIR="$reg"); status=$?
+  expect_code 0 "$status" "a failure-class-matching ship spawn must succeed"
+  assert_contains "$out" "spawned $id" "spawn must report success"
+  assert_grep '## Fleet memory' "$home/data/$id/brief.md" "the brief must carry the injected recall pack"
+  assert_grep 'FC-004' "$home/data/$id/brief.md" "the pack must contain the failure class whose detection cues the brief matches"
+  assert_grep 'mem show MEM-' "$home/data/$id/brief.md" "the pack must cite the memory id (pointer-only)"
+  assert_present "$home/data/$id/memory-proof.json" "a spawn-time proof must be written"
+  assert_grep '"injected": true' "$home/data/$id/memory-proof.json" "the proof must record what was injected"
+  pass "fm-spawn: a brief matching a failure class's cues yields a pack containing that class, cited, with proof"
+}
+
+test_wrapper_default_on_injects
+test_wrapper_config_disable_off
 test_wrapper_env_disable_wins
 test_wrapper_env_enable_injects
-test_wrapper_config_enable_injects
 test_wrapper_failopen_absent_registry
 test_wrapper_no_cli_noop
-test_spawn_inert_by_default
-test_spawn_injects_when_enabled
+test_wrapper_deadline_failopen
+test_spawn_injects_by_default
+test_spawn_inert_when_registry_absent
 test_spawn_failopen_does_not_break_spawn
+test_spawn_failure_class_recall
 
-pass "fm-memory-inject: all wrapper + fm-spawn integration cases passed"
+pass "fm-memory-inject: all wrapper + fm-spawn integration + failure-class recall cases passed"

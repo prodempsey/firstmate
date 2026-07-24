@@ -64,8 +64,10 @@ For each class it runs `mem propose` then `mem activate` with the following.
 - `--memory-type procedural`, `--scope fleet`, `--confidence guarded`.
 - The `--gate` reference as the activation `--validation` authority.
 
-Once activated, PR-4 dispatch recall (`mem recall` / `mem inject-brief`) surfaces the applicable classes when a task brief matches their shape.
+Once activated, dispatch recall (`mem recall` / `mem inject-brief`) surfaces the applicable classes when a task brief matches their shape.
 This is verified: a query like "validator keeps false-passing; add a check for the new corruption shape" recalls the relevant failure-class records.
+Stage B wires this into every dispatch: `bin/fm-spawn.sh` runs `bin/fm-memory-inject.sh` for every ship/scout task before launch, so a brief whose text matches a class's detection cues carries that class's invariant as a bounded, cited recall pointer.
+The wiring is on by default, fail-open (inert when the registry is empty or unavailable), and bounded by a portable deadline so it can never block a spawn (itself the FC-006 invariant).
 
 ### The typed `sourceType` field
 

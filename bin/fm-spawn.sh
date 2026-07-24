@@ -873,14 +873,16 @@ EOF2
   fi
 fi
 
-# --- governed memory injection (Memory PR-4) --------------------------------
+# --- governed memory injection (Memory PR-4 / Compounding Fleet stage B) -----
 # For a ship/scout task, recall governed fleet memory for the finalized brief and
 # inject a bounded, POINTER-ONLY block plus a spawn-time proof - BEFORE any backend
 # window, worktree lease, or agent launch, so the recalled pack is proven against
-# the brief the crew actually reads. fm-memory-inject.sh is opt-in (a no-op until
-# explicitly enabled) and fail-open (it NEVER fails a spawn and mutates the brief
-# only when there is proven memory to inject), so the default dispatch path is
-# byte-identical to today. See AGENTS.md task lifecycle and memory/lib/injection.mjs.
+# the brief the crew actually reads. This is the dispatch-recall wiring: recall runs
+# on EVERY ship/scout dispatch. fm-memory-inject.sh is fail-open (it NEVER fails a
+# spawn and mutates the brief only when there is proven memory to inject, so it stays
+# inert until the registry holds relevant memory) and bounded by a portable deadline
+# so it can never block the spawn (FC-006). See AGENTS.md task lifecycle and
+# memory/lib/injection.mjs.
 if { [ "$KIND" = ship ] || [ "$KIND" = scout ]; }; then
   "$FM_ROOT/bin/fm-memory-inject.sh" --task "$ID" --brief "$BRIEF" --project "$(basename "$PROJ_ABS")" --kind "$KIND" || true
 fi

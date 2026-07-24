@@ -34,6 +34,16 @@ FM_TEST_LIB_SOURCED=1
 # strips this to verify real refusal.
 export FM_GATE_REFUSE_BYPASS=1
 
+# Dispatch-recall (Compounding Fleet stage B) is ON by default for real fm-spawn
+# dispatch, so a spawn test that keeps node on PATH would otherwise recall against
+# the operator's PRODUCTION memory registry ($HOME/fleet/state/memory) and write a
+# proof sidecar into its brief dir. Pin it OFF for the general suite so every
+# unrelated spawn/brief test stays byte-identical, fast, and can never read or write
+# production memory. The dispatch-recall path is exercised deliberately in
+# tests/fm-memory-inject.test.sh, which unsets this (to test the intrinsic default)
+# or forces it on, always against an isolated fixture registry (MEM_REGISTRY_DIR).
+export FM_MEMORY_INJECT=0
+
 # Resolve the repo root from this library's own location. Consumed by sourcing
 # test files, not by this library, so it reads as "unused" here.
 # shellcheck disable=SC2034
