@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "firstmate/governed-bindings-entry/v1",
   "title": "Governed SHELL-CREW bindings entry",
-  "description": "Closed, total schema for a state/crew-profile-bindings.json entry keyed by a governed profile name (model-economy S3). harness, model, and backups are required and fully typed; effort, when present, is enum-constrained (an empty-string effort is rejected); backups items are typed objects with uniqueItems. model must be a string, proven BEFORE any cross-surface comparison. Whether effort is present is proven per tier by the validator's cross-check.",
+  "description": "Closed, total schema for a state/crew-profile-bindings.json entry keyed by a governed profile name (model-economy S3). harness, model, and backups are required and fully typed; effort, when present, is enum-constrained (an empty-string effort is rejected); each backups item is a closed object requiring harness and model (effort enum-optional), with uniqueItems on the array. model must be a string, proven BEFORE any cross-surface comparison. Whether effort is present is proven per tier by the validator's cross-check.",
   "type": "object",
   "additionalProperties": false,
   "required": ["harness", "model", "backups"],
@@ -16,7 +16,7 @@
     "backup": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["model"],
+      "required": ["harness", "model"],
       "properties": {
         "harness": {"type": "string", "minLength": 1},
         "model": {"type": "string", "minLength": 1},

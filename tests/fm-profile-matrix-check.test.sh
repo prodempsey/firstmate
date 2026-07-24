@@ -410,7 +410,10 @@ test_bindings_agreement_passes() {
   fresh
   bindings_run '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[]}}'
   expect_code 0 "$RC" "an agreeing governed bindings entry must pass"$'\n'"$OUT"
-  pass "a bindings entry agreeing with the manifest passes"
+  # positive control: a fully-typed backup (harness+model, effort optional) passes
+  bindings_run '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[{"harness":"codex","model":"gpt-5.5","effort":"high"}]}}'
+  expect_code 0 "$RC" "a complete backup entry must pass"$'\n'"$OUT"
+  pass "a bindings entry agreeing with the manifest (incl. a complete backup) passes"
 }
 
 test_bindings_legacy_only_is_noop() {
@@ -437,9 +440,11 @@ test_bindings_type_and_agreement_rejected() {
     '{"opus-high":{"model":"claude-opus-4-8","effort":"high","backups":[]}}|missing-harness'
     '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high"}}|missing-backups'
     '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[null]}}|backups-null-item'
-    '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[{"model":"x"},{"model":"x"}]}}|backups-duplicate'
-    '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[{"model":"x","bogus":1}]}}|backups-unknown-key'
+    '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[{"harness":"c","model":"x"},{"harness":"c","model":"x"}]}}|backups-duplicate'
+    '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[{"harness":"c","model":"x","bogus":1}]}}|backups-unknown-key'
     '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[{"harness":"c"}]}}|backups-missing-model'
+    '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[{"model":"x"}]}}|backups-missing-harness'
+    '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[{"harness":"c","model":"x","effort":""}]}}|backups-empty-effort'
     '{"haiku-evidence":{"harness":"claude","model":"claude-haiku-4-5","effort":"","backups":[]}}|haiku-empty-effort'
     '{"haiku-evidence":{"harness":"claude","model":"claude-haiku-4-5","effort":"low","backups":[]}}|haiku-effort-present-but-tier-has-none'
   )
@@ -495,6 +500,26 @@ test_sidecar_not_written_on_failure() {
   pass "a failed validation leaves no attestation sidecar"
 }
 
+test_preexisting_sidecar_invalidated_on_failure() {
+  # The stale-authority invariant (DJ stale-audit class): a failed --write-sidecar
+  # run must leave NO usable sidecar EVEN WHEN one already existed from a prior
+  # successful run. No `fresh` between the two runs — the sandbox (and its sidecar)
+  # persists across the mutation, exactly the scenario the round-4 test missed.
+  fresh
+  "$V" --manifest "$M" --agents-dir "$D" --schemas-dir "$SDIR" --write-sidecar --quiet
+  assert_present "$SB/manifest.fingerprint" "a valid run first establishes a sidecar"
+  # Now invalidate the matrix and re-run with --write-sidecar; the prior sidecar
+  # must be gone, not left standing beside a now-invalid matrix.
+  sed -i 's/^permissionMode: default$/permissionMode: [default]/' "$D/opus-high.md"
+  "$V" --manifest "$M" --agents-dir "$D" --schemas-dir "$SDIR" --write-sidecar --quiet 2>/dev/null
+  assert_absent "$SB/manifest.fingerprint" "a failed run removes the pre-existing sidecar"
+  # And a subsequent successful run re-establishes it.
+  sed -i 's/^permissionMode: \[default\]$/permissionMode: default/' "$D/opus-high.md"
+  "$V" --manifest "$M" --agents-dir "$D" --schemas-dir "$SDIR" --write-sidecar --quiet
+  assert_present "$SB/manifest.fingerprint" "a later valid run re-establishes the sidecar"
+  pass "a failed validation invalidates any pre-existing attestation sidecar"
+}
+
 # --- usage ------------------------------------------------------------------
 
 test_unknown_flag_is_usage_error() {
@@ -532,6 +557,7 @@ test_bindings_legacy_only_is_noop
 test_bindings_type_and_agreement_rejected
 test_fingerprint_pin_and_sidecar
 test_sidecar_not_written_on_failure
+test_preexisting_sidecar_invalidated_on_failure
 test_unknown_flag_is_usage_error
 
 pass "fm-profile-matrix-check: all authority-pattern cases passed"

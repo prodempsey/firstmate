@@ -95,6 +95,16 @@ if [ -n "$want" ]; then echo "fm-profile-matrix-check: --$want requires a value"
 [ -n "$AGENTS_DIR" ] || AGENTS_DIR="$FM_ROOT/.claude/agents"
 [ -n "$SCHEMAS_DIR" ] || SCHEMAS_DIR="$FM_ROOT/docs/model-economy/schemas"
 
+# Provenance stale-authority guard (same class as the DJ stale-audit ruling):
+# when --write-sidecar is requested, INVALIDATE any pre-existing attestation
+# BEFORE any validation step (or engine-availability refusal) can fail, so a
+# failed run never leaves a valid-looking sidecar standing beside a now-invalid
+# matrix. The fresh attestation is re-created only after the whole pass succeeds
+# (inside the python pass, temp file + atomic rename). Remove-first / write-last.
+if [ "$WRITE_SIDECAR" = "1" ]; then
+  rm -f "${MANIFEST%.json}.fingerprint" 2>/dev/null || true
+fi
+
 # Hard prerequisite: the strict validation engine must be present. Absence is
 # NON-AUTHORITATIVE and fails closed (never a weaker fallback).
 if ! command -v python3 >/dev/null 2>&1; then

@@ -101,6 +101,21 @@ twelfth/prohibited/missing profile, empty-effort/missing-key/bad-backup bindings
 and no-sidecar-after-failure on the frontmatter, projection, and bindings failure
 paths).
 
+### Round 5 (q123) — two residues closed
+
+1. **Backup objects are total.** The governed bindings backup schema now requires
+   both `harness` and `model` (effort enum-optional), so an incomplete backup —
+   e.g. `{"model":"x"}` with no harness — fails closed instead of validating.
+2. **Stale-authority sidecar removed (DJ stale-audit class).** Writing the sidecar
+   only on success fixed the fresh path but left a *pre-existing* sidecar standing
+   after a later failed run. Now, when `--write-sidecar` is requested, any existing
+   sidecar is invalidated (removed) BEFORE any validation step or engine-refusal can
+   fail, and re-created only after the whole pass succeeds — remove-first /
+   write-last. A failed validation therefore leaves no usable attestation even when
+   one existed before. Fixtures: a backup missing `harness`; and a first valid run
+   that establishes a sidecar, an artifact mutation, a re-run that must remove it,
+   and a later valid run that re-establishes it.
+
 ## T.2 runtime probes — EXPLICIT deferral (QA qa-me-s3-q119 finding 2)
 
 §T.2 lists two RUNTIME probes in its "Runtime probe (harmless)" column, and
