@@ -2,14 +2,26 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "firstmate/governed-bindings-entry/v1",
   "title": "Governed SHELL-CREW bindings entry",
-  "description": "Closed schema for a state/crew-profile-bindings.json entry keyed by a governed profile name (model-economy S3). model MUST be a string and effort a string, proven BEFORE any cross-surface comparison — closing the list-membership type bug where a list value satisfied a string field.",
+  "description": "Closed, total schema for a state/crew-profile-bindings.json entry keyed by a governed profile name (model-economy S3). harness, model, and backups are required and fully typed; effort, when present, is enum-constrained (an empty-string effort is rejected); backups items are typed objects with uniqueItems. model must be a string, proven BEFORE any cross-surface comparison. Whether effort is present is proven per tier by the validator's cross-check.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["model"],
+  "required": ["harness", "model", "backups"],
   "properties": {
-    "harness": {"type": "string"},
+    "harness": {"type": "string", "minLength": 1},
     "model": {"type": "string", "minLength": 1},
-    "effort": {"type": "string"},
-    "backups": {"type": "array"}
+    "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
+    "backups": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/backup"}}
+  },
+  "$defs": {
+    "backup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model"],
+      "properties": {
+        "harness": {"type": "string", "minLength": 1},
+        "model": {"type": "string", "minLength": 1},
+        "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]}
+      }
+    }
   }
 }

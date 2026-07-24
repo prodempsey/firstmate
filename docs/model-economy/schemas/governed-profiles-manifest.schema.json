@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "firstmate/governed-profiles-manifest/v1",
   "title": "Governed profile matrix manifest",
-  "description": "Closed, total schema for docs/model-economy/governed-profiles.manifest.json — the single machine-authoritative artifact for the 11 governed profiles (model-economy S3). additionalProperties:false at every level; any property the schema does not positively admit fails closed.",
+  "description": "Closed, total schema for docs/model-economy/governed-profiles.manifest.json — the single machine-authoritative artifact for the 11 governed profiles (model-economy S3). additionalProperties:false at every level; the profiles object is closed to exactly the 11 governed names, so an unauthorized twelfth profile fails closed. Any property the schema does not positively admit is a failure.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -65,26 +65,47 @@
     },
     "profiles": {
       "type": "object",
-      "minProperties": 1,
-      "additionalProperties": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["model", "effort", "description", "writes", "nesting", "tools", "maxTurns", "maxTurns_bounds", "version"],
-        "properties": {
-          "model": {"type": "string", "enum": ["haiku", "sonnet", "opus", "fable"]},
-          "effort": {"anyOf": [{"type": "null"}, {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]}]},
-          "description": {"type": "string", "minLength": 1},
-          "writes": {"type": "boolean"},
-          "nesting": {"type": "boolean"},
-          "tools": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
-          "maxTurns": {"type": "integer", "minimum": 1},
-          "maxTurns_bounds": {
-            "type": "object", "additionalProperties": false,
-            "required": ["min", "max"],
-            "properties": {"min": {"type": "integer", "minimum": 1}, "max": {"type": "integer", "minimum": 1}}
-          },
-          "version": {"type": "integer", "minimum": 1}
-        }
+      "additionalProperties": false,
+      "required": [
+        "haiku-evidence", "haiku-log-compressor",
+        "sonnet-high-engineer", "sonnet-high-reviewer",
+        "opus-low", "opus-medium", "opus-high", "opus-xhigh",
+        "fable-low", "fable-medium", "fable-high"
+      ],
+      "properties": {
+        "haiku-evidence": {"$ref": "#/$defs/profile"},
+        "haiku-log-compressor": {"$ref": "#/$defs/profile"},
+        "sonnet-high-engineer": {"$ref": "#/$defs/profile"},
+        "sonnet-high-reviewer": {"$ref": "#/$defs/profile"},
+        "opus-low": {"$ref": "#/$defs/profile"},
+        "opus-medium": {"$ref": "#/$defs/profile"},
+        "opus-high": {"$ref": "#/$defs/profile"},
+        "opus-xhigh": {"$ref": "#/$defs/profile"},
+        "fable-low": {"$ref": "#/$defs/profile"},
+        "fable-medium": {"$ref": "#/$defs/profile"},
+        "fable-high": {"$ref": "#/$defs/profile"}
+      }
+    }
+  },
+  "$defs": {
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "effort", "description", "writes", "nesting", "tools", "maxTurns", "maxTurns_bounds", "version"],
+      "properties": {
+        "model": {"type": "string", "enum": ["haiku", "sonnet", "opus", "fable"]},
+        "effort": {"anyOf": [{"type": "null"}, {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]}]},
+        "description": {"type": "string", "minLength": 1},
+        "writes": {"type": "boolean"},
+        "nesting": {"type": "boolean"},
+        "tools": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "maxTurns": {"type": "integer", "minimum": 1},
+        "maxTurns_bounds": {
+          "type": "object", "additionalProperties": false,
+          "required": ["min", "max"],
+          "properties": {"min": {"type": "integer", "minimum": 1}, "max": {"type": "integer", "minimum": 1}}
+        },
+        "version": {"type": "integer", "minimum": 1}
       }
     }
   }

@@ -220,6 +220,9 @@ test_manifest_schema_violations_rejected() {
     '.profiles["opus-high"].tools += ["Read"]|tools-not-unique'
     '.profiles["opus-high"].model = "gpt"|model-not-in-enum'
     '.profiles["opus-high"].effort = "ultra"|effort-not-in-enum'
+    '.profiles.rogue = .profiles["opus-high"]|unauthorized-twelfth-profile'
+    '.profiles["opus-max"] = .profiles["opus-high"]|prohibited-name-as-profile'
+    'del(.profiles["opus-high"])|missing-required-profile'
   )
   local entry expr label
   for entry in "${cases[@]}"; do
@@ -237,11 +240,11 @@ test_manifest_cross_property_violations_rejected() {
     '.effort_constraints.sonnet.fixed = "low"|ec-sonnet-fixed-contradicts-profile'
     '.effort_constraints.haiku.effort_present = true|ec-haiku-requires-effort-contradicts'
     '.effort_constraints.opus.prohibited = ["xhigh"]|ec-opus-prohibits-xhigh-hits-opus-xhigh'
+    '.effort_constraints.fable.ceiling = "low"|ec-fable-ceiling-below-profile-effort'
     '.profiles["opus-high"].maxTurns = 99|concrete-maxTurns-out-of-bounds'
     '.profiles["opus-high"].maxTurns_bounds = {"min":30,"max":16}|bounds-min-gt-max'
     'del(.models_allowed[2])|profile-model-not-in-models_allowed'
     'del(.efforts_allowed[2])|profile-effort-not-in-efforts_allowed'
-    '.profiles["opus-max"] = .profiles["opus-high"]|prohibited-name-defined-as-profile'
   )
   local entry expr label
   for entry in "${cases[@]}"; do
@@ -321,20 +324,43 @@ test_frontmatter_schema_violations_rejected() {
   pass "every frontmatter schema/type/enum/uniqueness/closed-set violation fails closed"
 }
 
-# --- frontmatter: whole-object projection divergence (one per field) --------
+# --- frontmatter: conditional-schema totality (presence proven by the schema) --
+# EFFORT and disallowedTools presence/absence is proven declaratively by the
+# closed frontmatter schema's conditional variants, BEFORE projection — so these
+# fail at the schema layer, demonstrating the schema itself is total.
+
+test_frontmatter_conditional_schema_rejected() {
+  # non-haiku missing EFFORT
+  fresh; sed -i '/^EFFORT: high$/d' "$D/opus-high.md"
+  expect_reject "PROFILE_FRONTMATTER_SCHEMA_INVALID" "conditional: EFFORT-absent-on-non-haiku"
+  # haiku carrying EFFORT
+  fresh; sed -i '/^model: haiku$/a EFFORT: high' "$D/haiku-evidence.md"
+  expect_reject "PROFILE_FRONTMATTER_SCHEMA_INVALID" "conditional: EFFORT-present-on-haiku"
+  # non-nesting missing disallowedTools
+  fresh; sed -i '/^disallowedTools: \[Agent\]$/d' "$D/opus-high.md"
+  expect_reject "PROFILE_FRONTMATTER_SCHEMA_INVALID" "conditional: disallowedTools-absent-on-non-nesting"
+  # nesting carrying disallowedTools
+  fresh; sed -i '/^permissionMode: default$/i disallowedTools: [Agent]' "$D/fable-low.md"
+  expect_reject "PROFILE_FRONTMATTER_SCHEMA_INVALID" "conditional: disallowedTools-present-on-nesting"
+  # non-nesting disallowedTools not exactly [Agent]
+  fresh; sed -i 's/^disallowedTools: \[Agent\]$/disallowedTools: [Read]/' "$D/opus-high.md"
+  expect_reject "PROFILE_FRONTMATTER_SCHEMA_INVALID" "conditional: disallowedTools-not-Agent"
+  pass "the frontmatter conditional variants are total and fail closed"
+}
+
+# --- frontmatter: whole-object projection divergence (VALUE differences) -----
 
 test_frontmatter_projection_divergence_rejected() {
-  # opus-high (non-haiku, non-nesting) exercises every projected field.
+  # opus-high (non-haiku, non-nesting): value differences the schema admits but
+  # the manifest projection rejects.
   local cases=(
     's/^name: opus-high$/name: opus-highest/|name'
     's/^model: opus$/model: sonnet/|model'
     's/^EFFORT: high$/EFFORT: low/|EFFORT-value'
-    '/^EFFORT: high$/d|EFFORT-absent-when-required'
     's/^maxTurns: 24$/maxTurns: 20/|maxTurns'
     's/^profile_version: 1$/profile_version: 9/|profile_version'
     's/^description: .*/description: Governed profile — a plausible but wrong description here./|description'
     's/^tools: \[Read, Write, Edit, Bash, Grep, Glob\]$/tools: [Read, Write, Edit, Bash, Glob, Grep]/|tools-order'
-    '/^disallowedTools: \[Agent\]$/d|disallowedTools-absent-when-required'
   )
   local entry expr label
   for entry in "${cases[@]}"; do
@@ -342,13 +368,7 @@ test_frontmatter_projection_divergence_rejected() {
     fresh; sed -i "$expr" "$D/opus-high.md"
     expect_reject "PROFILE_PROJECTION_MISMATCH" "projection field: $label"
   done
-  # A haiku profile must carry no EFFORT; adding one diverges from the projection.
-  fresh; sed -i '/^model: haiku$/a EFFORT: high' "$D/haiku-evidence.md"
-  expect_reject "PROFILE_PROJECTION_MISMATCH" "projection field: EFFORT-present-on-haiku"
-  # A fable (nesting) profile must carry no disallowedTools; adding one diverges.
-  fresh; sed -i '/^permissionMode: default$/i disallowedTools: [Agent]' "$D/fable-low.md"
-  expect_reject "PROFILE_PROJECTION_MISMATCH" "projection field: disallowedTools-on-nesting"
-  pass "every frontmatter projection divergence fails closed"
+  pass "every frontmatter value divergence fails closed"
 }
 
 # --- directory / file set ---------------------------------------------------
@@ -402,15 +422,26 @@ test_bindings_legacy_only_is_noop() {
 }
 
 test_bindings_type_and_agreement_rejected() {
-  # <json>|<label> — governed opus-high entry mistyped or disagreeing.
+  # <json>|<label> — a complete valid governed entry with exactly one property
+  # broken, so each case isolates its own violation. Base opus-high entry:
+  # {"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[]}.
   local cases=(
-    '{"opus-high":{"model":["claude-opus-4-8"],"effort":"high"}}|B-model-list'
-    '{"opus-high":{"model":5,"effort":"high"}}|model-number'
-    '{"opus-high":{"model":{"x":1},"effort":"high"}}|model-object'
-    '{"opus-high":{"model":"claude-opus-4-8","effort":5}}|effort-number'
-    '{"opus-high":{"model":"claude-opus-4-8","effort":"low"}}|effort-disagrees'
-    '{"opus-high":{"model":"claude-sonnet-5","effort":"high"}}|model-tier-disagrees'
-    '{"opus-high":{"model":"claude-opus-4-8","effort":"high","bogus":1}}|unknown-entry-key'
+    '{"opus-high":{"harness":"claude","model":["claude-opus-4-8"],"effort":"high","backups":[]}}|B-model-list'
+    '{"opus-high":{"harness":"claude","model":5,"effort":"high","backups":[]}}|model-number'
+    '{"opus-high":{"harness":"claude","model":{"x":1},"effort":"high","backups":[]}}|model-object'
+    '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":5,"backups":[]}}|effort-number'
+    '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"","backups":[]}}|effort-empty-string'
+    '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"low","backups":[]}}|effort-disagrees'
+    '{"opus-high":{"harness":"claude","model":"claude-sonnet-5","effort":"high","backups":[]}}|model-tier-disagrees'
+    '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[],"bogus":1}}|unknown-entry-key'
+    '{"opus-high":{"model":"claude-opus-4-8","effort":"high","backups":[]}}|missing-harness'
+    '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high"}}|missing-backups'
+    '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[null]}}|backups-null-item'
+    '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[{"model":"x"},{"model":"x"}]}}|backups-duplicate'
+    '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[{"model":"x","bogus":1}]}}|backups-unknown-key'
+    '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"high","backups":[{"harness":"c"}]}}|backups-missing-model'
+    '{"haiku-evidence":{"harness":"claude","model":"claude-haiku-4-5","effort":"","backups":[]}}|haiku-empty-effort'
+    '{"haiku-evidence":{"harness":"claude","model":"claude-haiku-4-5","effort":"low","backups":[]}}|haiku-effort-present-but-tier-has-none'
   )
   local entry json label
   for entry in "${cases[@]}"; do
@@ -419,7 +450,7 @@ test_bindings_type_and_agreement_rejected() {
     expect_code 1 "$RC" "bindings $label must be rejected"
     assert_contains "$OUT" "PROFILE_BINDINGS_MISMATCH" "bindings $label -> PROFILE_BINDINGS_MISMATCH"
   done
-  pass "bindings type violations and disagreements all fail closed"
+  pass "bindings type violations, missing keys, bad backups, and disagreements all fail closed"
 }
 
 # --- provenance: fingerprint pin + sidecar ----------------------------------
@@ -434,11 +465,34 @@ test_fingerprint_pin_and_sidecar() {
   runc --expect-fingerprint "deadbeefdeadbeef"
   expect_code 1 "$RC" "a wrong fingerprint must be rejected"
   assert_contains "$OUT" "PROFILE_FINGERPRINT_MISMATCH" "a wrong pin has its own code"
-  # sidecar write
+  # sidecar is written on success
   "$V" --manifest "$M" --agents-dir "$D" --schemas-dir "$SDIR" --write-sidecar --quiet
-  assert_present "$SB/manifest.fingerprint" "--write-sidecar writes the fingerprint sidecar"
+  assert_present "$SB/manifest.fingerprint" "--write-sidecar writes the fingerprint sidecar on success"
   assert_grep "$fp" "$SB/manifest.fingerprint" "sidecar records the fingerprint"
-  pass "fingerprint pinning and sidecar mirror the bindings-validate provenance surface"
+  pass "fingerprint pinning and sidecar-on-success mirror the bindings-validate provenance surface"
+}
+
+test_sidecar_not_written_on_failure() {
+  # A failed validation must NOT leave a valid-looking attestation. The sidecar
+  # is written only after the whole atomic pass proves the matrix, so a failure
+  # AFTER the fingerprint is computed (a late frontmatter/projection/bindings
+  # failure) must still leave no sidecar.
+  # (a) frontmatter schema failure (late, after fingerprint)
+  fresh
+  sed -i 's/^permissionMode: default$/permissionMode: [default]/' "$D/opus-high.md"
+  "$V" --manifest "$M" --agents-dir "$D" --schemas-dir "$SDIR" --write-sidecar --quiet 2>/dev/null
+  assert_absent "$SB/manifest.fingerprint" "no sidecar after a frontmatter-schema failure"
+  # (b) projection failure (latest per-profile stage)
+  fresh
+  sed -i 's/^maxTurns: 24$/maxTurns: 20/' "$D/opus-high.md"
+  "$V" --manifest "$M" --agents-dir "$D" --schemas-dir "$SDIR" --write-sidecar --quiet 2>/dev/null
+  assert_absent "$SB/manifest.fingerprint" "no sidecar after a projection failure"
+  # (c) bindings failure (last stage of all)
+  fresh
+  printf '%s' '{"opus-high":{"harness":"claude","model":"claude-opus-4-8","effort":"low","backups":[]}}' > "$SB/bindings.json"
+  "$V" --manifest "$M" --agents-dir "$D" --schemas-dir "$SDIR" --bindings "$SB/bindings.json" --write-sidecar --quiet 2>/dev/null
+  assert_absent "$SB/manifest.fingerprint" "no sidecar after a bindings failure"
+  pass "a failed validation leaves no attestation sidecar"
 }
 
 # --- usage ------------------------------------------------------------------
@@ -468,6 +522,7 @@ test_frontmatter_unterminated_rejected
 test_frontmatter_malformed_yaml_rejected
 test_frontmatter_duplicate_key_rejected
 test_frontmatter_schema_violations_rejected
+test_frontmatter_conditional_schema_rejected
 test_frontmatter_projection_divergence_rejected
 test_missing_profile_file_rejected
 test_unknown_profile_file_rejected
@@ -476,6 +531,7 @@ test_bindings_agreement_passes
 test_bindings_legacy_only_is_noop
 test_bindings_type_and_agreement_rejected
 test_fingerprint_pin_and_sidecar
+test_sidecar_not_written_on_failure
 test_unknown_flag_is_usage_error
 
 pass "fm-profile-matrix-check: all authority-pattern cases passed"

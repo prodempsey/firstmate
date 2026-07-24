@@ -71,6 +71,36 @@ uniqueness/enum/closed-set rule, cross-property policy, and projection field has
 one-property-at-a-time invalid fixture, alongside the missing-engine refuse paths
 and the retained r1/r2 regression cases.
 
+### Round 4 (q122) — three ruling-conformance gaps closed
+
+QA round 4 accepted the architecture but found three residual gaps; all fixed:
+
+1. **Fable `ceiling` now enforced.** `effort_constraints` declared a Fable
+   `ceiling` that the executable policy ignored. The validator now derives the
+   effort order from the (schema-validated) `efforts_allowed` and enforces every
+   declared operator generically — `effort_present`, `fixed`, `prohibited`, **and
+   `ceiling`** — so a profile whose effort exceeds its tier ceiling fails closed.
+2. **The three schemas are now genuinely closed/total.** The manifest `profiles`
+   object is closed to exactly the 11 governed names (`additionalProperties:false`
+   + `required` all 11 via `$defs`/`$ref`), so an unauthorized twelfth profile or a
+   missing one fails at the schema. The frontmatter schema expresses the two
+   conditional keys declaratively (`if/then/else`): EFFORT required for every
+   non-haiku model and forbidden for haiku; `disallowedTools` exactly `["Agent"]`,
+   required when the Agent tool is absent and forbidden when present. The governed
+   bindings entry requires `harness`/`model`/`backups`, enum-constrains `effort`
+   (an empty string is rejected), and types `backups` items with `uniqueItems`; the
+   bindings cross-check proves effort presence/value per tier before comparing.
+3. **The provenance sidecar is written only after the full pass succeeds.**
+   `--write-sidecar` now writes (via temp file + atomic rename, mirroring
+   `fm-bindings-validate.sh`) only after manifest, directory, frontmatter,
+   projection, and bindings all pass — a failed validation never leaves a
+   valid-looking attestation.
+
+Each gap has a one-property invalid fixture (Fable-ceiling contradiction, a
+twelfth/prohibited/missing profile, empty-effort/missing-key/bad-backup bindings,
+and no-sidecar-after-failure on the frontmatter, projection, and bindings failure
+paths).
+
 ## T.2 runtime probes — EXPLICIT deferral (QA qa-me-s3-q119 finding 2)
 
 §T.2 lists two RUNTIME probes in its "Runtime probe (harmless)" column, and

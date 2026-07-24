@@ -232,11 +232,15 @@ ec = manifest["effort_constraints"]
 
 # --- manifest cross-property policy (what JSON Schema cannot express) --------
 # Tier policy is read from effort_constraints ONLY (single source), never a
-# second hard-coded copy.
+# second hard-coded copy. The effort ORDER used by the ceiling rule is derived
+# from the (schema-validated) efforts_allowed list, so every declared operator —
+# effort_present, fixed, prohibited, AND ceiling — is enforced generically.
+effort_rank = {e: i for i, e in enumerate(efforts_allowed)}
 for name, p in profiles.items():
     where = "manifest profile '%s'" % name
-    if name in prohibited:
-        die("PROFILE_MANIFEST_INCONSISTENT", "prohibited name defined as a profile: %s" % name)
+    # A prohibited name can never appear here: the manifest schema closes the
+    # profiles object to exactly the 11 governed names (additionalProperties:false
+    # + required), so an unauthorized/prohibited name fails at PROFILE_MANIFEST_SCHEMA_INVALID.
     if p["model"] not in models_allowed:
         die("PROFILE_MANIFEST_INCONSISTENT", "%s model not in models_allowed" % where)
     if p["effort"] is not None and p["effort"] not in efforts_allowed:
@@ -261,17 +265,23 @@ for name, p in profiles.items():
         die("PROFILE_MANIFEST_INCONSISTENT", "%s effort must be fixed at %s per effort_constraints" % (where, rule["fixed"]))
     if "prohibited" in rule and p["effort"] in rule["prohibited"]:
         die("PROFILE_MANIFEST_INCONSISTENT", "%s effort %s is prohibited for tier per effort_constraints" % (where, p["effort"]))
+    if "ceiling" in rule and p["effort"] is not None:
+        ceil = rule["ceiling"]
+        if ceil not in effort_rank:
+            die("PROFILE_MANIFEST_INCONSISTENT", "%s effort_constraints ceiling '%s' not in efforts_allowed" % (where, ceil))
+        if effort_rank[p["effort"]] > effort_rank[ceil]:
+            die("PROFILE_MANIFEST_INCONSISTENT",
+                "%s effort %s exceeds the tier ceiling %s per effort_constraints" % (where, p["effort"], ceil))
 
 # --- fingerprint (semantic; canonical serialization of the manifest) --------
+# Computed now so --expect-fingerprint can fail early, but the sidecar
+# ATTESTATION is written only after the whole atomic pass proves the matrix
+# (see the end): a failed validation must never leave a valid-looking sidecar.
 fingerprint = hashlib.sha256(
     json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
 ).hexdigest()
 if EXPECT_FP and EXPECT_FP != fingerprint:
     die("PROFILE_FINGERPRINT_MISMATCH", "manifest fingerprint %s != expected %s" % (fingerprint, EXPECT_FP))
-if WRITE_SIDECAR:
-    side = (MANIFEST[:-5] if MANIFEST.endswith(".json") else MANIFEST) + ".fingerprint"
-    with open(side, "w", encoding="utf-8") as fh:
-        fh.write(fingerprint + "\n")
 
 # --- directory: exactly the manifest profiles, no prohibited, no unknown ----
 if os.path.isdir(AGENTS_DIR):
@@ -350,9 +360,11 @@ for name in sorted(profiles.keys()):
 
 # --- optional SHELL-CREW bindings cross-check -------------------------------
 # For each governed profile name a bindings file carries, the entry is proven
-# against the governed-bindings-entry schema FIRST (model MUST be a string, so a
-# list/number/object fails before any comparison), then agreement: effort equals
-# the manifest effort (empty == null) and the bindings model contains the tier.
+# against the governed-bindings-entry schema FIRST (model must be a string, effort
+# is enum-constrained so an empty string is rejected, backups are typed/unique),
+# so every value is type-proven before comparison. Then agreement: effort presence
+# and value match the manifest tier exactly, and the bindings model carries the
+# tier token.
 if BINDINGS:
     if not os.path.isfile(BINDINGS):
         die("PROFILE_BINDINGS_MISMATCH", "bindings file not found: %s" % BINDINGS)
@@ -371,13 +383,28 @@ if BINDINGS:
             continue
         entry = b[name]
         schema_check(BINDINGS_V, entry, "PROFILE_BINDINGS_MISMATCH", "bindings %s" % name)
-        b_model = entry["model"]
-        b_effort = entry.get("effort", "") or ""
-        m_effort = profiles[name]["effort"] or ""
-        if b_effort != m_effort:
-            die("PROFILE_BINDINGS_MISMATCH", "bindings %s effort '%s' != manifest '%s'" % (name, b_effort, m_effort))
-        if profiles[name]["model"] not in b_model:
-            die("PROFILE_BINDINGS_MISMATCH", "bindings %s model '%s' does not carry tier '%s'" % (name, b_model, profiles[name]["model"]))
+        m_effort = profiles[name]["effort"]  # None for haiku-tier, else an enum string
+        has_effort = "effort" in entry
+        if m_effort is None:
+            if has_effort:
+                die("PROFILE_BINDINGS_MISMATCH", "bindings %s must carry no effort (manifest tier has none)" % name)
+        else:
+            if not has_effort:
+                die("PROFILE_BINDINGS_MISMATCH", "bindings %s missing effort (manifest '%s')" % (name, m_effort))
+            if entry["effort"] != m_effort:
+                die("PROFILE_BINDINGS_MISMATCH", "bindings %s effort '%s' != manifest '%s'" % (name, entry["effort"], m_effort))
+        if profiles[name]["model"] not in entry["model"]:
+            die("PROFILE_BINDINGS_MISMATCH", "bindings %s model '%s' does not carry tier '%s'" % (name, entry["model"], profiles[name]["model"]))
+
+# --- provenance attestation: written ONLY after the full pass proves the matrix
+# (Finding 3): a failed validation must never leave a valid-looking sidecar.
+# Written via a temp file + atomic rename, mirroring bin/fm-bindings-validate.sh.
+if WRITE_SIDECAR:
+    side = (MANIFEST[:-5] if MANIFEST.endswith(".json") else MANIFEST) + ".fingerprint"
+    tmp = side + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(fingerprint + "\n")
+    os.replace(tmp, side)
 
 if not QUIET:
     sys.stdout.write("PROFILES_OK=%d\n" % count)

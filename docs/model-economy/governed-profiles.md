@@ -21,9 +21,12 @@ reaches the runtime home via the fold/sync path).
   projection of it.
 - **The committed schemas** — `docs/model-economy/schemas/*.schema.json`: three
   closed (`additionalProperties:false`, total) JSON Schema documents — one for the
-  manifest, one for a frontmatter object, one for a governed bindings entry.
-  These are the declarative authority the validator enforces; adding a property to
-  an artifact without adding it to the schema fails closed.
+  manifest, one for a frontmatter object, one for a governed bindings entry. The
+  manifest `profiles` object is closed to exactly the 11 governed names, the
+  frontmatter schema expresses EFFORT/`disallowedTools` presence as conditional
+  variants, and a governed bindings entry is fully required/typed. These are the
+  declarative authority the validator enforces; adding a property to an artifact
+  without adding it to the schema fails closed.
 - **The IN-SESSION surface** — `.claude/agents/<profile>.md`, one file per
   profile, whose YAML frontmatter Claude Code loads to define the sub-agent. It is
   a **derived projection** of the manifest, not an independent authority: the
@@ -63,7 +66,9 @@ The `model` field uses the family token (`haiku`/`sonnet`/`opus`/`fable`)
 exactly as the §G frontmatter sketch specifies; the manifest is the mapping from
 profile to tier. The tier policy (haiku → no effort, sonnet → fixed high, opus →
 not max, fable → ≤ high) lives once in the manifest's `effort_constraints` and is
-read from there by the validator — never hard-coded a second time.
+read from there by the validator — never hard-coded a second time. Every declared
+operator (`effort_present`, `fixed`, `prohibited`, `ceiling`) is enforced
+generically, with the effort order derived from the validated `efforts_allowed`.
 
 ## Validating the matrix
 
@@ -85,7 +90,9 @@ non-authoritative and fails closed.
 absent the validator refuses (`PROFILE_VALIDATOR_UNAVAILABLE`, exit 1) rather than
 degrading. On success it prints `PROFILES_OK=<n>` and a `MATRIX_FINGERPRINT=`
 (sha256 of the canonical manifest), pinnable via `--expect-fingerprint` and
-recordable via `--write-sidecar` — the analogue of `fm-bindings-validate.sh`'s
+recordable via `--write-sidecar` — which writes the attestation (temp file +
+atomic rename) only after the whole pass succeeds, so a failed validation never
+leaves a valid-looking sidecar. This mirrors `fm-bindings-validate.sh`'s
 provenance surface, for S4 to pin against. Each failure prints one stable
 `PROFILE_*` code — see the script header for the full list.
 

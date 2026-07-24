@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "firstmate/governed-profile-frontmatter/v1",
   "title": "Governed profile frontmatter object",
-  "description": "Closed, total schema for a .claude/agents/<profile>.md YAML frontmatter object (model-economy S3). The key set is exactly the projection of a manifest profile: additionalProperties:false admits only these keys, each fully typed. EFFORT and disallowedTools are optional at the schema layer (their per-profile presence is proven by whole-object projection equality against the manifest), everything else is required.",
+  "description": "Closed, total schema for a .claude/agents/<profile>.md YAML frontmatter object (model-economy S3). additionalProperties:false admits only the projected key set, each fully typed. The two conditional keys are made total declaratively: EFFORT is required for every non-haiku model and forbidden for haiku; disallowedTools is exactly [\"Agent\"] and required when the Agent tool is absent (non-nesting) and forbidden when Agent is present (nesting). Whole-object projection equality against the manifest additionally proves the values.",
   "type": "object",
   "additionalProperties": false,
   "required": ["name", "description", "model", "tools", "maxTurns", "permissionMode", "profile_version"],
@@ -16,5 +16,17 @@
     "maxTurns": {"type": "integer", "minimum": 1},
     "permissionMode": {"type": "string", "enum": ["default"]},
     "profile_version": {"type": "integer", "minimum": 1}
-  }
+  },
+  "allOf": [
+    {
+      "if": {"required": ["model"], "properties": {"model": {"const": "haiku"}}},
+      "then": {"not": {"required": ["EFFORT"]}},
+      "else": {"required": ["EFFORT"]}
+    },
+    {
+      "if": {"required": ["tools"], "properties": {"tools": {"contains": {"const": "Agent"}}}},
+      "then": {"not": {"required": ["disallowedTools"]}},
+      "else": {"required": ["disallowedTools"], "properties": {"disallowedTools": {"const": ["Agent"]}}}
+    }
+  ]
 }
