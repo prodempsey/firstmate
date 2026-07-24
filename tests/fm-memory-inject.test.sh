@@ -140,24 +140,85 @@ test_wrapper_no_cli_noop() {
   pass "a broken/missing memory CLI is a silent no-op (fail-open)"
 }
 
-# --- wrapper: portable spawn-safe deadline (FC-006) --------------------------
-test_wrapper_deadline_failopen() {
-  local d="$TMP_ROOT/deadline"; mkdir -p "$d/config"
+# --- wrapper: portable spawn-safe HARD deadline (FC-006) ---------------------
+# A CLI that IGNORES SIGTERM and would hang 30s past the deadline. A soft TERM-only
+# deadline would be defeated by this; the wrapper MUST escalate to SIGKILL and
+# return well inside its budget. This is the exact adversary FC-006 names.
+write_ignore_term_cli() {  # <path>
+  printf '#!/usr/bin/env bash\ntrap '"'"''"'"' TERM\nsleep 30\n' > "$1"
+  chmod +x "$1"
+}
+
+# A PATH containing neither `timeout` nor `gtimeout`, so the wrapper is forced down
+# its perl fork+alarm fallback. Only the tools the wrapper and the fixture need are
+# symlinked in; the native deadline tools are deliberately excluded.
+restricted_path_no_timeout() {  # <dir> -> echoes bin path
+  local b="$1/rbin"; mkdir -p "$b"
+  local tool src
+  for tool in env bash sh perl sleep grep tr dirname cat rm mkdir chmod mktemp; do
+    src=$(command -v "$tool" 2>/dev/null) && ln -sf "$src" "$b/$tool"
+  done
+  printf '%s\n' "$b"
+}
+
+# Runs the wrapper against an ignore-TERM child under a 1s budget and asserts it is
+# HARD-bounded (returns well under the 30s child, brief untouched, exit 0). $1 is a
+# label; $2, if set, is a PATH override that forces a particular deadline branch.
+assert_deadline_hard_bounds() {  # <label> [<path-override>]
+  local label=$1 pathv=${2:-}
+  local d="$TMP_ROOT/deadline-${label// /_}"; mkdir -p "$d/config"
   local brief="$d/brief.md"; printf '%s' "$FINAL_BRIEF" > "$brief"
   local before; before=$(cat "$brief")
-  # A CLI that would hang far past the deadline; the wrapper must kill it and
-  # fail open to no-injection without blocking the (simulated) spawn.
-  local slow="$d/slow-mem"
-  printf '#!/usr/bin/env bash\nexec sleep 30\n' > "$slow"; chmod +x "$slow"
-  local start status
+  local cli="$d/ignore-term"; write_ignore_term_cli "$cli"
+  local start status elapsed
   start=$SECONDS
-  env -u FM_MEMORY_INJECT FM_MEMORY_INJECT_TIMEOUT=1 MEM_CLI="$slow" FM_HOME="$d" \
+  if [ -n "$pathv" ]; then
+    PATH="$pathv" env -u FM_MEMORY_INJECT FM_MEMORY_INJECT_TIMEOUT=1 MEM_CLI="$cli" FM_HOME="$d" \
+      "$INJECT" --task t1 --brief "$brief" --project firstmate --kind ship >/dev/null 2>&1; status=$?
+  else
+    env -u FM_MEMORY_INJECT FM_MEMORY_INJECT_TIMEOUT=1 MEM_CLI="$cli" FM_HOME="$d" \
+      "$INJECT" --task t1 --brief "$brief" --project firstmate --kind ship >/dev/null 2>&1; status=$?
+  fi
+  elapsed=$((SECONDS - start))
+  expect_code 0 "$status" "$label: the deadline path must still exit 0 (never fail the spawn)"
+  [ "$elapsed" -lt 8 ] || fail "$label: the deadline must HARD-bound an ignore-TERM child (elapsed ${elapsed}s vs 30s child)"
+  [ "$(cat "$brief")" = "$before" ] || fail "$label: brief must be unchanged when the recall call is killed by the deadline"
+}
+
+test_wrapper_deadline_native_hard_kill() {
+  # Sanity-check the environment actually exercises the native branch here.
+  command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1 \
+    || { pass "SKIP native deadline: neither timeout nor gtimeout present (fallback covered separately)"; return; }
+  assert_deadline_hard_bounds "native timeout"
+  pass "native timeout/gtimeout escalates TERM->KILL: an ignore-TERM CLI is hard-bounded, spawn never blocked"
+}
+
+test_wrapper_deadline_perl_fallback_hard_kill() {
+  local rb; rb=$(restricted_path_no_timeout "$TMP_ROOT/perlfb")
+  if PATH="$rb" command -v timeout >/dev/null 2>&1 || PATH="$rb" command -v gtimeout >/dev/null 2>&1; then
+    fail "restricted PATH must expose neither timeout nor gtimeout"
+  fi
+  PATH="$rb" command -v perl >/dev/null 2>&1 || { pass "SKIP perl fallback: perl not available"; return; }
+  assert_deadline_hard_bounds "perl fallback" "$rb"
+  pass "the perl fork+alarm fallback group-kills an ignore-TERM CLI: hard-bounded with no native timeout tool"
+}
+
+test_wrapper_deadline_budget_zero_still_bounds() {
+  # A zero/invalid budget must fall back to the default, NOT disable the deadline
+  # (GNU `timeout 0` means "no limit"). The ignore-TERM child would otherwise run 30s.
+  local d="$TMP_ROOT/budget0"; mkdir -p "$d/config"
+  local brief="$d/brief.md"; printf '%s' "$FINAL_BRIEF" > "$brief"
+  local before; before=$(cat "$brief")
+  local cli="$d/ignore-term"; write_ignore_term_cli "$cli"
+  local start status elapsed
+  start=$SECONDS
+  env -u FM_MEMORY_INJECT FM_MEMORY_INJECT_TIMEOUT=0 MEM_CLI="$cli" FM_HOME="$d" \
     "$INJECT" --task t1 --brief "$brief" --project firstmate --kind ship >/dev/null 2>&1; status=$?
-  local elapsed=$((SECONDS - start))
-  expect_code 0 "$status" "the deadline path must still exit 0 (never fail the spawn)"
-  [ "$elapsed" -lt 8 ] || fail "the deadline must bound the call (elapsed ${elapsed}s should be well under the 30s child)"
-  [ "$(cat "$brief")" = "$before" ] || fail "brief must be unchanged when the recall call is killed by the deadline"
-  pass "a hung memory CLI is bounded by the portable deadline: fail-open, brief unchanged, spawn never blocked"
+  elapsed=$((SECONDS - start))
+  expect_code 0 "$status" "a zero budget must not fail the spawn"
+  [ "$elapsed" -lt 20 ] || fail "a zero/invalid budget must fall back to the default deadline, not disable it (elapsed ${elapsed}s vs 30s child)"
+  [ "$(cat "$brief")" = "$before" ] || fail "brief must be unchanged"
+  pass "an invalid/zero FM_MEMORY_INJECT_TIMEOUT falls back to the default bound instead of disabling it"
 }
 
 # --- fm-spawn integration (fakebin) -----------------------------------------
@@ -302,7 +363,9 @@ test_wrapper_env_disable_wins
 test_wrapper_env_enable_injects
 test_wrapper_failopen_absent_registry
 test_wrapper_no_cli_noop
-test_wrapper_deadline_failopen
+test_wrapper_deadline_native_hard_kill
+test_wrapper_deadline_perl_fallback_hard_kill
+test_wrapper_deadline_budget_zero_still_bounds
 test_spawn_injects_by_default
 test_spawn_inert_when_registry_absent
 test_spawn_failopen_does_not_break_spawn

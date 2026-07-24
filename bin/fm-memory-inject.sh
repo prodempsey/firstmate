@@ -119,43 +119,73 @@ args+=(${PASS[@]+"${PASS[@]}"})
 
 # --- portable spawn-safe deadline -------------------------------------------
 # Recall sits on the latency-critical spawn path, so the CLI call MUST be bounded
-# by a portable hard deadline that a slow/hung/missing tool cannot defeat, and MUST
-# fail open to no-injection when it hits - never block the spawn (FC-006). Prefer
-# GNU timeout / gtimeout; fall back to a perl fork+alarm that signals the whole
-# child process group (perl ships on macOS where GNU timeout does not). This is the
-# same portable-deadline idiom bin/fm-watch-checkpoint.sh uses on the primary path.
+# by a portable HARD deadline that a slow/hung/missing tool cannot defeat - not even
+# a child that ignores SIGTERM - and MUST fail open to no-injection when it hits,
+# never block the spawn (FC-006). Every branch escalates TERM -> KILL after a short
+# grace, so the bound is unconditional: GNU timeout / gtimeout via their kill-after
+# facility (-k), and the perl fork+alarm fallback (perl ships on macOS where GNU
+# timeout does not) by signalling the whole child process group. SIGKILL cannot be
+# trapped, so an ignore-TERM child is still reaped at BUDGET+GRACE.
+#
+# Budget hardening: an invalid or zero FM_MEMORY_INJECT_TIMEOUT must never DISABLE
+# the bound (GNU `timeout 0` means "no limit"), so a non-positive-integer value
+# falls back to the default rather than removing the deadline.
 BUDGET="${FM_MEMORY_INJECT_TIMEOUT:-8}"
-run_with_deadline() {  # runs "$@" under BUDGET seconds; exit 124 == deadline hit
+case "$BUDGET" in ''|*[!0-9]*) BUDGET=8 ;; esac
+[ "$BUDGET" -gt 0 ] 2>/dev/null || BUDGET=8
+GRACE=2   # seconds between the initial SIGTERM and the unconditional SIGKILL
+run_with_deadline() {  # runs "$@"; TERM at BUDGET, unconditional KILL at BUDGET+GRACE
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$BUDGET" "$@"
+    timeout -k "$GRACE" "$BUDGET" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$BUDGET" "$@"
+    gtimeout -k "$GRACE" "$BUDGET" "$@"
   else
     perl -e '
-      my $seconds = shift;
+      my ($seconds, $grace) = (shift, shift);
       my $pid = fork;
       die "fork failed\n" unless defined $pid;
       if (!$pid) { setpgrp(0, 0); exec @ARGV; die "exec failed: $!\n"; }
-      local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124; };
+      local $SIG{ALRM} = sub {
+        kill "TERM", -$pid;
+        select undef, undef, undef, $grace;
+        kill "KILL", -$pid;
+        exit 124;
+      };
       alarm $seconds;
       waitpid $pid, 0;
       exit($? >> 8);
-    ' "$BUDGET" "$@"
+    ' "$BUDGET" "$GRACE" "$@"
   fi
 }
 
-# Never fail the spawn: capture the outcome, print one line, always exit 0. Any
-# non-zero exit (including 124 = deadline) is treated as no-injection. injection.mjs
-# writes via same-dir temp + fsync + atomic rename + read-back, so a child killed
-# mid-write leaves the brief byte-for-byte intact rather than partially rewritten.
-if out=$(run_with_deadline "${MEM_CMD[@]}" "${args[@]}" 2>&1); then
+# Never fail the spawn: run under the deadline, print one line, always exit 0. Any
+# non-zero exit (124/137 = deadline TERM/KILL, anything else = a plain error) is
+# treated as no-injection. injection.mjs writes via same-dir temp + fsync + atomic
+# rename + read-back, so a child killed mid-write leaves the brief byte-for-byte
+# intact rather than partially rewritten.
+#
+# Capture through a temp FILE, not $(...). When the deadline kills the CLI it can
+# leave a grandchild that inherited the write end of a command-substitution pipe;
+# $(...) would then block until that orphan exits, silently defeating the deadline
+# on the native timeout branch. A regular file has no such reader-waits-for-writer
+# behaviour, so the wrapper returns as soon as the deadline tool does.
+dl_out=$(mktemp "${TMPDIR:-/tmp}/fm-mem-inject.XXXXXX" 2>/dev/null || true)
+if [ -n "$dl_out" ]; then
+  if run_with_deadline "${MEM_CMD[@]}" "${args[@]}" >"$dl_out" 2>&1; then
+    out=$(cat "$dl_out"); [ -n "$out" ] && printf '%s\n' "$out"
+  else
+    rc=$?
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+      debug "mem inject-brief hit the ${BUDGET}s deadline (treated as no-injection); brief unchanged"
+    else
+      debug "mem inject-brief exited $rc (treated as no-injection): $(cat "$dl_out" 2>/dev/null || true)"
+    fi
+  fi
+  rm -f "$dl_out"
+elif out=$(run_with_deadline "${MEM_CMD[@]}" "${args[@]}" 2>&1); then
+  # mktemp unavailable (extremely unlikely): fall back to inline capture.
   [ -n "$out" ] && printf '%s\n' "$out"
 else
-  rc=$?
-  if [ "$rc" -eq 124 ]; then
-    debug "mem inject-brief exceeded ${BUDGET}s deadline (treated as no-injection); brief unchanged"
-  else
-    debug "mem inject-brief exited $rc (treated as no-injection): $out"
-  fi
+  debug "mem inject-brief exited non-zero (treated as no-injection): $out"
 fi
 exit 0
