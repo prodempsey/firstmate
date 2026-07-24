@@ -15,6 +15,7 @@ import { auditRegistry, foldRegistry } from './registry.mjs';
 import { withRegistryLock } from './lock.mjs';
 import { NORMALIZER_VERSION } from './retrieval-normalize.mjs';
 import { PGLITE_SCHEMA_VERSION, buildGenerationDb, inspectGenerationDb, loadPGlite } from './retrieval-pglite.mjs';
+import { computeGenerationVectors, readVectorArtifacts, writeVectorArtifacts } from './retrieval-vector-build.mjs';
 
 export const RETRIEVAL_INDEX_SCHEMA = 'kraken-memory/retrieval-index/v1';
 export const RETRIEVAL_CURRENT_SCHEMA = 'kraken-memory/retrieval-current/v1';
@@ -134,6 +135,15 @@ export async function buildRetrievalIndex(registryDir, options = {}) {
     return { ok: false, mode: 'pglite-unavailable', reason: 'pglite-not-loadable', watermark: null };
   }
   const rp = retrievalPaths(registryDir);
+  // Resolve the previously-published generation dir (if any) so vector rebuild can
+  // reuse cached embeddings for records whose content is unchanged. Read BEFORE we
+  // take the build lock's captured snapshot; it only feeds incremental reuse.
+  const prevGenDir = (() => {
+    const cur = readCurrent(registryDir);
+    if (!cur) return null;
+    const resolved = generationDirFor(rp, cur);
+    return resolved && fs.existsSync(resolved) ? resolved : null;
+  })();
   return withRegistryLock(rp.buildLock, async () => {
     const captured = await captureCanonical(registryDir);
     if (!captured.ok) {
@@ -194,8 +204,54 @@ export async function buildRetrievalIndex(registryDir, options = {}) {
       if (inspected.contentHashes.get(id) !== expectedHash) issues.push(`reopened content hash mismatch: ${id}`);
     }
     manifest.validation = { ok: issues.length === 0, issues };
-    atomicWriteFile(path.join(genDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
     log('validated', { ok: manifest.validation.ok, issues });
+
+    // Optional rank-only vectors. Computed only when a valid FTS generation is in
+    // hand, AFTER validation and BEFORE publish, and bound to THIS generation id.
+    // Vectors are OPTIONAL by design (FC-004 distinction): no key or a provider
+    // error degrades to the still-proven FTS tier — it is logged once into the
+    // build log and NEVER fails the build. This is why a provider failure here
+    // leaves manifest.vector describing the fallback rather than returning failed.
+    let vectorSummary = { enabled: false, status: 'disabled', reason: 'vectors not requested' };
+    if (manifest.validation.ok && options.vectors) {
+      const provider = options.embeddingProvider;
+      if (!provider) {
+        vectorSummary = { enabled: false, status: 'fallback', reason: 'no embedding provider' };
+        log('vectors-skipped', vectorSummary);
+      } else {
+        try {
+          const canEmbed = typeof provider.canEmbed === 'function' ? await provider.canEmbed() : true;
+          if (!canEmbed) {
+            vectorSummary = { enabled: false, status: 'fallback', reason: 'no embedding key' };
+            log('vectors-skipped', vectorSummary);
+          } else {
+            const prev = prevGenDir ? readVectorArtifacts(prevGenDir) : null;
+            const prevVectorsById = prev?.vectorsById || new Map();
+            const computed = await computeGenerationVectors({
+              records: captured.records, provider, generationId: genId, prevVectorsById
+            });
+            writeVectorArtifacts(genDir, computed);
+            vectorSummary = {
+              enabled: true,
+              status: 'built',
+              provider: computed.vectorManifest.provider,
+              model: computed.vectorManifest.model,
+              dimensions: computed.vectorManifest.dimensions,
+              vectorCount: computed.vectorManifest.vectorCount,
+              embeddedCount: computed.embeddedCount,
+              reusedCount: computed.reusedCount
+            };
+            log('vectors-built', vectorSummary);
+          }
+        } catch (error) {
+          // Never fail the build on a vector error: FTS stays authoritative.
+          vectorSummary = { enabled: false, status: 'fallback', reason: `provider error: ${error.message}` };
+          log('vectors-error', { reason: vectorSummary.reason });
+        }
+      }
+    }
+    manifest.vector = vectorSummary;
+    atomicWriteFile(path.join(genDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 
     if (!manifest.validation.ok) {
       return { ok: false, mode: 'failed', reason: 'build-validation-failed', generationId: genId, issues, watermark: captured.watermark };
@@ -211,7 +267,7 @@ export async function buildRetrievalIndex(registryDir, options = {}) {
     };
     atomicWriteFile(rp.current, `${JSON.stringify(current, null, 2)}\n`);
     log('published', { generationId: genId });
-    return { ok: true, mode: 'pglite-fts', generationId: genId, recordCount: built.rowCount, watermark: captured.watermark };
+    return { ok: true, mode: 'pglite-fts', generationId: genId, recordCount: built.rowCount, watermark: captured.watermark, vector: vectorSummary };
   });
 }
 

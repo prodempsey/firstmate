@@ -3,8 +3,11 @@ import path from 'node:path';
 import { appendRegistryEvent, auditRegistry, buildActiveIndex, foldRegistry, recoverRegistry, snapshotRegistry } from './registry.mjs';
 import { checkDoctor } from './doctor.mjs';
 import { canonicalCheckout, registryDir, registryPaths } from './paths.mjs';
-import { buildRetrievalIndex, captureCanonical, cleanRetrievalIndex, inspectRetrievalIndex } from './retrieval-index.mjs';
+import { buildRetrievalIndex, captureCanonical, cleanRetrievalIndex, inspectRetrievalIndex, readCurrent, retrievalPaths } from './retrieval-index.mjs';
 import { retrieveMemory } from './retrieve.mjs';
+import { getEmbeddingProvider, hasEmbeddingKey, OPENAI_MODEL } from './embedding-provider.mjs';
+import { readVectorArtifacts } from './retrieval-vector-build.mjs';
+import { validateVectorManifest } from './retrieval-vector.mjs';
 import { DEFAULT_MAX_ACTIVATION, applyMigration, migrationPaths, runDryRun } from './migrate.mjs';
 import { recall } from './recall.mjs';
 import { extractTaskSection, hasUnresolvedPlaceholder, injectBrief, proofPathFor, verifyBrief, writeProof } from './injection.mjs';
@@ -206,6 +209,35 @@ function recallFiltersFromFlags(flags) {
   };
 }
 
+// Honest vector-tier report for `mem retrieval doctor`: does the CURRENT
+// generation carry a vector manifest bound to it (FC-002)? Never reads a key
+// value; the caller adds presence separately.
+function vectorTierReport(dir, derived) {
+  if (!derived || derived.status !== 'current') {
+    return { status: 'unavailable', reason: 'no current generation', bound: false };
+  }
+  let artifacts = null;
+  try {
+    const current = readCurrent(dir);
+    const rp = retrievalPaths(dir);
+    const genDir = path.resolve(rp.root, current.generationDir);
+    artifacts = readVectorArtifacts(genDir);
+  } catch {
+    artifacts = null;
+  }
+  if (!artifacts) return { status: 'absent', reason: 'no vector manifest for current generation', bound: false };
+  const check = validateVectorManifest(artifacts.vectorManifest, derived.generationId);
+  if (!check.valid) return { status: 'unbound', reason: check.reason, bound: false };
+  return {
+    status: 'bound',
+    bound: true,
+    provider: artifacts.vectorManifest.provider,
+    model: artifacts.vectorManifest.model,
+    dimensions: artifacts.vectorManifest.dimensions,
+    vectorCount: artifacts.vectorManifest.vectorCount ?? artifacts.vectorsById.size
+  };
+}
+
 function print(value, json = false) {
   if (json) console.log(JSON.stringify(value, null, 2));
   else if (typeof value === 'string') console.log(value);
@@ -282,35 +314,53 @@ export async function main(args, options = {}) {
       const sub = flags._[1];
       if (sub === 'build') {
         if (!flags.full) throw new Error('retrieval build requires --full (incremental build is not in PR-2)');
-        const result = await buildRetrievalIndex(dir);
+        // Rank-only vectors are OPTIONAL: `--vectors` computes and caches embeddings
+        // bound to this generation. No key / a provider error degrades to FTS and is
+        // recorded in the build's vector block; it never fails the build (FC-004
+        // distinction: vectors are optional, so their absence degrades to the proven
+        // FTS tier rather than refusing).
+        const embeddingProvider = flags.vectors ? getEmbeddingProvider({ env: process.env }) : null;
+        const result = await buildRetrievalIndex(dir, { vectors: Boolean(flags.vectors), embeddingProvider });
         print(result, flags.json);
         process.exitCode = result.ok ? 0 : 1;
       } else if (sub === 'doctor') {
         const canonical = await captureCanonical(dir);
         const derived = await inspectRetrievalIndex(dir, canonical);
-        const readiness = !canonical.ok ? 'failed' : (derived.status === 'current' ? 'pglite-fts' : 'lexical-fallback');
+        // Report the ACTIVE tier honestly: whether the current generation carries a
+        // valid, generation-bound vector manifest AND a key is configured decides
+        // whether retrieval would run hybrid-rank vs pglite-fts vs lexical-fallback.
+        const vector = vectorTierReport(dir, derived);
+        const keyed = hasEmbeddingKey(process.env);
+        let readiness;
+        if (!canonical.ok) readiness = 'failed';
+        else if (derived.status !== 'current') readiness = 'lexical-fallback';
+        else if (vector.bound && keyed) readiness = 'hybrid-rank';
+        else readiness = 'pglite-fts';
         const report = {
           canonical: { ok: canonical.ok, reason: canonical.reason, watermark: canonical.watermark },
           derived: { status: derived.status, reason: derived.reason, generationId: derived.generationId },
+          vector: { ...vector, keyConfigured: keyed, model: OPENAI_MODEL },
           retrievalReadiness: readiness
         };
         if (flags.json) print(report, true);
         else {
           console.log(`Canonical: ${canonical.ok ? 'verified' : `failed (${canonical.reason})`}`);
           console.log(`Derived index: ${derived.status}${derived.reason ? ` (${derived.reason})` : ''}`);
+          console.log(`Vectors: ${vector.status}${vector.reason ? ` (${vector.reason})` : ''}; embedding key ${keyed ? 'configured' : 'not configured'}`);
           console.log(`Retrieval readiness: ${readiness}`);
         }
         process.exitCode = canonical.ok ? 0 : 1;
       } else if (sub === 'clean') {
         print(await cleanRetrievalIndex(dir), flags.json);
       } else {
-        throw new Error('usage: mem retrieval build --full | retrieval doctor | retrieval clean');
+        throw new Error('usage: mem retrieval build --full [--vectors] | retrieval doctor | retrieval clean');
       }
     } else if (verb === 'retrieve') {
       // Resolve and validate the query source and filters BEFORE any work, so a bad
       // argument contract fails closed with a JSON error and never runs a retrieval.
       const query = retrievalQuery(flags);
       const opts = retrievalOptions(flags);
+      const embeddingProvider = flags.vectors ? getEmbeddingProvider({ env: process.env }) : null;
       const result = await retrieveMemory({
         registryDir: dir,
         query,
@@ -318,7 +368,9 @@ export async function main(args, options = {}) {
         kind: opts.kind,
         scopes: list(flags.scope),
         top: opts.top,
-        asOf: opts.asOf
+        asOf: opts.asOf,
+        vectors: Boolean(flags.vectors),
+        embeddingProvider
       });
       if (flags.json) print(result, true);
       else {
@@ -391,7 +443,8 @@ export async function main(args, options = {}) {
         query = retrievalQuery(flags);
         querySource = flags.stdin ? 'stdin' : (typeof flags['query-file'] === 'string' ? 'query-file' : 'inline');
       }
-      const pack = await recall({ registryDir: dir, query, querySource, ...filters, budget });
+      const embeddingProvider = flags.vectors ? getEmbeddingProvider({ env: process.env }) : null;
+      const pack = await recall({ registryDir: dir, query, querySource, ...filters, budget, vectors: Boolean(flags.vectors), embeddingProvider });
       if (flags.json) print(pack, true);
       else {
         console.log(`State: ${pack.state}${pack.fallbackReason ? ` (${pack.fallbackReason})` : ''} [mode ${pack.retrievalMode}]`);
@@ -463,7 +516,7 @@ export async function main(args, options = {}) {
         console.log(`Required dependencies: ${doctor.requiredDependencies.ok ? 'available' : `missing ${[...doctor.requiredDependencies.missing, ...(doctor.requiredDependencies.mismatched || [])].join(', ')}`}`);
         console.log(`PGlite: ${doctor.pglite.available ? 'available' : doctor.pglite.status}`);
         console.log(`Vector extension: ${doctor.vectorExtension.available ? 'available' : doctor.vectorExtension.status}`);
-        console.log(`Embedding provider: ${doctor.embeddingProvider.configured ? 'configured' : 'not configured (optional)'}`);
+        console.log(`Embedding provider: ${doctor.embeddingProvider.configured ? `configured (${doctor.embeddingProvider.model}, ${doctor.embeddingProvider.dimensions}d)` : `not configured (optional; ${doctor.embeddingProvider.model} when a key is present)`}`);
         console.log(`Registry: ${doctor.registry.status} (${doctor.registry.path})`);
         console.log(`Snapshots: ${doctor.snapshots.health || 'unknown'}`);
         console.log(`Active-memory index: ${doctor.activeIndex.status}`);
@@ -471,8 +524,9 @@ export async function main(args, options = {}) {
       }
       process.exitCode = doctor.ok ? 0 : 1;
     } else if (verb === 'help' || !verb) {
-      console.log('Usage: mem propose|activate|revalidate|show|update|supersede|retire|quarantine|audit|project|index rebuild|snapshot|recover|doctor|retrieval build --full|retrieval doctor|retrieval clean|retrieve|recall|inject-brief|verify-brief|migrate dry-run|migrate apply');
+      console.log('Usage: mem propose|activate|revalidate|show|update|supersede|retire|quarantine|audit|project|index rebuild|snapshot|recover|doctor|retrieval build --full [--vectors]|retrieval doctor|retrieval clean|retrieve|recall|inject-brief|verify-brief|migrate dry-run|migrate apply');
       console.log('  propose/update accept --source-type <type> to set the typed provenance-class marker (e.g. failure-class) curation can filter on.');
+      console.log('  retrieval build --vectors, retrieve --vectors, recall --vectors: OPTIONAL rank-only vectors (OpenAI text-embedding-3-small); no key or a provider error degrades to the proven FTS tier, never fails.');
     } else {
       throw new Error(`unknown command: ${verb}`);
     }

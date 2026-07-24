@@ -12,14 +12,48 @@
 //     BOTH modes, so ordering never depends on model-specific ts_rank and PR-4 does
 //     not re-litigate scores. FTS is the acceleration/telemetry substrate; the
 //     governed ranking is deterministic and reproducible.
-//   * Vectors are deferred to PR-2b: telemetry reports them disabled and no
-//     provider is ever contacted.
+//   * Rank-only vectors (PR-2b) are an OPTIONAL refinement on top: when enabled and
+//     a generation-bound vector manifest + embedding provider are available, they
+//     REORDER the already-eligible set only (retrievalMode `hybrid-rank`) and surface
+//     semantic-only neighbors as non-selectable diagnostics. They never add, drop, or
+//     make an ineligible record selectable (invariants 1 & 2 in retrieval-vector.mjs).
+//
+// The FC-004 DISTINCTION (documented deliberately): FC-004 says a missing REQUIRED
+// validation tool must REFUSE, never degrade to a weaker path. Vectors are NOT such
+// a tool — they are an optional rank refinement whose absence degrades to the STILL-
+// PROVEN FTS tier, which is itself a proven ranking, not a best-effort weaker path.
+// So no key, a provider error, or a missing/stale/unbound vector manifest degrades to
+// FTS (logged once) and NEVER fails a retrieval, recall, or build. This is not an
+// FC-004 violation; it is the correct treatment of an optional-by-design capability.
 
 import path from 'node:path';
 import { sha256 } from './hash.mjs';
 import { normalizeQuery, recordLexicalFields } from './retrieval-normalize.mjs';
 import { captureCanonical, inspectRetrievalIndex, readCurrent, retrievalPaths } from './retrieval-index.mjs';
 import { TS_CONFIG, loadPGlite, queryGenerationDb } from './retrieval-pglite.mjs';
+import { rerankByVectors, validateVectorManifest } from './retrieval-vector.mjs';
+import { embeddingsById, readVectorArtifacts } from './retrieval-vector-build.mjs';
+
+// Vector-degradation is fail-open and OPTIONAL by design. When vectors are
+// unavailable (no key, provider error, missing/stale/unbound manifest, dimension
+// mismatch) retrieval degrades to the STILL-PROVEN FTS tier and this logs the
+// reason ONCE per process (deduped by reason) rather than spamming every recall.
+// This is the FC-004 distinction, not a violation: FTS is proven, so vector
+// absence degrades to it instead of refusing.
+const loggedVectorFallbacks = new Set();
+function logVectorFallbackOnce(reason) {
+  if (loggedVectorFallbacks.has(reason)) return;
+  loggedVectorFallbacks.add(reason);
+  try {
+    process.stderr.write(`mem: vectors unavailable, using FTS-only (${reason})\n`);
+  } catch {
+    // never let a logging failure affect retrieval
+  }
+}
+// Test-only: reset the once-per-process dedupe so a suite can assert the log fires.
+export function __resetVectorFallbackLog() {
+  loggedVectorFallbacks.clear();
+}
 
 export const RETRIEVAL_TELEMETRY_SCHEMA = 'kraken-memory/retrieval-telemetry/v1';
 // All retrieval modes the telemetry contract reserves. `hybrid-rank` is reserved
@@ -132,7 +166,7 @@ export function buildTsquery(terms) {
   return lexemes.join(' | ');
 }
 
-function telemetry({ mode, fallbackReason, watermark, generationId, derivedStatus, derivedReason, q, filters, counts, timing }) {
+function telemetry({ mode, fallbackReason, watermark, generationId, derivedStatus, derivedReason, vector, q, filters, counts, timing }) {
   return {
     schema: RETRIEVAL_TELEMETRY_SCHEMA,
     retrievalMode: mode,
@@ -140,7 +174,7 @@ function telemetry({ mode, fallbackReason, watermark, generationId, derivedStatu
     canonicalWatermark: watermark,
     retrievalGeneration: generationId ?? null,
     pglite: { status: derivedStatus, reason: derivedReason ?? null },
-    vector: { enabled: false, status: 'disabled', reason: 'vectors deferred to PR-2b' },
+    vector: vector || { enabled: false, status: 'disabled', reason: 'vectors not requested' },
     query: { sha256: sha256(q.raw), byteLength: Buffer.byteLength(q.raw, 'utf8'), normalizedTermCount: q.normalizedTermCount },
     filters,
     counts,
@@ -159,7 +193,13 @@ export async function retrieveMemory(options = {}) {
     kind = null,
     scopes = [],
     top = DEFAULT_TOP,
-    asOf = isoNow()
+    asOf = isoNow(),
+    // Rank-only vectors (PR-2b). Optional: when enabled and a bound vector manifest
+    // + provider are available they REORDER the already-eligible set only. Any
+    // failure degrades to the proven FTS tier without failing retrieval.
+    vectors = false,
+    embeddingProvider = null,
+    vectorThreshold = 0
   } = options;
 
   const t0 = Date.now();
@@ -179,9 +219,11 @@ export async function retrieveMemory(options = {}) {
       selected: [],
       rejected: [],
       candidateDiagnostics: [],
+      semanticOnly: [],
       telemetry: telemetry({
         mode: 'failed', fallbackReason: canonical.reason, watermark: canonical.watermark, generationId: null,
-        derivedStatus: 'skipped', derivedReason: 'canonical verification failed', q, filters,
+        derivedStatus: 'skipped', derivedReason: 'canonical verification failed',
+        vector: { enabled: false, status: 'disabled', reason: 'canonical verification failed' }, q, filters,
         counts: { eligible: 0, candidates: 0, selected: 0, rejected: 0 },
         timing: { canonicalVerify: canonicalVerifyMs, pgliteVerify: 0, query: 0, rank: 0 }
       })
@@ -275,9 +317,102 @@ export async function retrieveMemory(options = {}) {
   }
   eligible.sort(compareCandidates);
 
+  // 5b. Rank-only vector reranking (PR-2b). This ONLY reorders the already-eligible
+  //     set and surfaces semantic-only neighbors as non-selectable diagnostics; it
+  //     never adds, drops, or makes an ineligible record selectable (invariants 1 &
+  //     2 from retrieval-vector.mjs). It runs only in pglite-fts mode (a healthy
+  //     generation the vectors are bound to) and degrades to the proven FTS order on
+  //     ANY failure — logged once, never throwing.
+  let vectorTelemetry = { enabled: false, status: 'disabled', reason: 'vectors not requested' };
+  let semanticOnly = [];
+  let reranked = eligible;
+  const simById = new Map();
+  if (vectors) {
+    const skip = (reason, status = 'fallback') => {
+      logVectorFallbackOnce(reason);
+      vectorTelemetry = { enabled: false, status, reason };
+    };
+    if (mode !== 'pglite-fts') {
+      // No healthy generation to bind vectors to; FTS-only path can't rerank.
+      skip(`no-generation (${fallbackReason || 'lexical-fallback'})`);
+    } else {
+      const artifacts = (() => {
+        try {
+          const current = readCurrent(registryDir);
+          const rp = retrievalPaths(registryDir);
+          const genDir = path.resolve(rp.root, current.generationDir);
+          return readVectorArtifacts(genDir);
+        } catch {
+          return null;
+        }
+      })();
+      if (!artifacts) {
+        skip('no vector manifest for current generation');
+      } else {
+        const check = validateVectorManifest(artifacts.vectorManifest, generationId);
+        if (!check.valid) {
+          // FC-002: a manifest not bound to the CURRENT generation is refused, never
+          // used stale. Degrade to FTS.
+          skip(`vector manifest invalid: ${check.reason}`);
+        } else if (!embeddingProvider || typeof embeddingProvider.embed !== 'function') {
+          skip('no embedding provider');
+        } else {
+          let queryVector = null;
+          try {
+            const canEmbed = typeof embeddingProvider.canEmbed === 'function' ? await embeddingProvider.canEmbed() : true;
+            if (!canEmbed) {
+              skip('no embedding key');
+            } else {
+              queryVector = await embeddingProvider.embed(query);
+            }
+          } catch (error) {
+            skip(`provider error: ${error.message}`);
+          }
+          if (queryVector) {
+            if (!Array.isArray(queryVector) || queryVector.length !== artifacts.vectorManifest.dimensions) {
+              skip(`query vector dimension mismatch (${queryVector?.length} != ${artifacts.vectorManifest.dimensions})`);
+            } else {
+              // Restrict the vector set to filter-PASSING records so a semantic-only
+              // neighbor can never be an out-of-scope (project/kind/scope/validity)
+              // record. Within that set, rerank the eligible list only.
+              const passingIds = new Set(passing.map((r) => r.id));
+              const embMap = new Map();
+              for (const [id, emb] of embeddingsById(artifacts.vectorsById)) {
+                if (passingIds.has(id)) embMap.set(id, emb);
+              }
+              const rerankInput = eligible.map((c) => ({
+                id: c.record.id,
+                score: c.score,
+                matchedTermCount: c.matchedTermCount,
+                verifiedAt: c.record.verifiedAt ?? null,
+                recordedAt: c.record.recordedAt ?? null
+              }));
+              const result = rerankByVectors(rerankInput, { queryVector, vectorsById: embMap, threshold: vectorThreshold });
+              const byId = new Map(eligible.map((c) => [c.record.id, c]));
+              reranked = result.reranked.map((r) => byId.get(r.id)).filter(Boolean);
+              for (const r of result.reranked) simById.set(r.id, r.vectorSimilarity);
+              semanticOnly = result.semanticOnly;
+              mode = 'hybrid-rank';
+              vectorTelemetry = {
+                enabled: true,
+                status: 'active',
+                provider: artifacts.vectorManifest.provider,
+                model: artifacts.vectorManifest.model,
+                dimensions: artifacts.vectorManifest.dimensions,
+                reordered: true,
+                rerankedCount: reranked.length,
+                semanticOnlyCount: semanticOnly.length
+              };
+            }
+          }
+        }
+      }
+    }
+  }
+
   const topN = Number.isInteger(top) && top > 0 ? top : DEFAULT_TOP;
-  const selectedCands = eligible.slice(0, topN);
-  for (const cand of eligible.slice(topN)) rejected.push({ id: cand.record.id, reason: 'rank-cutoff' });
+  const selectedCands = reranked.slice(0, topN);
+  for (const cand of reranked.slice(topN)) rejected.push({ id: cand.record.id, reason: 'rank-cutoff' });
   const rankMs = Date.now() - tRank;
 
   const selected = selectedCands.map((c) => ({
@@ -293,10 +428,17 @@ export async function retrieveMemory(options = {}) {
     score: c.score,
     matchedTermCount: c.matchedTermCount,
     evidence: c.evidence,
-    ftsRank: c.ftsRank
+    ftsRank: c.ftsRank,
+    vectorSimilarity: simById.has(c.record.id) ? simById.get(c.record.id) : null
   }));
 
-  const counts = { eligible: eligible.length, candidates: pool.length, selected: selected.length, rejected: rejected.length };
+  const counts = {
+    eligible: eligible.length,
+    candidates: pool.length,
+    selected: selected.length,
+    rejected: rejected.length,
+    semanticOnly: semanticOnly.length
+  };
 
   return {
     ok: true,
@@ -306,13 +448,17 @@ export async function retrieveMemory(options = {}) {
     retrievalGeneration: generationId,
     selected,
     rejected,
+    // Semantic-only neighbors: NON-SELECTABLE diagnostics (invariant 2). Never
+    // eligible for governed injection; surfaced only for observability.
+    semanticOnly,
     candidateDiagnostics: candidates.map((c) => ({
       id: c.record.id, score: c.score, matchedTermCount: c.matchedTermCount,
-      evidence: c.evidence, ftsMatched: c.ftsMatched, ftsRank: c.ftsRank
+      evidence: c.evidence, ftsMatched: c.ftsMatched, ftsRank: c.ftsRank,
+      vectorSimilarity: simById.has(c.record.id) ? simById.get(c.record.id) : null
     })),
     telemetry: telemetry({
       mode, fallbackReason, watermark: canonical.watermark, generationId,
-      derivedStatus: derived.status, derivedReason: derived.reason, q, filters, counts,
+      derivedStatus: derived.status, derivedReason: derived.reason, vector: vectorTelemetry, q, filters, counts,
       timing: { canonicalVerify: canonicalVerifyMs, pgliteVerify: pgliteVerifyMs, query: queryMs, rank: rankMs }
     })
   };

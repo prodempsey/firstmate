@@ -4,10 +4,52 @@ import os from 'node:os';
 import path from 'node:path';
 import test, { afterEach } from 'node:test';
 import { registryPaths } from '../lib/paths.mjs';
-import { cleanTracked, runMemIn, tmpRegistry } from './helpers.mjs';
+import { cleanTracked, runMemIn, seedActive, tmpRegistry } from './helpers.mjs';
 
 // The retrieval CLI smokes build derived PGlite generations; reclaim them per test.
 afterEach(cleanTracked);
+
+// PR-2b: the optional rank-only vector path through the CLI. Uses the TEST-ONLY
+// stub embedding provider (MEM_EMBED_PROVIDER=stub) so no live API is contacted.
+test('CLI: retrieval build --vectors + retrieval doctor + retrieve --vectors (stub provider)', async () => {
+  const dir = tmpRegistry();
+  await seedActive(dir, [
+    { id: 'MEM-0001', summary: 'alpha beta gamma vector smoke', keywords: ['alpha', 'beta'], projects: ['*'], taskKinds: ['*'] },
+    { id: 'MEM-0002', summary: 'alpha delta vector smoke', keywords: ['alpha'], projects: ['*'], taskKinds: ['*'] }
+  ]);
+  const stubEnv = { MEM_EMBED_PROVIDER: 'stub' };
+
+  const build = runMemIn(dir, ['retrieval', 'build', '--full', '--vectors', '--json'], stubEnv);
+  assert.equal(build.status, 0, build.stderr);
+  const buildOut = JSON.parse(build.stdout);
+  assert.equal(buildOut.ok, true);
+  assert.equal(buildOut.vector.status, 'built');
+  assert.equal(buildOut.vector.embeddedCount, 2);
+
+  const doctor = runMemIn(dir, ['retrieval', 'doctor', '--json'], stubEnv);
+  assert.equal(doctor.status, 0, doctor.stderr);
+  const doctorOut = JSON.parse(doctor.stdout);
+  assert.equal(doctorOut.vector.status, 'bound', 'the current generation carries a bound vector manifest');
+  assert.equal(doctorOut.vector.bound, true);
+
+  const retrieve = runMemIn(dir, ['retrieve', '--query', 'alpha beta', '--project', 'firstmate', '--kind', 'ship', '--vectors', '--json'], stubEnv);
+  assert.equal(retrieve.status, 0, retrieve.stderr);
+  const retrieveOut = JSON.parse(retrieve.stdout);
+  assert.equal(retrieveOut.retrievalMode, 'hybrid-rank');
+  assert.equal(retrieveOut.telemetry.vector.enabled, true);
+  assert.deepEqual(retrieveOut.selected.map((s) => s.id).sort(), ['MEM-0001', 'MEM-0002']);
+});
+
+// Without --vectors, retrieval stays exactly on the proven FTS tier (no provider
+// contacted, no behavior change) — the opt-in nature of the feature.
+test('CLI: retrieve without --vectors stays pglite-fts (vectors are opt-in)', async () => {
+  const dir = tmpRegistry();
+  await seedActive(dir, [{ id: 'MEM-0001', summary: 'alpha beta plain fts', keywords: ['alpha', 'beta'], projects: ['*'], taskKinds: ['*'] }]);
+  assert.equal(runMemIn(dir, ['retrieval', 'build', '--full', '--json']).status, 0);
+  const r = JSON.parse(runMemIn(dir, ['retrieve', '--query', 'alpha beta', '--project', 'firstmate', '--kind', 'ship', '--json']).stdout);
+  assert.equal(r.retrievalMode, 'pglite-fts');
+  assert.equal(r.telemetry.vector.enabled, false);
+});
 
 test('CLI fixture smoke exercises PR-1 verbs on an isolated registry with valid transitions only', () => {
   const dir = tmpRegistry();

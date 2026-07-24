@@ -130,7 +130,12 @@ export async function recall(options = {}) {
     statuses = ['active'],
     budget: budgetOpt = {},
     asOf = isoNow(),
-    querySource = 'inline'
+    querySource = 'inline',
+    // Rank-only vectors (PR-2b) are forwarded to the single retrieval authority.
+    // recall NEVER re-ranks: it consumes whatever order the authority returns, so
+    // the rank-only invariants live entirely in retrieveMemory/retrieval-vector.
+    vectors = false,
+    embeddingProvider = null
   } = options;
 
   const budget = normalizeBudget(budgetOpt);
@@ -161,7 +166,7 @@ export async function recall(options = {}) {
   // 2. Ask the single retrieval authority for governed, ranked candidates. Request
   //    up to candidateCap so the type filter and pointer budget still have room to
   //    fill; the authority returns them already rank-ordered.
-  const retrieval = await retrieveMemory({ registryDir, query, project, kind, scopes, top: budget.candidateCap, asOf });
+  const retrieval = await retrieveMemory({ registryDir, query, project, kind, scopes, top: budget.candidateCap, asOf, vectors, embeddingProvider });
 
   // 3. Recall-failed: the authority could not verify canonical state. Fail-open with
   //    ZERO pointers. Never synthesize or reuse stale content here.

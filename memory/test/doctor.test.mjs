@@ -47,7 +47,11 @@ test('semver range honors the minor/patch floor, not just the major', () => {
 
 test('mem doctor and --json report required PR-1 probes', () => {
   const dir = tmpRegistry();
-  const human = runMemIn(dir, ['doctor']);
+  // Isolate the embedding-key probe from the operator's real ~/.fleet secret store
+  // so the "not configured" assertion is hermetic. Point MEM_SECRETS_DIR at an
+  // empty registry dir (no secrets.json) and clear the env keys.
+  const noKeyEnv = { MEM_SECRETS_DIR: dir, OPENAI_API_KEY: '', MEM_EMBEDDING_KEY: '' };
+  const human = runMemIn(dir, ['doctor'], noKeyEnv);
   assert.equal(human.status, 0, human.stderr);
   assert.match(human.stdout, /Memory CLI: available/);
   // PR-2 installs PGlite as a real dependency, so doctor now reports it available
@@ -55,7 +59,9 @@ test('mem doctor and --json report required PR-1 probes', () => {
   assert.match(human.stdout, /PGlite: available/);
   assert.match(human.stdout, /Retrieval index: (missing|present)/);
   assert.match(human.stdout, /Embedding provider: not configured/);
-  const json = runMemIn(dir, ['doctor', '--json']);
+  // PR-2b: the model family is named honestly even when no key is present.
+  assert.match(human.stdout, /text-embedding-3-small/);
+  const json = runMemIn(dir, ['doctor', '--json'], noKeyEnv);
   assert.equal(json.status, 0, json.stderr);
   const parsed = JSON.parse(json.stdout);
   assert.equal(parsed.cli.available, true);
@@ -63,7 +69,30 @@ test('mem doctor and --json report required PR-1 probes', () => {
   assert.equal(parsed.requiredDependencies.ok, true);
   assert.equal(parsed.pglite.required, false);
   assert.equal(parsed.vectorExtension.required, false);
+  assert.equal(parsed.embeddingProvider.configured, false);
+  assert.equal(parsed.embeddingProvider.required, false);
+  assert.equal(parsed.embeddingProvider.model, 'text-embedding-3-small');
+  assert.equal(parsed.embeddingProvider.dimensions, 1536);
   assert.equal(parsed.registry.status, 'missing');
+});
+
+test('mem doctor reports the embedding provider configured (presence-only) from env and secret store', () => {
+  const dir = tmpRegistry();
+  // Env key path: presence reported without ever printing the value.
+  const envKeyed = runMemIn(dir, ['doctor', '--json'], { MEM_SECRETS_DIR: dir, OPENAI_API_KEY: 'sk-test-should-never-be-logged' });
+  const parsedEnv = JSON.parse(envKeyed.stdout);
+  assert.equal(parsedEnv.embeddingProvider.configured, true);
+  assert.doesNotMatch(envKeyed.stdout, /sk-test-should-never-be-logged/, 'key value must never appear in doctor output');
+  assert.doesNotMatch(envKeyed.stderr, /sk-test-should-never-be-logged/, 'key value must never appear on stderr');
+
+  // Secret-store path: a ~/.fleet-style secrets.json presence flips configured on.
+  const secretsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mem-secrets-'));
+  fs.writeFileSync(path.join(secretsDir, 'secrets.json'), JSON.stringify({ openai: 'sk-stored-secret' }), { mode: 0o600 });
+  const storeKeyed = runMemIn(dir, ['doctor', '--json'], { MEM_SECRETS_DIR: secretsDir, OPENAI_API_KEY: '', MEM_EMBEDDING_KEY: '' });
+  const parsedStore = JSON.parse(storeKeyed.stdout);
+  assert.equal(parsedStore.embeddingProvider.configured, true);
+  assert.doesNotMatch(storeKeyed.stdout, /sk-stored-secret/, 'stored key value must never appear in doctor output');
+  fs.rmSync(secretsDir, { recursive: true, force: true });
 });
 
 test('doctor reports critical registry as non-green', () => {

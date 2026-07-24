@@ -5,6 +5,7 @@ import { auditRegistry } from './registry.mjs';
 import { canonicalCheckout, registryDir } from './paths.mjs';
 import { assembleDoctor, packageLockStatus, versionMatches } from './doctor-core.mjs';
 import { retrievalPaths } from './retrieval-index.mjs';
+import { OPENAI_MODEL, OPENAI_DIM, hasEmbeddingKey } from './embedding-provider.mjs';
 
 function requiredDependencies(root, pkg) {
   const missing = [];
@@ -115,9 +116,12 @@ export function checkDoctor(root, env = process.env) {
     // (retrieval falls back to lexical when it is absent), so `required` stays
     // false, but the status now reports real availability rather than a placeholder.
     pglite: { available: pgliteAvailable, required: false, status: pgliteAvailable ? 'available' : 'not installed (retrieval degrades to lexical fallback)' },
-    // Rank-only vectors are deferred to PR-2b; the extension is optional and absent.
-    vectorExtension: { available: vectorAvailable, required: false, status: vectorAvailable ? 'available' : 'not installed (vectors deferred to PR-2b)' },
-    embeddingProvider: { configured: Boolean(env.MEM_EMBEDDING_KEY || env.OPENAI_API_KEY), required: false, status: 'optional' },
+    // Rank-only vectors (PR-2b) use an external embedding provider, not the pgvector
+    // extension, so the extension stays optional/absent regardless of vector use.
+    vectorExtension: { available: vectorAvailable, required: false, status: vectorAvailable ? 'available' : 'not installed (rank-only vectors use an external embedding provider, not pgvector)' },
+    // Presence-only: reports whether a key WOULD resolve (env or ~/.fleet secret
+    // store), never the key value. Optional by design; absence degrades to FTS.
+    embeddingProvider: { configured: hasEmbeddingKey(env), required: false, model: OPENAI_MODEL, dimensions: OPENAI_DIM, status: 'optional' },
     registry: { path: registryDir(env), status: registryStatus, health: registryHealth, reason: registryReason },
     snapshots,
     activeIndex: { status: activeIndexStatus, watermark: activeIndexWatermark, reason: null },

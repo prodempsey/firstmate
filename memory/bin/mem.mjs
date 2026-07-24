@@ -53,8 +53,8 @@ function fallbackDoctor(json) {
     packageLock: packageLockStatus(lock, pkg, lockPath),
     requiredDependencies: dependencyStatus(),
     pglite: { available: false, required: false, status: 'not installed (dependencies missing)' },
-    vectorExtension: { available: false, required: false, status: 'not installed (vectors deferred to PR-2b)' },
-    embeddingProvider: { configured: Boolean(process.env.MEM_EMBEDDING_KEY || process.env.OPENAI_API_KEY), required: false, status: 'optional' },
+    vectorExtension: { available: false, required: false, status: 'not installed (rank-only vectors use an external embedding provider, not pgvector)' },
+    embeddingProvider: { configured: Boolean(process.env.MEM_EMBEDDING_KEY || process.env.OPENAI_API_KEY), required: false, model: 'text-embedding-3-small', dimensions: 1536, status: 'optional' },
     registry: { path: process.env.MEM_REGISTRY_DIR || path.join(process.env.HOME || '', 'fleet', 'state', 'memory'), status: 'unknown', health: null, reason },
     snapshots: { health: null, outstanding: [], issues: [], path: null, reason },
     activeIndex: { status: 'unknown', watermark: null, reason },
@@ -70,8 +70,8 @@ function fallbackDoctor(json) {
     const dep = payload.requiredDependencies;
     console.log(dep.ok ? 'Required dependencies: available' : `Required dependencies: missing ${[...dep.missing, ...dep.mismatched].join(', ')}; fix: cd ${root} && npm ci`);
     console.log('PGlite: not installed (dependencies missing)');
-    console.log('Vector extension: not installed (vectors deferred to PR-2b)');
-    console.log(`Embedding provider: ${payload.embeddingProvider.configured ? 'configured' : 'not configured (optional)'}`);
+    console.log('Vector extension: not installed (rank-only vectors use an external embedding provider, not pgvector)');
+    console.log(`Embedding provider: ${payload.embeddingProvider.configured ? `configured (${payload.embeddingProvider.model}, ${payload.embeddingProvider.dimensions}d)` : `not configured (optional; ${payload.embeddingProvider.model} when a key is present)`}`);
     console.log(`Registry: ${payload.registry.status} (${payload.registry.reason})`);
     console.log(`Active-memory index: ${payload.activeIndex.status}`);
     console.log(`Retrieval index: ${payload.retrieval.status}`);
