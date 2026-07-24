@@ -1,0 +1,116 @@
+{
+  "schema_version": "firstmate/governed-profiles/v1",
+  "profile_version": 1,
+  "source_authority": "data/model-economy/ord-223-report.md §G (Order 2 design, ORD-223); slice S3 of ORD-224.",
+  "description": "Canonical, immutable source of truth for the 11 governed agent profiles (model-economy program). Both surfaces are checked against THIS manifest, never hand-maintained independently: IN-SESSION .claude/agents/<profile>.md frontmatter, and (when it carries governed entries) the SHELL-CREW state/crew-profile-bindings.json. To change a profile, edit this manifest and the matching agent file, then run bin/fm-profile-matrix-check.sh. maxTurns ranges and tool lists are calibration-pending proposals (§G / B.1 #5), not measured optimums.",
+  "models_allowed": ["haiku", "sonnet", "opus", "fable"],
+  "efforts_allowed": ["low", "medium", "high", "xhigh", "max"],
+  "prohibited_profile_names": ["opus-max", "fable-xhigh", "fable-max"],
+  "effort_constraints": {
+    "haiku": {"effort_present": false, "reason": "Haiku rejects the effort parameter at the API; the EFFORT key must be absent, not empty."},
+    "sonnet": {"fixed": "high", "reason": "Sonnet governed profiles are fixed at high effort."},
+    "opus": {"prohibited": ["max"], "reason": "Opus max is prohibited under all circumstances (captain policy); no scoring or exception path reaches it."},
+    "fable": {"prohibited": ["xhigh", "max"], "ceiling": "high", "reason": "High is the absolute Fable ceiling; xhigh/max are prohibited with no exception process."}
+  },
+  "profiles": {
+    "haiku-evidence": {
+      "model": "haiku",
+      "effort": null,
+      "writes": false,
+      "nesting": false,
+      "tools": ["Read", "Grep", "Glob", "Bash", "WebFetch"],
+      "maxTurns": {"min": 6, "max": 10},
+      "version": 1
+    },
+    "haiku-log-compressor": {
+      "model": "haiku",
+      "effort": null,
+      "writes": false,
+      "nesting": false,
+      "tools": ["Read", "Bash"],
+      "maxTurns": {"min": 6, "max": 8},
+      "version": 1
+    },
+    "sonnet-high-engineer": {
+      "model": "sonnet",
+      "effort": "high",
+      "writes": true,
+      "nesting": false,
+      "tools": ["Read", "Write", "Edit", "Bash", "Grep", "Glob"],
+      "maxTurns": {"min": 10, "max": 16},
+      "version": 1
+    },
+    "sonnet-high-reviewer": {
+      "model": "sonnet",
+      "effort": "high",
+      "writes": false,
+      "nesting": false,
+      "tools": ["Read", "Grep", "Glob", "Bash"],
+      "maxTurns": {"min": 10, "max": 14},
+      "version": 1
+    },
+    "opus-low": {
+      "model": "opus",
+      "effort": "low",
+      "writes": false,
+      "nesting": false,
+      "tools": ["Read", "Grep", "Glob", "Bash"],
+      "maxTurns": {"min": 8, "max": 12},
+      "version": 1
+    },
+    "opus-medium": {
+      "model": "opus",
+      "effort": "medium",
+      "writes": true,
+      "nesting": false,
+      "tools": ["Read", "Write", "Edit", "Bash", "Grep", "Glob"],
+      "maxTurns": {"min": 12, "max": 20},
+      "version": 1
+    },
+    "opus-high": {
+      "model": "opus",
+      "effort": "high",
+      "writes": true,
+      "nesting": false,
+      "tools": ["Read", "Write", "Edit", "Bash", "Grep", "Glob"],
+      "maxTurns": {"min": 16, "max": 28},
+      "version": 1
+    },
+    "opus-xhigh": {
+      "model": "opus",
+      "effort": "xhigh",
+      "writes": true,
+      "nesting": false,
+      "tools": ["Read", "Write", "Edit", "Bash", "Grep", "Glob"],
+      "maxTurns": {"min": 20, "max": 36},
+      "version": 1
+    },
+    "fable-low": {
+      "model": "fable",
+      "effort": "low",
+      "writes": false,
+      "nesting": true,
+      "tools": ["Read", "Grep", "Glob", "Bash", "Agent"],
+      "maxTurns": {"min": 16, "max": 24},
+      "version": 1
+    },
+    "fable-medium": {
+      "model": "fable",
+      "effort": "medium",
+      "writes": false,
+      "nesting": true,
+      "tools": ["Read", "Grep", "Glob", "Bash", "Agent"],
+      "maxTurns": {"min": 24, "max": 36},
+      "version": 1
+    },
+    "fable-high": {
+      "model": "fable",
+      "effort": "high",
+      "writes": false,
+      "nesting": true,
+      "tools": ["Read", "Grep", "Glob", "Bash", "Agent"],
+      "maxTurns": {"min": 32, "max": 48},
+      "version": 1
+    }
+  }
+}
