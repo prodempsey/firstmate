@@ -8,7 +8,7 @@ Design authority: `data/kl-improve-scout-f5/compounding-fleet.kd.html` (stage C)
 
 - Ledger: [`ledger.jsonl`](ledger.jsonl) is the tracked artifact.
 - Writer / register flow: [`bin/fm-failure-class.sh`](../../bin/fm-failure-class.sh) is the only sanctioned writer; run `--help` for the full flag set.
-- Seed builder: [`seed.sh`](seed.sh) deterministically rebuilds the seed ledger from the CLI (a reproducible provenance-distillation record).
+- Seed builder: [`seed.sh`](seed.sh) is the canonical, non-destructive seed set; `--check` (default) verifies the committed ledger reproduces it, `--apply` idempotently ensures the classes into a ledger, `--to <path>` writes a fresh copy.
 - Tests: [`tests/fm-failure-class.test.sh`](../../tests/fm-failure-class.test.sh).
 
 ## Why an append-only event log
@@ -41,6 +41,9 @@ The `occurrence` event is `{id, provenance:{type, ref, note?}}`: one more citati
 The writer refuses a duplicate id, an occurrence against an unknown id, and any event missing provenance, so the ledger cannot drift into an unprovenanced or self-contradictory state.
 A malformed line, an unknown-schema line, or an occurrence for an undefined id makes `list` and `validate` fail closed rather than fold silently.
 
+Every mutation (`add`, `ensure`, `bump`) serializes its whole read-check-append under a portable, abandoned-owner-aware lock (the fleet's `fm-wake-lib.sh` discipline) co-located with the ledger, so two concurrent sanctioned writers can never both pass the duplicate check and append the same id.
+There is no destructive path: `add` refuses a duplicate, `ensure` skips an existing id, `bump` only appends, and the seed builder never deletes or rewrites the ledger, so no supported command can drop an appended occurrence.
+
 ## Retrievability: registering classes into the live memory registry
 
 Retrieval is delegated to the landed memory registry (Memory PR-4).
@@ -55,22 +58,23 @@ bin/fm-failure-class.sh register --live --gate captain-approved:ORD-274
 Registration mutates the live per-home registry, so it is dry-run by default and touches the registry only behind the explicit `--live` flag.
 For each class it runs `mem propose` then `mem activate` with the following.
 
+- A distinct, typed `sourceType=failure-class` (`mem propose --source-type`), so curation can filter failure classes on a first-class field.
 - Every provenance citation as an `--evidence <type>:<ref>`, on both propose and activate.
 - The class invariant, fix, cues, and provenance as the record body, so a dispatch recall pointer resolves (`mem show`) to actionable guidance.
 - `--memory-type procedural`, `--scope fleet`, `--confidence guarded`.
 - The `--gate` reference as the activation `--validation` authority.
 
 Once activated, PR-4 dispatch recall (`mem recall` / `mem inject-brief`) surfaces the applicable classes when a task brief matches their shape.
-This is verified: a query like "validator keeps false-passing; add a check for the new corruption shape" recalls the relevant `failure-class` records.
+This is verified: a query like "validator keeps false-passing; add a check for the new corruption shape" recalls the relevant failure-class records.
 
-### The `source_type` marker (a deliberate design decision)
+### The typed `sourceType` field
 
-Stage C asks for a distinct `source_type` so curation can filter these records.
-The landed registry schema has no `source_type` field, and the `mem propose` CLI exposes no arbitrary-field flag.
-Adding one is a memory-package change outside this slice's scope, and exactly the kind of silent scope expansion the DJ-S2 and ME-S3 rulings warn against.
-So the distinct marker is carried through the existing propose/activate flow as a reserved keyword: every registered class carries the `failure-class` keyword, plus its `FC-NNN` id and a name slug.
-Curation and dispatch recall filter to just these classes on that keyword.
-If the registry later grows a first-class `source_type` field (the scout report anticipates it for `task-postmortem` rows in stage A), the marker migrates to it; until then the reserved keyword is the filter.
+Stage C requires a distinct `source_type` so curation can filter these records.
+The memory registry now carries a first-class, typed `sourceType` record field (`memory/lib/schema.mjs`), threaded through the fold, the active index, `mem propose --source-type`, `mem update --source-type`, and the retrieve/recall projections.
+Every registered failure class sets `sourceType: "failure-class"`, so curation filters on a typed field, not a free-form keyword.
+The field is optional and absent on ordinary records, and it is bound under the same whole-document content hash as every other content field (change it, and the record's approval digest changes), while a record that never carried it hashes identically to the pre-field era so the existing corpus never churns on upgrade.
+The `failure-class` keyword is retained additionally as a retrieval alias.
+The same typed field is what a later stage would set to `task-postmortem` for the scout report's stage-A postmortem rows.
 
 ## The seed set (7 classes)
 
@@ -82,7 +86,7 @@ Every row cites its provenance; see `ledger.jsonl` for the full citations.
 | FC-001 | Authority as allowlist instead of closed-schema positive proof | DJ S2 ruling sec 1; ME S3 ruling sec 1; qa-me-s3r4-q122; qa-dj-s2r3-q107 |
 | FC-002 | Absence read as discharge | DJ S2 ruling sec 1/2.3-2.4; qa-dj-s2r2-q106; qa-g2-q4 |
 | FC-003 | Digest/verification not covering the whole document | ME S3 ruling sec 1; qa-mem-pr3r2-q113; qa-mem-pr4r3-q117 |
-| FC-004 | Fail-open on a missing prerequisite tool | ME S3 ruling sec 3.2/5; qa-me-s3r7-q125 |
+| FC-004 | Fail-open on a missing prerequisite tool | ME S3 ruling sec 3.2/5; qa-me-s3r2-q120 (direct FAIL); qa-me-s3r7-q125 |
 | FC-005 | Proof/validation not atomic with the mutation it authorizes | DJ S2 ruling sec 2.2; qa-mem-pr4-q115 (F3); qa-scr-q93; qa-m1r3-q22 |
 | FC-006 | Unbounded/synchronous wait on a critical path | qa-mem-pr4-q115; qa-mem-pr4r2-q116; qa-mem-pr4r4-q118; scout improvement 3 |
 | FC-007 | Stale artifact preserved on failure (cleanup-failure ignored) | qa-me-s3r6-q124; qa-mem-pr4-q115 (F1); qa-s6-q72 |

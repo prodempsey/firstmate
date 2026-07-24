@@ -39,6 +39,7 @@ function proposeFieldsFromFlags(flags) {
   const fields = {
     summary: flags.summary,
     body: typeof flags.body === 'string' ? flags.body : '',
+    ...(typeof flags['source-type'] === 'string' ? { sourceType: flags['source-type'] } : {}),
     memoryType: flags['memory-type'] || 'factual',
     scope: flags.scope || 'fleet',
     projects: list(flags.project).length ? list(flags.project) : ['*'],
@@ -69,6 +70,7 @@ function updateFieldsFromFlags(flags) {
   };
   setStr('summary', 'summary');
   setStr('body', 'body');
+  setStr('source-type', 'sourceType');
   setStr('memory-type', 'memoryType');
   setStr('scope', 'scope');
   setList('project', 'projects');
@@ -470,6 +472,7 @@ export async function main(args, options = {}) {
       process.exitCode = doctor.ok ? 0 : 1;
     } else if (verb === 'help' || !verb) {
       console.log('Usage: mem propose|activate|revalidate|show|update|supersede|retire|quarantine|audit|project|index rebuild|snapshot|recover|doctor|retrieval build --full|retrieval doctor|retrieval clean|retrieve|recall|inject-brief|verify-brief|migrate dry-run|migrate apply');
+      console.log('  propose/update accept --source-type <type> to set the typed provenance-class marker (e.g. failure-class) curation can filter on.');
     } else {
       throw new Error(`unknown command: ${verb}`);
     }

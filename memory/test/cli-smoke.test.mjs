@@ -44,6 +44,22 @@ test('CLI fixture smoke exercises PR-1 verbs on an isolated registry with valid 
   assert.ok(fs.readFileSync(registryPaths(dir).registry, 'utf8').includes('Replacement smoke memory'));
 });
 
+test('CLI: --source-type sets a typed, filterable record field (propose + update)', () => {
+  const dir = tmpRegistry();
+  const memId = JSON.parse(runMemIn(dir, ['propose', '--summary', 'a failure class', '--source-type', 'failure-class', '--json']).stdout).memId;
+  let rec = JSON.parse(runMemIn(dir, ['show', memId, '--json']).stdout).record;
+  assert.equal(rec.sourceType, 'failure-class', 'propose --source-type sets the typed field');
+  // update can change it without touching other fields.
+  const up = runMemIn(dir, ['update', memId, '--source-type', 'task-postmortem', '--json']);
+  assert.equal(up.status, 0, up.stderr);
+  rec = JSON.parse(runMemIn(dir, ['show', memId, '--json']).stdout).record;
+  assert.equal(rec.sourceType, 'task-postmortem', 'update --source-type replaces the typed field');
+  // a record proposed without it reads back null (not undefined), so curation can filter on it.
+  const plain = JSON.parse(runMemIn(dir, ['propose', '--summary', 'plain', '--json']).stdout).memId;
+  const plainRec = JSON.parse(runMemIn(dir, ['show', plain, '--json']).stdout).record;
+  assert.equal(plainRec.sourceType, null);
+});
+
 // Finding 1 (Captain contract decision): `--validation <ref>` is the ONLY CLI
 // source of the scalar `validation.ref`; `--evidence` is an ordered list that
 // never populates authorization. Evidence-only activation must not satisfy a

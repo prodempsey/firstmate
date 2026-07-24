@@ -81,6 +81,7 @@ function buildPointer(sel, meta) {
     // Prefer the authority's own source field; fall back to the canonical capture
     // (they agree, but the capture is the type/status source of truth used below).
     source: sel.source ?? meta?.source ?? null,
+    sourceType: sel.sourceType ?? meta?.sourceType ?? null,
     scope: sel.scope,
     memoryType: meta?.memoryType ?? null,
     status: meta?.status ?? null,
@@ -153,7 +154,7 @@ export async function recall(options = {}) {
   const captured = await captureCanonical(registryDir);
   const metaById = new Map();
   if (captured.ok) {
-    for (const rec of captured.records) metaById.set(rec.id, { memoryType: rec.memoryType ?? null, status: rec.status ?? 'active', source: rec.source ?? null });
+    for (const rec of captured.records) metaById.set(rec.id, { memoryType: rec.memoryType ?? null, status: rec.status ?? 'active', source: rec.source ?? null, sourceType: rec.sourceType ?? null });
   }
   const activeCount = captured.ok ? captured.records.length : 0;
 

@@ -112,8 +112,12 @@ if command -v node >/dev/null 2>&1; then
   audit=$(MEM_REGISTRY_DIR="$REGL" node "$ROOT/memory/bin/mem.mjs" audit 2>&1)
   assert_contains "$audit" "7 total, 7 active" "register --live proposed AND activated all 7 classes"
   rec=$(MEM_REGISTRY_DIR="$REGL" node "$ROOT/memory/bin/mem.mjs" show MEM-0001 --json 2>&1)
+  # Finding 1: the DISTINCT TYPED sourceType field is the curation boundary, not
+  # merely a keyword. Assert the typed field, per the QA recommendation.
+  if printf '%s' "$rec" | jq -e '.record.sourceType == "failure-class"' >/dev/null; then
+    pass "registered record carries the typed sourceType == failure-class"; else fail "typed sourceType missing/incorrect on record"; fi
   if printf '%s' "$rec" | jq -e '.record.keywords | index("failure-class")' >/dev/null; then
-    pass "registered record carries the failure-class marker keyword"; else fail "marker keyword missing on record"; fi
+    pass "registered record also carries the failure-class retrieval keyword"; else fail "marker keyword missing on record"; fi
   if printf '%s' "$rec" | jq -e '.record.evidence | length >= 1' >/dev/null; then
     pass "registered record carries provenance as evidence"; else fail "evidence missing on record"; fi
   if printf '%s' "$rec" | jq -e '.record.memoryType == "procedural"' >/dev/null; then
@@ -121,5 +125,52 @@ if command -v node >/dev/null 2>&1; then
 else
   echo "SKIP fm-failure-class: node not available for register --live checks" >&2
 fi
+
+# --- Finding 2: concurrent sanctioned adds cannot corrupt the append-only log ---
+# Two writers race to define the same id against an empty fixture ledger. The lock
+# must let EXACTLY ONE win; the ledger must validate; there must be one class-defined
+# line, not two. Run several rounds because a race does not reproduce every time.
+race_ok=1
+for _ in 1 2 3 4 5 6 7 8; do
+  RL="$TMP_ROOT/race-$RANDOM.jsonl"
+  FM_FC_LEDGER="$RL" "$FC" add --id FC-900 --name first --invariant i --fix f --cue c --provenance qa:data/a >/dev/null 2>&1 &
+  rp1=$!
+  FM_FC_LEDGER="$RL" "$FC" add --id FC-900 --name second --invariant i --fix f --cue c --provenance qa:data/b >/dev/null 2>&1 &
+  rp2=$!
+  wait "$rp1"; wait "$rp2"
+  n=$(grep -c 'class-defined' "$RL" 2>/dev/null || echo 0)
+  if [ "$n" != 1 ]; then race_ok=0; break; fi
+  if ! FM_FC_LEDGER="$RL" "$FC" validate >/dev/null 2>&1; then race_ok=0; break; fi
+done
+if [ "$race_ok" = 1 ]; then
+  pass "concurrent same-id adds: exactly one wins and the ledger stays valid (lock holds)"
+else fail "concurrent adds corrupted the append-only ledger"; fi
+
+# --- Finding 3: no supported command erases a prior appended occurrence ---------
+# Copy the committed seed, append a real occurrence via bump, then run the seed
+# utility in every mode. The occurrence and its provenance must survive, and no
+# class row may be duplicated (idempotent reseed).
+RS="$TMP_ROOT/reseed.jsonl"
+cp "$ROOT/docs/failure-classes/ledger.jsonl" "$RS"
+FM_FC_LEDGER="$RS" "$FC" bump FC-001 --provenance "qa:data/qa-reseed/report.md#1:a real later occurrence" >/dev/null
+before_count=$(FM_FC_LEDGER="$RS" "$FC" show FC-001 --json | jq '.occurrence_count')
+# --apply is additive/idempotent: it must NOT drop the occurrence and must NOT
+# duplicate any class definition.
+FM_FC_LEDGER="$RS" "$ROOT/docs/failure-classes/seed.sh" --apply >/dev/null 2>&1
+expect_code 0 $? "seed --apply succeeds against a populated ledger"
+after_count=$(FM_FC_LEDGER="$RS" "$FC" show FC-001 --json | jq '.occurrence_count')
+if [ "$after_count" = "$before_count" ]; then
+  pass "reseed --apply preserved the appended occurrence (never drops rows)"; else fail "reseed dropped an occurrence: $before_count -> $after_count"; fi
+if FM_FC_LEDGER="$RS" "$FC" show FC-001 --json | jq -e '[.provenance[] | select(.ref|test("qa-reseed"))] | length == 1' >/dev/null; then
+  pass "the appended occurrence survives reseed exactly once"; else fail "the appended occurrence was lost or duplicated"; fi
+# No class-defined id is duplicated after reseed.
+if FM_FC_LEDGER="$RS" "$FC" validate >/dev/null 2>&1; then
+  pass "reseeded ledger still validates (no duplicated class rows)"; else fail "reseed corrupted the ledger"; fi
+# The default seed mode writes nothing durable: a --check leaves the file byte-identical.
+before_hash=$(cksum "$RS" | awk '{print $1}')
+FM_FC_LEDGER="$RS" "$ROOT/docs/failure-classes/seed.sh" >/dev/null 2>&1 || true
+after_hash=$(cksum "$RS" | awk '{print $1}')
+if [ "$before_hash" = "$after_hash" ]; then
+  pass "seed --check writes nothing to the target ledger"; else fail "seed --check mutated the ledger"; fi
 
 pass "fm-failure-class: all checks passed"

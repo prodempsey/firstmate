@@ -231,3 +231,30 @@ test('permission failure surfaces as an append error', async (t) => {
   );
   fs.chmodSync(dir, 0o700);
 });
+
+test('sourceType is a first-class typed field: round-trips into the projected index and is absent (not null) from a record that never carried it', async () => {
+  const paths = registryPaths;
+  // A record WITH sourceType folds and projects the typed value.
+  const dir = tmpRegistry();
+  await propose(dir, 'MEM-0001', { summary: 'a failure class', sourceType: 'failure-class' });
+  await activate(dir, 'MEM-0001');
+  assert.equal(foldRegistry(dir).records.get('MEM-0001').sourceType, 'failure-class');
+  buildActiveIndex(dir);
+  const idxTyped = JSON.parse(fs.readFileSync(paths(dir).index, 'utf8'));
+  const typed = idxTyped.records.find((r) => r.id === 'MEM-0001');
+  assert.equal(typed.sourceType, 'failure-class');
+  assert.ok('sourceType' in typed, 'typed record projects the sourceType key');
+
+  // A record WITHOUT sourceType folds to null and is projected with NO sourceType
+  // key at all, so its content hash is byte-identical to the pre-field era: the
+  // existing corpus never churns its content hash on upgrade.
+  const dirA = tmpRegistry();
+  await propose(dirA, 'MEM-0002', { summary: 'plain record' });
+  await activate(dirA, 'MEM-0002');
+  assert.equal(foldRegistry(dirA).records.get('MEM-0002').sourceType, null);
+  buildActiveIndex(dirA);
+  const idxPlain = JSON.parse(fs.readFileSync(paths(dirA).index, 'utf8'));
+  const plain = idxPlain.records.find((r) => r.id === 'MEM-0002');
+  assert.ok(!('sourceType' in plain), 'a record without sourceType projects no sourceType key (hash-stable)');
+  assert.equal(auditRegistry(dirA).ok, true);
+});

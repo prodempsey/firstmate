@@ -26,6 +26,11 @@ export const recordFieldsSchema = z.object({
   summary: z.string().min(1).max(240).optional(),
   body: z.string().optional(),
   source: z.object({ path: z.string(), anchor: z.string().optional() }).passthrough().optional(),
+  // A distinct, typed provenance-class marker (e.g. "failure-class",
+  // "task-postmortem") that curation and dispatch recall can filter on. Optional
+  // and absent on ordinary records; a first-class field, not a keyword, so a typed
+  // curation boundary exists independent of free-form keywords.
+  sourceType: z.string().min(1).optional(),
   memoryType: z.enum(MEMORY_TYPES).optional(),
   scope: z.enum(['fleet', 'project', 'captain', 'environment']).optional(),
   projects: z.array(z.string()).optional(),

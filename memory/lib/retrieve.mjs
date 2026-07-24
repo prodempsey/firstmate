@@ -288,6 +288,7 @@ export async function retrieveMemory(options = {}) {
     taskKinds: c.record.taskKinds,
     confidence: c.record.confidence,
     source: c.record.source ?? null,
+    sourceType: c.record.sourceType ?? null,
     contentHash: c.record.contentHash,
     score: c.score,
     matchedTermCount: c.matchedTermCount,

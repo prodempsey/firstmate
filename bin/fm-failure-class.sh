@@ -36,8 +36,17 @@
 #        --provenance <type>:<ref>[:<note>] [--provenance ... ] \
 #        [--memory-type procedural|factual] [--scope fleet|project|captain|environment] \
 #        [--confidence unverified|observed|reproduced|guarded] [--keyword <kw> ...]
+#   fm-failure-class.sh ensure --id <FC-NNN> ...   # idempotent-additive add (skip if present)
 #   fm-failure-class.sh bump <id> --provenance <type>:<ref>[:<note>] [--note <text>]
 #   fm-failure-class.sh register [--id <FC-NNN> ...] [--live] [--gate <ref>] [--json]
+#
+# register sets a distinct, typed `sourceType=failure-class` (mem propose
+# --source-type) on every registered record so curation can filter failure classes
+# by a first-class field, not only a keyword.
+#
+# All ledger mutations (add/ensure/bump) serialize the whole read-check-append
+# under a portable, abandoned-owner-aware lock co-located with the ledger, so
+# concurrent sanctioned writers cannot corrupt the append-only log.
 #
 # Env:
 #   FM_FC_LEDGER    ledger path override (default docs/failure-classes/ledger.jsonl).
@@ -55,6 +64,29 @@ usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
 die() { echo "fm-failure-class: $*" >&2; exit 1; }
 
 command -v jq >/dev/null 2>&1 || die "jq is required"
+
+# ---- serialization --------------------------------------------------------
+# The ledger is append-only, but "check the id is absent, then append" is only
+# durable if the whole read-check-append runs as one serialized transaction: two
+# concurrent writers could otherwise both pass the duplicate check and append the
+# same id. Reuse the fleet's portable, abandoned-owner-aware lock (fm-wake-lib.sh)
+# on a lock co-located with the ledger, so distinct ledgers never contend and a
+# dead writer's lock is reclaimed rather than deadlocking.
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+
+LEDGER_LOCK="$LEDGER.lock"
+FM_FC_LOCK_HELD=""
+release_ledger_lock() {
+  [ -n "$FM_FC_LOCK_HELD" ] || return 0
+  fm_lock_release "$FM_FC_LOCK_HELD" 2>/dev/null || true
+  FM_FC_LOCK_HELD=""
+}
+# EXIT covers a normal return, a die(), and set -e; the trap guarantees the lock is
+# released even if the critical section aborts mid-transaction.
+trap release_ledger_lock EXIT
+lock_ledger() { mkdir -p "$(dirname "$LEDGER")"; fm_lock_acquire_wait "$LEDGER_LOCK"; FM_FC_LOCK_HELD="$LEDGER_LOCK"; }
+unlock_ledger() { fm_lock_release "$LEDGER_LOCK"; FM_FC_LOCK_HELD=""; }
 
 # ---- fold -----------------------------------------------------------------
 # Fold the append-only event log into one record per class id. class-defined sets
@@ -167,7 +199,11 @@ cmd_validate() {
   echo "FAILURE_CLASSES_OK=$n ($LEDGER)"
 }
 
-cmd_add() {
+# Parse the class-definition flags shared by `add` and `ensure`, validate them, and
+# build the class-defined event. Sets FC_EVENT, FC_ID, FC_PROVCOUNT. Pure: reads no
+# ledger and appends nothing, so it is safe to run before taking the lock.
+FC_EVENT="" FC_ID="" FC_PROVCOUNT=0
+build_class_event() {
   local id="" name="" invariant="" fix="" memtype="procedural" scope="fleet" confidence="guarded"
   local cues=() provs=() keywords=()
   while [ $# -gt 0 ]; do
@@ -182,20 +218,16 @@ cmd_add() {
       --memory-type) memtype=${2:-}; shift 2 ;;
       --scope) scope=${2:-}; shift 2 ;;
       --confidence) confidence=${2:-}; shift 2 ;;
-      *) die "add: unknown flag '$1'" ;;
+      *) die "unknown flag '$1'" ;;
     esac
   done
-  [ -n "$id" ] || die "add requires --id"
+  [ -n "$id" ] || die "requires --id"
   echo "$id" | grep -Eq '^FC-[0-9]{3,}$' || die "id must match FC-NNN, got '$id'"
-  [ -n "$name" ] || die "add requires --name"
-  [ -n "$invariant" ] || die "add requires --invariant"
-  [ -n "$fix" ] || die "add requires --fix"
-  [ "${#cues[@]}" -gt 0 ] || die "add requires at least one --cue"
-  [ "${#provs[@]}" -gt 0 ] || die "add requires at least one --provenance (a class with no provenance is not admissible)"
-  # Duplicate-id refusal: append-only means we must not shadow an existing class.
-  if [ -f "$LEDGER" ] && fold_or_die | jq -e --arg id "$id" 'any(.[]; .id==$id)' >/dev/null; then
-    die "class id already defined: $id (append-only; use bump to add provenance)"
-  fi
+  [ -n "$name" ] || die "requires --name"
+  [ -n "$invariant" ] || die "requires --invariant"
+  [ -n "$fix" ] || die "requires --fix"
+  [ "${#cues[@]}" -gt 0 ] || die "requires at least one --cue"
+  [ "${#provs[@]}" -gt 0 ] || die "requires at least one --provenance (a class with no provenance is not admissible)"
   local cues_json prov_json_arr kw_json
   cues_json=$(printf '%s\n' "${cues[@]}" | jq -R . | jq -s .)
   prov_json_arr="["; local first=1 p
@@ -209,8 +241,7 @@ cmd_add() {
   local slug; slug=$(echo "$name" | tr '[:upper:] /' '[:lower:]--' | tr -cd 'a-z0-9-' | tr -s '-' | cut -c1-40 | sed 's/-*$//')
   kw_json=$(printf '%s\n' "$MARKER_KEYWORD" "$id" "$slug" "${keywords[@]:-}" \
     | jq -R 'select(length>0)' | jq -s 'unique_by(.)')
-  local event
-  event=$(jq -cn \
+  FC_EVENT=$(jq -cn \
     --arg schema "$SCHEMA" --arg id "$id" --arg name "$name" \
     --arg inv "$invariant" --arg fix "$fix" \
     --arg mt "$memtype" --arg scope "$scope" --arg conf "$confidence" \
@@ -218,8 +249,43 @@ cmd_add() {
     '{schema:$schema, event:"class-defined", id:$id, name:$name, invariant:$inv,
       cues:$cues, fix:$fix, provenance:$prov,
       registry:{memory_type:$mt, scope:$scope, confidence:$conf, keywords:$kw}}')
-  append_event "$event"
-  echo "added $id ($(echo "$prov_json_arr" | jq length) provenance citation(s))"
+  FC_ID="$id"
+  FC_PROVCOUNT=$(echo "$prov_json_arr" | jq length)
+}
+
+# Commit FC_EVENT under the ledger lock. mode=strict refuses a duplicate id;
+# mode=ensure treats an existing id as an idempotent no-op (skip). The whole
+# read-check-append runs inside one lock so two concurrent writers can never both
+# pass the check and append the same id.
+commit_class() {
+  local mode=$1 exists
+  lock_ledger
+  exists=0
+  if [ -f "$LEDGER" ] && fold_or_die | jq -e --arg id "$FC_ID" 'any(.[]; .id==$id)' >/dev/null; then exists=1; fi
+  if [ "$exists" = 1 ]; then
+    if [ "$mode" = strict ]; then
+      die "class id already defined: $FC_ID (append-only; use bump to add provenance)"
+    fi
+    unlock_ledger
+    echo "present: $FC_ID (unchanged)"
+    return 0
+  fi
+  append_event "$FC_EVENT"
+  unlock_ledger
+  echo "added $FC_ID ($FC_PROVCOUNT provenance citation(s))"
+}
+
+cmd_add() {
+  build_class_event "$@"
+  commit_class strict
+}
+
+# ensure: idempotent-additive add. Appends the class only if its id is absent; an
+# already-present id is a skip, never an error and never a rewrite. This is the
+# safe reseed primitive - re-running it never drops or duplicates a row.
+cmd_ensure() {
+  build_class_event "$@"
+  commit_class ensure
 }
 
 cmd_bump() {
@@ -234,15 +300,19 @@ cmd_bump() {
     esac
   done
   [ -n "$prov" ] || die "bump requires --provenance <type>:<ref>[:<note>]"
-  fold_or_die | jq -e --arg id "$id" 'any(.[]; .id==$id)' >/dev/null \
-    || die "cannot bump unknown class id: $id (define it with add first)"
   local pj; pj=$(prov_json "$prov")
   [ -n "$note" ] && pj=$(printf '%s' "$pj" | jq -c --arg n "$note" '.note = (.note // $n)')
   local event
   event=$(jq -cn --arg schema "$SCHEMA" --arg id "$id" --argjson prov "$pj" \
     '{schema:$schema, event:"occurrence", id:$id, provenance:$prov}')
+  # The existence check and the occurrence append run under one lock, against one
+  # serialized generation, so bump can never append against a stale read.
+  lock_ledger
+  fold_or_die | jq -e --arg id "$id" 'any(.[]; .id==$id)' >/dev/null \
+    || die "cannot bump unknown class id: $id (define it with add first)"
   append_event "$event"
   local count; count=$(fold_or_die | jq --arg id "$id" '.[] | select(.id==$id) | .occurrence_count')
+  unlock_ledger
   echo "bumped $id -> occurrence_count=$count"
 }
 
@@ -289,7 +359,10 @@ cmd_register() {
       "\n\nProvenance: " + (.provenance | map("\(.type):\(.ref)") | join("; "))')
     # Build the flag arrays for propose/activate.
     local -a propose_args activate_args
-    propose_args=(propose --summary "$summary" --body "$body"
+    # --source-type is the typed, filterable provenance-class marker curation uses;
+    # the failure-class keyword is retained as a retrieval alias, but the typed field
+    # is the curation boundary.
+    propose_args=(propose --summary "$summary" --body "$body" --source-type "$MARKER_KEYWORD"
       --memory-type "$memtype" --scope "$scope" --confidence "$conf")
     local kw
     while IFS= read -r kw; do [ -n "$kw" ] && propose_args+=(--keyword "$kw"); done \
@@ -335,6 +408,7 @@ main() {
     show) cmd_show "$@" ;;
     validate) cmd_validate "$@" ;;
     add) cmd_add "$@" ;;
+    ensure) cmd_ensure "$@" ;;
     bump) cmd_bump "$@" ;;
     register) cmd_register "$@" ;;
     -h|--help|help) usage ;;

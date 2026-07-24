@@ -86,6 +86,7 @@ function defaultRecord(memId, event) {
     summary: '',
     body: '',
     source: null,
+    sourceType: null,
     memoryType: 'factual',
     scope: 'fleet',
     projects: ['*'],
@@ -120,6 +121,7 @@ const MUTABLE_FIELD_KEYS = new Set([
   'summary',
   'body',
   'source',
+  'sourceType',
   'memoryType',
   'scope',
   'projects',
@@ -457,6 +459,11 @@ function contentFields(record) {
     summary: record.summary,
     body: record.body,
     source: record.source ?? null,
+    // sourceType is folded into content ONLY when set, so a record that never
+    // carried it hashes identically to before this field existed (no content-hash
+    // churn for the existing corpus); a record that carries it binds it under the
+    // same whole-document digest as every other content field.
+    ...(record.sourceType != null ? { sourceType: record.sourceType } : {}),
     memoryType: record.memoryType,
     scope: record.scope,
     projects: record.projects,
