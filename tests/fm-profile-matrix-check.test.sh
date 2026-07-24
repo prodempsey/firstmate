@@ -2,10 +2,11 @@
 # Behavior tests for bin/fm-profile-matrix-check.sh — the fail-closed validator
 # for the governed agent-profile matrix (model-economy program, ORD-224 slice
 # S3). Implements test group T.2 (profile definitions) from
-# data/model-economy/ord-223-report.md: every STATIC rule of the group, plus
-# fail-closed parsing (unterminated / duplicate frontmatter keys, duplicate
-# manifest JSON keys), with per-rule negative cases proving each drift fails
-# closed with its own stable code.
+# data/model-economy/ord-223-report.md: every STATIC rule of the group, plus the
+# authority-pattern properties (data/dj-orders-s2/design-ruling.md) that the
+# validator must positively prove in one strict pass — whole-document YAML
+# validity, whole-manifest JSON types, key uniqueness at any depth, and a hard
+# (never-degrading) parser prerequisite — each with its own invalid fixture.
 #
 # The two T.2 RUNTIME probes — a real non-nesting-profile dispatch attempting
 # Agent (ord-223-report.md:1435) and a live run cut off at maxTurns
@@ -237,7 +238,9 @@ test_maxturns_non_integer_rejected() {
   sed -i 's/^maxTurns: 24$/maxTurns: lots/' "$D/opus-high.md"
   runc
   expect_code 1 "$RC" "a non-integer maxTurns must be rejected"
-  assert_contains "$OUT" "PROFILE_MAXTURNS_OUT_OF_RANGE" "non-integer maxTurns is a range error"
+  # A non-integer is a type violation caught by the strict YAML type check,
+  # before any range comparison.
+  assert_contains "$OUT" "PROFILE_FRONTMATTER_INVALID" "non-integer maxTurns is a type violation"
   pass "a non-integer maxTurns fails closed"
 }
 
@@ -431,6 +434,95 @@ test_manifest_inconsistent_rejected() {
   pass "an internally inconsistent manifest fails closed"
 }
 
+# --- authority pattern: positively prove every property (qa-me-s3r2-q120) ----
+# Each property that the round-one line-scraping validator could not prove is now
+# a strict-parse property with its own invalid fixture: whole-document YAML
+# validity, whole-manifest JSON types, and a hard (never-degrading) parser
+# prerequisite. Per data/dj-orders-s2/design-ruling.md: any parse ambiguity,
+# type violation, or missing tool = non-authoritative = fail closed.
+
+test_invalid_yaml_frontmatter_rejected() {
+  fresh
+  # A syntactically invalid YAML value elsewhere in the confirmed field set
+  # (the QA repro: permissionMode becomes an unterminated flow sequence).
+  sed -i 's/^permissionMode: default$/permissionMode: [/' "$D/opus-high.md"
+  runc
+  expect_code 1 "$RC" "malformed frontmatter YAML anywhere must be rejected"
+  assert_contains "$OUT" "PROFILE_FRONTMATTER_INVALID" "malformed YAML is a PROFILE_FRONTMATTER_INVALID"
+  pass "syntactically invalid frontmatter YAML fails closed"
+}
+
+test_unrecognized_frontmatter_key_rejected() {
+  fresh
+  sed -i '/^permissionMode: default$/a bogusKey: whatever' "$D/opus-high.md"
+  runc
+  expect_code 1 "$RC" "an unrecognized frontmatter key must be rejected"
+  assert_contains "$OUT" "PROFILE_FRONTMATTER_INVALID" "an unknown key is not silently ignored"
+  pass "an unrecognized frontmatter key fails closed"
+}
+
+test_frontmatter_wrong_typed_tools_rejected() {
+  fresh
+  # tools as a bare scalar instead of a YAML list — a type violation.
+  sed -i 's/^tools: \[Read, Write, Edit, Bash, Grep, Glob\]$/tools: Read/' "$D/opus-high.md"
+  runc
+  expect_code 1 "$RC" "a mistyped tools value must be rejected"
+  assert_contains "$OUT" "PROFILE_FRONTMATTER_INVALID" "tools-not-a-list is a type violation"
+  pass "a frontmatter tools value of the wrong type fails closed"
+}
+
+test_manifest_type_violations_rejected() {
+  # The QA repro set: established manifest fields mutated to the wrong JSON type
+  # while stringifying like the originals. Each must be rejected on type alone.
+  # <jq-expr>|<label>
+  local cases=(
+    '.profiles["opus-high"].writes = "true"|writes-as-string'
+    '.profiles["opus-high"].nesting = "false"|nesting-as-string'
+    '.profiles["opus-high"].version = "1"|version-as-string'
+    '.profiles["opus-high"].maxTurns.min = "16"|min-as-string'
+    '.profiles["opus-high"].maxTurns.min = 30|min-greater-than-max'
+    '.profiles["opus-high"].tools = "Read"|tools-not-a-list'
+    '.profiles["opus-high"].tools += ["Read"]|tools-not-unique'
+    '.profiles["opus-high"].effort = 5|effort-wrong-type'
+    '.models_allowed = "opus"|models-allowed-not-a-list'
+    '.profiles["opus-high"].bogus = 1|unknown-profile-key'
+    'del(.profiles["opus-high"].writes)|missing-profile-key'
+  )
+  local entry expr label
+  for entry in "${cases[@]}"; do
+    expr=${entry%%|*}
+    label=${entry##*|}
+    fresh
+    jq_manifest "$expr"
+    runc
+    expect_code 1 "$RC" "manifest type/schema violation '$label' must be rejected"
+    assert_contains "$OUT" "PROFILE_MANIFEST_INCONSISTENT" "'$label' is a PROFILE_MANIFEST_INCONSISTENT"
+  done
+  pass "every manifest type/schema violation fails closed"
+}
+
+test_missing_parser_refuses_not_degrades() {
+  fresh
+  # Remove python3 (the strict-parse engine) from PATH. The validator must
+  # REFUSE — never fall through to a weaker check or a warn-and-pass — even on an
+  # otherwise-valid duplicate-key manifest that the raw check would have caught.
+  python3 - "$M" > "$M.tmp" <<'PY'
+import sys
+s = open(sys.argv[1]).read()
+s = s.replace('{\n', '{\n  "schema_version": "firstmate/governed-profiles/v1",\n', 1)
+sys.stdout.write(s)
+PY
+  mv "$M.tmp" "$M"
+  local nopy="$SB/nopy"
+  mkdir -p "$nopy"
+  ln -sf "$(command -v bash)" "$nopy/bash"
+  OUT=$(PATH="$nopy" bash "$V" --manifest "$M" --agents-dir "$D" --quiet 2>&1); RC=$?
+  expect_code 1 "$RC" "an absent strict-parse engine must fail closed, not pass"
+  assert_contains "$OUT" "PROFILE_VALIDATOR_UNAVAILABLE" "a missing mandatory tool refuses rather than degrades"
+  assert_not_contains "$OUT" "PROFILES_OK" "the validator must not report success without its engine"
+  pass "a missing mandatory parser refuses (fail-closed) rather than degrading"
+}
+
 # --- optional SHELL-CREW bindings cross-check -------------------------------
 
 test_bindings_agreement_passes() {
@@ -531,6 +623,11 @@ test_manifest_missing_rejected
 test_manifest_invalid_json_rejected
 test_manifest_bad_schema_rejected
 test_manifest_inconsistent_rejected
+test_invalid_yaml_frontmatter_rejected
+test_unrecognized_frontmatter_key_rejected
+test_frontmatter_wrong_typed_tools_rejected
+test_manifest_type_violations_rejected
+test_missing_parser_refuses_not_degrades
 test_bindings_agreement_passes
 test_bindings_legacy_only_is_noop
 test_bindings_effort_mismatch_rejected

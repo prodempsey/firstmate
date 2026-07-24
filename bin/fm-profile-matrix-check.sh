@@ -3,13 +3,24 @@
 # program, ORD-224 slice S3). Design authority:
 # data/model-economy/ord-223-report.md §G (profile matrix), §H (model policy),
 # §I (effort policy); B.1 #1 (committed manifest) and #15 (tracked-material home).
+# Authority-pattern authority: data/dj-orders-s2/design-ruling.md.
 #
 # The manifest docs/model-economy/governed-profiles.manifest.json is the single
 # committed source of truth for all 11 governed profiles. This script asserts
 # that the IN-SESSION surface (.claude/agents/<profile>.md frontmatter) agrees
 # with the manifest per profile, and — when a SHELL-CREW bindings file that
-# carries governed entries is present — that its model/effort agree too. Nothing
-# is hand-maintained in two places; drift fails closed here.
+# carries governed entries is present — that its model/effort agree too.
+#
+# AUTHORITY MODEL (per the DJ ruling): the matrix is authoritative ONLY if ONE
+# strict validation pass POSITIVELY PROVES every property — JSON/YAML parses
+# cleanly, every key is unique at every depth, every value has exactly the
+# required type, and every cross-surface value agrees. There is no weaker
+# fallback: any parse ambiguity, type violation, missing required key, or absent
+# host tool is non-authoritative and fails closed. The parser (python3 with
+# PyYAML + json) is a HARD prerequisite; if it is unavailable the validator
+# REFUSES rather than degrading to a weaker check. Regex line-scraping of YAML is
+# deliberately gone — it could not prove a whole-document parse and silently
+# accepted schema-invalid frontmatter and mistyped manifest values.
 #
 # Usage: fm-profile-matrix-check.sh [--manifest <file>] [--agents-dir <dir>]
 #                                   [--bindings <file>] [--quiet]
@@ -19,25 +30,22 @@
 #                          and that file carries at least one governed profile key.
 #
 # Exit 0: the matrix is coherent. Prints "PROFILES_OK=<n>" unless --quiet.
-# Exit 1: incoherent. Prints exactly one stable code line to stderr:
-#   PROFILE_MANIFEST_MISSING | PROFILE_MANIFEST_INVALID | PROFILE_MANIFEST_DUPLICATE_KEY |
-#   PROFILE_MANIFEST_SCHEMA_UNSUPPORTED | PROFILE_MANIFEST_INCONSISTENT |
-#   PROFILE_PROHIBITED_PRESENT | PROFILE_FILE_MISSING | PROFILE_FILE_UNKNOWN |
-#   PROFILE_FRONTMATTER_INVALID | PROFILE_FRONTMATTER_DUPLICATE_KEY | PROFILE_NAME_MISMATCH |
-#   PROFILE_MODEL_MISMATCH | PROFILE_EFFORT_MISMATCH | PROFILE_TOOLS_MISMATCH |
-#   PROFILE_WRITES_MISMATCH | PROFILE_NESTING_MISMATCH | PROFILE_MAXTURNS_OUT_OF_RANGE |
-#   PROFILE_VERSION_MISMATCH | PROFILE_BINDINGS_MISMATCH
+# Exit 1: incoherent OR the validator could not run authoritatively. Prints
+#   exactly one stable code line to stderr:
+#   PROFILE_VALIDATOR_UNAVAILABLE | PROFILE_MANIFEST_MISSING | PROFILE_MANIFEST_INVALID |
+#   PROFILE_MANIFEST_DUPLICATE_KEY | PROFILE_MANIFEST_SCHEMA_UNSUPPORTED |
+#   PROFILE_MANIFEST_INCONSISTENT | PROFILE_PROHIBITED_PRESENT | PROFILE_FILE_MISSING |
+#   PROFILE_FILE_UNKNOWN | PROFILE_FRONTMATTER_INVALID | PROFILE_FRONTMATTER_DUPLICATE_KEY |
+#   PROFILE_NAME_MISMATCH | PROFILE_MODEL_MISMATCH | PROFILE_EFFORT_MISMATCH |
+#   PROFILE_TOOLS_MISMATCH | PROFILE_WRITES_MISMATCH | PROFILE_NESTING_MISMATCH |
+#   PROFILE_MAXTURNS_OUT_OF_RANGE | PROFILE_VERSION_MISMATCH | PROFILE_BINDINGS_MISMATCH
 # Exit 2: usage error.
-#
-# Fail-closed parsing: duplicate object keys in the manifest JSON (jq silently
-# keeps the last, so a raw python3 parse detects them, matching the pattern in
-# bin/fm-bindings-validate.sh), and in the agent frontmatter an unterminated
-# block or any duplicate governed key, are all rejected before any parsed value
-# is trusted - an ambiguous key is unsafe because this validator and the runtime
-# loader need not resolve it to the same occurrence.
 set -u
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# SCRIPT_DIR / FM_ROOT via shell builtins only, so the sole external dependency
+# is the validation engine itself (python3) — that keeps "refuse if the engine is
+# absent" a clean, single check rather than one masked by a missing coreutil.
+SCRIPT_DIR="$(cd "${BASH_SOURCE[0]%/*}" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
 MANIFEST=""
@@ -68,231 +76,337 @@ if [ -n "$want" ]; then echo "fm-profile-matrix-check: --$want requires a value"
 [ -n "$MANIFEST" ] || MANIFEST="$FM_ROOT/docs/model-economy/governed-profiles.manifest.json"
 [ -n "$AGENTS_DIR" ] || AGENTS_DIR="$FM_ROOT/.claude/agents"
 
-command -v jq >/dev/null 2>&1 || { echo "fm-profile-matrix-check: jq is required" >&2; exit 2; }
-
-die() { # die <CODE> <message>
-  echo "$1" >&2
-  [ -n "${2:-}" ] && echo "fm-profile-matrix-check: $2" >&2
+# Hard prerequisite: the strict validation engine must be present. Absence is
+# NON-AUTHORITATIVE and fails closed (never a weaker fallback), per the DJ ruling.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "PROFILE_VALIDATOR_UNAVAILABLE" >&2
+  echo "fm-profile-matrix-check: python3 is a hard prerequisite; refusing rather than degrading to a weaker check" >&2
   exit 1
-}
-
-# raw_dup_keys <json-file>: echo any duplicate object keys (any depth), one per
-# line. jq keeps only the last occurrence, so a raw parse is required to see the
-# ambiguity. Mirrors bin/fm-bindings-validate.sh's detection; degrades to a
-# warning (no false pass) only if python3 is genuinely absent.
-raw_dup_keys() {
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$1" <<'PYEOF'
-import json, sys
-dups = []
-def hook(pairs):
-    ks = [k for k, _ in pairs]
-    for k in sorted(set(k for k in ks if ks.count(k) > 1)):
-        dups.append(k)
-    return dict(pairs)
-try:
-    json.load(open(sys.argv[1]), object_pairs_hook=hook)
-except Exception as e:
-    print("RAWPARSE_ERROR:%s" % e); sys.exit(4)
-if dups:
-    print("\n".join(dups)); sys.exit(3)
-PYEOF
-    return $?
-  fi
-  echo "fm-profile-matrix-check: warning: python3 absent - JSON duplicate-key check skipped" >&2
-  return 0
-}
-
-# --- manifest load + self-consistency --------------------------------------
-[ -f "$MANIFEST" ] || die PROFILE_MANIFEST_MISSING "manifest not found: $MANIFEST"
-jq -e . "$MANIFEST" >/dev/null 2>&1 || die PROFILE_MANIFEST_INVALID "manifest is not valid JSON: $MANIFEST"
-dupout=$(raw_dup_keys "$MANIFEST"); rc=$?
-case "$rc" in
-  0) : ;;
-  3) die PROFILE_MANIFEST_DUPLICATE_KEY "duplicate key(s) in manifest JSON: $(echo "$dupout" | tr '\n' ' ')" ;;
-  *) die PROFILE_MANIFEST_INVALID "manifest raw-parse failed: $dupout" ;;
-esac
-
-SCHEMA=$(jq -r '.schema_version // ""' "$MANIFEST")
-[ "$SCHEMA" = "firstmate/governed-profiles/v1" ] || die PROFILE_MANIFEST_SCHEMA_UNSUPPORTED "unsupported schema_version: '$SCHEMA'"
-
-# Profile names (sorted), and the prohibited-name list.
-mapfile -t PROFILES < <(jq -r '.profiles | keys[]' "$MANIFEST" | sort)
-[ "${#PROFILES[@]}" -gt 0 ] || die PROFILE_MANIFEST_INCONSISTENT "manifest defines no profiles"
-mapfile -t PROHIBITED < <(jq -r '.prohibited_profile_names[]?' "$MANIFEST")
-
-# Manifest self-consistency: model in models_allowed; effort legal for the tier.
-for name in "${PROFILES[@]}"; do
-  read -r model effort <<<"$(jq -r --arg n "$name" '.profiles[$n] | "\(.model) \(.effort // "null")"' "$MANIFEST")"
-  jq -e --arg m "$model" '.models_allowed | index($m)' "$MANIFEST" >/dev/null \
-    || die PROFILE_MANIFEST_INCONSISTENT "profile $name has model '$model' not in models_allowed"
-  case "$model" in
-    haiku)
-      [ "$effort" = "null" ] || die PROFILE_MANIFEST_INCONSISTENT "haiku profile $name must have null effort" ;;
-    sonnet)
-      [ "$effort" = "high" ] || die PROFILE_MANIFEST_INCONSISTENT "sonnet profile $name must be fixed at high" ;;
-    opus)
-      [ "$effort" != "max" ] || die PROFILE_MANIFEST_INCONSISTENT "opus profile $name must not be max" ;;
-    fable)
-      case "$effort" in xhigh|max) die PROFILE_MANIFEST_INCONSISTENT "fable profile $name must not be $effort" ;; esac ;;
-  esac
-  # A prohibited name must never appear as a defined profile.
-  for p in "${PROHIBITED[@]}"; do
-    [ "$name" = "$p" ] && die PROFILE_MANIFEST_INCONSISTENT "prohibited name defined in manifest: $name"
-  done
-done
-
-# --- frontmatter helpers ----------------------------------------------------
-# frontmatter <file>: print the body of the first --- ... --- block. Fails
-# closed (non-zero, no output trusted) when the file does not open with --- on
-# line 1 (exit 2) or the block is never closed before EOF (exit 3). An
-# unterminated block must never be accepted as valid frontmatter.
-frontmatter() {
-  awk '
-    NR==1 && $0 !~ /^---[[:space:]]*$/ { exit 2 }
-    NR==1 { next }
-    /^---[[:space:]]*$/ { closed=1; exit 0 }
-    { print }
-    END { if (!closed) exit 3 }
-  ' "$1"
-}
-fm_has() { # fm_has <fm-text> <key>
-  printf '%s\n' "$1" | grep -Eq "^$2:[[:space:]]"
-}
-fm_scalar() { # fm_scalar <fm-text> <key> -> trimmed value (first match)
-  printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | head -n1 \
-    | sed 's/[[:space:]]*$//'
-}
-fm_list_sorted() { # fm_list_sorted <fm-text> <key> -> newline tokens, sorted
-  local raw
-  raw=$(fm_scalar "$1" "$2")
-  raw=${raw#[}
-  raw=${raw%]}
-  printf '%s\n' "$raw" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
-    | grep -v '^$' | sort
-}
-
-# --- exact agent-file set vs manifest ---------------------------------------
-# Every manifest profile has a file; no extra .md files; no prohibited-name file.
-for p in "${PROHIBITED[@]}"; do
-  [ -e "$AGENTS_DIR/$p.md" ] && die PROFILE_PROHIBITED_PRESENT "prohibited profile file exists: $p.md"
-done
-if [ -d "$AGENTS_DIR" ]; then
-  while IFS= read -r f; do
-    stem=$(basename "$f" .md)
-    found=0
-    for name in "${PROFILES[@]}"; do [ "$stem" = "$name" ] && found=1 && break; done
-    [ "$found" = 1 ] || die PROFILE_FILE_UNKNOWN "agent file has no manifest entry: $stem.md"
-  done < <(find "$AGENTS_DIR" -maxdepth 1 -type f -name '*.md' | sort)
 fi
+
+python3 - "$MANIFEST" "$AGENTS_DIR" "$BINDINGS" "$QUIET" <<'PYEOF'
+import json, os, sys
+
+MANIFEST, AGENTS_DIR, BINDINGS, QUIET = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+
+# PyYAML is part of the hard prerequisite: without a real YAML parser we cannot
+# POSITIVELY prove a frontmatter document is well-formed, so we refuse.
+try:
+    import yaml
+except Exception:
+    sys.stderr.write("PROFILE_VALIDATOR_UNAVAILABLE\n")
+    sys.stderr.write("fm-profile-matrix-check: PyYAML is required to prove frontmatter validity; refusing\n")
+    sys.exit(1)
+
+SCHEMA = "firstmate/governed-profiles/v1"
+# The full confirmed frontmatter field set (ord-223-report.md §G sketch) plus the
+# slice's profile_version. Any key outside this set is an unrecognized field and
+# fails closed rather than being ignored.
+ALLOWED_FM_KEYS = {
+    "name", "description", "tools", "disallowedTools", "model", "permissionMode",
+    "maxTurns", "mcpServers", "hooks", "skills", "initialPrompt", "memory",
+    "EFFORT", "background", "isolation", "color", "profile_version",
+}
+PROFILE_KEYS = {"model", "effort", "writes", "nesting", "tools", "maxTurns", "version"}
+
+
+def die(code, msg):
+    sys.stderr.write(code + "\n")
+    sys.stderr.write("fm-profile-matrix-check: " + msg + "\n")
+    sys.exit(1)
+
+
+class DupKey(Exception):
+    def __init__(self, key):
+        self.key = key
+
+
+def _json_no_dupes(pairs):
+    seen = set()
+    for k, _ in pairs:
+        if k in seen:
+            raise DupKey(k)
+        seen.add(k)
+    return dict(pairs)
+
+
+def load_json_strict(path, missing_code, invalid_code, dup_code):
+    if not os.path.isfile(path):
+        die(missing_code, "file not found: %s" % path)
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    try:
+        return json.loads(text, object_pairs_hook=_json_no_dupes)
+    except DupKey as e:
+        die(dup_code, "duplicate key in JSON (any depth): %s (%s)" % (e.key, path))
+    except Exception as e:
+        die(invalid_code, "not valid JSON: %s (%s)" % (e, path))
+
+
+# --- strict YAML mapping loader: reject duplicate keys ----------------------
+class StrictLoader(yaml.SafeLoader):
+    pass
+
+
+def _yaml_no_dupes(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise DupKey(key)
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+StrictLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _yaml_no_dupes
+)
+
+
+def is_bool(v):
+    return type(v) is bool
+
+
+def is_int(v):
+    # bool is a subclass of int in Python; exclude it explicitly.
+    return type(v) is int
+
+
+def is_str(v):
+    return isinstance(v, str)
+
+
+# --- manifest: one strict pass, positively prove every property -------------
+manifest = load_json_strict(
+    MANIFEST, "PROFILE_MANIFEST_MISSING", "PROFILE_MANIFEST_INVALID",
+    "PROFILE_MANIFEST_DUPLICATE_KEY",
+)
+if not isinstance(manifest, dict):
+    die("PROFILE_MANIFEST_INVALID", "manifest top level must be an object")
+
+if manifest.get("schema_version") != SCHEMA:
+    die("PROFILE_MANIFEST_SCHEMA_UNSUPPORTED",
+        "schema_version must be exactly '%s'" % SCHEMA)
+
+
+def require_str_list(obj, field):
+    v = obj.get(field)
+    if not isinstance(v, list) or not all(is_str(x) and x for x in v):
+        die("PROFILE_MANIFEST_INCONSISTENT",
+            "%s must be a list of non-empty strings" % field)
+    return v
+
+
+models_allowed = require_str_list(manifest, "models_allowed")
+efforts_allowed = require_str_list(manifest, "efforts_allowed")
+prohibited = manifest.get("prohibited_profile_names")
+if not isinstance(prohibited, list) or not all(is_str(x) and x for x in prohibited):
+    die("PROFILE_MANIFEST_INCONSISTENT",
+        "prohibited_profile_names must be a list of non-empty strings")
+prohibited = set(prohibited)
+
+profiles = manifest.get("profiles")
+if not isinstance(profiles, dict) or not profiles:
+    die("PROFILE_MANIFEST_INCONSISTENT", "profiles must be a non-empty object")
+
+norm = {}  # validated per-profile record consumed by the frontmatter checks
+for name, p in profiles.items():
+    where = "manifest profile '%s'" % name
+    if not (is_str(name) and name):
+        die("PROFILE_MANIFEST_INCONSISTENT", "profile name must be a non-empty string")
+    if name in prohibited:
+        die("PROFILE_MANIFEST_INCONSISTENT", "prohibited name defined as a profile: %s" % name)
+    if not isinstance(p, dict):
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s must be an object" % where)
+    extra = set(p.keys()) - PROFILE_KEYS
+    if extra:
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s has unknown key(s): %s" % (where, ",".join(sorted(extra))))
+    missing = PROFILE_KEYS - set(p.keys())
+    if missing:
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s missing key(s): %s" % (where, ",".join(sorted(missing))))
+
+    model = p["model"]
+    if not (is_str(model) and model in models_allowed):
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s model must be a string in models_allowed" % where)
+
+    effort = p["effort"]
+    if effort is not None and not (is_str(effort) and effort in efforts_allowed):
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s effort must be null or a string in efforts_allowed" % where)
+
+    if not is_bool(p["writes"]):
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s writes must be a boolean" % where)
+    if not is_bool(p["nesting"]):
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s nesting must be a boolean" % where)
+
+    tools = p["tools"]
+    if not isinstance(tools, list) or not tools or not all(is_str(x) and x for x in tools):
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s tools must be a non-empty list of non-empty strings" % where)
+    if len(set(tools)) != len(tools):
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s tools must be unique" % where)
+
+    mt = p["maxTurns"]
+    if not isinstance(mt, dict) or set(mt.keys()) != {"min", "max"}:
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s maxTurns must be an object with exactly min,max" % where)
+    if not (is_int(mt["min"]) and is_int(mt["max"])):
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s maxTurns.min/max must be integers" % where)
+    if mt["min"] < 1 or mt["min"] > mt["max"]:
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s maxTurns range invalid (1<=min<=max)" % where)
+
+    if not is_int(p["version"]):
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s version must be an integer" % where)
+
+    # Effort-tier constraints (captain policy, §G/§H/§I).
+    if model == "haiku" and effort is not None:
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s (haiku) must have null effort" % where)
+    if model == "sonnet" and effort != "high":
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s (sonnet) must be fixed at high" % where)
+    if model == "opus" and effort == "max":
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s (opus) must not be max" % where)
+    if model == "fable" and effort in ("xhigh", "max"):
+        die("PROFILE_MANIFEST_INCONSISTENT", "%s (fable) must not be %s" % (where, effort))
+
+    norm[name] = {
+        "model": model, "effort": effort, "writes": p["writes"],
+        "nesting": p["nesting"], "tools": sorted(tools),
+        "min": mt["min"], "max": mt["max"], "version": p["version"],
+    }
+
+# --- directory: exactly the manifest profiles, no prohibited, no unknown ----
+if os.path.isdir(AGENTS_DIR):
+    for fn in sorted(os.listdir(AGENTS_DIR)):
+        if not fn.endswith(".md"):
+            continue
+        if not os.path.isfile(os.path.join(AGENTS_DIR, fn)):
+            continue
+        stem = fn[:-3]
+        if stem in prohibited:
+            die("PROFILE_PROHIBITED_PRESENT", "prohibited profile file exists: %s" % fn)
+        if stem not in norm:
+            die("PROFILE_FILE_UNKNOWN", "agent file has no manifest entry: %s" % fn)
+
+
+def load_frontmatter(path, name):
+    with open(path, "r", encoding="utf-8") as fh:
+        lines = fh.read().split("\n")
+    if not lines or lines[0].strip() != "---":
+        die("PROFILE_FRONTMATTER_INVALID", "%s.md must open with a --- delimiter on line 1" % name)
+    body, closed = [], False
+    for ln in lines[1:]:
+        if ln.strip() == "---":
+            closed = True
+            break
+        body.append(ln)
+    if not closed:
+        die("PROFILE_FRONTMATTER_INVALID", "%s.md frontmatter block is never closed" % name)
+    block = "\n".join(body)
+    try:
+        data = yaml.load(block, Loader=StrictLoader)
+    except DupKey as e:
+        die("PROFILE_FRONTMATTER_DUPLICATE_KEY", "%s.md duplicate frontmatter key: %s" % (name, e.key))
+    except Exception as e:
+        die("PROFILE_FRONTMATTER_INVALID", "%s.md frontmatter is not valid YAML: %s" % (name, e))
+    if not isinstance(data, dict) or not data:
+        die("PROFILE_FRONTMATTER_INVALID", "%s.md frontmatter must be a non-empty mapping" % name)
+    unknown = set(data.keys()) - ALLOWED_FM_KEYS
+    if unknown:
+        die("PROFILE_FRONTMATTER_INVALID", "%s.md has unrecognized frontmatter key(s): %s"
+            % (name, ",".join(sorted(str(k) for k in unknown))))
+    return data
+
 
 # --- per-profile frontmatter agreement --------------------------------------
-count=0
-for name in "${PROFILES[@]}"; do
-  file="$AGENTS_DIR/$name.md"
-  [ -f "$file" ] || die PROFILE_FILE_MISSING "missing agent file for profile: $name.md"
+count = 0
+for name in sorted(norm.keys()):
+    m = norm[name]
+    path = os.path.join(AGENTS_DIR, name + ".md")
+    if not os.path.isfile(path):
+        die("PROFILE_FILE_MISSING", "missing agent file for profile: %s.md" % name)
+    fm = load_frontmatter(path, name)
 
-  fm=$(frontmatter "$file") || die PROFILE_FRONTMATTER_INVALID "$name.md frontmatter is missing, malformed, or unterminated"
-  [ -n "$fm" ] || die PROFILE_FRONTMATTER_INVALID "$name.md has an empty frontmatter block"
+    if fm.get("name") != name:
+        die("PROFILE_NAME_MISMATCH", "%s.md frontmatter name must equal '%s'" % (name, name))
+    if fm.get("model") != m["model"]:
+        die("PROFILE_MODEL_MISMATCH", "%s.md model must be '%s'" % (name, m["model"]))
 
-  # No governed key may appear twice: a duplicate is ambiguous, and fm_scalar
-  # (first-match) and the runtime YAML loader need not resolve it identically.
-  dupkeys=$(printf '%s\n' "$fm" | grep -oE '^[A-Za-z_]+:' | sort | uniq -d | tr -d ':' | tr '\n' ' ')
-  [ -z "${dupkeys// /}" ] || die PROFILE_FRONTMATTER_DUPLICATE_KEY "$name.md: duplicate frontmatter key(s): $dupkeys"
+    if m["effort"] is None:
+        if "EFFORT" in fm:
+            die("PROFILE_EFFORT_MISMATCH", "%s.md (haiku) must carry no EFFORT key" % name)
+    else:
+        if fm.get("EFFORT") != m["effort"]:
+            die("PROFILE_EFFORT_MISMATCH", "%s.md EFFORT must be '%s'" % (name, m["effort"]))
 
-  # manifest expectations
-  m_model=$(jq -r --arg n "$name" '.profiles[$n].model' "$MANIFEST")
-  m_effort=$(jq -r --arg n "$name" '.profiles[$n].effort // "null"' "$MANIFEST")
-  m_writes=$(jq -r --arg n "$name" '.profiles[$n].writes' "$MANIFEST")
-  m_nesting=$(jq -r --arg n "$name" '.profiles[$n].nesting' "$MANIFEST")
-  m_min=$(jq -r --arg n "$name" '.profiles[$n].maxTurns.min' "$MANIFEST")
-  m_max=$(jq -r --arg n "$name" '.profiles[$n].maxTurns.max' "$MANIFEST")
-  m_ver=$(jq -r --arg n "$name" '.profiles[$n].version' "$MANIFEST")
-  mapfile -t m_tools < <(jq -r --arg n "$name" '.profiles[$n].tools[]' "$MANIFEST" | sort)
+    tools = fm.get("tools")
+    if not isinstance(tools, list) or not all(is_str(x) for x in tools):
+        die("PROFILE_FRONTMATTER_INVALID", "%s.md tools must be a YAML list of strings" % name)
+    if len(set(tools)) != len(tools):
+        die("PROFILE_TOOLS_MISMATCH", "%s.md tools must be unique" % name)
+    if sorted(tools) != m["tools"]:
+        die("PROFILE_TOOLS_MISMATCH", "%s.md tools must be %s, got %s" % (name, m["tools"], sorted(tools)))
 
-  # name
-  [ "$(fm_scalar "$fm" name)" = "$name" ] || die PROFILE_NAME_MISMATCH "$name.md: frontmatter name must equal '$name'"
+    has_write = any(t in ("Write", "Edit") for t in tools)
+    if m["writes"] and not has_write:
+        die("PROFILE_WRITES_MISMATCH", "%s.md a writing profile must list Write/Edit tools" % name)
+    if not m["writes"] and has_write:
+        die("PROFILE_WRITES_MISMATCH", "%s.md a non-writing profile must not list Write/Edit tools" % name)
 
-  # model
-  [ "$(fm_scalar "$fm" model)" = "$m_model" ] || die PROFILE_MODEL_MISMATCH "$name.md: model must be '$m_model'"
+    has_agent = "Agent" in tools
+    disallowed = fm.get("disallowedTools", [])
+    if disallowed is None:
+        disallowed = []
+    if not isinstance(disallowed, list) or not all(is_str(x) for x in disallowed):
+        die("PROFILE_FRONTMATTER_INVALID", "%s.md disallowedTools must be a YAML list of strings" % name)
+    disallow_agent = "Agent" in disallowed
+    if m["nesting"]:
+        if not has_agent:
+            die("PROFILE_NESTING_MISMATCH", "%s.md nesting profile must list the Agent tool" % name)
+        if disallow_agent:
+            die("PROFILE_NESTING_MISMATCH", "%s.md nesting profile must not disallow Agent" % name)
+    else:
+        if has_agent:
+            die("PROFILE_NESTING_MISMATCH", "%s.md non-nesting profile must not list the Agent tool" % name)
+        if not disallow_agent:
+            die("PROFILE_NESTING_MISMATCH", "%s.md non-nesting profile must disallow the Agent tool" % name)
 
-  # effort: haiku (null) -> key must be ABSENT; else EFFORT must equal manifest.
-  if [ "$m_effort" = "null" ]; then
-    fm_has "$fm" EFFORT && die PROFILE_EFFORT_MISMATCH "$name.md: haiku profile must carry no EFFORT key"
-  else
-    fm_has "$fm" EFFORT || die PROFILE_EFFORT_MISMATCH "$name.md: missing EFFORT key (expected '$m_effort')"
-    [ "$(fm_scalar "$fm" EFFORT)" = "$m_effort" ] || die PROFILE_EFFORT_MISMATCH "$name.md: EFFORT must be '$m_effort'"
-  fi
+    turns = fm.get("maxTurns")
+    if not is_int(turns):
+        die("PROFILE_FRONTMATTER_INVALID", "%s.md maxTurns must be an integer, got %r" % (name, turns))
+    if turns < m["min"] or turns > m["max"]:
+        die("PROFILE_MAXTURNS_OUT_OF_RANGE", "%s.md maxTurns %d outside [%d,%d]" % (name, turns, m["min"], m["max"]))
 
-  # tools set
-  mapfile -t f_tools < <(fm_list_sorted "$fm" tools)
-  if [ "${m_tools[*]}" != "${f_tools[*]}" ]; then
-    die PROFILE_TOOLS_MISMATCH "$name.md: tools must be [${m_tools[*]}], got [${f_tools[*]}]"
-  fi
+    if fm.get("profile_version") != m["version"]:
+        die("PROFILE_VERSION_MISMATCH", "%s.md profile_version must be %r" % (name, m["version"]))
 
-  # writes: Write and Edit present in tools iff manifest.writes == true
-  has_write=0
-  for t in "${f_tools[@]}"; do case "$t" in Write|Edit) has_write=1 ;; esac; done
-  if [ "$m_writes" = "true" ]; then
-    [ "$has_write" = 1 ] || die PROFILE_WRITES_MISMATCH "$name.md: a writing profile must list Write/Edit tools"
-  else
-    [ "$has_write" = 0 ] || die PROFILE_WRITES_MISMATCH "$name.md: a non-writing profile must not list Write/Edit tools"
-  fi
-
-  # nesting: Agent in tools iff manifest.nesting; disallowedTools must include
-  # Agent for a non-nesting profile and must never include Agent for a nesting one.
-  has_agent=0
-  for t in "${f_tools[@]}"; do [ "$t" = "Agent" ] && has_agent=1; done
-  mapfile -t f_disallowed < <(fm_list_sorted "$fm" disallowedTools)
-  disallow_agent=0
-  for t in "${f_disallowed[@]}"; do [ "$t" = "Agent" ] && disallow_agent=1; done
-  if [ "$m_nesting" = "true" ]; then
-    [ "$has_agent" = 1 ] || die PROFILE_NESTING_MISMATCH "$name.md: nesting profile must list the Agent tool"
-    [ "$disallow_agent" = 0 ] || die PROFILE_NESTING_MISMATCH "$name.md: nesting profile must not disallow Agent"
-  else
-    [ "$has_agent" = 0 ] || die PROFILE_NESTING_MISMATCH "$name.md: non-nesting profile must not list the Agent tool"
-    [ "$disallow_agent" = 1 ] || die PROFILE_NESTING_MISMATCH "$name.md: non-nesting profile must disallow the Agent tool"
-  fi
-
-  # maxTurns within the manifest range
-  turns=$(fm_scalar "$fm" maxTurns)
-  case "$turns" in
-    ''|*[!0-9]*) die PROFILE_MAXTURNS_OUT_OF_RANGE "$name.md: maxTurns must be an integer, got '$turns'" ;;
-  esac
-  if [ "$turns" -lt "$m_min" ] || [ "$turns" -gt "$m_max" ]; then
-    die PROFILE_MAXTURNS_OUT_OF_RANGE "$name.md: maxTurns $turns outside [$m_min,$m_max]"
-  fi
-
-  # profile_version
-  [ "$(fm_scalar "$fm" profile_version)" = "$m_ver" ] || die PROFILE_VERSION_MISMATCH "$name.md: profile_version must be '$m_ver'"
-
-  count=$((count + 1))
-done
+    count += 1
 
 # --- optional SHELL-CREW bindings cross-check -------------------------------
-# Runs only when a bindings file is provided and it carries at least one governed
-# profile name as a top-level key. For each such entry, the bindings effort must
-# equal the manifest effort (empty == null) and the bindings model string must
-# contain the manifest model token. Bindings that carry only the legacy
-# crew-dispatch profile names (implementer_balanced, scout_fast, ...) are a clean
-# no-op here, exactly as the runtime file is today.
-if [ -n "$BINDINGS" ]; then
-  [ -f "$BINDINGS" ] || die PROFILE_BINDINGS_MISMATCH "bindings file not found: $BINDINGS"
-  jq -e . "$BINDINGS" >/dev/null 2>&1 || die PROFILE_BINDINGS_MISMATCH "bindings file is not valid JSON: $BINDINGS"
-  for name in "${PROFILES[@]}"; do
-    present=$(jq -r --arg n "$name" 'has($n)' "$BINDINGS")
-    [ "$present" = "true" ] || continue
-    b_model=$(jq -r --arg n "$name" '.[$n].model // ""' "$BINDINGS")
-    b_effort=$(jq -r --arg n "$name" '.[$n].effort // ""' "$BINDINGS")
-    m_model=$(jq -r --arg n "$name" '.profiles[$n].model' "$MANIFEST")
-    m_effort=$(jq -r --arg n "$name" '.profiles[$n].effort // ""' "$MANIFEST")
-    [ "$b_effort" = "$m_effort" ] || die PROFILE_BINDINGS_MISMATCH "bindings $name: effort '$b_effort' != manifest '$m_effort'"
-    case "$b_model" in
-      *"$m_model"*) : ;;
-      *) die PROFILE_BINDINGS_MISMATCH "bindings $name: model '$b_model' does not carry manifest tier '$m_model'" ;;
-    esac
-  done
-fi
+# Runs only when a bindings file is provided. For each governed profile name it
+# carries, the bindings effort must equal the manifest effort (empty == null) and
+# the bindings model string must contain the manifest model token. A bindings
+# file that carries only legacy crew-dispatch names is a clean no-op.
+if BINDINGS:
+    b = load_json_strict(
+        BINDINGS, "PROFILE_BINDINGS_MISMATCH", "PROFILE_BINDINGS_MISMATCH",
+        "PROFILE_BINDINGS_MISMATCH",
+    )
+    if not isinstance(b, dict):
+        die("PROFILE_BINDINGS_MISMATCH", "bindings top level must be an object")
+    for name in sorted(norm.keys()):
+        if name not in b:
+            continue
+        entry = b[name]
+        if not isinstance(entry, dict):
+            die("PROFILE_BINDINGS_MISMATCH", "bindings %s must be an object" % name)
+        b_model = entry.get("model") or ""
+        b_effort = entry.get("effort") or ""
+        m_effort = norm[name]["effort"] or ""
+        if b_effort != m_effort:
+            die("PROFILE_BINDINGS_MISMATCH", "bindings %s effort '%s' != manifest '%s'" % (name, b_effort, m_effort))
+        if norm[name]["model"] not in b_model:
+            die("PROFILE_BINDINGS_MISMATCH", "bindings %s model '%s' does not carry tier '%s'"
+                % (name, b_model, norm[name]["model"]))
 
-[ "$QUIET" = 1 ] || echo "PROFILES_OK=$count"
-exit 0
+if not QUIET:
+    sys.stdout.write("PROFILES_OK=%d\n" % count)
+sys.exit(0)
+PYEOF
+exit $?

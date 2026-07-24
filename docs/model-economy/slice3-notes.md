@@ -19,23 +19,45 @@ policy), §I (effort policy), §T.2 (test group), §U/S3 (slice entry).
 
 Additive only: no dispatch is routed through the profiles yet (that is S4/S5).
 
-## Fail-closed parsing (QA qa-me-s3-q119 finding 1 — RESOLVED)
+## Fail-closed validation — the authority pattern (QA q119 + q120 — RESOLVED)
 
-The validator now rejects, before trusting any parsed value:
+QA round 1 (q119) surfaced duplicate-key and unterminated-block holes; QA round
+2 (q120) surfaced two deeper validator-class holes — schema-invalid YAML and
+mistyped manifest values still passed, and duplicate detection false-passed on
+hosts without `python3`. Rather than spot-patch each shape, the validator was
+rebuilt on the fleet's proven authority pattern
+(`data/dj-orders-s2/design-ruling.md`): **one strict validation pass that must
+POSITIVELY PROVE every property before the matrix is authoritative; any parse
+ambiguity, type violation, or absent tool = non-authoritative = fail closed,
+never a weaker check.**
 
-- duplicate object keys in the manifest JSON, at any depth, via a raw python3
-  parse (`PROFILE_MANIFEST_DUPLICATE_KEY`) — jq keeps only the last occurrence,
-  so a raw parse is required; this mirrors `bin/fm-bindings-validate.sh`;
-- an agent frontmatter block that does not open with `---` on line 1 or is never
-  closed before EOF (`PROFILE_FRONTMATTER_INVALID`);
-- any duplicate governed frontmatter key (`PROFILE_FRONTMATTER_DUPLICATE_KEY`) —
-  an ambiguous key is unsafe because this validator's first-match read and the
-  runtime YAML loader need not resolve it to the same occurrence.
+Concretely:
 
-Regression coverage for all three, including per-key duplicate cases for
-`name`/`model`/`EFFORT`/`tools`/`disallowedTools`/`maxTurns`/`profile_version`,
-a divergent-value duplicate `model`, a top-level duplicate manifest key, and a
-nested duplicate manifest key, is in the test suite.
+- The regex line-scraping of YAML is gone. Every `.claude/agents/*.md`
+  frontmatter is parsed as a whole YAML document with a strict PyYAML loader that
+  rejects duplicate keys; any syntax error anywhere in the document (e.g. the q120
+  `permissionMode: [` repro) fails closed (`PROFILE_FRONTMATTER_INVALID`), and any
+  unrecognized frontmatter key fails closed rather than being ignored.
+- The manifest is validated against an explicit type schema in one JSON pass:
+  duplicate keys at any depth (`PROFILE_MANIFEST_DUPLICATE_KEY`), and exact types
+  for every field — `writes`/`nesting` must be booleans (a `"true"` string is
+  rejected), `version`/`maxTurns.min`/`maxTurns.max` must be integers, `tools`
+  must be a unique non-empty string list, `min<=max`, no unknown or missing
+  profile keys — all `PROFILE_MANIFEST_INCONSISTENT`.
+- Frontmatter values are type-checked after the real parse: `maxTurns` must be an
+  integer, `tools`/`disallowedTools` must be lists of strings.
+- The parser (`python3` + PyYAML + json) is a **hard prerequisite**. If it is
+  absent the validator REFUSES with `PROFILE_VALIDATOR_UNAVAILABLE` and a nonzero
+  exit — it never degrades to a weaker best-effort check. This closes the q120
+  "duplicate manifest key false-passes without python3" hole at its root: there is
+  no path in which a missing tool yields success.
+
+Every property above is encoded as a test with an invalid fixture (the q120 repro
+set included): malformed YAML, unknown frontmatter key, mistyped tools, the full
+manifest wrong-type matrix (`writes`/`nesting`/`version`/`min` as strings, `min`
+> `max`, non-list/non-unique `tools`, wrong-type `effort`, non-list
+`models_allowed`, unknown/missing profile key), and the missing-`python3`
+refuses-not-degrades path, alongside the round-1 duplicate/delimiter cases.
 
 ## T.2 runtime probes — EXPLICIT deferral (QA qa-me-s3-q119 finding 2)
 

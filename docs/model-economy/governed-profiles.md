@@ -59,8 +59,17 @@ profile to tier.
 
 `bin/fm-profile-matrix-check.sh` fails closed on any drift between the manifest
 and the `.claude/agents/*.md` files (and, when given `--bindings`, the
-SHELL-CREW file). Each failure prints one stable `PROFILE_*` code — see the
-script header for the full list. Run it after any profile change:
+SHELL-CREW file). It follows the fleet authority pattern
+(`data/dj-orders-s2/design-ruling.md`): one strict validation pass must
+*positively prove* every property — the manifest JSON and every frontmatter
+document parse cleanly, every key is unique at every depth, every value has
+exactly the required type (a `"true"` string is not the boolean `true`), and
+every cross-surface value agrees. There is no weaker fallback: any parse
+ambiguity, type violation, or absent parser is non-authoritative and fails
+closed. The parser (`python3` with PyYAML + json) is a hard prerequisite — if it
+is unavailable the validator refuses (`PROFILE_VALIDATOR_UNAVAILABLE`) rather
+than degrading. Each failure prints one stable `PROFILE_*` code — see the script
+header for the full list. Run it after any profile change:
 
 ```sh
 bin/fm-profile-matrix-check.sh            # validate the committed matrix
