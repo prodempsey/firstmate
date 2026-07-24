@@ -10,21 +10,29 @@ Design authority: `data/model-economy/ord-223-report.md` §G (profile matrix),
 #1 (committed manifest) and #15 (tracked material lands in this template repo and
 reaches the runtime home via the fold/sync path).
 
-## The three artifacts
+## The artifacts
 
 - **The manifest** — `docs/model-economy/governed-profiles.manifest.json`
-  (`schema_version: firstmate/governed-profiles/v1`) is the single committed
-  source of truth for all 11 profiles: each profile's model, effort, tool list,
-  write capability, nesting, `maxTurns` range, and version. Do not maintain the
-  matrix independently in two places; edit this manifest and the matching agent
-  file together, then run the validator.
+  (`schema_version: firstmate/governed-profiles/v1`) is the single
+  machine-authoritative source of truth for all 11 profiles: each profile's
+  model, effort, description, tool list, write capability, nesting, concrete
+  `maxTurns` (plus `maxTurns_bounds`), and version, and the `effort_constraints`
+  tier policy. It is the ONLY authored surface; everything else is a derived
+  projection of it.
+- **The committed schemas** — `docs/model-economy/schemas/*.schema.json`: three
+  closed (`additionalProperties:false`, total) JSON Schema documents — one for the
+  manifest, one for a frontmatter object, one for a governed bindings entry.
+  These are the declarative authority the validator enforces; adding a property to
+  an artifact without adding it to the schema fails closed.
 - **The IN-SESSION surface** — `.claude/agents/<profile>.md`, one file per
-  profile, whose YAML frontmatter is the actual runtime definition Claude Code
-  loads. Each file carries `profile_version`.
+  profile, whose YAML frontmatter Claude Code loads to define the sub-agent. It is
+  a **derived projection** of the manifest, not an independent authority: the
+  validator derives each expected frontmatter object from the manifest and asserts
+  whole-object equality.
 - **The SHELL-CREW surface** — the runtime-local, gitignored
   `state/crew-profile-bindings.json`. It carries the legacy crew-dispatch
   profiles today; when it later gains governed-profile entries keyed by these 11
-  names, the validator cross-checks their model/effort against the manifest too.
+  names, the validator schema-checks and cross-checks them against the manifest.
 
 ## The 11 profiles
 
@@ -47,40 +55,52 @@ key (Haiku rejects the parameter at the API); Sonnet profiles are fixed at
 `high`; `opus-max`, `fable-xhigh`, and `fable-max` are prohibited and no such
 profile file may exist; non-nesting profiles both exclude `Agent` from `tools`
 and list it in `disallowedTools`; fable profiles include `Agent` and never
-disallow it. `maxTurns` values and tool lists are calibration-pending proposals
-(§G / B.1 #5), not measured optimums — the range in the manifest is the
-committed envelope.
+disallow it. Concrete `maxTurns` values, their `maxTurns_bounds`, and tool lists
+are calibration-pending proposals (§G / B.1 #5), not measured optimums; the
+concrete value must sit inside the committed bounds.
 
 The `model` field uses the family token (`haiku`/`sonnet`/`opus`/`fable`)
 exactly as the §G frontmatter sketch specifies; the manifest is the mapping from
-profile to tier.
+profile to tier. The tier policy (haiku → no effort, sonnet → fixed high, opus →
+not max, fable → ≤ high) lives once in the manifest's `effort_constraints` and is
+read from there by the validator — never hard-coded a second time.
 
 ## Validating the matrix
 
-`bin/fm-profile-matrix-check.sh` fails closed on any drift between the manifest
-and the `.claude/agents/*.md` files (and, when given `--bindings`, the
-SHELL-CREW file). It follows the fleet authority pattern
-(`data/dj-orders-s2/design-ruling.md`): one strict validation pass must
-*positively prove* every property — the manifest JSON and every frontmatter
-document parse cleanly, every key is unique at every depth, every value has
-exactly the required type (a `"true"` string is not the boolean `true`), and
-every cross-surface value agrees. There is no weaker fallback: any parse
-ambiguity, type violation, or absent parser is non-authoritative and fails
-closed. The parser (`python3` with PyYAML + json) is a hard prerequisite — if it
-is unavailable the validator refuses (`PROFILE_VALIDATOR_UNAVAILABLE`) rather
-than degrading. Each failure prints one stable `PROFILE_*` code — see the script
-header for the full list. Run it after any profile change:
+`bin/fm-profile-matrix-check.sh` fails closed on any drift. It follows the fleet
+authority pattern (`data/me-s3-profiles/design-ruling.md`, precedent
+`data/dj-orders-s2/design-ruling.md`): one atomic pass proves authority by
+*conformance to the closed committed schemas* plus *whole-object projection
+equality*, not by an enumerated ladder of hand predicates. Concretely — the
+manifest JSON and every frontmatter document parse cleanly and reject duplicate
+keys at any depth; the manifest conforms to its closed schema (every property
+present, exactly typed via `jsonschema` which excludes `bool` from `integer`,
+enum-constrained, unique, no property the schema does not admit); each frontmatter
+object conforms to its closed schema and then equals the manifest projection
+exactly; and any governed bindings entry is type-proven before comparison. Any
+parse ambiguity, unproven/extra property, or projection divergence is
+non-authoritative and fails closed.
+
+`python3`, PyYAML, **and `jsonschema`** are all hard prerequisites — if any is
+absent the validator refuses (`PROFILE_VALIDATOR_UNAVAILABLE`, exit 1) rather than
+degrading. On success it prints `PROFILES_OK=<n>` and a `MATRIX_FINGERPRINT=`
+(sha256 of the canonical manifest), pinnable via `--expect-fingerprint` and
+recordable via `--write-sidecar` — the analogue of `fm-bindings-validate.sh`'s
+provenance surface, for S4 to pin against. Each failure prints one stable
+`PROFILE_*` code — see the script header for the full list.
 
 ```sh
 bin/fm-profile-matrix-check.sh            # validate the committed matrix
 bin/fm-profile-matrix-check.sh --bindings state/crew-profile-bindings.json
 ```
 
-Coverage lives in `tests/fm-profile-matrix-check.test.sh` (the T.2 static rules
-in full, plus fail-closed parsing of malformed/duplicate keys). The two T.2
-*runtime* probes (a real Agent-denial dispatch, a live maxTurns cutoff) require a
-dispatch path and real model calls; their explicit, design-referenced deferral
-and the ready-to-run probe procedure are recorded in
+Coverage lives in `tests/fm-profile-matrix-check.test.sh`: one invalid fixture per
+schema property, uniqueness/enum/closed-set rule, cross-property policy, and
+projection field, plus the missing-engine refuse paths and the two canaries
+(`M-extra-root`, `F-permissionMode-list`). The two T.2 *runtime* probes (a real
+Agent-denial dispatch, a live maxTurns cutoff) require a dispatch path and real
+model calls; their explicit, design-referenced deferral — coordinator-accepted,
+pending captain ratification — and the ready-to-run probe procedure are in
 `docs/model-economy/slice3-notes.md`. Wiring this validator into bootstrap
 diagnostics and into the governed dispatch path is later-slice work
 (bootstrap/S4), not part of S3.

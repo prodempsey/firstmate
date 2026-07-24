@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "firstmate/governed-profiles-manifest/v1",
+  "title": "Governed profile matrix manifest",
+  "description": "Closed, total schema for docs/model-economy/governed-profiles.manifest.json — the single machine-authoritative artifact for the 11 governed profiles (model-economy S3). additionalProperties:false at every level; any property the schema does not positively admit fails closed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_version",
+    "source_authority",
+    "description",
+    "models_allowed",
+    "efforts_allowed",
+    "prohibited_profile_names",
+    "effort_constraints",
+    "profiles"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "enum": ["firstmate/governed-profiles/v1"]},
+    "profile_version": {"type": "integer", "minimum": 1},
+    "source_authority": {"type": "string", "minLength": 1},
+    "description": {"type": "string", "minLength": 1},
+    "models_allowed": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "efforts_allowed": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "prohibited_profile_names": {
+      "type": "array", "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "effort_constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["haiku", "sonnet", "opus", "fable"],
+      "properties": {
+        "haiku": {
+          "type": "object", "additionalProperties": false,
+          "required": ["effort_present"],
+          "properties": {"effort_present": {"type": "boolean"}}
+        },
+        "sonnet": {
+          "type": "object", "additionalProperties": false,
+          "required": ["fixed"],
+          "properties": {"fixed": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]}}
+        },
+        "opus": {
+          "type": "object", "additionalProperties": false,
+          "required": ["prohibited"],
+          "properties": {"prohibited": {"type": "array", "uniqueItems": true, "items": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]}}}
+        },
+        "fable": {
+          "type": "object", "additionalProperties": false,
+          "required": ["prohibited", "ceiling"],
+          "properties": {
+            "prohibited": {"type": "array", "uniqueItems": true, "items": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]}},
+            "ceiling": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]}
+          }
+        }
+      }
+    },
+    "profiles": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["model", "effort", "description", "writes", "nesting", "tools", "maxTurns", "maxTurns_bounds", "version"],
+        "properties": {
+          "model": {"type": "string", "enum": ["haiku", "sonnet", "opus", "fable"]},
+          "effort": {"anyOf": [{"type": "null"}, {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]}]},
+          "description": {"type": "string", "minLength": 1},
+          "writes": {"type": "boolean"},
+          "nesting": {"type": "boolean"},
+          "tools": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+          "maxTurns": {"type": "integer", "minimum": 1},
+          "maxTurns_bounds": {
+            "type": "object", "additionalProperties": false,
+            "required": ["min", "max"],
+            "properties": {"min": {"type": "integer", "minimum": 1}, "max": {"type": "integer", "minimum": 1}}
+          },
+          "version": {"type": "integer", "minimum": 1}
+        }
+      }
+    }
+  }
+}

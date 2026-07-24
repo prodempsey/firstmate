@@ -7,57 +7,69 @@ policy), §I (effort policy), §T.2 (test group), §U/S3 (slice entry).
 
 ## What landed
 
-- `docs/model-economy/governed-profiles.manifest.json` — the single committed
-  source of truth (`schema_version: firstmate/governed-profiles/v1`) for all 11
-  profiles.
-- `.claude/agents/*.md` (11) — the IN-SESSION profile definitions; each carries
-  `profile_version: 1`.
-- `bin/fm-profile-matrix-check.sh` — the fail-closed matrix validator.
-- `tests/fm-profile-matrix-check.test.sh` — the T.2 static rules in full, plus
-  fail-closed-parsing negative cases.
+- `docs/model-economy/governed-profiles.manifest.json` — the single
+  machine-authoritative source of truth (`schema_version:
+  firstmate/governed-profiles/v1`) for all 11 profiles; carries concrete
+  `maxTurns` + `maxTurns_bounds`, per-profile `description`, and the
+  `effort_constraints` tier policy.
+- `docs/model-economy/schemas/*.schema.json` (3) — closed JSON Schemas (manifest,
+  frontmatter object, governed bindings entry): the declarative authority.
+- `.claude/agents/*.md` (11) — the IN-SESSION projection of the manifest; each
+  carries `profile_version: 1`.
+- `bin/fm-profile-matrix-check.sh` — the fail-closed schema-and-projection
+  validator, with the `MATRIX_FINGERPRINT` provenance surface.
+- `tests/fm-profile-matrix-check.test.sh` — one invalid fixture per schema
+  property, policy rule, and projection field, plus the missing-engine paths.
 - `docs/model-economy/governed-profiles.md` — the pointer doc.
 
 Additive only: no dispatch is routed through the profiles yet (that is S4/S5).
 
-## Fail-closed validation — the authority pattern (QA q119 + q120 — RESOLVED)
+## Fail-closed validation — the authority pattern (q119 → q120 → q121 — RESOLVED)
 
-QA round 1 (q119) surfaced duplicate-key and unterminated-block holes; QA round
-2 (q120) surfaced two deeper validator-class holes — schema-invalid YAML and
-mistyped manifest values still passed, and duplicate detection false-passed on
-hosts without `python3`. Rather than spot-patch each shape, the validator was
-rebuilt on the fleet's proven authority pattern
-(`data/dj-orders-s2/design-ruling.md`): **one strict validation pass that must
-POSITIVELY PROVE every property before the matrix is authoritative; any parse
-ambiguity, type violation, or absent tool = non-authoritative = fail closed,
-never a weaker check.**
+Three QA rounds each found a different symptom on the same broken spine: r1
+(q119) did not parse the format; r2 (q120) parsed but only proved enumerated
+fields; r3 (q121) parsed with a hard-tool prerequisite yet still false-passed on
+un-enumerated properties (unknown root keys, wrong root types, `bool`-as-integer,
+a bindings `model` given as a list). The senior ruling
+(`data/me-s3-profiles/design-ruling.md`, precedent
+`data/dj-orders-s2/design-ruling.md`) diagnosed the root cause: **authority was an
+enumerated conjunction of hand predicates, not conformance to a closed schema.**
+Round 3's fix implements the ruling's section (e) exactly:
 
-Concretely:
+- **Three committed closed JSON Schemas** (`docs/model-economy/schemas/`), one
+  each for the manifest, a frontmatter object, and a governed bindings entry —
+  `additionalProperties:false`, full `required`, exact `type`, `enum`,
+  `uniqueItems`. Adding a property to an artifact without adding it to the schema
+  fails closed; the schema is the enumeration, not a `die()` ladder.
+- **Parse → duplicate-reject → jsonschema.** Each artifact is parsed once
+  (JSON `object_pairs_hook` / YAML `StrictLoader` reject duplicate keys at any
+  depth), then validated against its committed schema via `jsonschema`
+  (Draft 2020-12), which excludes `bool` from `integer`/`number` by construction —
+  closing the `profile_version: true` and mistyped-manifest holes.
+- **`jsonschema` joins `python3`+PyYAML as a hard prerequisite.** If any engine
+  (or a committed schema file) is absent the validator refuses with
+  `PROFILE_VALIDATOR_UNAVAILABLE`, exit 1 — no degradation, no warn-and-pass.
+- **The frontmatter is a derived projection, asserted by whole-object equality.**
+  The manifest gained concrete `maxTurns` and per-profile `description` so the
+  expected frontmatter object is fully manifest-derived; the validator asserts
+  dict-equality, so any divergence on any key (enumerated or not) fails.
+- **Tier policy from one source.** `effort_constraints` is schema-validated and is
+  the only source of the executable tier rules; a null or contradicting policy
+  fails closed.
+- **Bindings type-before-compare.** A governed bindings entry is schema-checked
+  (`model` must be a string) before any comparison, closing the list-membership
+  bug.
+- **Provenance.** On success the validator emits `MATRIX_FINGERPRINT=<sha256>`
+  over the canonical manifest, pinnable via `--expect-fingerprint` and recordable
+  via `--write-sidecar` — mirroring `bin/fm-bindings-validate.sh` for S4 to pin
+  against.
 
-- The regex line-scraping of YAML is gone. Every `.claude/agents/*.md`
-  frontmatter is parsed as a whole YAML document with a strict PyYAML loader that
-  rejects duplicate keys; any syntax error anywhere in the document (e.g. the q120
-  `permissionMode: [` repro) fails closed (`PROFILE_FRONTMATTER_INVALID`), and any
-  unrecognized frontmatter key fails closed rather than being ignored.
-- The manifest is validated against an explicit type schema in one JSON pass:
-  duplicate keys at any depth (`PROFILE_MANIFEST_DUPLICATE_KEY`), and exact types
-  for every field — `writes`/`nesting` must be booleans (a `"true"` string is
-  rejected), `version`/`maxTurns.min`/`maxTurns.max` must be integers, `tools`
-  must be a unique non-empty string list, `min<=max`, no unknown or missing
-  profile keys — all `PROFILE_MANIFEST_INCONSISTENT`.
-- Frontmatter values are type-checked after the real parse: `maxTurns` must be an
-  integer, `tools`/`disallowedTools` must be lists of strings.
-- The parser (`python3` + PyYAML + json) is a **hard prerequisite**. If it is
-  absent the validator REFUSES with `PROFILE_VALIDATOR_UNAVAILABLE` and a nonzero
-  exit — it never degrades to a weaker best-effort check. This closes the q120
-  "duplicate manifest key false-passes without python3" hole at its root: there is
-  no path in which a missing tool yields success.
-
-Every property above is encoded as a test with an invalid fixture (the q120 repro
-set included): malformed YAML, unknown frontmatter key, mistyped tools, the full
-manifest wrong-type matrix (`writes`/`nesting`/`version`/`min` as strings, `min`
-> `max`, non-list/non-unique `tools`, wrong-type `effort`, non-list
-`models_allowed`, unknown/missing profile key), and the missing-`python3`
-refuses-not-degrades path, alongside the round-1 duplicate/delimiter cases.
+The two canaries the ruling named — `M-extra-root` (an unknown manifest root key)
+and `F-permissionMode-list` (permissionMode as a list) — were written first,
+confirmed to false-pass on `d043626`, and now reject. Every schema property,
+uniqueness/enum/closed-set rule, cross-property policy, and projection field has a
+one-property-at-a-time invalid fixture, alongside the missing-engine refuse paths
+and the retained r1/r2 regression cases.
 
 ## T.2 runtime probes — EXPLICIT deferral (QA qa-me-s3-q119 finding 2)
 
@@ -91,13 +103,19 @@ record — not silently dropped.** Rationale:
 - Live sub-agent dispatch is additionally constrained under the active KrakenLoop
   maintenance mode in force during this slice.
 
-### Proposed S3-acceptance amendment (for coordinator/captain ratification)
+### Deferral status: COORDINATOR-ACCEPTED, pending captain ratification
 
-Move the two §T.2 runtime probes to the S4/S5 slices that introduce the dispatch
-path they exercise, keeping S3's binding acceptance to the T.2 STATIC rules
-(all implemented here). This is the "amend the binding S3 acceptance explicitly
-rather than silently deferring" resolution the QA recommended. Until ratified,
-this note is the explicit, design-referenced record of the deferral.
+The senior design ruling (`data/me-s3-profiles/design-ruling.md` §5(d)9, §7 "Out
+of scope by the slice") accepts this deferral: "the two §T.2 live-harness runtime
+probes remain deferred pending explicit acceptance amendment … that deferral is a
+coordinator/captain ratification item, not a thing to silently satisfy or silently
+drop here." So the coordinator has accepted the deferral; the remaining step is the
+captain's ratification of the acceptance amendment below.
+
+**Acceptance amendment (awaiting captain ratification):** move the two §T.2
+runtime probes to the S4/S5 slices that introduce the dispatch path they exercise,
+keeping S3's binding acceptance to the T.2 STATIC rules (all implemented here).
+This note is the explicit, design-referenced record until the captain ratifies.
 
 ### Ready-to-run probe procedure (run once, on demand, to capture evidence)
 

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "firstmate/governed-profile-frontmatter/v1",
+  "title": "Governed profile frontmatter object",
+  "description": "Closed, total schema for a .claude/agents/<profile>.md YAML frontmatter object (model-economy S3). The key set is exactly the projection of a manifest profile: additionalProperties:false admits only these keys, each fully typed. EFFORT and disallowedTools are optional at the schema layer (their per-profile presence is proven by whole-object projection equality against the manifest), everything else is required.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "description", "model", "tools", "maxTurns", "permissionMode", "profile_version"],
+  "properties": {
+    "name": {"type": "string", "minLength": 1},
+    "description": {"type": "string", "minLength": 1},
+    "model": {"type": "string", "enum": ["haiku", "sonnet", "opus", "fable"]},
+    "EFFORT": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
+    "tools": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "disallowedTools": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "maxTurns": {"type": "integer", "minimum": 1},
+    "permissionMode": {"type": "string", "enum": ["default"]},
+    "profile_version": {"type": "integer", "minimum": 1}
+  }
+}

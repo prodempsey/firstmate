@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "firstmate/governed-bindings-entry/v1",
+  "title": "Governed SHELL-CREW bindings entry",
+  "description": "Closed schema for a state/crew-profile-bindings.json entry keyed by a governed profile name (model-economy S3). model MUST be a string and effort a string, proven BEFORE any cross-surface comparison — closing the list-membership type bug where a list value satisfied a string field.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["model"],
+  "properties": {
+    "harness": {"type": "string"},
+    "model": {"type": "string", "minLength": 1},
+    "effort": {"type": "string"},
+    "backups": {"type": "array"}
+  }
+}
