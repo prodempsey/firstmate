@@ -345,6 +345,8 @@ EOF
   assert_not_contains "$out" "NUDGE_SECONDMATES" "mutating secondmate sweep ran during a lock refusal"
   [ ! -e "$home/state/fleet-triage.check.sh" ] \
     || fail "read-only session installed the fleet-triage watcher check"
+  [ ! -e "$home/state/reconciler.check.sh" ] \
+    || fail "read-only session installed the reconciler watcher check"
 
   # The rest of the digest (read-only-safe) still completed.
   assert_contains "$out" "FLEET STATE" "fleet-state digest section missing on the read-only path"
@@ -621,6 +623,26 @@ EOF
   pass "locked session start self-heals the fleet-triage watcher check"
 }
 
+test_locked_session_installs_reconciler_check() {
+  local rec root home fakebin shim before
+  rec=$(new_world reconciler-install)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  run_session_start "$home" "$root" "$fakebin:$BASE_PATH" >/dev/null
+  shim="$home/state/reconciler.check.sh"
+  [ -x "$shim" ] || fail "locked session start did not install the reconciler check"
+  grep -F 'fm-reconciler.sh' "$shim" >/dev/null || fail "the reconciler shim does not exec the reconciler"
+  before=$(stat -c '%Y:%s' "$shim")
+  sleep 1
+  run_session_start "$home" "$root" "$fakebin:$BASE_PATH" >/dev/null
+  [ "$before" = "$(stat -c '%Y:%s' "$shim")" ] \
+    || fail "locked session start rewrote an unchanged reconciler check"
+  pass "locked session start self-heals the reconciler watcher check"
+}
+
 test_next_step_sources_x_mode_cadence() {
   local rec root home fakebin out
   rec=$(new_world next-step-x)
@@ -805,6 +827,7 @@ test_endpoint_liveness_herdr
 test_composition_invokes_real_scripts
 test_fleet_digest_empty_fleet
 test_locked_session_installs_fleet_triage_check
+test_locked_session_installs_reconciler_check
 test_next_step_sources_x_mode_cadence
 test_next_step_afk_delegates_to_daemon
 test_supervision_block_exactly_one_and_pi_diagnostic

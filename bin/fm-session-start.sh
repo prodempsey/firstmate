@@ -204,6 +204,15 @@ if [ "$READ_ONLY" -eq 0 ] && [ -x "$SCRIPT_DIR/fm-fleet-triage.sh" ]; then
   fi
 fi
 
+# The Reconciler's watcher shim (ORD-277 slice 1) is installed the same way: a per-home,
+# cooldown-guarded check.sh that runs the closure-loop pass at a bounded cadence and wakes
+# firstmate only when it has actionable closure proposals. Lock-owning primary only.
+if [ "$READ_ONLY" -eq 0 ] && [ -x "$SCRIPT_DIR/fm-reconciler.sh" ]; then
+  if ! "$SCRIPT_DIR/fm-reconciler.sh" install >/dev/null; then
+    printf 'RECONCILER_INSTALL: failed to install watcher check shim\n'
+  fi
+fi
+
 # --- 3. ghost reconciliation ----------------------------------------------
 subsection "GHOST RECONCILIATION"
 if [ "$READ_ONLY" -eq 1 ]; then

@@ -102,6 +102,9 @@ state/               volatile runtime signals; gitignored
   <id>.grok-turnend-token   firstmate-owned grok hook registry token for the task; removed by teardown
   <id>.meta          written by fm-spawn: window=, worktree=, project=, harness=, model=, effort=, kind=, mode=, yolo=, tasktmp=; kind=secondmate also records home= and projects=; a non-default runtime backend records further backend-specific fields (docs/configuration.md "Runtime backend"; bin/fm-backend.sh, section 8); fm-pr-check, including through fm-pr-merge, appends pr= and GitHub's pr_head= when available; fm-x-link appends x_request=, x_request_ts=, x_followups=, and optional x_platform=/x_reply_max_chars= for an X-mode-originated task (section 14)
   <id>.check.sh      optional slow poll you write per task (e.g. merged-PR check)
+  reconciler.check.sh   generated watcher check shim installed at locked session start; runs the cooldown-guarded bin/fm-reconciler.sh closure-loop pass and wakes only on actionable closure proposals (bin/fm-reconciler.sh)
+  .reconciler-check-last   volatile cadence marker for the reconciler check lane; touched every pass so bin/fm-reconciler.sh check runs only every FM_RECONCILER_CHECK_INTERVAL (default 900s); never hand-edited
+  .order-audit-last.json   deterministic product of bin/fm-order.sh audit: the ACCOUNTED predicate over every non-terminal captain order; refreshed by the audit and by the reconciler pass, read as a cheap file (never re-enumerated)
   x-watch.check.sh   generated X-mode relay poll shim; present only when opted in (section 14)
   x-inbox/           generated X-mode pending mention payloads; fmx-respond drains it (section 14)
   x-context/         generated X-mode durable per-request reply context (platform/budget), keyed by request_id; survives inbox cleanup so a delayed follow-up recovers the original platform (section 14; bin/fm-x-lib.sh)
