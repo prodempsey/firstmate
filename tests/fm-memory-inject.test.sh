@@ -221,6 +221,28 @@ test_wrapper_deadline_budget_zero_still_bounds() {
   pass "an invalid/zero FM_MEMORY_INJECT_TIMEOUT falls back to the default bound instead of disabling it"
 }
 
+test_wrapper_mktemp_failure_fails_open() {
+  # If the output-capture file cannot be created (e.g. TMPDIR names an absent dir),
+  # the wrapper must NOT fall back to a command-substitution pipe - a killed child's
+  # grandchild could hold that pipe open past BUDGET+GRACE. It must fail open to
+  # no-injection immediately, without even invoking the (here ignore-TERM) CLI.
+  local d="$TMP_ROOT/mktempfail"; mkdir -p "$d/config"
+  local brief="$d/brief.md"; printf '%s' "$FINAL_BRIEF" > "$brief"
+  local before; before=$(cat "$brief")
+  local cli="$d/ignore-term"; write_ignore_term_cli "$cli"
+  local start status elapsed
+  start=$SECONDS
+  env -u FM_MEMORY_INJECT TMPDIR="$d/absent-tmp" FM_MEMORY_INJECT_TIMEOUT=1 \
+    MEM_CLI="$cli" FM_HOME="$d" \
+    "$INJECT" --task t1 --brief "$brief" --project firstmate --kind ship >/dev/null 2>&1; status=$?
+  elapsed=$((SECONDS - start))
+  expect_code 0 "$status" "a capture-file failure must still exit 0 (never fail the spawn)"
+  [ "$elapsed" -lt 8 ] || fail "a capture-file failure must fail open immediately, not wait on an unbounded pipe (elapsed ${elapsed}s vs 30s child)"
+  [ "$(cat "$brief")" = "$before" ] || fail "brief must be unchanged when the capture file cannot be created"
+  assert_not_contains "$(cat "$brief")" "## Fleet memory" "no injection when the capture file cannot be created (fail-open)"
+  pass "a capture-file (mktemp) failure fails open immediately to no-injection - no unbounded pipe wait"
+}
+
 # --- fm-spawn integration (fakebin) -----------------------------------------
 make_fakebin() {  # <dir> -> echoes fakebin path
   local fakebin; fakebin=$(fm_fakebin "$1")
@@ -366,6 +388,7 @@ test_wrapper_no_cli_noop
 test_wrapper_deadline_native_hard_kill
 test_wrapper_deadline_perl_fallback_hard_kill
 test_wrapper_deadline_budget_zero_still_bounds
+test_wrapper_mktemp_failure_fails_open
 test_spawn_injects_by_default
 test_spawn_inert_when_registry_absent
 test_spawn_failopen_does_not_break_spawn

@@ -170,22 +170,24 @@ run_with_deadline() {  # runs "$@"; TERM at BUDGET, unconditional KILL at BUDGET
 # on the native timeout branch. A regular file has no such reader-waits-for-writer
 # behaviour, so the wrapper returns as soon as the deadline tool does.
 dl_out=$(mktemp "${TMPDIR:-/tmp}/fm-mem-inject.XXXXXX" 2>/dev/null || true)
-if [ -n "$dl_out" ]; then
-  if run_with_deadline "${MEM_CMD[@]}" "${args[@]}" >"$dl_out" 2>&1; then
-    out=$(cat "$dl_out"); [ -n "$out" ] && printf '%s\n' "$out"
-  else
-    rc=$?
-    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-      debug "mem inject-brief hit the ${BUDGET}s deadline (treated as no-injection); brief unchanged"
-    else
-      debug "mem inject-brief exited $rc (treated as no-injection): $(cat "$dl_out" 2>/dev/null || true)"
-    fi
-  fi
-  rm -f "$dl_out"
-elif out=$(run_with_deadline "${MEM_CMD[@]}" "${args[@]}" 2>&1); then
-  # mktemp unavailable (extremely unlikely): fall back to inline capture.
-  [ -n "$out" ] && printf '%s\n' "$out"
-else
-  debug "mem inject-brief exited non-zero (treated as no-injection): $out"
+if [ -z "$dl_out" ]; then
+  # No capture file (e.g. TMPDIR names an absent/unwritable dir). Do NOT fall back
+  # to a command-substitution pipe: a killed child's grandchild could hold that pipe
+  # open past the deadline - the exact FC-006 wedge the file capture exists to
+  # prevent. The whole path is fail-open-to-no-injection, so refuse recall entirely
+  # here (the CLI is never even invoked) and leave the brief unchanged.
+  debug "could not create a capture file (mktemp failed); brief unchanged (fail-open, no recall)"
+  exit 0
 fi
+if run_with_deadline "${MEM_CMD[@]}" "${args[@]}" >"$dl_out" 2>&1; then
+  out=$(cat "$dl_out"); [ -n "$out" ] && printf '%s\n' "$out"
+else
+  rc=$?
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    debug "mem inject-brief hit the ${BUDGET}s deadline (treated as no-injection); brief unchanged"
+  else
+    debug "mem inject-brief exited $rc (treated as no-injection): $(cat "$dl_out" 2>/dev/null || true)"
+  fi
+fi
+rm -f "$dl_out"
 exit 0
