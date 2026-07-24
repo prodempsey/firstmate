@@ -67,9 +67,14 @@ bin/fm-profile-matrix-check.sh            # validate the committed matrix
 bin/fm-profile-matrix-check.sh --bindings state/crew-profile-bindings.json
 ```
 
-Coverage lives in `tests/fm-profile-matrix-check.test.sh` (test group T.2 of the
-design in full). Wiring this validator into bootstrap diagnostics and into the
-governed dispatch path is later-slice work (bootstrap/S4), not part of S3.
+Coverage lives in `tests/fm-profile-matrix-check.test.sh` (the T.2 static rules
+in full, plus fail-closed parsing of malformed/duplicate keys). The two T.2
+*runtime* probes (a real Agent-denial dispatch, a live maxTurns cutoff) require a
+dispatch path and real model calls; their explicit, design-referenced deferral
+and the ready-to-run probe procedure are recorded in
+`docs/model-economy/slice3-notes.md`. Wiring this validator into bootstrap
+diagnostics and into the governed dispatch path is later-slice work
+(bootstrap/S4), not part of S3.
 
 ## Maintaining this file
 

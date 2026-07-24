@@ -20,13 +20,21 @@
 #
 # Exit 0: the matrix is coherent. Prints "PROFILES_OK=<n>" unless --quiet.
 # Exit 1: incoherent. Prints exactly one stable code line to stderr:
-#   PROFILE_MANIFEST_MISSING | PROFILE_MANIFEST_INVALID | PROFILE_MANIFEST_SCHEMA_UNSUPPORTED |
-#   PROFILE_MANIFEST_INCONSISTENT | PROFILE_PROHIBITED_PRESENT | PROFILE_FILE_MISSING |
-#   PROFILE_FILE_UNKNOWN | PROFILE_FRONTMATTER_INVALID | PROFILE_NAME_MISMATCH |
+#   PROFILE_MANIFEST_MISSING | PROFILE_MANIFEST_INVALID | PROFILE_MANIFEST_DUPLICATE_KEY |
+#   PROFILE_MANIFEST_SCHEMA_UNSUPPORTED | PROFILE_MANIFEST_INCONSISTENT |
+#   PROFILE_PROHIBITED_PRESENT | PROFILE_FILE_MISSING | PROFILE_FILE_UNKNOWN |
+#   PROFILE_FRONTMATTER_INVALID | PROFILE_FRONTMATTER_DUPLICATE_KEY | PROFILE_NAME_MISMATCH |
 #   PROFILE_MODEL_MISMATCH | PROFILE_EFFORT_MISMATCH | PROFILE_TOOLS_MISMATCH |
 #   PROFILE_WRITES_MISMATCH | PROFILE_NESTING_MISMATCH | PROFILE_MAXTURNS_OUT_OF_RANGE |
 #   PROFILE_VERSION_MISMATCH | PROFILE_BINDINGS_MISMATCH
 # Exit 2: usage error.
+#
+# Fail-closed parsing: duplicate object keys in the manifest JSON (jq silently
+# keeps the last, so a raw python3 parse detects them, matching the pattern in
+# bin/fm-bindings-validate.sh), and in the agent frontmatter an unterminated
+# block or any duplicate governed key, are all rejected before any parsed value
+# is trusted - an ambiguous key is unsafe because this validator and the runtime
+# loader need not resolve it to the same occurrence.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -68,9 +76,42 @@ die() { # die <CODE> <message>
   exit 1
 }
 
+# raw_dup_keys <json-file>: echo any duplicate object keys (any depth), one per
+# line. jq keeps only the last occurrence, so a raw parse is required to see the
+# ambiguity. Mirrors bin/fm-bindings-validate.sh's detection; degrades to a
+# warning (no false pass) only if python3 is genuinely absent.
+raw_dup_keys() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$1" <<'PYEOF'
+import json, sys
+dups = []
+def hook(pairs):
+    ks = [k for k, _ in pairs]
+    for k in sorted(set(k for k in ks if ks.count(k) > 1)):
+        dups.append(k)
+    return dict(pairs)
+try:
+    json.load(open(sys.argv[1]), object_pairs_hook=hook)
+except Exception as e:
+    print("RAWPARSE_ERROR:%s" % e); sys.exit(4)
+if dups:
+    print("\n".join(dups)); sys.exit(3)
+PYEOF
+    return $?
+  fi
+  echo "fm-profile-matrix-check: warning: python3 absent - JSON duplicate-key check skipped" >&2
+  return 0
+}
+
 # --- manifest load + self-consistency --------------------------------------
 [ -f "$MANIFEST" ] || die PROFILE_MANIFEST_MISSING "manifest not found: $MANIFEST"
 jq -e . "$MANIFEST" >/dev/null 2>&1 || die PROFILE_MANIFEST_INVALID "manifest is not valid JSON: $MANIFEST"
+dupout=$(raw_dup_keys "$MANIFEST"); rc=$?
+case "$rc" in
+  0) : ;;
+  3) die PROFILE_MANIFEST_DUPLICATE_KEY "duplicate key(s) in manifest JSON: $(echo "$dupout" | tr '\n' ' ')" ;;
+  *) die PROFILE_MANIFEST_INVALID "manifest raw-parse failed: $dupout" ;;
+esac
 
 SCHEMA=$(jq -r '.schema_version // ""' "$MANIFEST")
 [ "$SCHEMA" = "firstmate/governed-profiles/v1" ] || die PROFILE_MANIFEST_SCHEMA_UNSUPPORTED "unsupported schema_version: '$SCHEMA'"
@@ -102,11 +143,18 @@ for name in "${PROFILES[@]}"; do
 done
 
 # --- frontmatter helpers ----------------------------------------------------
-frontmatter() { # frontmatter <file> -> prints the first --- ... --- block body
-  awk 'NR==1 && $0 !~ /^---[[:space:]]*$/ { exit 1 }
-       /^---[[:space:]]*$/ { c++; next }
-       c==1 { print }
-       c>=2 { exit }' "$1"
+# frontmatter <file>: print the body of the first --- ... --- block. Fails
+# closed (non-zero, no output trusted) when the file does not open with --- on
+# line 1 (exit 2) or the block is never closed before EOF (exit 3). An
+# unterminated block must never be accepted as valid frontmatter.
+frontmatter() {
+  awk '
+    NR==1 && $0 !~ /^---[[:space:]]*$/ { exit 2 }
+    NR==1 { next }
+    /^---[[:space:]]*$/ { closed=1; exit 0 }
+    { print }
+    END { if (!closed) exit 3 }
+  ' "$1"
 }
 fm_has() { # fm_has <fm-text> <key>
   printf '%s\n' "$1" | grep -Eq "^$2:[[:space:]]"
@@ -144,8 +192,13 @@ for name in "${PROFILES[@]}"; do
   file="$AGENTS_DIR/$name.md"
   [ -f "$file" ] || die PROFILE_FILE_MISSING "missing agent file for profile: $name.md"
 
-  fm=$(frontmatter "$file") || die PROFILE_FRONTMATTER_INVALID "$name.md must open with a --- frontmatter block"
+  fm=$(frontmatter "$file") || die PROFILE_FRONTMATTER_INVALID "$name.md frontmatter is missing, malformed, or unterminated"
   [ -n "$fm" ] || die PROFILE_FRONTMATTER_INVALID "$name.md has an empty frontmatter block"
+
+  # No governed key may appear twice: a duplicate is ambiguous, and fm_scalar
+  # (first-match) and the runtime YAML loader need not resolve it identically.
+  dupkeys=$(printf '%s\n' "$fm" | grep -oE '^[A-Za-z_]+:' | sort | uniq -d | tr -d ':' | tr '\n' ' ')
+  [ -z "${dupkeys// /}" ] || die PROFILE_FRONTMATTER_DUPLICATE_KEY "$name.md: duplicate frontmatter key(s): $dupkeys"
 
   # manifest expectations
   m_model=$(jq -r --arg n "$name" '.profiles[$n].model' "$MANIFEST")

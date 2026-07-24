@@ -2,13 +2,18 @@
 # Behavior tests for bin/fm-profile-matrix-check.sh — the fail-closed validator
 # for the governed agent-profile matrix (model-economy program, ORD-224 slice
 # S3). Implements test group T.2 (profile definitions) from
-# data/model-economy/ord-223-report.md in full: the static rules of the group,
-# with per-rule negative cases proving each drift fails closed with its own
-# stable code. The T.2 runtime probes (a live dispatch cut off at maxTurns, a
-# real Agent call on a non-nesting profile) are deliberately out of scope for
-# this additive definitions-only slice, which forces no dispatch through the
-# profiles yet; those probes belong to the S4/S5 slices that wire the profiles
-# into an actual dispatch path.
+# data/model-economy/ord-223-report.md: every STATIC rule of the group, plus
+# fail-closed parsing (unterminated / duplicate frontmatter keys, duplicate
+# manifest JSON keys), with per-rule negative cases proving each drift fails
+# closed with its own stable code.
+#
+# The two T.2 RUNTIME probes — a real non-nesting-profile dispatch attempting
+# Agent (ord-223-report.md:1435) and a live run cut off at maxTurns
+# (ord-223-report.md:1437) — are live-harness observations that require an actual
+# dispatch path (S4/S5) and real model calls, so they are unfit for this
+# always-on CI suite. Their deferral is recorded EXPLICITLY, with the ready-to-run
+# probe procedure and the proposed S3-acceptance amendment, in
+# docs/model-economy/slice3-notes.md — not silently dropped.
 #
 # Fully sandboxed: every fixture is a copy of the committed manifest and agent
 # files into a mktemp root, mutated one axis at a time. The positive parity
@@ -295,7 +300,100 @@ test_unknown_profile_file_rejected() {
   pass "an ungoverned agent file fails closed"
 }
 
+# --- fail-closed parsing: unterminated / duplicate frontmatter keys ---------
+
+test_unterminated_frontmatter_rejected() {
+  fresh
+  # Strip the closing --- delimiter from a profile's frontmatter block.
+  awk 'BEGIN{c=0} /^---[[:space:]]*$/{c++; if(c==2) next} {print}' \
+    "$D/opus-high.md" > "$D/opus-high.md.tmp" && mv "$D/opus-high.md.tmp" "$D/opus-high.md"
+  runc
+  expect_code 1 "$RC" "an unterminated frontmatter block must be rejected"
+  assert_contains "$OUT" "PROFILE_FRONTMATTER_INVALID" "unterminated frontmatter is a PROFILE_FRONTMATTER_INVALID"
+  pass "an unterminated frontmatter block fails closed"
+}
+
+test_file_not_opening_with_delimiter_rejected() {
+  fresh
+  printf 'oops not frontmatter\n%s' "$(cat "$D/opus-high.md")" > "$D/opus-high.md.tmp" \
+    && mv "$D/opus-high.md.tmp" "$D/opus-high.md"
+  runc
+  expect_code 1 "$RC" "a file not opening with --- must be rejected"
+  assert_contains "$OUT" "PROFILE_FRONTMATTER_INVALID" "a bad opening is a PROFILE_FRONTMATTER_INVALID"
+  pass "a profile file that does not open with a frontmatter delimiter fails closed"
+}
+
+test_duplicate_frontmatter_key_rejected() {
+  # Every governed key, when duplicated, must be rejected as ambiguous — even
+  # when the duplicate value still matches the manifest. Duplication is by exact
+  # line equality (awk), so bracketed list values are handled literally.
+  local lines=(
+    "name: opus-high"
+    "model: opus"
+    "EFFORT: high"
+    "tools: [Read, Write, Edit, Bash, Grep, Glob]"
+    "disallowedTools: [Agent]"
+    "maxTurns: 24"
+    "profile_version: 1"
+  )
+  local line key
+  for line in "${lines[@]}"; do
+    key=${line%%:*}
+    fresh
+    awk -v L="$line" '{print} $0==L && !d {print L; d=1}' \
+      "$D/opus-high.md" > "$D/opus-high.md.tmp" && mv "$D/opus-high.md.tmp" "$D/opus-high.md"
+    runc
+    expect_code 1 "$RC" "a duplicate '$key' frontmatter key must be rejected"
+    assert_contains "$OUT" "PROFILE_FRONTMATTER_DUPLICATE_KEY" "duplicate '$key' is a PROFILE_FRONTMATTER_DUPLICATE_KEY"
+  done
+  pass "a duplicate of any governed frontmatter key fails closed"
+}
+
+test_duplicate_frontmatter_key_with_divergent_value_rejected() {
+  fresh
+  # The QA repro: a second, DIFFERENT model value after the valid one — the
+  # validator and the runtime loader could disagree on which wins.
+  sed -i '/^model: opus$/a model: fable' "$D/opus-high.md"
+  runc
+  expect_code 1 "$RC" "a divergent duplicate model key must be rejected"
+  assert_contains "$OUT" "PROFILE_FRONTMATTER_DUPLICATE_KEY" "a divergent duplicate model is caught before its value is trusted"
+  pass "a duplicate model key with a divergent value fails closed"
+}
+
 # --- manifest integrity -----------------------------------------------------
+
+test_duplicate_manifest_key_rejected() {
+  fresh
+  # Inject a duplicate top-level schema_version key into the raw JSON. jq keeps
+  # only the last, so the ambiguity must be caught by the raw-parse guard.
+  python3 - "$M" > "$M.tmp" <<'PY'
+import sys
+s = open(sys.argv[1]).read()
+s = s.replace('{\n', '{\n  "schema_version": "firstmate/governed-profiles/v1",\n', 1)
+sys.stdout.write(s)
+PY
+  mv "$M.tmp" "$M"
+  runc
+  expect_code 1 "$RC" "a duplicate manifest JSON key must be rejected"
+  assert_contains "$OUT" "PROFILE_MANIFEST_DUPLICATE_KEY" "a duplicate manifest key has its own code"
+  pass "a duplicate manifest JSON key fails closed"
+}
+
+test_duplicate_nested_manifest_key_rejected() {
+  fresh
+  # A duplicate key nested inside a profile object must also be caught.
+  python3 - "$M" > "$M.tmp" <<'PY'
+import sys
+s = open(sys.argv[1]).read()
+s = s.replace('"opus-high": {\n', '"opus-high": {\n      "model": "fable",\n', 1)
+sys.stdout.write(s)
+PY
+  mv "$M.tmp" "$M"
+  runc
+  expect_code 1 "$RC" "a duplicate nested manifest key must be rejected"
+  assert_contains "$OUT" "PROFILE_MANIFEST_DUPLICATE_KEY" "a nested duplicate manifest key has its own code"
+  pass "a duplicate key nested in a manifest profile fails closed"
+}
 
 test_manifest_missing_rejected() {
   fresh
@@ -423,6 +521,12 @@ test_name_mismatch_rejected
 test_model_mismatch_rejected
 test_missing_profile_file_rejected
 test_unknown_profile_file_rejected
+test_unterminated_frontmatter_rejected
+test_file_not_opening_with_delimiter_rejected
+test_duplicate_frontmatter_key_rejected
+test_duplicate_frontmatter_key_with_divergent_value_rejected
+test_duplicate_manifest_key_rejected
+test_duplicate_nested_manifest_key_rejected
 test_manifest_missing_rejected
 test_manifest_invalid_json_rejected
 test_manifest_bad_schema_rejected
