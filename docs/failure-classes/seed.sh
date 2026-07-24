@@ -92,6 +92,7 @@ emit_seed() {
   --cue "'if python3/jq/jsonschema/timeout absent, fall back to ...'" \
   --cue "a duplicate/type/deadline check that only runs when an optional tool is present" \
   --cue "the fix relies on GNU-only tooling that is simply absent on a supported platform (macOS)" \
+  --detection '{"engine":"awk-ere","pattern":"command -v .*[|][|][[:space:]]*(true|:|return 0|continue)([[:space:]#]|$)","cue_ref":"command -v X || <skip the check> / <weaker path>"}' \
   --provenance "ruling:data/me-s3-profiles/design-ruling.md#3.2:python3+PyYAML+jsonschema are hard prerequisites; if any is absent print PROFILE_VALIDATOR_UNAVAILABLE and exit 1, never warn-and-pass" \
   --provenance "ruling:data/me-s3-profiles/design-ruling.md#5:MUST NOT degrade when any engine is absent" \
   --provenance "qa:data/qa-me-s3r7-q125/report.md:engine fail-closed / no-degradation contract under absent tool"
@@ -117,6 +118,7 @@ emit_seed() {
   --cue "|| true that handles a non-zero exit but NOT a child that never returns" \
   --cue "a deadline implemented with a GNU-only timeout that is absent on a supported host" \
   --cue "a network/HTTP/recall call awaited inline on the critical path" \
+  --detection '{"engine":"awk-ere","pattern":"(curl|wget|nc|ssh|wait|sleep)([[:space:]][^|]*)?[|][|][[:space:]]*true([[:space:]#]|$)","cue_ref":"|| true that handles a non-zero exit but NOT a child that never returns"}' \
   --provenance "qa:data/qa-mem-pr4-q115/report.md#104:injection cannot block a spawn - FAIL: the memory CLI is executed synchronously with no timeout (fm-memory-inject.sh:113)" \
   --provenance "qa:data/qa-mem-pr4r2-q116/report.md#69:supported hosts without GNU timeout remain unbounded" \
   --provenance "qa:data/qa-mem-pr4r4-q118/report.md#84:fix - portable PID-watchdog deadline completes a 2s budget against a 12s child, brief unchanged" \
@@ -130,6 +132,7 @@ emit_seed() {
   --cue "a stale derived index treated as a 'proven' result and consumed" \
   --cue "an operation that leaves a partial/temp file on crash (no atomic rename)" \
   --cue "'invalidate' that neither verifies the old artifact is gone nor refuses on failure" \
+  --detection '{"engine":"awk-ere","pattern":"rm[[:space:]].*2>/dev/null.*[|][|][[:space:]]*true","cue_ref":"rm -f ... 2>/dev/null || true guarding an attestation/sidecar/lock"}' \
   --provenance "qa:data/qa-me-s3r6-q124/report.md#98:unlink refusal leaves stale authority; the unconditional || true neither verifies the old attestation is gone nor refuses" \
   --provenance "qa:data/qa-mem-pr4-q115/report.md#112:F1 - stale or missing derived index injects instead of failing open" \
   --provenance "qa:data/qa-s6-q72/report.md#90:fix pattern - temp write + fsync + atomic rename; the crashed child leaves no final partial file"

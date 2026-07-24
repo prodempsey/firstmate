@@ -261,7 +261,7 @@ cmd_validate() {
 FC_EVENT="" FC_ID="" FC_PROVCOUNT=0
 build_class_event() {
   local id="" name="" invariant="" fix="" memtype="procedural" scope="fleet" confidence="guarded"
-  local cues=() provs=() keywords=()
+  local cues=() provs=() keywords=() dets=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --id) id=${2:-}; shift 2 ;;
@@ -269,6 +269,7 @@ build_class_event() {
       --invariant) invariant=${2:-}; shift 2 ;;
       --fix) fix=${2:-}; shift 2 ;;
       --cue) cues+=("${2:-}"); shift 2 ;;
+      --detection) dets+=("${2:-}"); shift 2 ;;
       --provenance) provs+=("${2:-}"); shift 2 ;;
       --keyword) keywords+=("${2:-}"); shift 2 ;;
       --memory-type) memtype=${2:-}; shift 2 ;;
@@ -297,14 +298,25 @@ build_class_event() {
   local slug; slug=$(echo "$name" | tr '[:upper:] /' '[:lower:]--' | tr -cd 'a-z0-9-' | tr -s '-' | cut -c1-40 | sed 's/-*$//')
   kw_json=$(printf '%s\n' "$MARKER_KEYWORD" "$id" "$slug" "${keywords[@]:-}" \
     | jq -R 'select(length>0)' | jq -s 'unique_by(.)')
+  # Optional machine-readable detection: each --detection is one JSON object
+  # ({engine, pattern, cue_ref, ...}) that graduates a natural-language cue into an
+  # executable check a verifier can run live from this ledger. The field is emitted
+  # only when supplied, so classes without detection stay byte-identical.
+  local dets_json="[]"
+  if [ "${#dets[@]}" -gt 0 ]; then
+    dets_json=$(printf '%s\n' "${dets[@]}" | jq -c . 2>/dev/null | jq -sc .) \
+      || die "each --detection must be one valid JSON object"
+  fi
   FC_EVENT=$(jq -cn \
     --arg schema "$SCHEMA" --arg id "$id" --arg name "$name" \
     --arg inv "$invariant" --arg fix "$fix" \
     --arg mt "$memtype" --arg scope "$scope" --arg conf "$confidence" \
     --argjson cues "$cues_json" --argjson prov "$prov_json_arr" --argjson kw "$kw_json" \
+    --argjson dets "$dets_json" \
     '{schema:$schema, event:"class-defined", id:$id, name:$name, invariant:$inv,
       cues:$cues, fix:$fix, provenance:$prov,
-      registry:{memory_type:$mt, scope:$scope, confidence:$conf, keywords:$kw}}')
+      registry:{memory_type:$mt, scope:$scope, confidence:$conf, keywords:$kw}}
+     + (if ($dets|length) > 0 then {detection:$dets} else {} end)')
   FC_ID="$id"
   FC_PROVCOUNT=$(echo "$prov_json_arr" | jq length)
 }

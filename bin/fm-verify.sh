@@ -11,47 +11,50 @@
 # judgement, not on things a script can prove. Design authority:
 # data/kl-improve2-scout-f6/report.md improvement 1 (in firstmate-runtime).
 #
-# A verifier must itself obey the failure-class ledger it lints with. The five
-# invariants that shape this script:
+# A verifier must itself obey the failure-class ledger it lints with. The
+# invariants that shape this script (each proven by an adversarial fixture):
 #   FC-002  completeness is positive per-item proof; absence from a partial
-#           discovery is NOT discharge - every declared suite is executed and
-#           recorded, never a first-match ladder that silently omits one.
+#           discovery is NOT discharge. Suites are enumerated INDEPENDENTLY of
+#           execution from authoritative structures (a filesystem glob, Make's
+#           own parsed target database, package.json), recorded as a declared
+#           manifest, and matched one-to-one to execution records.
 #   FC-004  a missing prerequisite tool is a refusal, never a skipped check.
-#   FC-005  the proof must be ATOMIC with the attestation it authorizes - every
-#           mutable git fact is read once AFTER execution and revalidated against
-#           a pre-execution snapshot; any drift fails the run.
-#   FC-006  every call on this latency-critical path is bounded by a PORTABLE
-#           hard deadline (timeout/gtimeout, else a PID-watchdog) that a missing
-#           tool cannot defeat; a wedged suite is a finding, never a hang.
-#   FC-007  the authoritative output is INVALIDATED before work begins, so no
-#           refusal or crash can leave a stale passing bundle to be read as fresh.
+#   FC-005  the proof must be ATOMIC with the attestation. Tests NEVER run in the
+#           authority-bearing worktree: they run in a disposable checkout of the
+#           exact HEAD tree, so no test - synchronous or a delayed background
+#           child - can dirty the tree whose cleanliness the bundle attests. The
+#           authoritative worktree is only ever read.
+#   FC-006  every suite runs under a PORTABLE hard deadline (timeout/gtimeout,
+#           else a PID-watchdog killing only the exact child) a missing tool
+#           cannot defeat; a wedged suite is a finding, never a hang.
+#   FC-007  the authoritative outputs (bundle JSON and its summary sibling) are
+#           INVALIDATED before any refusable check or tool-dependent work runs, so
+#           NO refusal (unknown option, bad format, missing tool/binding) can
+#           leave a stale passing artifact to be read as fresh.
 #
 # THE GATES (each recorded in the bundle with pass/fail and findings)
 #   identity        HEAD SHA + branch bound to the DECLARED candidate (mandatory
-#                   --sha/--branch); tree clean - read post-execution
+#                   --sha/--branch); tree clean
 #   base_currency   the candidate contains the current canonical trunk tip
 #                   (bin/fm-trunk-check.sh integration when --project is given)
-#   tests           EVERY discovered suite ACTUALLY EXECUTED under a hard
-#                   deadline; PASS/FAIL/SKIP/TIMEOUT parsed; SKIP, timeout, and
-#                   no-tests are findings, never passes
-#   cue_lint        failure-class detection cues sourced from the ledger's
-#                   machine-readable `detection` field (built-in patterns are a
-#                   labeled fallback) grepped against the candidate DIFF
-#   brief_contract  the dispatch contract echoed from the mandatory brief plus
-#                   the mechanically-checkable items (committed work, branch)
-#   revalidation    the pre-execution git snapshot equals the post-execution one
-#                   (FC-005): HEAD, branch, porcelain, and base did not move
-#
-# THE BUNDLE lands at data/<task>/verify-bundle.json (JSON) with a sibling
-# verify-summary.md; a human summary also prints to stdout. The path is
-# invalidated first (FC-007) and the final result is published atomically.
+#   tests           EVERY independently-enumerated suite ACTUALLY EXECUTED in an
+#                   isolated checkout under a hard deadline; PASS/FAIL/SKIP/TIMEOUT
+#                   parsed; SKIP, timeout, no-tests, and any declared!=executed
+#                   mismatch are findings, never passes
+#   cue_lint        failure-class detection cues read LIVE from the ledger's
+#                   machine-readable `detection` field (docs/failure-classes/
+#                   ledger.jsonl) - no hardcoded patterns - grepped against the diff
+#   brief_contract  the dispatch contract echoed from the mandatory brief plus the
+#                   mechanically-checkable items (committed work, branch)
+#   revalidation    the authority-bearing worktree did not change during
+#                   verification (defence in depth atop isolated execution)
 #
 # EXIT
 #   0  clean pass: every gate passed with zero findings
 #   1  findings: at least one gate failed or produced a finding
 #   2  refuse: a prerequisite tool is missing, a mandatory binding is absent or
-#      unreadable, or an input could not be read (fail closed; the output path is
-#      left carrying a non-authoritative "invalidated" marker, never a stale pass)
+#      unreadable, or an input could not be read (fail closed; the outputs are left
+#      carrying a non-authoritative "invalidated" marker, never a stale pass)
 #
 # Usage:
 #   fm-verify.sh --worktree <path> --sha <sha> --branch <name> --task <id> [options]
@@ -61,7 +64,7 @@
 #     --task <id>         REQUIRED. Task id: locates the brief and default --out.
 #     --base <ref>        Explicit base ref for currency + diff (skips trunk-check).
 #     --project <name>    Resolve the canonical trunk via bin/fm-trunk-check.sh.
-#     --tests-cmd <cmd>   Explicit closed test command run in the worktree.
+#     --tests-cmd <cmd>   Explicit closed test command run in the isolated checkout.
 #     --brief <file>      Brief file to echo + check (default data/<task>/brief.md).
 #     --out <file>        Bundle path (default data/<task>/verify-bundle.json).
 #     --format json|text  Human summary format on stdout (default text).
@@ -84,11 +87,48 @@ TEST_TIMEOUT="${FM_VERIFY_TEST_TIMEOUT:-600}"
 
 usage() { sed -n '/^# Usage:/,/^set -u$/p' "$0" | sed 's/^# \{0,1\}//;$d'; }
 
-# refuse() aborts with exit 2. Once OUT is known it is left carrying the
-# invalidation marker written by invalidate_output (FC-007), never a stale pass.
+# refuse() aborts with exit 2. Once the outputs are known they have already been
+# overwritten with the invalidation marker (FC-007), never a stale pass.
 refuse() { echo "fm-verify: $1" >&2; exit 2; }
 
-# --- arguments (pure bash; parsed before any external-tool dependency) --------
+# ============================================================================
+# FC-007: resolve and INVALIDATE the outputs before any refusable/tool-dependent
+# work. A side-effect-free lenient scan finds --out/--task without validating
+# anything, so an unknown option or a bad --format below cannot preserve a stale
+# pass. Both the JSON bundle AND its advertised summary sibling are invalidated.
+# ============================================================================
+scan_output_target() {
+  local out="" task=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out=${2:-}; if [ $# -ge 2 ]; then shift 2; else shift; fi ;;
+      --task) task=${2:-}; if [ $# -ge 2 ]; then shift 2; else shift; fi ;;
+      *) shift ;;
+    esac
+  done
+  if [ -n "$out" ]; then printf '%s\n' "$out"
+  elif [ -n "$task" ]; then printf '%s\n' "$DATA/$task/verify-bundle.json"; fi
+}
+OUT=$(scan_output_target "$@")
+OUT_DIR=""
+SUMMARY_OUT=""
+if [ -n "$OUT" ]; then
+  OUT_DIR=$(dirname "$OUT")
+  SUMMARY_OUT="$OUT_DIR/verify-summary.md"
+  mkdir -p "$OUT_DIR" || refuse "cannot create output dir: $OUT_DIR (stale output NOT invalidated)"
+  tmp="$OUT.invalidating.$$"
+  printf '%s\n' '{"schema":"firstmate/verify-bundle/1","verdict":"invalidated","reason":"verification started or refused; no authoritative result at this path","gates":[],"findings":[]}' > "$tmp" \
+    || refuse "cannot stage bundle invalidation marker"
+  mv -f "$tmp" "$OUT" || { rm -f "$tmp"; refuse "cannot invalidate stale bundle at $OUT"; }
+  stmp="$SUMMARY_OUT.invalidating.$$"
+  printf '%s\n' '# Gauntlet verify - invalidated' '' 'Verification started or refused; there is no authoritative result at this path.' > "$stmp" \
+    || refuse "cannot stage summary invalidation marker"
+  mv -f "$stmp" "$SUMMARY_OUT" || { rm -f "$stmp"; refuse "cannot invalidate stale summary at $SUMMARY_OUT"; }
+fi
+
+# ============================================================================
+# Strict parse (may refuse; the outputs above are already invalidated)
+# ============================================================================
 WORKTREE=""
 EXPECT_SHA=""
 EXPECT_BRANCH=""
@@ -98,7 +138,6 @@ TESTS_CMD=""
 TESTS_CMD_SET=no
 BRIEF=""
 TASK=""
-OUT=""
 FORMAT=text
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -111,7 +150,7 @@ while [ $# -gt 0 ]; do
     --tests-cmd) TESTS_CMD=${2:-}; TESTS_CMD_SET=yes; shift ;;
     --brief) BRIEF=${2:-}; shift ;;
     --task) TASK=${2:-}; shift ;;
-    --out) OUT=${2:-}; shift ;;
+    --out) shift ;;
     --format) FORMAT=${2:-}; shift ;;
     -*) refuse "unknown option $1" ;;
     *) refuse "unexpected argument $1" ;;
@@ -120,36 +159,14 @@ while [ $# -gt 0 ]; do
 done
 
 case "$FORMAT" in json|text) ;; *) refuse "--format must be json or text" ;; esac
-
-# The output path must be resolvable before anything else so it can be
-# invalidated (FC-007). --task alone is enough (it fixes the default path).
-if [ -z "$OUT" ]; then
-  [ -n "$TASK" ] || refuse "--out or --task is required to place (and invalidate) the bundle"
-  OUT="$DATA/$TASK/verify-bundle.json"
-fi
-OUT_DIR=$(dirname "$OUT")
-
-# --- FC-007: invalidate the authoritative output as the FIRST durable action --
-# A non-authoritative marker overwrites any prior bundle before a single
-# tool-dependent or execution step runs, so NO refusal or crash below can leave a
-# stale passing bundle at OUT. The marker is written with printf (no jq), so it
-# does not depend on the prerequisite tools checked next. A failed invalidation
-# fails the run rather than proceeding over stale authority.
-invalidate_output() {
-  mkdir -p "$OUT_DIR" || refuse "cannot create output dir: $OUT_DIR (stale output NOT invalidated)"
-  local tmp="$OUT.invalidating.$$"
-  printf '%s\n' '{"schema":"firstmate/verify-bundle/1","verdict":"invalidated","reason":"verification started or refused; no authoritative result at this path","gates":[],"findings":[]}' > "$tmp" \
-    || refuse "cannot stage invalidation marker at $tmp"
-  mv -f "$tmp" "$OUT" || { rm -f "$tmp"; refuse "cannot invalidate stale output at $OUT"; }
-}
-invalidate_output
+[ -n "$OUT" ] || refuse "--out or --task is required to place (and invalidate) the bundle"
 
 # --- prerequisites (FC-004: a missing tool is a refusal, not a skipped check) --
 for tool in git jq awk grep sed; do
   command -v "$tool" >/dev/null 2>&1 || refuse "missing prerequisite tool: $tool (fail closed, FC-004)"
 done
 
-# --- mandatory bindings (F1: identity is proven, never merely observed) -------
+# --- mandatory bindings (identity is proven, never merely observed) -----------
 [ -n "$WORKTREE" ] || refuse "--worktree is required"
 [ -d "$WORKTREE" ] || refuse "worktree does not exist: $WORKTREE"
 git -C "$WORKTREE" rev-parse --git-dir >/dev/null 2>&1 || refuse "worktree is not a git repository: $WORKTREE"
@@ -161,10 +178,17 @@ git -C "$WORKTREE" rev-parse --git-dir >/dev/null 2>&1 || refuse "worktree is no
 case "$TEST_TIMEOUT" in ''|*[!0-9]*) refuse "FM_VERIFY_TEST_TIMEOUT must be a positive integer: $TEST_TIMEOUT" ;; esac
 [ "$TEST_TIMEOUT" -gt 0 ] || refuse "FM_VERIFY_TEST_TIMEOUT must be a positive integer: $TEST_TIMEOUT"
 
-# --- scratch ----------------------------------------------------------------
+# --- scratch + guaranteed teardown of the disposable checkout -----------------
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/fm-verify.XXXXXX") || refuse "cannot create scratch dir"
+SANDBOX=""
 # shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below
-cleanup() { rm -rf "$WORK"; }
+cleanup() {
+  if [ -n "$SANDBOX" ]; then
+    git -C "$WORKTREE" worktree remove --force "$SANDBOX" >/dev/null 2>&1 || true
+    git -C "$WORKTREE" worktree prune >/dev/null 2>&1 || true
+  fi
+  rm -rf "$WORK"
+}
 trap cleanup EXIT
 
 GATES="$WORK/gates.jsonl"
@@ -173,7 +197,6 @@ FINDINGS="$WORK/findings.jsonl"
 : > "$FINDINGS"
 
 FINDING_COUNT=0
-# emit_finding <gate> <code> <severity> <message> [file] [line]
 emit_finding() {
   local gate=$1 code=$2 severity=$3 message=$4 file=${5:-} line=${6:-}
   jq -nc \
@@ -184,7 +207,6 @@ emit_finding() {
       line:(if $line=="" then null else ($line|tonumber?) end)}' >> "$FINDINGS"
   FINDING_COUNT=$((FINDING_COUNT + 1))
 }
-# emit_gate <name> <status> <details-json>
 emit_gate() {
   local name=$1 status=$2 details=$3
   jq -nc --arg name "$name" --arg status "$status" --argjson details "$details" \
@@ -208,10 +230,6 @@ resolve_local_default() {
   done
   return 1
 }
-
-# base_tip_now echoes the base's current commit, so a test that moved a local
-# base ref is caught by revalidation (FC-005). A trunk-check base lives in an
-# external checkout and cannot be moved by the candidate's tests.
 base_tip_now() {
   case "$BASE_SOURCE" in
     explicit) git -C "$WORKTREE" rev-parse --verify "$BASE_REF^{commit}" 2>/dev/null || true ;;
@@ -268,7 +286,7 @@ else
 fi
 
 # ============================================================================
-# PRE-execution snapshot (FC-005 baseline)
+# PRE-execution snapshot of the AUTHORITATIVE worktree (revalidation baseline)
 # ============================================================================
 SHA0=$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || true)
 BRANCH0=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
@@ -276,37 +294,81 @@ DIRTY0=no; [ -n "$(git -C "$WORKTREE" status --porcelain 2>/dev/null || true)" ]
 BASE0=$(base_tip_now)
 
 # ============================================================================
-# GATE: tests - EVERY discovered suite executed under a hard deadline
+# FC-005: build a DISPOSABLE isolated checkout of the exact HEAD tree. All test
+# execution happens here, never in the authority-bearing worktree, so no test
+# (even a delayed background child) can dirty the tree the bundle attests.
+# ============================================================================
+EXEC_DIR=""
+if [ -n "$SHA0" ]; then
+  SANDBOX="$WORK/sandbox"
+  if git -C "$WORKTREE" worktree add --detach --quiet "$SANDBOX" "$SHA0" 2>"$WORK/wt.err"; then
+    EXEC_DIR="$SANDBOX"
+  else
+    SANDBOX=""
+    emit_finding tests sandbox-failed fail "could not create an isolated test checkout at $SHA0: $(head -1 "$WORK/wt.err" 2>/dev/null)"
+  fi
+fi
+
+# ============================================================================
+# GATE: tests - independently enumerated, isolated, bounded execution
 # ============================================================================
 tests_status=pass
 TOTAL_OK=0
 TOTAL_NOTOK=0
 TOTAL_SKIP=0
 SUITE_JSONL="$WORK/suites.jsonl"
-DETECTED_FILE="$WORK/detected.txt"
+DECLARED_FILE="$WORK/declared.tsv"    # <label>\t<kind>\t<arg>  - built BEFORE execution
 EXECUTED_FILE="$WORK/executed.txt"
-: > "$SUITE_JSONL"; : > "$DETECTED_FILE"; : > "$EXECUTED_FILE"
+: > "$SUITE_JSONL"; : > "$DECLARED_FILE"; : > "$EXECUTED_FILE"
+
+# --- independent discovery (FC-002): enumerate from authoritative structures ---
+if [ -n "$EXEC_DIR" ]; then
+  if [ "$TESTS_CMD_SET" = yes ]; then
+    printf 'explicit\texplicit\t\n' >> "$DECLARED_FILE"
+  else
+    if compgen -G "$EXEC_DIR/tests/*.test.sh" >/dev/null 2>&1; then
+      for t in "$EXEC_DIR"/tests/*.test.sh; do
+        printf 'shell:%s\tshell\t%s\n' "$(basename "$t")" "$t" >> "$DECLARED_FILE"
+      done
+    fi
+    if [ -f "$EXEC_DIR/package.json" ] && jq -e '.scripts.test' "$EXEC_DIR/package.json" >/dev/null 2>&1; then
+      printf 'npm test\tnpm\t\n' >> "$DECLARED_FILE"
+    fi
+    if [ -f "$EXEC_DIR/Makefile" ] || [ -f "$EXEC_DIR/makefile" ] || [ -f "$EXEC_DIR/GNUmakefile" ]; then
+      # Query Make's OWN parsed target database, not a single source spelling, so
+      # `test :`, `.PHONY: test`, and pattern rules are all seen. A Makefile with
+      # no tool to parse it is ambiguous discovery => fail closed (FC-004/FC-002).
+      if ! command -v make >/dev/null 2>&1; then
+        refuse "a Makefile is present but make is unavailable to enumerate its targets (fail closed, FC-004)"
+      fi
+      if make -C "$EXEC_DIR" -pn 2>/dev/null | grep -qE '^test:'; then
+        printf 'make test\tmake\t\n' >> "$DECLARED_FILE"
+      fi
+    fi
+  fi
+fi
+DECLARED_N=$(grep -c . "$DECLARED_FILE" 2>/dev/null || true); DECLARED_N=${DECLARED_N:-0}
 
 TIMEOUT_BIN=""
-for t in timeout gtimeout; do command -v "$t" >/dev/null 2>&1 && { TIMEOUT_BIN=$t; break; }; done
+for tb in timeout gtimeout; do command -v "$tb" >/dev/null 2>&1 && { TIMEOUT_BIN=$tb; break; }; done
 
-# run_bounded <budget> <outfile> <cmd...>: run cmd in the worktree under a hard
-# deadline (FC-006). Sets BOUNDED_TIMEOUT=yes and returns 124 on deadline. Falls
-# back to a PID-watchdog that kills ONLY the exact child PID when no
-# timeout/gtimeout is available, so a missing tool cannot defeat the deadline.
+# run_bounded <budget> <outfile> <cmd...>: run cmd in EXEC_DIR under a hard
+# deadline (FC-006). Sets BOUNDED_TIMEOUT=yes and returns 124 on deadline; the
+# PID-watchdog fallback kills ONLY the exact child PID so a missing tool cannot
+# defeat the deadline.
 BOUNDED_TIMEOUT=no
 run_bounded() {
   local budget=$1 outfile=$2; shift 2
   BOUNDED_TIMEOUT=no
   if [ -n "$TIMEOUT_BIN" ] && [ "${FM_VERIFY_FORCE_PID_WATCHDOG:-}" != 1 ]; then
-    ( cd "$WORKTREE" && exec "$TIMEOUT_BIN" -k 5 "$budget" "$@" ) > "$outfile" 2>&1
+    ( cd "$EXEC_DIR" && exec "$TIMEOUT_BIN" -k 5 "$budget" "$@" ) > "$outfile" 2>&1
     local rc=$?
     [ "$rc" -eq 124 ] && BOUNDED_TIMEOUT=yes
     return "$rc"
   fi
   local flag="$WORK/timedout.$RANDOM"
   rm -f "$flag"
-  ( cd "$WORKTREE" && exec "$@" ) > "$outfile" 2>&1 &
+  ( cd "$EXEC_DIR" && exec "$@" ) > "$outfile" 2>&1 &
   local child=$!
   ( sleep "$budget"; touch "$flag"; kill -TERM "$child" 2>/dev/null; sleep 5; kill -KILL "$child" 2>/dev/null ) &
   local watcher=$!
@@ -317,10 +379,9 @@ run_bounded() {
   return "$rc"
 }
 
-# run_one <label> <interp> <cmd...>
+# run_one <label> <interp> <cmd...>: execute one declared suite and record it.
 run_one() {
   local label=$1 interp=$2; shift 2
-  printf '%s\n' "$label" >> "$DETECTED_FILE"
   if [ -n "$interp" ] && ! command -v "$interp" >/dev/null 2>&1; then
     refuse "test runner '$interp' for suite '$label' is not installed (fail closed, FC-004)"
   fi
@@ -347,14 +408,8 @@ run_one() {
     emit_finding tests suite-failed fail "test suite '$label' exited $rc"
     tests_status=fail
   fi
-  if [ "$notok" -gt 0 ]; then
-    emit_finding tests assertions-failed fail "test suite '$label' reported $notok failing assertion(s)"
-    tests_status=fail
-  fi
-  if [ "$skip" -gt 0 ]; then
-    emit_finding tests skipped fail "test suite '$label' SKIPPED $skip check(s); a SKIP is a finding, never a pass"
-    tests_status=fail
-  fi
+  [ "$notok" -gt 0 ] && { emit_finding tests assertions-failed fail "test suite '$label' reported $notok failing assertion(s)"; tests_status=fail; }
+  [ "$skip" -gt 0 ] && { emit_finding tests skipped fail "test suite '$label' SKIPPED $skip check(s); a SKIP is a finding, never a pass"; tests_status=fail; }
   if [ "$timedout" = no ] && [ "$rc" -eq 0 ] && [ "$ok" -eq 0 ] && [ "$notok" -eq 0 ]; then
     emit_finding tests no-assertions fail "test suite '$label' produced no PASS/FAIL assertions; execution proved nothing"
     tests_status=fail
@@ -362,67 +417,56 @@ run_one() {
   rm -f "$tout"
 }
 
-# Suite discovery is a CLOSED set, not a first-match ladder (FC-002): an explicit
-# --tests-cmd is the closed manifest; otherwise EVERY supported suite present is
-# executed, so an available failing suite can never be silently omitted.
-RUNNERS=()
+# The interpreter to probe for an explicit command is its first word.
+EXPLICIT_INTERP=""
 if [ "$TESTS_CMD_SET" = yes ]; then
-  RUNNERS+=(explicit)
-  # shellcheck disable=SC2086
-  run_one "explicit" "$(set -- $TESTS_CMD; echo "$1")" bash -c "$TESTS_CMD"
-else
-  if compgen -G "$WORKTREE/tests/*.test.sh" >/dev/null 2>&1; then
-    RUNNERS+=(shell-tests)
-    for t in "$WORKTREE"/tests/*.test.sh; do
-      run_one "shell:$(basename "$t")" bash bash "$t"
-    done
-  fi
-  if [ -f "$WORKTREE/package.json" ] && jq -e '.scripts.test' "$WORKTREE/package.json" >/dev/null 2>&1; then
-    RUNNERS+=(npm)
-    run_one "npm test" npm npm test --silent
-  fi
-  if [ -f "$WORKTREE/Makefile" ] && grep -qE '^test:' "$WORKTREE/Makefile" 2>/dev/null; then
-    RUNNERS+=(make)
-    run_one "make test" make make test
-  fi
+  # shellcheck disable=SC2086  # intentional word-split: the first token is the interp
+  set -- $TESTS_CMD
+  EXPLICIT_INTERP=${1:-}
 fi
 
-DETECTED_N=$(grep -c . "$DETECTED_FILE" 2>/dev/null || true); DETECTED_N=${DETECTED_N:-0}
+# --- execute EVERY declared suite (the declared manifest drives execution) ----
+while IFS=$'\t' read -r label kind arg; do
+  [ -n "$label" ] || continue
+  case "$kind" in
+    explicit) run_one "$label" "$EXPLICIT_INTERP" bash -c "$TESTS_CMD" ;;
+    shell) run_one "$label" bash bash "$arg" ;;
+    npm) run_one "$label" npm npm test --silent ;;
+    make) run_one "$label" make make test ;;
+  esac
+done < "$DECLARED_FILE"
+
 EXECUTED_N=$(grep -c . "$EXECUTED_FILE" 2>/dev/null || true); EXECUTED_N=${EXECUTED_N:-0}
-if [ "$DETECTED_N" -eq 0 ]; then
+if [ "$DECLARED_N" -eq 0 ]; then
   emit_finding tests no-tests fail "no test suite was discovered or executed; nothing was proven (never a pass)"
   tests_status=fail
 fi
-# Completeness is machine-checkable: every detected suite has an execution record.
-if [ "$DETECTED_N" -ne "$EXECUTED_N" ]; then
-  emit_finding tests incomplete-execution fail "detected $DETECTED_N suite(s) but executed $EXECUTED_N; a discovered suite was not run (FC-002)"
+# FC-002: completeness is machine-checkable - every declared suite has a record.
+if [ "$DECLARED_N" -ne "$EXECUTED_N" ]; then
+  emit_finding tests incomplete-execution fail "declared $DECLARED_N suite(s) but executed $EXECUTED_N; a discovered suite was not run (FC-002)"
   tests_status=fail
 fi
-RUNNERS_JSON=$(printf '%s\n' "${RUNNERS[@]:-}" | jq -Rn '[inputs|select(length>0)]')
+DECLARED_ARR=$(cut -f1 "$DECLARED_FILE" | jq -Rn '[inputs|select(length>0)]')
 emit_gate tests "$tests_status" "$(jq -nc \
-  --argjson runners "$RUNNERS_JSON" \
-  --arg detected "$DETECTED_N" --arg executed "$EXECUTED_N" \
+  --argjson declared "$DECLARED_ARR" \
+  --arg dn "$DECLARED_N" --arg en "$EXECUTED_N" \
   --arg ok "$TOTAL_OK" --arg notok "$TOTAL_NOTOK" --arg skip "$TOTAL_SKIP" \
-  --arg budget "$TEST_TIMEOUT" \
+  --arg budget "$TEST_TIMEOUT" --arg isolated "$([ -n "$EXEC_DIR" ] && echo true || echo false)" \
   --slurpfile suites "$SUITE_JSONL" \
-  '{runners:$runners,executed:($detected|tonumber>0),
-    suites_detected:($detected|tonumber),suites_executed:($executed|tonumber),
-    per_suite_timeout_s:($budget|tonumber),
+  '{isolated_checkout:($isolated=="true"),
+    declared_suites:$declared,suites_declared:($dn|tonumber),suites_executed:($en|tonumber),
+    executed:($dn|tonumber>0),per_suite_timeout_s:($budget|tonumber),
     totals:{ok:($ok|tonumber),not_ok:($notok|tonumber),skip:($skip|tonumber)},
     suites:$suites}')"
 
 # ============================================================================
-# POST-execution snapshot + FC-005 revalidation
+# POST-execution snapshot of the AUTHORITATIVE worktree + revalidation (FC-005)
 # ============================================================================
 SHA1=$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || true)
 BRANCH1=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
 DIRTY1=no; [ -n "$(git -C "$WORKTREE" status --porcelain 2>/dev/null || true)" ] && DIRTY1=yes
 BASE1=$(base_tip_now)
 
-# Every attestation below is computed from the SINGLE post-execution snapshot, so
-# the published claims describe the tree AS IT IS at publish time, not a stale
-# pre-test observation. Revalidation proves that snapshot did not move during
-# execution; any drift fails the run (the proof is atomic with the attestation).
 revalidation_status=pass
 drift=""
 [ "$SHA0" = "$SHA1" ] || drift="$drift HEAD($SHA0->$SHA1)"
@@ -430,7 +474,7 @@ drift=""
 [ "$DIRTY0" = "$DIRTY1" ] || drift="$drift dirty($DIRTY0->$DIRTY1)"
 [ "$BASE0" = "$BASE1" ] || drift="$drift base($BASE0->$BASE1)"
 if [ -n "$drift" ]; then
-  emit_finding revalidation identity-drift fail "git state changed during verification (FC-005: proof not atomic with attestation):$drift"
+  emit_finding revalidation identity-drift fail "the authority-bearing worktree changed during verification (FC-005):$drift"
   revalidation_status=fail
 fi
 emit_gate revalidation "$revalidation_status" "$(jq -nc \
@@ -439,54 +483,45 @@ emit_gate revalidation "$revalidation_status" "$(jq -nc \
   '{before:{head_sha:$s0,branch:$b0,tree_dirty:($d0=="yes"),base_sha:(if $bs0=="" then null else $bs0 end)},
     after:{head_sha:$s1,branch:$b1,tree_dirty:($d1=="yes"),base_sha:(if $bs1=="" then null else $bs1 end)}}')"
 
-# Authoritative post-execution values used by every remaining attestation gate.
 ACTUAL_SHA=$SHA1
 ACTUAL_BRANCH=$BRANCH1
 DIRTY=$DIRTY1
 
 # ============================================================================
-# GATE: identity - the post-execution snapshot matches the declared binding
+# GATE: identity
 # ============================================================================
 identity_status=pass
 if [ -z "$ACTUAL_SHA" ]; then
-  emit_finding identity no-head fail "candidate worktree has no HEAD commit"
-  identity_status=fail
+  emit_finding identity no-head fail "candidate worktree has no HEAD commit"; identity_status=fail
 fi
 if [ "$EXPECT_SHA" != "$ACTUAL_SHA" ]; then
-  emit_finding identity sha-mismatch fail "declared SHA $EXPECT_SHA does not match candidate HEAD $ACTUAL_SHA"
-  identity_status=fail
+  emit_finding identity sha-mismatch fail "declared SHA $EXPECT_SHA does not match candidate HEAD $ACTUAL_SHA"; identity_status=fail
 fi
 if [ "$ACTUAL_BRANCH" = "HEAD" ]; then
-  emit_finding identity detached-head fail "candidate is in detached HEAD, not on the declared branch"
-  identity_status=fail
+  emit_finding identity detached-head fail "candidate is in detached HEAD, not on the declared branch"; identity_status=fail
 elif [ "$EXPECT_BRANCH" != "$ACTUAL_BRANCH" ]; then
-  emit_finding identity branch-mismatch fail "declared branch $EXPECT_BRANCH does not match candidate branch $ACTUAL_BRANCH"
-  identity_status=fail
+  emit_finding identity branch-mismatch fail "declared branch $EXPECT_BRANCH does not match candidate branch $ACTUAL_BRANCH"; identity_status=fail
 fi
 if [ "$DIRTY" = yes ]; then
-  emit_finding identity tree-dirty fail "candidate worktree has uncommitted changes at publish time"
-  identity_status=fail
+  emit_finding identity tree-dirty fail "candidate worktree has uncommitted changes at publish time"; identity_status=fail
 fi
 emit_gate identity "$identity_status" "$(jq -nc \
   --arg sha "$ACTUAL_SHA" --arg branch "$ACTUAL_BRANCH" \
   --arg esha "$EXPECT_SHA" --arg ebranch "$EXPECT_BRANCH" --arg dirty "$DIRTY" \
-  '{head_sha:$sha,branch:$branch,expected_sha:$esha,expected_branch:$ebranch,
-    tree_dirty:($dirty=="yes")}')"
+  '{head_sha:$sha,branch:$branch,expected_sha:$esha,expected_branch:$ebranch,tree_dirty:($dirty=="yes")}')"
 
 # ============================================================================
-# GATE: base_currency - the candidate contains the current base tip
+# GATE: base_currency
 # ============================================================================
 BASE_RELATION=unknown
 if [ -n "$BASE_SHA" ] && [ -n "$ACTUAL_SHA" ]; then
   if ! git -C "$WORKTREE" cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
-    emit_finding base_currency base-absent fail "base commit $BASE_SHA is not present in the candidate repo; base currency cannot be proven"
-    base_status=fail
+    emit_finding base_currency base-absent fail "base commit $BASE_SHA is not present in the candidate repo; base currency cannot be proven"; base_status=fail
   elif git -C "$WORKTREE" merge-base --is-ancestor "$BASE_SHA" "$ACTUAL_SHA" 2>/dev/null; then
     BASE_RELATION=current
   else
     BASE_RELATION=behind
-    emit_finding base_currency base-stale fail "candidate does not contain the current base ($BASE_LABEL $BASE_SHA); rebase before QA so the eventual merge stays a fast-forward"
-    base_status=fail
+    emit_finding base_currency base-stale fail "candidate does not contain the current base ($BASE_LABEL $BASE_SHA); rebase before QA so the eventual merge stays a fast-forward"; base_status=fail
   fi
 fi
 emit_gate base_currency "$base_status" "$(jq -nc \
@@ -495,7 +530,7 @@ emit_gate base_currency "$base_status" "$(jq -nc \
     base_sha:(if $sha=="" then null else $sha end),relation:$rel}')"
 
 # ============================================================================
-# Candidate diff (post-execution HEAD vs base); shared by cue_lint + brief
+# Candidate diff (authoritative HEAD vs base); shared by cue_lint + brief
 # ============================================================================
 DIFF_FILE="$WORK/candidate.diff"
 ADDED_FILE="$WORK/added.tsv"
@@ -518,26 +553,13 @@ awk '
 ' "$DIFF_FILE" > "$ADDED_FILE"
 
 # ============================================================================
-# GATE: cue_lint - detection cues SOURCED FROM THE LEDGER, applied to the diff
+# GATE: cue_lint - detections read LIVE from the ledger; no hardcoded patterns
 # ============================================================================
-# The ledger owns which cues are executable: each class MAY carry a
-# machine-readable `detection` array of {engine:"awk-ere", pattern, cue_ref}.
-# When present, those patterns drive the lint, so changing the ledger changes what
-# is enforced. The built-in table below is a LABELLED FALLBACK for the three
-# historically grep-shaped classes, used only for a class the ledger gives no
-# detection for; classes with neither are reported advisory-only, never silently
-# clean. (Adding `detection` to the production ledger is the captain-gated
-# Stage-E step; the verifier already consumes it.)
-builtin_detection() {
-  # <id> -> awk-ERE pattern; a literal pipe is [|] (awk reads \| as alternation).
-  case "$1" in
-    FC-004) printf '%s' 'command -v .*[|][|][[:space:]]*(true|:|return 0|continue)([[:space:]#]|$)' ;;
-    FC-006) printf '%s' '(curl|wget|nc|ssh|wait|sleep)([[:space:]][^|]*)?[|][|][[:space:]]*true([[:space:]#]|$)' ;;
-    FC-007) printf '%s' 'rm[[:space:]].*2>/dev/null.*[|][|][[:space:]]*true' ;;
-    *) return 1 ;;
-  esac
-}
-
+# The single authority for executable cues is docs/failure-classes/ledger.jsonl:
+# each class-defined event MAY carry a machine-readable `detection` array of
+# {engine:"awk-ere", pattern, cue_ref}. The verifier reads it live and lints from
+# it. There is no built-in fallback table - a class the ledger gives no detection
+# for is reported advisory-only, never silently enforced from a duplicate source.
 cue_status=pass
 LEDGER_OK=no
 if [ -f "$LEDGER" ] && grep -q '"event":"class-defined"' "$LEDGER" 2>/dev/null; then
@@ -548,8 +570,7 @@ if [ "$LEDGER_OK" != yes ]; then
   cue_status=fail
 fi
 
-# Build the effective detection set (id<TAB>engine<TAB>pattern<TAB>cue_ref<TAB>source).
-EFFECTIVE="$WORK/detections.tsv"
+EFFECTIVE="$WORK/detections.tsv"   # <id>\t<pattern>\t<cue_ref>
 LINTED_FILE="$WORK/linted.txt"
 ADVISORY_FILE="$WORK/advisory.txt"
 : > "$EFFECTIVE"; : > "$LINTED_FILE"; : > "$ADVISORY_FILE"
@@ -559,30 +580,23 @@ if [ "$LEDGER_OK" = yes ]; then
     got=no
     while IFS=$'\t' read -r engine pattern cueref; do
       [ -n "$pattern" ] || continue
-      if [ "$engine" != "awk-ere" ]; then continue; fi
-      printf '%s\t%s\t%s\t%s\t%s\n' "$cid" "$engine" "$pattern" "$cueref" ledger >> "$EFFECTIVE"
+      [ "$engine" = "awk-ere" ] || continue
+      printf '%s\t%s\t%s\n' "$cid" "$pattern" "$cueref" >> "$EFFECTIVE"
       got=yes
     done < <(jq -r --arg id "$cid" '
       select(.event=="class-defined" and .id==$id) | (.detection // [])[]
       | [ (.engine // "awk-ere"), (.pattern // ""), (.cue_ref // "") ] | @tsv' "$LEDGER" 2>/dev/null)
-    if [ "$got" = no ]; then
-      if bp=$(builtin_detection "$cid"); then
-        printf '%s\t%s\t%s\t%s\t%s\n' "$cid" awk-ere "$bp" "built-in fallback detection" builtin >> "$EFFECTIVE"
-        got=yes
-      fi
-    fi
     if [ "$got" = yes ]; then printf '%s\n' "$cid" >> "$LINTED_FILE"; else printf '%s\n' "$cid" >> "$ADVISORY_FILE"; fi
   done < <(jq -r 'select(.event=="class-defined")|.id' "$LEDGER" 2>/dev/null)
 fi
 
 CUE_HITS=0
 if [ "$LEDGER_OK" = yes ] && [ -s "$ADDED_FILE" ] && [ -s "$EFFECTIVE" ]; then
-  while IFS=$'\t' read -r cid engine pattern cueref source; do
+  while IFS=$'\t' read -r cid pattern cueref; do
     [ -n "$cid" ] || continue
     class_name=$(jq -r --arg id "$cid" 'select(.event=="class-defined" and .id==$id)|.name' "$LEDGER" 2>/dev/null | head -1)
     while IFS=$'\t' read -r hfile hline _; do
-      emit_finding cue_lint "$cid" finding \
-        "$cid ($class_name) [$source]: ${cueref:-detection cue}" "$hfile" "$hline"
+      emit_finding cue_lint "$cid" finding "$cid ($class_name): ${cueref:-detection cue}" "$hfile" "$hline"
       CUE_HITS=$((CUE_HITS + 1))
     done < <(awk -F'\t' -v ere="$pattern" '$3 ~ ere { print }' "$ADDED_FILE")
   done < "$EFFECTIVE"
@@ -591,15 +605,15 @@ fi
 
 LINTED_ARR=$(jq -Rn '[inputs|select(length>0)]|unique' "$LINTED_FILE" 2>/dev/null || echo '[]')
 ADVISORY_ARR=$(jq -Rn '[inputs|select(length>0)]|unique' "$ADVISORY_FILE" 2>/dev/null || echo '[]')
-SOURCES_ARR=$(jq -Rn '[inputs|select(length>0)|split("\t")|{fc:.[0],source:.[4],cue_ref:.[3]}]' "$EFFECTIVE" 2>/dev/null || echo '[]')
+DETECT_ARR=$(jq -Rn '[inputs|select(length>0)|split("\t")|{fc:.[0],cue_ref:.[2],source:"ledger"}]' "$EFFECTIVE" 2>/dev/null || echo '[]')
 emit_gate cue_lint "$cue_status" "$(jq -nc \
-  --arg hits "$CUE_HITS" --arg diffbase "$DIFF_BASE" \
-  --argjson linted "$LINTED_ARR" --argjson advisory "$ADVISORY_ARR" --argjson detections "$SOURCES_ARR" \
-  '{hits:($hits|tonumber),diff_base:(if $diffbase=="" then null else $diffbase end),
+  --arg hits "$CUE_HITS" --arg diffbase "$DIFF_BASE" --arg ledger "$LEDGER" \
+  --argjson linted "$LINTED_ARR" --argjson advisory "$ADVISORY_ARR" --argjson detections "$DETECT_ARR" \
+  '{hits:($hits|tonumber),ledger:$ledger,diff_base:(if $diffbase=="" then null else $diffbase end),
     mechanically_linted:$linted,advisory_only:$advisory,detections:$detections}')"
 
 # ============================================================================
-# GATE: brief_contract - echo the mandatory brief + mechanical checks
+# GATE: brief_contract
 # ============================================================================
 brief_status=pass
 CONTRACT_FILE="$WORK/contract.txt"
@@ -616,14 +630,12 @@ if [ -n "$DIFF_BASE" ] && [ -n "$ACTUAL_SHA" ]; then
 fi
 COMMITS=${COMMITS:-0}
 if [ "$COMMITS" -eq 0 ]; then
-  emit_finding brief_contract no-commits fail "no commits on the candidate over its base; the contract requires committed work"
-  brief_status=fail
+  emit_finding brief_contract no-commits fail "no commits on the candidate over its base; the contract requires committed work"; brief_status=fail
 fi
 BRANCH_OK=yes
 if [ "$ACTUAL_BRANCH" != "fm/$TASK" ]; then
   BRANCH_OK=no
-  emit_finding brief_contract branch-name fail "candidate branch is '$ACTUAL_BRANCH'; the contract expected 'fm/$TASK'"
-  brief_status=fail
+  emit_finding brief_contract branch-name fail "candidate branch is '$ACTUAL_BRANCH'; the contract expected 'fm/$TASK'"; brief_status=fail
 fi
 emit_gate brief_contract "$brief_status" "$(jq -nc \
   --arg present true --arg commits "$COMMITS" --arg branchok "$BRANCH_OK" \
@@ -644,31 +656,23 @@ if [ "$(jq -s '[.[]|select(.severity!="note")]|length' "$FINDINGS" 2>/dev/null)"
 STAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
 BUNDLE="$WORK/bundle.json"
 jq -n \
-  --arg schema "firstmate/verify-bundle/1" \
-  --arg verdict "$VERDICT" \
-  --arg task "$TASK" \
-  --arg worktree "$WORKTREE" \
-  --arg sha "$ACTUAL_SHA" \
-  --arg branch "$ACTUAL_BRANCH" \
-  --arg esha "$EXPECT_SHA" \
-  --arg ebranch "$EXPECT_BRANCH" \
-  --arg stamp "$STAMP" \
-  --arg findings_n "$FINDING_COUNT" \
-  --slurpfile gates "$GATES" \
-  --slurpfile findings "$FINDINGS" \
+  --arg schema "firstmate/verify-bundle/1" --arg verdict "$VERDICT" --arg task "$TASK" \
+  --arg worktree "$WORKTREE" --arg sha "$ACTUAL_SHA" --arg branch "$ACTUAL_BRANCH" \
+  --arg esha "$EXPECT_SHA" --arg ebranch "$EXPECT_BRANCH" \
+  --arg stamp "$STAMP" --arg findings_n "$FINDING_COUNT" \
+  --slurpfile gates "$GATES" --slurpfile findings "$FINDINGS" \
   '{schema:$schema,verdict:$verdict,task:$task,
-    candidate:{worktree:$worktree,head_sha:$sha,branch:$branch,
-               declared_sha:$esha,declared_branch:$ebranch},
+    candidate:{worktree:$worktree,head_sha:$sha,branch:$branch,declared_sha:$esha,declared_branch:$ebranch},
     generated_at:(if $stamp=="" then null else $stamp end),
-    finding_count:($findings_n|tonumber),
-    gates:$gates,findings:$findings}' > "$BUNDLE" || refuse "failed to assemble bundle JSON"
+    finding_count:($findings_n|tonumber),gates:$gates,findings:$findings}' > "$BUNDLE" \
+  || refuse "failed to assemble bundle JSON"
 
 # Atomic publish: replace the invalidation marker with the final result.
 TMP_OUT="$OUT.tmp.$$"
 cp "$BUNDLE" "$TMP_OUT" || refuse "cannot stage bundle at $TMP_OUT"
 mv -f "$TMP_OUT" "$OUT" || { rm -f "$TMP_OUT"; refuse "cannot publish bundle to $OUT"; }
 
-# --- human summary ----------------------------------------------------------
+# --- human summary (replaces the invalidated summary marker) ------------------
 SUMMARY="$WORK/summary.md"
 {
   printf '# Gauntlet verify - %s\n\n' "$VERDICT"
@@ -678,19 +682,12 @@ SUMMARY="$WORK/summary.md"
   printf '\n## Gates\n'
   jq -r '.gate + ": " + (.status|ascii_upcase)' "$GATES"
   printf '\n## Findings (%s)\n' "$FINDING_COUNT"
-  if [ "$FINDING_COUNT" -eq 0 ]; then
-    printf 'none\n'
-  else
+  if [ "$FINDING_COUNT" -eq 0 ]; then printf 'none\n'; else
     jq -r '"- [" + .severity + "] " + .gate + " / " + .code + ": " + .message
            + (if .file then " (" + .file + (if .line then ":" + (.line|tostring) else "" end) + ")" else "" end)' "$FINDINGS"
   fi
 } > "$SUMMARY"
-cp "$SUMMARY" "$OUT_DIR/verify-summary.md" 2>/dev/null || true
+cp "$SUMMARY" "$SUMMARY_OUT" 2>/dev/null || true
 
-if [ "$FORMAT" = json ]; then
-  cat "$OUT"
-else
-  cat "$SUMMARY"
-fi
-
+if [ "$FORMAT" = json ]; then cat "$OUT"; else cat "$SUMMARY"; fi
 exit "$EXIT"
