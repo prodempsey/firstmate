@@ -759,16 +759,28 @@ fi
 # each class-defined event MAY carry a machine-readable `detection` array of
 # {engine:"awk-ere", pattern, cue_ref}, and a later `class-amended` event MAY append
 # more detection onto that id (the ledger's append-only fold-at-read idiom). The
-# verifier reads BOTH event kinds live and lints from their merged detection. There
-# is no built-in fallback table - a class the ledger gives no detection for is
-# reported advisory-only, never silently enforced from a duplicate source.
+# verifier folds BOTH event kinds and lints from their merged detection. There is no
+# built-in fallback table - a class the ledger gives no detection for is reported
+# advisory-only, never silently enforced from a duplicate source.
+#
+# FC-004: the ledger is the cue-lint AUTHORITY, so a broken authority input must fail
+# CLOSED with one loud finding - never fall through to a silent pass. The whole ledger
+# is folded ONCE, up front, through its sanctioned writer (bin/fm-failure-class.sh, the
+# single fold owner), which parses every event and exits non-zero on ANY malformed line,
+# unknown-schema row, duplicate id, or amendment against an undefined class. A substring
+# grep is NOT a parse: it would let invalid JSON before a valid class row silently empty
+# the lint. Enumeration then reads from that VALIDATED folded snapshot, so no downstream
+# error-suppressed jq can turn a corrupt ledger into an all-clear.
 cue_status=pass
 LEDGER_OK=no
-if [ -f "$LEDGER" ] && grep -q '"event":"class-defined"' "$LEDGER" 2>/dev/null; then
+FOLDED="$WORK/ledger-folded.json"
+if [ -f "$LEDGER" ] \
+  && FM_FC_LEDGER="$LEDGER" "$FM_ROOT/bin/fm-failure-class.sh" list --json > "$FOLDED" 2>/dev/null \
+  && jq -e 'type=="array" and length>0' "$FOLDED" >/dev/null 2>&1; then
   LEDGER_OK=yes
 fi
 if [ "$LEDGER_OK" != yes ]; then
-  emit_finding cue_lint ledger-unreadable fail "failure-class ledger is missing or unreadable: $LEDGER (fail closed)"
+  emit_finding cue_lint ledger-unreadable fail "failure-class ledger is missing, unparseable, or has no class definition: $LEDGER (fail closed)"
   cue_status=fail
 fi
 
@@ -785,18 +797,17 @@ if [ "$LEDGER_OK" = yes ]; then
       [ "$engine" = "awk-ere" ] || continue
       printf '%s\t%s\t%s\n' "$cid" "$pattern" "$cueref" >> "$EFFECTIVE"
       got=yes
-    done < <(jq -r --arg id "$cid" '
-      select(.id==$id and (.event=="class-defined" or .event=="class-amended")) | (.detection // [])[]
-      | [ (.engine // "awk-ere"), (.pattern // ""), (.cue_ref // "") ] | @tsv' "$LEDGER" 2>/dev/null)
+    done < <(jq -r --arg id "$cid" '.[] | select(.id==$id) | (.detection // [])[]
+      | [ (.engine // "awk-ere"), (.pattern // ""), (.cue_ref // "") ] | @tsv' "$FOLDED" 2>/dev/null)
     if [ "$got" = yes ]; then printf '%s\n' "$cid" >> "$LINTED_FILE"; else printf '%s\n' "$cid" >> "$ADVISORY_FILE"; fi
-  done < <(jq -r 'select(.event=="class-defined")|.id' "$LEDGER" 2>/dev/null)
+  done < <(jq -r '.[].id' "$FOLDED" 2>/dev/null)
 fi
 
 CUE_HITS=0
 if [ "$LEDGER_OK" = yes ] && [ -s "$ADDED_FILE" ] && [ -s "$EFFECTIVE" ]; then
   while IFS=$'\t' read -r cid pattern cueref; do
     [ -n "$cid" ] || continue
-    class_name=$(jq -r --arg id "$cid" 'select(.event=="class-defined" and .id==$id)|.name' "$LEDGER" 2>/dev/null | head -1)
+    class_name=$(jq -r --arg id "$cid" '.[]|select(.id==$id)|.name' "$FOLDED" 2>/dev/null | head -1)
     while IFS=$'\t' read -r hfile hline _; do
       emit_finding cue_lint "$cid" finding "$cid ($class_name): ${cueref:-detection cue}" "$hfile" "$hline"
       CUE_HITS=$((CUE_HITS + 1))

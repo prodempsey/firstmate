@@ -80,6 +80,11 @@ LEDGER="${FM_FC_LEDGER:-$FM_ROOT/docs/failure-classes/ledger.jsonl}"
 SCHEMA="kraken-failure-class/ledger-event/v1"
 MARKER_KEYWORD="failure-class"
 REFINE_THRESHOLD_DEFAULT=3
+# The CLOSED set of supported detection engines. A detection whose engine is not in this
+# set reads as valid to the CLI yet is silently inert in the live cue lint (bin/fm-verify.sh
+# executes only awk-ere), so the sanctioned writer and `validate` reject it - a closed
+# schema proven positively, never an open allowlist (FC-001).
+DETECTION_ENGINES="awk-ere"
 REFINE_RULE='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
@@ -169,6 +174,29 @@ prov_json() {
 append_event() { # <compact-json-object>
   mkdir -p "$(dirname "$LEDGER")"
   printf '%s\n' "$1" >> "$LEDGER"
+}
+
+# ---- detection schema -----------------------------------------------------
+# 0 iff every element of the detection JSON array conforms to the closed detection schema:
+# an object with `engine` in DETECTION_ENGINES, a non-empty string `pattern`, and a
+# non-empty string `cue_ref`. On failure, prints the first offending element's reason to
+# stderr and returns 1. This is the ONE writer-side check both `add`/`ensure`, `amend`,
+# and `validate` share, so a row that would be inert in the live lint can never be written.
+detection_array_conforms() { # <detection-array-json>
+  local bad
+  bad=$(printf '%s' "$1" | jq -r --arg engines "$DETECTION_ENGINES" '
+    ($engines | split(" ")) as $ok
+    | to_entries[] | .key as $i | .value as $d
+    | if ($d|type) != "object" then "detection[\($i)] is not an object"
+      elif ($d.engine|type) != "string" or (($d.engine) as $e | ($ok|index($e))|not)
+        then "detection[\($i)] has unsupported engine \($d.engine|tojson) (supported: \($ok|join(",")))"
+      elif ($d.pattern|type) != "string" or ($d.pattern|length) == 0
+        then "detection[\($i)] has an empty or non-string pattern"
+      elif ($d.cue_ref|type) != "string" or ($d.cue_ref|length) == 0
+        then "detection[\($i)] has an empty or missing cue_ref"
+      else empty end' 2>/dev/null | head -1)
+  [ -z "$bad" ] || { echo "$bad" >&2; return 1; }
+  return 0
 }
 
 # ---- stage E: captain-gated refinement ------------------------------------
@@ -266,6 +294,21 @@ cmd_validate() {
       (.id|test("^FC-[0-9]{3,}$")|not)
     ) | .id')
   [ -z "$bad" ] || die "invalid class record(s): $bad"
+  # A class MAY carry no detection (advisory-only), but any detection row it does carry must
+  # conform to the closed detection schema - a supported engine, a non-empty pattern, and a
+  # non-empty cue_ref - so a row that reads as valid can never be silently inert in the live
+  # cue lint (bin/fm-verify.sh).
+  local det_bad
+  det_bad=$(printf '%s\n' "$folded" | jq -r --arg engines "$DETECTION_ENGINES" '
+    ($engines | split(" ")) as $ok
+    | .[] as $c | ($c.detection // [])[] as $d
+    | select(
+        ($d|type) != "object"
+        or ($d.engine|type) != "string" or (($d.engine) as $e | ($ok|index($e))|not)
+        or ($d.pattern|type) != "string" or ($d.pattern|length) == 0
+        or ($d.cue_ref|type) != "string" or ($d.cue_ref|length) == 0)
+    | $c.id' | sort -u | tr '\n' ' ' | sed 's/ *$//')
+  [ -z "$det_bad" ] || die "class record(s) with a malformed detection row (engine not in [$DETECTION_ENGINES], or empty pattern/cue_ref): $det_bad"
   echo "FAILURE_CLASSES_OK=$n ($LEDGER)"
 }
 
@@ -320,6 +363,8 @@ build_class_event() {
   if [ "${#dets[@]}" -gt 0 ]; then
     dets_json=$(printf '%s\n' "${dets[@]}" | jq -c . 2>/dev/null | jq -sc .) \
       || die "each --detection must be one valid JSON object"
+    detection_array_conforms "$dets_json" \
+      || die "each --detection must be {engine, pattern, cue_ref} with engine in the supported set ($DETECTION_ENGINES)"
   fi
   FC_EVENT=$(jq -cn \
     --arg schema "$SCHEMA" --arg id "$id" --arg name "$name" \
@@ -435,10 +480,11 @@ cmd_amend() {
   if [ "${#dets[@]}" -gt 0 ]; then
     dets_json=$(printf '%s\n' "${dets[@]}" | jq -c . 2>/dev/null | jq -sc .) \
       || die "each --detection must be one valid JSON object"
-    # Fail closed on a detection that carries no usable pattern: a silently-inert tripwire
-    # would let a class read as mechanically linted while enforcing nothing.
-    printf '%s' "$dets_json" | jq -e 'all(.[]; type=="object" and (.pattern|type=="string" and length>0))' >/dev/null \
-      || die "each --detection must be an object with a non-empty string 'pattern'"
+    # Fail closed on a detection that does not conform to the closed detection schema: a
+    # silently-inert tripwire (unsupported engine, empty pattern, or missing cue_ref) would
+    # let a class read as mechanically linted while enforcing nothing.
+    detection_array_conforms "$dets_json" \
+      || die "each --detection must be {engine, pattern, cue_ref} with engine in the supported set ($DETECTION_ENGINES)"
   fi
   if [ "${#cues[@]}" -gt 0 ]; then
     cues_json=$(printf '%s\n' "${cues[@]}" | jq -R . | jq -s .)

@@ -604,6 +604,22 @@ FM_HOME="$TMP/nohome" FM_FAILURE_LEDGER="$STRIPPED" "$VERIFY" --out "$TMP/cues2.
 [ "$(bget "$TMP/cues2.json" '.gates[]|select(.gate=="cue_lint")|.details.advisory_only|index("FC-007")|type')" = number ] || fail "FC-007 must fall to advisory-only when the ledger drops its detection"
 pass "F5: lint behavior changes from the ledger authority alone (strip FC-007 detection => not linted)"
 
+# --- FC-004: a MALFORMED ledger fails the cue lint CLOSED, never a silent pass ----
+# The ledger is the cue-lint authority (qa-scg1-q168 F1). Before this, "readable" was a file
+# check plus a substring grep, and error-suppressed jq streams meant invalid JSON before a
+# valid class row silently emptied the lint while the gate stayed pass. The whole ledger is
+# now folded once up front and must fail closed. Malformed JSON both BEFORE and AFTER a valid
+# class row must still produce one loud finding, not a silent all-clear.
+CORRUPT="$TMP/ledger-corrupt.jsonl"
+{ printf '{broken-json\n'; grep '"event":"class-defined"' "$LEDGER" | head -1; printf '}also-broken\n'; } > "$CORRUPT"
+FM_HOME="$TMP/nohome" FM_FAILURE_LEDGER="$CORRUPT" "$VERIFY" --out "$TMP/cues3.json" --brief "$BRIEF" \
+  --worktree "$RCu" --base main --sha "$USHA" --branch fm/g1 --task g1 >/dev/null 2>&1
+expect_code 1 "$?" "a malformed ledger fails the verifier closed (never exit 0)"
+[ "$(bget "$TMP/cues3.json" '.gates[]|select(.gate=="cue_lint")|.status')" = fail ] || fail "cue_lint must fail closed on an unparseable ledger, never report pass"
+[ "$(bget "$TMP/cues3.json" '[.findings[]|select(.gate=="cue_lint" and .code=="ledger-unreadable")]|length')" -ge 1 ] || fail "a malformed ledger must emit one loud ledger-unreadable finding"
+[ "$(bget "$TMP/cues3.json" '[.findings[]|select(.gate=="cue_lint" and .severity=="finding")]|length')" = 0 ] || fail "a malformed ledger must not silently emit mechanical cue findings off a half-parsed authority"
+pass "F5/FC-004: a malformed ledger fails the cue lint closed with a loud finding, never a silent pass"
+
 # --- FC-007: EVERY refusal invalidates the prior pass in BOTH artifacts --------
 seed_pass() { # <out>  - seed an authoritative pass bundle + pass summary
   jq -n '{schema:"firstmate/verify-bundle/1",verdict:"pass"}' > "$1"

@@ -98,6 +98,24 @@ FM_FC_LEDGER="$A" "$FC" amend FC-001 >/dev/null 2>&1
 expect_code 1 $? "amend refuses when it would add nothing"
 FM_FC_LEDGER="$A" "$FC" amend FC-001 --detection '{"engine":"awk-ere","pattern":""}' >/dev/null 2>&1
 expect_code 1 $? "amend refuses a detection with an empty pattern (never a silently-inert tripwire)"
+# Closed detection schema (qa-scg1-q168 F2): a detection whose engine is outside the supported
+# set, or which is missing cue_ref, reads as valid to a naive check yet is inert in the live
+# lint - the sanctioned writer must reject it, not accept it.
+FM_FC_LEDGER="$A" "$FC" amend FC-001 --detection '{"engine":"not-an-engine","pattern":"synthetic","cue_ref":"bad engine"}' >/dev/null 2>&1
+expect_code 1 $? "amend refuses an unsupported detection engine (closed schema)"
+FM_FC_LEDGER="$A" "$FC" amend FC-001 --detection '{"engine":"awk-ere","pattern":"synthetic"}' >/dev/null 2>&1
+expect_code 1 $? "amend refuses a detection missing cue_ref"
+# add/ensure enforce the same closed schema on inline detection.
+FM_FC_LEDGER="$TMP_ROOT/badengine-add.jsonl" "$FC" add --id FC-050 --name n --invariant i --fix f --cue c \
+  --provenance "qa:data/y#1" --detection '{"engine":"not-an-engine","pattern":"x","cue_ref":"c"}' >/dev/null 2>&1
+expect_code 1 $? "add refuses an unsupported inline detection engine"
+# validate rejects a hand-injected bad-engine row: a corrupt ledger that a substring grep
+# would call valid must still fail closed.
+BE="$TMP_ROOT/validate-badengine.jsonl"; seed_one "$BE"
+printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-amended","id":"FC-001","detection":[{"engine":"regex-pcre","pattern":"x","cue_ref":"c"}]}\n' >> "$BE"
+FM_FC_LEDGER="$BE" "$FC" validate >/dev/null 2>&1
+expect_code 1 $? "validate refuses a detection row whose engine is outside the supported set"
+pass "closed detection schema enforced by amend, add, and validate (engine in supported set, non-empty pattern and cue_ref)"
 # A class-amended event against an id no class-defined ever declared is corrupt: fail closed.
 Cam="$TMP_ROOT/corrupt-amend.jsonl"
 printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-amended","id":"FC-777","detection":[{"engine":"awk-ere","pattern":"x"}]}\n' > "$Cam"

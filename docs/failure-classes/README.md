@@ -36,13 +36,15 @@ The `class-defined` event carries these fields.
 | `fix` | the fix pattern |
 | `provenance` | array of `{type, ref, note?}`: the rulings / QA reports it was distilled from |
 | `registry` | `{memory_type, scope, confidence, keywords}`: how it registers into memory |
-| `detection` | optional array of `{engine:"awk-ere", pattern, cue_ref}`: machine-readable tripwires that graduate a natural-language cue into an executable check `bin/fm-verify.sh`'s cue lint runs live over a candidate diff. May be seeded inline here or appended later via `class-amended`. |
+| `detection` | optional array of `{engine, pattern, cue_ref}`: machine-readable tripwires that graduate a natural-language cue into an executable check `bin/fm-verify.sh`'s cue lint runs live over a candidate diff. `engine` MUST be one of the closed supported set (currently only `awk-ere`), `pattern` a non-empty ERE, and `cue_ref` a non-empty label. May be seeded inline here or appended later via `class-amended`. |
 
 The `occurrence` event is `{id, provenance:{type, ref, note?}}`: one more citation for `id`.
 The `class-amended` event is `{id, detection?, cues?}`: it appends `detection` tripwires and/or natural-language `cues` onto an existing `id`, folded (concatenated) onto the class record at read.
 
-The writer refuses a duplicate id, an occurrence or amendment against an unknown id, an amendment that adds nothing, a detection with no non-empty `pattern`, and any event missing provenance, so the ledger cannot drift into an unprovenanced or self-contradictory state.
+The writer refuses a duplicate id, an occurrence or amendment against an unknown id, an amendment that adds nothing, a detection whose `engine` is outside the supported set or whose `pattern`/`cue_ref` is empty, and any event missing provenance, so the ledger cannot drift into an unprovenanced or self-contradictory state.
+`validate` enforces the same closed detection schema over the folded ledger, so a detection row that reads as valid to a naive check can never be silently inert in the live cue lint.
 A malformed line, an unknown-schema line, or an occurrence/amendment for an undefined id makes `list` and `validate` fail closed rather than fold silently.
+`bin/fm-verify.sh`'s cue lint likewise folds the whole ledger through this sanctioned writer once, up front, and fails its gate closed on any parse/fold failure - a broken authority input is one loud finding, never a silent pass.
 
 Every mutation (`add`, `ensure`, `bump`, `amend`) serializes its whole read-check-append under a portable, abandoned-owner-aware lock (the fleet's `fm-wake-lib.sh` discipline) co-located with the ledger, so two concurrent sanctioned writers can never both pass the duplicate check and append the same id.
 There is no destructive path: `add` refuses a duplicate, `ensure` skips an existing id, `bump` and `amend` only append, and the seed builder never deletes or rewrites the ledger, so no supported command can drop an appended occurrence or amendment.
