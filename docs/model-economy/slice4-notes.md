@@ -20,10 +20,14 @@ precedent), precedent `data/dj-orders-s2/design-ruling.md`.
   `docs/model-economy/schemas/governed-dispatch-policy.schema.json`.
 - `bin/fm-dispatch-validate.sh` — the fail-closed validator the dispatch path
   consults; `python3` + `jsonschema` hard prerequisites; one stable §F denial code
-  per failure; `REQUEST_FINGERPRINT` provenance surface.
+  per failure; `REQUEST_FINGERPRINT` provenance surface plus the `--write-sidecar`
+  write-after-proof / invalidate-before-validation attestation lifecycle mirroring
+  `bin/fm-profile-matrix-check.sh`.
 - `tests/fm-dispatch-validate.test.sh` — the exhaustive fixture matrix (T.1 in
-  full plus the structural closed-schema properties and the fail-closed
-  engine/artifact paths).
+  full, a wrong-type fixture for all 31 root properties, each always-required
+  field's absence, the `binding_fingerprint` format, the both-tier evidence-packet
+  requirement, the full sidecar lifecycle, and the fail-closed engine/artifact
+  paths).
 - `docs/model-economy/governed-dispatch.md` — the pointer doc.
 
 Additive only: no dispatch is routed through the validator yet (that binding is
@@ -78,12 +82,15 @@ a pinned matrix:
   Fable profile) is caught one layer later by the effort projection
   (`PROFILE_EFFORT_MISMATCH`). Both fail closed; the split is documented in the
   test.
-- **`PROFILE_IMMUTABLE_MISMATCH` and `NEXT_LOWER_MODEL_INVALID` are added codes.**
-  §F's named list does not give codes for the `write_allowed`/`allowed_tools`/
-  `max_turns` immutable-profile fields or for the `next_lower_model` relation, but
-  §F declares them immutable-profile / required-when fields. Enforcing them is
-  fail-closed-correct and the ruling explicitly permits extending the code set;
-  they are the projection-equality analogue of S3's `PROFILE_PROJECTION_MISMATCH`.
+- **Added codes: `PROFILE_IMMUTABLE_MISMATCH`, `NEXT_LOWER_MODEL_INVALID`, and the
+  two `DISPATCH_SIDECAR_*` codes.** §F's named list does not give codes for the
+  `write_allowed`/`allowed_tools`/`max_turns` immutable-profile fields or for the
+  `next_lower_model` relation, but §F declares them immutable-profile / required-when
+  fields; the sidecar codes come from the S3 provenance contract the brief requires.
+  Enforcing them is fail-closed-correct and the S3 ruling explicitly permits
+  extending the code set; the projection codes are the analogue of S3's
+  `PROFILE_PROJECTION_MISMATCH`, and the sidecar codes mirror
+  `PROFILE_SIDECAR_INVALIDATION_FAILED` / `PROFILE_SIDECAR_WRITE_FAILED`.
 - **Task-class taxonomy home.** §F says `task_class` is "one of
   `config/crew-profiles.json`'s committed task-class taxonomy, extended per §D5",
   but the report's own canonical examples use governed classes
@@ -94,15 +101,39 @@ a pinned matrix:
   and the canonical examples validate. Reconciling this list *into*
   `config/crew-profiles.json` is the separate §D5 firstmate-repo change, out of S4
   scope.
-- **`evidence_packet_id` — field-table vs. example conflict, reconciled.** The §F
-  field table marks it required "when `selected_profile` is any `opus-*` or
-  `fable-*`", but the §F valid example is `opus-high` with `evidence_packet_id:
-  null`. The example is authoritative for opus; brief §7 explicitly requires an
-  evidence packet for *Fable*. So S4 requires it for `fable-*`, treats it as
-  optional-but-resolvable for `opus-*`, and, when a `--packets-dir` is supplied,
-  requires a present id to resolve to a packet file. This is the SHALLOW form of
-  §F rule 10; the DEEP §M packet-schema validation depends on the S7 evidence-
-  packet validator and is deferred there (see below).
+- **`evidence_packet_id` — field-table vs. example conflict, resolved to the field
+  table (QA q156 finding 3).** The §F field table marks it required for every
+  `opus-*` or `fable-*` profile, but the §F prose valid example is `opus-high` with
+  `evidence_packet_id: null`. Round 1 resolved that conflict in favor of the example
+  (requiring the packet only for Fable), which QA q156 rejected as silently
+  weakening the binding field-table requirement under a "section-F schema" QA
+  contract, and the captain confirmed the field table is binding. S4 now requires a
+  non-null `evidence_packet_id` for **every** `opus-*` and `fable-*` profile
+  (`EVIDENCE_PACKET_MISSING`); a haiku/sonnet dispatch needs none. When a
+  `--packets-dir` is supplied, a present id must resolve to a packet file. This is
+  the SHALLOW form of §F rule 10; the DEEP §M packet-schema validation depends on
+  the S7 evidence-packet validator and is deferred there (see below).
+- **`binding_fingerprint` is a positively-verified format, not a presence check
+  (QA q156 FC-003).** Round 1 admitted any non-empty string, so `"x"` false-passed.
+  It is now patterned to the exact form its producer emits — `bin/fm-bindings-validate.sh`
+  computes `sha256sum | awk '{print $1}'`, i.e. a **bare** 64-hex digest (no
+  `sha256:` prefix) — so the schema pattern is `^[0-9a-f]{64}$`. The §F prose
+  example's `sha256:9b1f...e04a` is illustrative and does not match the real
+  producer; patterning to the prefix would false-*reject* a genuine bindings
+  fingerprint, so the bare-hex form is correct. A malformed, prefixed, uppercase, or
+  wrong-typed value now fails closed (`DISPATCH_SCHEMA_INVALID`).
+- **The provenance sidecar lifecycle is present (QA q156 finding 1).** `--write-sidecar`
+  mirrors `bin/fm-profile-matrix-check.sh`'s stale-authority-safe contract exactly:
+  the sidecar path is `<request minus .json>.fingerprint`; any pre-existing
+  attestation is INVALIDATED in the bash preamble before any validation (or engine
+  refusal) can run, and that invalidation is PROVEN — an unlink refused by a
+  read-only dir is `DISPATCH_SIDECAR_INVALIDATION_FAILED` (refuse before validation,
+  never proceed under stale authority); the fresh attestation is written (temp +
+  atomic rename) ONLY after the whole pass proves the request, and an unwritable
+  attestation is a clean `DISPATCH_SIDECAR_WRITE_FAILED` with no partial temp file.
+  Round 1 omitted this entirely; the suite now covers success-writes-after-proof,
+  no-sidecar-on-early/late-failure, stale-sidecar-invalidation, invalidation-failure,
+  and write-failure (the last two root-skipped, like S3).
 - **`runtime_state_fingerprint` format is defined here.** §F says "sha256 of
   {repository, branch, HEAD, worktree-clean-flag}" without pinning a serialization.
   S4 defines it as `sha256:` + `sha256("<repository>\n<branch>\n<HEAD>\n<clean|dirty>")`
@@ -138,14 +169,41 @@ a pinned matrix:
 - **`config/crew-profiles.json` reconciliation (§D5).** Adding the governed
   profile names and task classes to that file is a separate firstmate-repo change.
 
+## Fixture discipline (QA q156 finding)
+
+The invalid-fixture matrix is now genuinely per-property, not a grouped subset:
+`test_every_root_property_wrong_type` asserts a wrong-type fixture for **all 31**
+admitted root properties (with a runtime assertion that all 31 ran), and
+`test_required_field_absence` deletes each of the 18 always-required fields. Those
+sit alongside the format/enum/uniqueness fixtures, the per-§F-denial-code fixtures,
+the `binding_fingerprint` format fixtures, the both-tier evidence-packet fixtures,
+and the full sidecar lifecycle.
+
+## Explicitly deferred (not silently dropped)
+
+- **Deep evidence-packet validation (§F rule 10 / §M).** S4 requires a non-null
+  packet reference for every Opus/Fable dispatch and resolves it against a supplied
+  `--packets-dir`; validating the packet's own schema/contents is the S7 evidence-
+  packet validator's job and is deferred there. When S7 lands, rule 10 gains the
+  full packet-conformance check.
+- **The dispatcher entry point and live routing (S5).** `fm-dispatch-governed.sh`,
+  the PreToolUse anti-inheritance hook, `.claude/settings.json` registration, and
+  the routing ledger are S5/S6 — a validated request has no routing effect until
+  then, by design (§U/S4 "no effect on actual routing until S5").
+- **`config/crew-profiles.json` reconciliation (§D5).** Adding the governed
+  profile names and task classes to that file is a separate firstmate-repo change.
+
 ## Verification (at build)
 
-`bash tests/fm-dispatch-validate.test.sh` (30 tests) and
-`bash tests/fm-profile-matrix-check.test.sh` (S3, unaffected) both exit 0;
-`shellcheck --norc` over `bin/fm-dispatch-validate.sh`,
+`bash tests/fm-dispatch-validate.test.sh` (38 tests) and
+`bash tests/fm-profile-matrix-check.test.sh` (S3, unaffected — both canaries still
+reject) both exit 0; `shellcheck --norc` over `bin/fm-dispatch-validate.sh`,
 `tests/fm-dispatch-validate.test.sh`, and `tests/lib.sh` is clean at the pinned
-0.11.0; `git diff --check` is clean. Every one of the 11 governed profiles yields
-a valid base request; every §F denial code and every closed-schema property has a
-one-property-at-a-time fixture; the two §F canonical denials (omitted model →
-`MODEL_REQUIRED`, Fable without justification → `FABLE_JUSTIFICATION_MISSING`)
-reproduce.
+0.11.0; `git diff --check` is clean; the request schema is valid Draft 2020-12 and
+the policy self-validates. Every one of the 11 governed profiles yields a valid base
+request; every §F denial code, all 31 closed-schema properties, and every
+always-required field have one-property-at-a-time fixtures; the two §F canonical
+denials (omitted model → `MODEL_REQUIRED`, Fable without justification →
+`FABLE_JUSTIFICATION_MISSING`) reproduce; and the three QA q156 findings —
+sidecar lifecycle, `binding_fingerprint` format, Opus/Fable evidence-packet
+requirement — each have direct fixtures.

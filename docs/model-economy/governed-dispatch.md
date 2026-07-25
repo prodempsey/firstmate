@@ -67,12 +67,14 @@ degrading. The ordered pass:
    (`NESTING_PROHIBITED`), and `write_allowed`/`allowed_tools`/`max_turns`-bounds
    (`PROFILE_IMMUTABLE_MISMATCH`) must equal the manifest projection for the
    profile.
-6. **justification gates** — `opus-xhigh` requires a non-empty
+6. **justification + evidence gates** — `opus-xhigh` requires a non-empty
    `opus_xhigh_justification` (`OPUS_XHIGH_JUSTIFICATION_MISSING`); every Fable
    dispatch requires a non-empty `why_opus_is_insufficient` free of the §H
-   denylist phrases and an `evidence_packet_id` (`FABLE_JUSTIFICATION_MISSING` /
-   `EVIDENCE_PACKET_MISSING`); a non-haiku dispatch needs a correct
-   `next_lower_model` and its justification (`NEXT_LOWER_MODEL_INVALID`).
+   denylist phrases (`FABLE_JUSTIFICATION_MISSING`); **every `opus-*` and `fable-*`
+   dispatch requires a non-null `evidence_packet_id`** per the §F field table
+   (`EVIDENCE_PACKET_MISSING`), resolved against `--packets-dir` when supplied; a
+   non-haiku dispatch needs a correct `next_lower_model` and its justification
+   (`NEXT_LOWER_MODEL_INVALID`).
 7. **environment agreement** — `captain_exception_id` must be attributable to a
    captured captain instruction (`CAPTAIN_EXCEPTION_INVALID`); `parent_task_id`
    must resolve to a tracked task or the in-session id (`PARENT_LINKAGE_MISSING`);
@@ -84,10 +86,14 @@ degrading. The ordered pass:
 On success it prints `DISPATCH_OK=<profile>` and `REQUEST_FINGERPRINT=` (sha256 of
 the canonical request), which the dispatch path records so a routing decision is
 traceable to the exact request that produced it (`--expect-fingerprint` pins it).
-Every failure prints exactly one stable code — see the script header for the full
-list. Fail-closed everywhere: a captain override changes a would-be-denied outcome
-only by supplying a resolvable `captain_exception_id`, never by suppressing a
-check.
+`--write-sidecar` writes that fingerprint to a `<request>.fingerprint` attestation
+ONLY after the whole pass proves the request, invalidating any pre-existing
+attestation before validation and refusing (`DISPATCH_SIDECAR_INVALIDATION_FAILED`
+/ `DISPATCH_SIDECAR_WRITE_FAILED`) rather than leave stale or partial authority —
+the same stale-authority-safe contract as `bin/fm-profile-matrix-check.sh`. Every
+failure prints exactly one stable code — see the script header for the full list.
+Fail-closed everywhere: a captain override changes a would-be-denied outcome only
+by supplying a resolvable `captain_exception_id`, never by suppressing a check.
 
 ```sh
 bin/fm-dispatch-validate.sh request.json --session-id <in-session-id>

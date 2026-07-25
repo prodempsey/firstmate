@@ -49,6 +49,7 @@
 #     --packets-dir <dir>     evidence-packet dir (§F rule 10 reference resolution)
 #     --captain-orders <file> captain-order inbox file (§F rule 11 exception resolution)
 #     --expect-fingerprint <sha256>   pin the request fingerprint (DISPATCH_FINGERPRINT_MISMATCH)
+#     --write-sidecar         write a provenance attestation ONLY after full proof
 #     --quiet                 suppress the success lines
 #   Defaults: manifest    = $FM_ROOT/docs/model-economy/governed-profiles.manifest.json
 #             policy      = $FM_ROOT/docs/model-economy/governed-dispatch-policy.json
@@ -61,7 +62,8 @@
 #   stable code line to stderr. Engine/artifact codes:
 #     DISPATCH_VALIDATOR_UNAVAILABLE | DISPATCH_POLICY_MISSING | DISPATCH_POLICY_INVALID |
 #     DISPATCH_MANIFEST_MISSING | DISPATCH_MANIFEST_INVALID | DISPATCH_REQUEST_MISSING |
-#     DISPATCH_INVALID | DISPATCH_SCHEMA_INVALID
+#     DISPATCH_INVALID | DISPATCH_SCHEMA_INVALID |
+#     DISPATCH_SIDECAR_INVALIDATION_FAILED | DISPATCH_SIDECAR_WRITE_FAILED
 #   §F denial codes (schema-layer + shared-with-hook):
 #     SCHEMA_VERSION_UNSUPPORTED | MODEL_REQUIRED | PROFILE_REQUIRED | PROFILE_NOT_GOVERNED |
 #     TASK_CLASS_UNKNOWN | MODEL_PROFILE_MISMATCH | PROFILE_EFFORT_MISMATCH | NESTING_PROHIBITED |
@@ -69,6 +71,17 @@
 #     NEXT_LOWER_MODEL_INVALID | EVIDENCE_PACKET_MISSING | CAPTAIN_EXCEPTION_INVALID |
 #     PARENT_LINKAGE_MISSING | REPO_STATE_STALE | DISPATCH_FINGERPRINT_MISMATCH
 # Exit 2: usage error.
+#
+# Provenance sidecar (--write-sidecar): mirrors bin/fm-profile-matrix-check.sh's
+# stale-authority-safe contract. The sidecar path is <request minus .json>.fingerprint.
+# Remove-first / write-last: any pre-existing attestation is INVALIDATED before any
+# validation runs (so a failed run never leaves a valid-looking sidecar beside a
+# now-invalid request), and the invalidation is PROVEN — if the unlink is refused
+# (read-only dir, immutable file) the validator refuses loudly
+# (DISPATCH_SIDECAR_INVALIDATION_FAILED) rather than proceed under stale authority.
+# The fresh attestation is written (temp file + atomic rename) ONLY after the whole
+# pass proves the request; a write that cannot complete is a clean typed refusal
+# (DISPATCH_SIDECAR_WRITE_FAILED), never a traceback or a partial temp file.
 #
 # Fail-closed everywhere: every code above denies; there is no "warn and proceed".
 # A captain override is the only path that changes a would-be-denied outcome, and
@@ -91,6 +104,7 @@ SESSION_ID=""
 PACKETS_DIR=""
 CAPTAIN_ORDERS=""
 EXPECT_FP=""
+WRITE_SIDECAR=0
 QUIET=0
 want=
 for a in "$@"; do
@@ -119,6 +133,7 @@ for a in "$@"; do
     --packets-dir) want=packets ;;
     --captain-orders) want=orders ;;
     --expect-fingerprint) want=fp ;;
+    --write-sidecar) WRITE_SIDECAR=1 ;;
     --quiet) QUIET=1 ;;
     --*) echo "fm-dispatch-validate: unknown flag $a" >&2; exit 2 ;;
     *)
@@ -138,6 +153,28 @@ if [ -z "$STATE_DIR" ]; then
   else STATE_DIR="$FM_ROOT/state"; fi
 fi
 
+# Provenance stale-authority guard (same class as the DJ stale-audit ruling, per
+# bin/fm-profile-matrix-check.sh): when --write-sidecar is requested, INVALIDATE any
+# pre-existing attestation BEFORE any validation step (or engine-availability
+# refusal) can fail, so a failed run never leaves a valid-looking sidecar standing
+# beside a now-invalid request. The fresh attestation is re-created only after the
+# whole pass succeeds (inside the python pass: temp file + atomic rename).
+# Remove-first / write-last. The invalidation itself must be PROVEN: if the unlink
+# is refused (read-only dir, immutable file) the old attestation would silently
+# persist, so removal failure is itself fail-closed — refuse loudly rather than
+# proceed under a still-present, now-unverifiable attestation.
+if [ "$WRITE_SIDECAR" = "1" ]; then
+  SIDECAR="${REQUEST%.json}.fingerprint"
+  if [ -e "$SIDECAR" ]; then
+    rm -f "$SIDECAR" 2>/dev/null || true
+    if [ -e "$SIDECAR" ]; then
+      echo "DISPATCH_SIDECAR_INVALIDATION_FAILED" >&2
+      echo "fm-dispatch-validate: could not invalidate the pre-existing attestation sidecar $SIDECAR before validation; refusing rather than risk leaving stale authority" >&2
+      exit 1
+    fi
+  fi
+fi
+
 # Hard prerequisite: the strict validation engine must be present. Absence is
 # NON-AUTHORITATIVE and fails closed (never a weaker fallback).
 if ! command -v python3 >/dev/null 2>&1; then
@@ -146,13 +183,14 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-python3 - "$REQUEST" "$MANIFEST" "$POLICY" "$SCHEMAS_DIR" "$STATE_DIR" "$SESSION_ID" "$PACKETS_DIR" "$CAPTAIN_ORDERS" "$EXPECT_FP" "$QUIET" <<'PYEOF'
+python3 - "$REQUEST" "$MANIFEST" "$POLICY" "$SCHEMAS_DIR" "$STATE_DIR" "$SESSION_ID" "$PACKETS_DIR" "$CAPTAIN_ORDERS" "$EXPECT_FP" "$WRITE_SIDECAR" "$QUIET" <<'PYEOF'
 import hashlib, json, os, subprocess, sys
 
 (REQUEST, MANIFEST, POLICY, SCHEMAS_DIR, STATE_DIR, SESSION_ID,
- PACKETS_DIR, CAPTAIN_ORDERS, EXPECT_FP, QUIET) = (
+ PACKETS_DIR, CAPTAIN_ORDERS, EXPECT_FP, WRITE_SIDECAR, QUIET) = (
     sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
-    sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10] == "1",
+    sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9],
+    sys.argv[10] == "1", sys.argv[11] == "1",
 )
 
 # A test-only fault-injection seam. It can ONLY force a refusal (never a false
@@ -353,15 +391,17 @@ if req["requested_model"] == "fable":
         die("FABLE_JUSTIFICATION_MISSING",
             "Fable justification relies on an enumerated insufficient reason (%r); name the specific "
             "reasoning limitation Opus cannot meet" % hit)
-    # (§F rule 10, S4 shallow form) EVIDENCE_PACKET_MISSING — Fable decision work
-    # requires an evidence packet (brief §7). Deep §M packet-schema validation is
-    # deferred to S7; here the reference must exist and, when a packets dir is
-    # given, resolve to a packet file.
-    if req.get("evidence_packet_id") is None:
-        die("EVIDENCE_PACKET_MISSING", "a Fable dispatch requires an evidence_packet_id")
 
-# (§F rule 10) reference resolution for any present packet id (any profile).
+# (§F rule 10) EVIDENCE_PACKET_MISSING — the §F field table requires evidence_packet_id
+# for EVERY opus-* or fable-* profile (Opus/Fable is decision-class work, brief §7/§15).
+# This enforces the binding field-table requirement; the §F prose valid example's
+# null-packet opus-high is superseded by the field table under the QA contract (see
+# slice4-notes.md). Deep §M packet-schema validation is deferred to S7; here the
+# reference must be present and, when a packets dir is given, resolve to a packet file.
 pkt = req.get("evidence_packet_id")
+if (profile.startswith("opus-") or profile.startswith("fable-")) and pkt is None:
+    die("EVIDENCE_PACKET_MISSING",
+        "profile %s is decision-class; §F requires a non-null evidence_packet_id" % profile)
 if pkt is not None and PACKETS_DIR:
     if not os.path.isfile(os.path.join(PACKETS_DIR, pkt + ".json")):
         die("EVIDENCE_PACKET_MISSING", "evidence_packet_id %r resolves to no packet under %s"
@@ -450,6 +490,26 @@ fingerprint = hashlib.sha256(
 ).hexdigest()
 if EXPECT_FP and EXPECT_FP != fingerprint:
     die("DISPATCH_FINGERPRINT_MISMATCH", "request fingerprint %s != expected %s" % (fingerprint, EXPECT_FP))
+
+# --- provenance attestation: written ONLY after the full pass proves the request
+# (never before), so a failed validation never leaves a valid-looking sidecar. The
+# bash preamble already invalidated any pre-existing attestation (and refused if it
+# could not). Written via a temp file + atomic rename, mirroring
+# bin/fm-profile-matrix-check.sh; a write that cannot complete is a clean typed
+# refusal, never a traceback and never a partially-written attestation.
+if WRITE_SIDECAR:
+    side = (REQUEST[:-5] if REQUEST.endswith(".json") else REQUEST) + ".fingerprint"
+    tmp = side + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(fingerprint + "\n")
+        os.replace(tmp, side)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        die("DISPATCH_SIDECAR_WRITE_FAILED", "could not write attestation sidecar %s: %s" % (side, e))
 
 if not QUIET:
     sys.stdout.write("DISPATCH_OK=%s\n" % profile)

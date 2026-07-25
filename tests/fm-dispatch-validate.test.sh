@@ -47,7 +47,8 @@ SID="parent-in-session-s4"
 # committed manifest for <profile>. Derives every immutable-profile field from the
 # matrix (single source of truth) and fills the conditionally-required fields
 # (next_lower_model + its justification for non-haiku; opus_xhigh_justification for
-# opus-xhigh; why_opus_is_insufficient + evidence_packet_id for fable).
+# opus-xhigh; evidence_packet_id for every opus-*/fable-* per §F; why_opus_is_insufficient
+# for fable).
 base_request() {
   python3 - "$MANIFEST_SRC" "$1" "$SID" <<'PY'
 import json, sys
@@ -87,11 +88,13 @@ if profile == "opus-xhigh":
     req["opus_xhigh_justification"] = (
         "opus-high dispatch task-q6 stalled on the cross-file state machine; remaining work bounded "
         "with explicit stop conditions")
+if model in ("opus", "fable"):
+    # §F field table: evidence_packet_id required for every opus-* or fable-* profile.
+    req["evidence_packet_id"] = "pkt-base"
 if model == "fable":
     req["why_opus_is_insufficient"] = (
         "a prior opus-high dispatch (task-n1) could not span the three-runtime state machine within its "
         "turn budget; the remaining synthesis is long-horizon across two repos")
-    req["evidence_packet_id"] = "pkt-base"
 json.dump(req, sys.stdout, indent=2)
 PY
 }
@@ -271,6 +274,89 @@ test_structural_schema_violations_rejected() {
   pass "every structural schema/type/enum/format/uniqueness/closed-set violation fails closed"
 }
 
+test_every_root_property_wrong_type() {
+  # One wrong-TYPE mutation for EVERY one of the 31 admitted root properties, built
+  # on the opus-high base and asserting the specific code. This makes the "one
+  # invalid fixture per closed-schema property" claim literally true (QA
+  # fixture-discipline finding). Boolean properties get a string; every other
+  # property gets `false`; schema_version keeps its dedicated gate code.
+  # <property>|<jq-wrong-type>|<code>
+  local cases=(
+    'schema_version|.schema_version=false|SCHEMA_VERSION_UNSUPPORTED'
+    'dispatch_request_id|.dispatch_request_id=false|DISPATCH_SCHEMA_INVALID'
+    'parent_task_id|.parent_task_id=false|DISPATCH_SCHEMA_INVALID'
+    'parent_decision_id|.parent_decision_id=false|DISPATCH_SCHEMA_INVALID'
+    'task_type|.task_type=false|DISPATCH_SCHEMA_INVALID'
+    'task_class|.task_class=false|DISPATCH_SCHEMA_INVALID'
+    'requested_role|.requested_role=false|DISPATCH_SCHEMA_INVALID'
+    'selected_profile|.selected_profile=false|DISPATCH_SCHEMA_INVALID'
+    'requested_model|.requested_model=false|DISPATCH_SCHEMA_INVALID'
+    'configured_effort|.configured_effort=false|DISPATCH_SCHEMA_INVALID'
+    'repository|.repository=false|DISPATCH_SCHEMA_INVALID'
+    'worktree|.worktree=false|DISPATCH_SCHEMA_INVALID'
+    'branch|.branch=false|DISPATCH_SCHEMA_INVALID'
+    'HEAD|.HEAD=false|DISPATCH_SCHEMA_INVALID'
+    'runtime_state_fingerprint|.runtime_state_fingerprint=false|DISPATCH_SCHEMA_INVALID'
+    'scope|.scope=false|DISPATCH_SCHEMA_INVALID'
+    'exclusions|.exclusions=false|DISPATCH_SCHEMA_INVALID'
+    'write_allowed|.write_allowed="x"|DISPATCH_SCHEMA_INVALID'
+    'allowed_tools|.allowed_tools=false|DISPATCH_SCHEMA_INVALID'
+    'max_turns|.max_turns="x"|DISPATCH_SCHEMA_INVALID'
+    'nesting_allowed|.nesting_allowed="x"|DISPATCH_SCHEMA_INVALID'
+    'evidence_packet_id|.evidence_packet_id=false|DISPATCH_SCHEMA_INVALID'
+    'session_continuation_candidate|.session_continuation_candidate="x"|DISPATCH_SCHEMA_INVALID'
+    'routing_reason|.routing_reason=false|DISPATCH_SCHEMA_INVALID'
+    'next_lower_model|.next_lower_model=false|DISPATCH_SCHEMA_INVALID'
+    'why_next_lower_model_is_insufficient|.why_next_lower_model_is_insufficient=false|DISPATCH_SCHEMA_INVALID'
+    'opus_xhigh_justification|.opus_xhigh_justification=false|DISPATCH_SCHEMA_INVALID'
+    'why_opus_is_insufficient|.why_opus_is_insufficient=false|DISPATCH_SCHEMA_INVALID'
+    'captain_exception_id|.captain_exception_id=false|DISPATCH_SCHEMA_INVALID'
+    'policy_version|.policy_version=false|DISPATCH_SCHEMA_INVALID'
+    'binding_fingerprint|.binding_fingerprint=false|DISPATCH_SCHEMA_INVALID'
+  )
+  local entry prop expr code seen=0
+  for entry in "${cases[@]}"; do
+    prop=${entry%%|*}; expr=${entry#*|}; code=${expr##*|}; expr=${expr%|*}
+    mut opus-high "$expr"
+    expect_reject "$code" "wrong-type $prop"
+    seen=$((seen + 1))
+  done
+  [ "$seen" -eq 31 ] || fail "expected 31 root-property fixtures, ran $seen"
+  pass "every one of the 31 admitted root properties has a wrong-type fixture that fails closed"
+}
+
+test_required_field_absence() {
+  # Deleting each ALWAYS-required field fails closed; the three with a dedicated
+  # presence code (schema_version/model/profile) report it, the rest are structural.
+  local cases=(
+    'schema_version|SCHEMA_VERSION_UNSUPPORTED'
+    'requested_model|MODEL_REQUIRED'
+    'selected_profile|PROFILE_REQUIRED'
+    'dispatch_request_id|DISPATCH_SCHEMA_INVALID'
+    'parent_task_id|DISPATCH_SCHEMA_INVALID'
+    'task_type|DISPATCH_SCHEMA_INVALID'
+    'task_class|DISPATCH_SCHEMA_INVALID'
+    'requested_role|DISPATCH_SCHEMA_INVALID'
+    'configured_effort|DISPATCH_SCHEMA_INVALID'
+    'repository|DISPATCH_SCHEMA_INVALID'
+    'scope|DISPATCH_SCHEMA_INVALID'
+    'write_allowed|DISPATCH_SCHEMA_INVALID'
+    'allowed_tools|DISPATCH_SCHEMA_INVALID'
+    'max_turns|DISPATCH_SCHEMA_INVALID'
+    'nesting_allowed|DISPATCH_SCHEMA_INVALID'
+    'session_continuation_candidate|DISPATCH_SCHEMA_INVALID'
+    'routing_reason|DISPATCH_SCHEMA_INVALID'
+    'policy_version|DISPATCH_SCHEMA_INVALID'
+  )
+  local entry field code
+  for entry in "${cases[@]}"; do
+    field=${entry%%|*}; code=${entry##*|}
+    mut opus-high "del(.$field)"
+    expect_reject "$code" "missing required $field"
+  done
+  pass "every always-required field, when absent, fails closed with its expected code"
+}
+
 # --- §F dedicated denial codes (the T.1 must-reject list) --------------------
 
 test_schema_version_gate() {
@@ -411,12 +497,20 @@ test_next_lower_model_rules() {
 }
 
 test_evidence_packet_rules() {
-  mut fable-medium '.evidence_packet_id=null'
-  expect_reject "EVIDENCE_PACKET_MISSING" "fable without evidence packet"
+  # §F field table: evidence_packet_id required for EVERY opus-* and fable-* profile.
+  local prof
+  for prof in opus-low opus-medium opus-high opus-xhigh fable-low fable-medium fable-high; do
+    mut "$prof" '.evidence_packet_id=null'
+    expect_reject "EVIDENCE_PACKET_MISSING" "$prof without evidence packet"
+  done
+  # a haiku/sonnet dispatch is NOT decision-class and needs no packet (positive control)
+  base_request sonnet-high-engineer > "$REQ"
+  run
+  expect_code 0 "$RC" "a non-decision-class profile needs no evidence packet"$'\n'"$OUT"
   # a present packet id that does not resolve under a supplied packets dir
   local pkts="$SB/pkts"
   mkdir -p "$pkts"
-  base_request fable-medium > "$REQ"
+  base_request opus-high > "$REQ"
   run --quiet --packets-dir "$pkts"
   expect_code 1 "$RC" "a dangling packet reference must fail closed"
   assert_contains "$OUT" "EVIDENCE_PACKET_MISSING" "dangling packet reference refuses"
@@ -424,7 +518,26 @@ test_evidence_packet_rules() {
   echo '{}' > "$pkts/pkt-base.json"
   run --packets-dir "$pkts"
   expect_code 0 "$RC" "a resolvable packet reference passes"$'\n'"$OUT"
-  pass "Fable evidence-packet presence and reference resolution fail closed (§F rule 10, S4 shallow form)"
+  pass "every Opus/Fable dispatch requires a present, resolvable evidence packet (§F rule 10 / field table)"
+}
+
+test_binding_fingerprint_format() {
+  # §F: binding_fingerprint is a sha256 fingerprint (bare 64-hex, as its producer
+  # bin/fm-bindings-validate.sh emits). A non-fingerprint string is a structural
+  # false pass the round-1 schema admitted (QA FC-003); it must fail closed now.
+  mut opus-high '.binding_fingerprint="x"'
+  expect_reject "DISPATCH_SCHEMA_INVALID" "binding_fingerprint non-fingerprint string"
+  mut opus-high '.binding_fingerprint="sha256:'"$(printf '0%.0s' {1..64})"'"'
+  expect_reject "DISPATCH_SCHEMA_INVALID" "binding_fingerprint with a sha256: prefix (producer emits bare hex)"
+  mut opus-high '.binding_fingerprint="ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789"'
+  expect_reject "DISPATCH_SCHEMA_INVALID" "binding_fingerprint uppercase hex"
+  mut opus-high '.binding_fingerprint=false'
+  expect_reject "DISPATCH_SCHEMA_INVALID" "binding_fingerprint wrong type"
+  # a well-formed bare 64-hex fingerprint is accepted (positive control)
+  mut opus-high '.binding_fingerprint="'"$(printf 'a%.0s' {1..64})"'"'
+  run
+  expect_code 0 "$RC" "a well-formed binding_fingerprint is accepted"$'\n'"$OUT"
+  pass "binding_fingerprint is enforced as a real sha256 fingerprint, not merely present (§F / QA FC-003)"
 }
 
 test_captain_exception_resolution() {
@@ -519,6 +632,99 @@ test_fingerprint_pin() {
   pass "request fingerprint pinning mirrors the S3 provenance surface"
 }
 
+# --- provenance: sidecar lifecycle (mirrors the S3 stale-authority contract) --
+
+SIDE() { echo "${REQ%.json}.fingerprint"; }
+
+test_sidecar_written_after_proof() {
+  base_request opus-high > "$REQ"
+  rm -f "$(SIDE)"
+  "$V" "$REQ" --session-id "$SID" --write-sidecar --quiet
+  assert_present "$(SIDE)" "--write-sidecar writes the attestation on success"
+  local fp
+  fp=$("$V" "$REQ" --session-id "$SID" 2>/dev/null | sed -n 's/^REQUEST_FINGERPRINT=//p')
+  assert_grep "$fp" "$(SIDE)" "the sidecar records the request fingerprint"
+  pass "a proven request writes its attestation sidecar (write-last)"
+}
+
+test_sidecar_not_written_on_failure() {
+  # A failed validation must leave NO attestation. Cover both an EARLY failure
+  # (before the fingerprint is computed) and a LATE one (after it).
+  # (a) early: a structural schema failure
+  base_request opus-high | jq '.bogus=1' > "$REQ"
+  rm -f "$(SIDE)"
+  "$V" "$REQ" --session-id "$SID" --write-sidecar --quiet 2>/dev/null
+  assert_absent "$(SIDE)" "no sidecar after an early (structural) failure"
+  # (b) late: a projection failure, which happens after the fingerprint is computed
+  base_request opus-high | jq '.max_turns=999' > "$REQ"
+  rm -f "$(SIDE)"
+  "$V" "$REQ" --session-id "$SID" --write-sidecar --quiet 2>/dev/null
+  assert_absent "$(SIDE)" "no sidecar after a late (projection) failure"
+  pass "a failed validation leaves no attestation sidecar (write-last, early and late)"
+}
+
+test_preexisting_sidecar_invalidated_on_failure() {
+  # The stale-authority invariant: a failed --write-sidecar run must leave NO usable
+  # sidecar EVEN WHEN one already existed from a prior successful run. No regenerate
+  # of $REQ between the two runs — the request file (and its sidecar) persists.
+  base_request opus-high > "$REQ"
+  "$V" "$REQ" --session-id "$SID" --write-sidecar --quiet
+  assert_present "$(SIDE)" "a valid run first establishes a sidecar"
+  # invalidate the request in place, then re-run with --write-sidecar
+  jq '.max_turns=999' "$REQ" > "$REQ.tmp" && mv "$REQ.tmp" "$REQ"
+  "$V" "$REQ" --session-id "$SID" --write-sidecar --quiet 2>/dev/null
+  assert_absent "$(SIDE)" "a failed run removes the pre-existing sidecar"
+  # a subsequent valid run re-establishes it
+  base_request opus-high > "$REQ"
+  "$V" "$REQ" --session-id "$SID" --write-sidecar --quiet
+  assert_present "$(SIDE)" "a later valid run re-establishes the sidecar"
+  pass "a failed validation invalidates any pre-existing attestation sidecar"
+}
+
+test_sidecar_invalidation_failure_refuses() {
+  # If the pre-existing sidecar cannot be removed (read-only dir), the validator
+  # must refuse loudly BEFORE validation rather than proceed under stale authority.
+  # Root bypasses directory permissions, so skip there.
+  if [ "$(id -u)" = "0" ]; then
+    pass "sidecar-invalidation-failure refusal (skipped: root cannot be denied unlink)"
+    return
+  fi
+  local mdir="$SB/mdir-inval"
+  rm -rf "$mdir"; mkdir -p "$mdir"
+  base_request opus-high > "$mdir/request.json"
+  "$V" "$mdir/request.json" --session-id "$SID" --write-sidecar --quiet
+  assert_present "$mdir/request.fingerprint" "a valid run first establishes the sidecar"
+  # invalidate the request, then deny unlink by making the dir read-only
+  jq '.max_turns=999' "$mdir/request.json" > "$mdir/request.json.tmp" && mv "$mdir/request.json.tmp" "$mdir/request.json"
+  chmod 0555 "$mdir"
+  OUT=$("$V" "$mdir/request.json" --session-id "$SID" --write-sidecar --quiet 2>&1); RC=$?
+  chmod 0755 "$mdir"   # restore BEFORE asserting so cleanup always succeeds
+  expect_code 1 "$RC" "an unlink-refused invalidation must fail closed"
+  assert_contains "$OUT" "DISPATCH_SIDECAR_INVALIDATION_FAILED" "a proven-failed invalidation refuses with its own code"
+  assert_not_contains "$OUT" "PROFILE_IMMUTABLE_MISMATCH" "the refusal precedes validation, not after it"
+  pass "a sidecar that cannot be invalidated makes the validator refuse (no silent stale authority)"
+}
+
+test_sidecar_write_failure_refuses() {
+  # Symmetric hygiene: a proven request whose attestation cannot be written
+  # (read-only dir, no pre-existing sidecar) is a clean typed refusal, never a
+  # traceback or a partial temp file. Root bypasses permissions, so skip.
+  if [ "$(id -u)" = "0" ]; then
+    pass "sidecar-write-failure refusal (skipped: root cannot be denied write)"
+    return
+  fi
+  local mdir="$SB/mdir-write"
+  rm -rf "$mdir"; mkdir -p "$mdir"
+  base_request opus-high > "$mdir/request.json"
+  chmod 0555 "$mdir"
+  OUT=$("$V" "$mdir/request.json" --session-id "$SID" --write-sidecar --quiet 2>&1); RC=$?
+  chmod 0755 "$mdir"
+  expect_code 1 "$RC" "an unwritable sidecar on an otherwise-valid request must fail closed"
+  assert_contains "$OUT" "DISPATCH_SIDECAR_WRITE_FAILED" "an unwritable attestation refuses with its own code"
+  assert_absent "$mdir/request.fingerprint.tmp" "no partial temp sidecar is left behind"
+  pass "an attestation that cannot be written makes the validator refuse cleanly"
+}
+
 # --- usage ------------------------------------------------------------------
 
 test_usage_errors() {
@@ -540,6 +746,9 @@ test_policy_and_manifest_absence_refuses
 test_policy_and_manifest_malformed_refuses
 test_request_missing_and_unparseable
 test_structural_schema_violations_rejected
+test_every_root_property_wrong_type
+test_required_field_absence
+test_binding_fingerprint_format
 test_schema_version_gate
 test_model_and_profile_required
 test_profile_not_governed
@@ -558,4 +767,9 @@ test_parent_linkage_missing
 test_repo_state_agreement
 test_repo_state_stale_rejected
 test_fingerprint_pin
+test_sidecar_written_after_proof
+test_sidecar_not_written_on_failure
+test_preexisting_sidecar_invalidated_on_failure
+test_sidecar_invalidation_failure_refuses
+test_sidecar_write_failure_refuses
 test_usage_errors
