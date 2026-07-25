@@ -361,7 +361,7 @@ build_class_event() {
     dets_json=$(printf '%s\n' "${dets[@]}" | jq -c . 2>/dev/null | jq -sc .) \
       || die "each --detection must be one valid JSON object"
     detection_array_conforms "$dets_json" \
-      || die "each --detection must be {engine, pattern, cue_ref} with engine in the supported set ($FM_CUE_ENGINES); pattern must compile"
+      || die "each --detection must have EXACTLY the keys {engine, pattern, cue_ref}, engine in the supported set ($FM_CUE_ENGINES), and a pattern that compiles"
   fi
   FC_EVENT=$(jq -cn \
     --arg schema "$SCHEMA" --arg id "$id" --arg name "$name" \
@@ -481,7 +481,7 @@ cmd_amend() {
     # silently-inert tripwire (unsupported engine, empty pattern, or missing cue_ref) would
     # let a class read as mechanically linted while enforcing nothing.
     detection_array_conforms "$dets_json" \
-      || die "each --detection must be {engine, pattern, cue_ref} with engine in the supported set ($FM_CUE_ENGINES); pattern must compile"
+      || die "each --detection must have EXACTLY the keys {engine, pattern, cue_ref}, engine in the supported set ($FM_CUE_ENGINES), and a pattern that compiles"
   fi
   if [ "${#cues[@]}" -gt 0 ]; then
     cues_json=$(printf '%s\n' "${cues[@]}" | jq -R . | jq -s .)

@@ -5,8 +5,9 @@
 # fm_validate_cue_row, so no path ever writes, folds, or EXECUTES a cue row that has not
 # been proven - in ONE atomic pass - to:
 #   (a) parse as a JSON object,
-#   (b) conform to the closed detection schema: engine in the supported set, a non-empty
-#       STRING pattern, and a non-empty STRING cue_ref,
+#   (b) conform to the CLOSED detection schema (additionalProperties:false): its key set is
+#       EXACTLY {engine, pattern, cue_ref} - any undeclared key is a failure - with engine in
+#       the supported set, a non-empty STRING pattern, and a non-empty STRING cue_ref,
 #   (c) actually COMPILE under the engine that will execute it.
 # Any failure is a single fail-closed verdict, never a silently-skipped row or an
 # empty-hit-stream pass (FC-001 closed-schema positive proof; the me-s3-profiles and
@@ -46,7 +47,11 @@ fm_validate_cue_row() {
   # at all makes jq exit non-zero, which is itself a fail-closed verdict.
   reason=$(printf '%s' "$row" | jq -r --arg engines "$FM_CUE_ENGINES" '
     . as $d | ($engines | split(" ")) as $ok
+    | (["cue_ref","engine","pattern"]) as $allowed
     | if ($d|type) != "object" then "not a JSON object"
+      elif (($d|keys) - $allowed) != []
+        then "undeclared propert\(if ((($d|keys) - $allowed)|length) > 1 then "ies" else "y" end): "
+             + ((($d|keys) - $allowed)|join(", ")) + " (allowed exactly: \($allowed|join(", ")))"
       elif ($d.engine|type) != "string" or (($ok | index($d.engine)) | not)
         then "unsupported engine \($d.engine|tojson) (supported: \($ok|join(",")))"
       elif ($d.pattern|type) != "string" or ($d.pattern|length) == 0 then "empty or non-string pattern"

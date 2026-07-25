@@ -27,12 +27,14 @@ bad_row '{broken json'                                              "not valid J
 bad_row '"just-a-string"'                                           "a JSON string is not an object -> invalid"
 bad_row '["array"]'                                                 "a JSON array is not an object -> invalid"
 
-# (b) closed schema
+# (b) closed schema (additionalProperties:false): exact key set {engine, pattern, cue_ref}
 bad_row '{"engine":"regex-pcre","pattern":"x","cue_ref":"c"}'      "unsupported engine -> invalid (F2)"
 bad_row '{"pattern":"x","cue_ref":"c"}'                            "missing engine -> invalid"
 bad_row '{"engine":"awk-ere","pattern":"","cue_ref":"c"}'         "empty pattern -> invalid"
 bad_row '{"engine":"awk-ere","pattern":"x"}'                       "missing cue_ref -> invalid"
 bad_row '{"engine":"awk-ere","pattern":123,"cue_ref":"c"}'        "non-string pattern -> invalid"
+bad_row '{"engine":"awk-ere","pattern":"x","cue_ref":"c","unexpected":true}' "one undeclared property -> invalid (r3: additionalProperties:false)"
+bad_row '{"engine":"awk-ere","pattern":"x","cue_ref":"c","a":1,"b":2}' "multiple undeclared properties -> invalid"
 
 # (c) pattern must COMPILE under the engine
 bad_row '{"engine":"awk-ere","pattern":"[","cue_ref":"c"}'        "unclosed bracket ERE does not compile -> invalid (F1)"

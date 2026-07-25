@@ -644,6 +644,17 @@ expect_code 1 "$?" "an unsupported engine on the read path fails the verifier cl
 [ "$(bget "$TMP/badeng.json" '.gates[]|select(.gate=="cue_lint")|.status')" = fail ] || fail "the live reader must fail closed on an unsupported engine, not downgrade the class to advisory and pass"
 [ "$(bget "$TMP/badeng.json" '[.findings[]|select(.gate=="cue_lint" and .severity=="fail")]|length')" -ge 1 ] || fail "an unsupported engine must emit a loud fail-closed finding on the read path"
 pass "F2: the live cue lint enforces the closed engine set on its read path (fail closed, one finding)"
+# F3 (qa-scg1r3-q180) - an undeclared detection property (additionalProperties:false) must fail
+# the LIVE read path closed, not be admitted and executed. A hand-injected class-amended row with
+# a valid engine/pattern/cue_ref plus one unknown key exercises read-side corruption.
+BADKEY="$TMP/ledger-bad-key.jsonl"; cp "$LEDGER" "$BADKEY"
+printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-amended","id":"FC-001","detection":[{"engine":"awk-ere","pattern":"feature","cue_ref":"extra","unexpected":true}]}\n' >> "$BADKEY"
+FM_HOME="$TMP/nohome" FM_FAILURE_LEDGER="$BADKEY" "$VERIFY" --out "$TMP/badkey.json" --brief "$BRIEF" \
+  --worktree "$RCu" --base main --sha "$USHA" --branch fm/g1 --task g1 >/dev/null 2>&1
+expect_code 1 "$?" "an undeclared detection property fails the verifier closed"
+[ "$(bget "$TMP/badkey.json" '.gates[]|select(.gate=="cue_lint")|.status')" = fail ] || fail "the live reader must fail closed on an undeclared detection property, not execute the row"
+[ "$(bget "$TMP/badkey.json" '[.findings[]|select(.gate=="cue_lint" and .severity=="fail")]|length')" -ge 1 ] || fail "an undeclared detection property must emit a loud fail-closed finding on the read path"
+pass "F3: the live cue lint enforces additionalProperties:false on its read path (fail closed, one finding)"
 
 # --- FC-007: EVERY refusal invalidates the prior pass in BOTH artifacts --------
 seed_pass() { # <out>  - seed an authoritative pass bundle + pass summary

@@ -127,7 +127,19 @@ IE="$TMP_ROOT/validate-badere.jsonl"; seed_one "$IE"
 printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-amended","id":"FC-001","detection":[{"engine":"awk-ere","pattern":"[","cue_ref":"c"}]}\n' >> "$IE"
 FM_FC_LEDGER="$IE" "$FC" validate >/dev/null 2>&1
 expect_code 1 $? "validate refuses a detection whose pattern does not compile as an ERE"
-pass "closed detection schema (incl. pattern compilation) enforced by amend, add, and validate"
+# additionalProperties:false (qa-scg1r3-q180 F1): the detection object's key set must be
+# EXACTLY {engine, pattern, cue_ref}; an otherwise-valid row with one undeclared key must be
+# refused by the writer and by validate, never admitted then executed.
+FM_FC_LEDGER="$A" "$FC" amend FC-001 --detection '{"engine":"awk-ere","pattern":"synthetic","cue_ref":"c","unexpected":true}' >/dev/null 2>&1
+expect_code 1 $? "amend refuses a detection with an undeclared property (closed schema)"
+FM_FC_LEDGER="$TMP_ROOT/badkey-add.jsonl" "$FC" add --id FC-071 --name n --invariant i --fix f --cue c \
+  --provenance "qa:data/y#1" --detection '{"engine":"awk-ere","pattern":"x","cue_ref":"c","extra":1}' >/dev/null 2>&1
+expect_code 1 $? "add refuses an inline detection with an undeclared property"
+XK="$TMP_ROOT/validate-badkey.jsonl"; seed_one "$XK"
+printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-amended","id":"FC-001","detection":[{"engine":"awk-ere","pattern":"x","cue_ref":"c","unexpected":true}]}\n' >> "$XK"
+FM_FC_LEDGER="$XK" "$FC" validate >/dev/null 2>&1
+expect_code 1 $? "validate refuses a detection carrying an undeclared property"
+pass "closed detection schema (exact key set, engine, compilable pattern, cue_ref) enforced by amend, add, and validate"
 # A class-amended event against an id no class-defined ever declared is corrupt: fail closed.
 Cam="$TMP_ROOT/corrupt-amend.jsonl"
 printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-amended","id":"FC-777","detection":[{"engine":"awk-ere","pattern":"x"}]}\n' > "$Cam"
