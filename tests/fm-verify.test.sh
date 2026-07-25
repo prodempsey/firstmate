@@ -139,36 +139,49 @@ EOF
 
 FAKEBIN="$TMP/fake-npm"
 mkdir -p "$FAKEBIN"
-REAL_NPM=$(command -v npm) || fail "npm is required for memory dependency validation fixtures"
 cat > "$FAKEBIN/npm" <<'EOF'
 #!/usr/bin/env bash
 [ -z "${FM_TEST_NPM_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_TEST_NPM_LOG"
-if [ "${1:-}" = ls ] && [ -n "${FM_TEST_REAL_NPM:-}" ]; then
-  exec "$FM_TEST_REAL_NPM" "$@"
+if [ "${1:-}" = config ] && [ "${2:-}" = get ] && [ "${3:-}" = cache ]; then
+  [ -n "${FM_TEST_NPM_CACHE:-}" ] || exit 91
+  printf '%s\n' "$FM_TEST_NPM_CACHE"
+  exit 0
+fi
+if [ "${1:-}" = ci ] && [ "${FM_TEST_NPM_MODE:-fail}" = success ]; then
+  mkdir -p memory/node_modules/fixture-dep
+  cat > memory/node_modules/fixture-dep/package.json <<'JSON'
+{"name":"fixture-dep","version":"1.0.0","type":"module","exports":"./index.mjs"}
+JSON
+  printf 'export default "ready";\n' > memory/node_modules/fixture-dep/index.mjs
+  exit 0
 fi
 exit 91
 EOF
 chmod +x "$FAKEBIN/npm"
 
-RMD=$(build_memory_repo memory-deps-copy)
-mkdir -p "$RMD/memory/node_modules/fixture-dep"
-cat > "$RMD/memory/node_modules/fixture-dep/package.json" <<'EOF'
-{"name":"fixture-dep","version":"1.0.0","type":"module","exports":"./index.mjs"}
-EOF
-printf 'export default "ready";\n' > "$RMD/memory/node_modules/fixture-dep/index.mjs"
+NPM_CACHE="$TMP/npm-cache"
+mkdir -p "$NPM_CACHE"
+
+RMD=$(build_memory_repo memory-deps-green)
 MDSHA=$(git -C "$RMD" rev-parse HEAD)
-FM_TEST_REAL_NPM="$REAL_NPM" PATH="$FAKEBIN:$PATH" FM_HOME="$TMP/nohome" "$VERIFY" \
+GREEN_NPM_LOG="$TMP/memdeps-green-npm.log"
+FM_TEST_NPM_MODE=success FM_TEST_NPM_CACHE="$NPM_CACHE" FM_TEST_NPM_LOG="$GREEN_NPM_LOG" \
+  PATH="$FAKEBIN:$PATH" FM_HOME="$TMP/nohome" "$VERIFY" \
   --out "$TMP/memdeps-copy.json" --brief "$BRIEF" \
   --worktree "$RMD" --base main --sha "$MDSHA" --branch fm/g1 --task g1 >/dev/null 2>&1
-expect_code 0 "$?" "source memory dependencies make the isolated fixture pass"
-[ "$(bget "$TMP/memdeps-copy.json" '.gates[]|select(.gate=="tests")|.details.dependency_provisioner')" = source-copy ] \
-  || fail "byte-identical memory lockfiles must prefer source node_modules"
-pass "FC-005: provisioned memory dependencies make a mem-dependent sandbox fixture pass"
+expect_code 0 "$?" "npm ci provisions the isolated memory fixture"
+[ "$(bget "$TMP/memdeps-copy.json" '.gates[]|select(.gate=="tests")|.details.dependency_provisioner')" = npm-ci ] \
+  || fail "npm ci must be the only memory dependency provisioner"
+[ "$(sed -n '1p' "$GREEN_NPM_LOG")" = "config get cache" ] \
+  || fail "provisioning must resolve the invoking npm cache"
+[ "$(sed -n '2p' "$GREEN_NPM_LOG")" = "ci --prefix memory --silent --prefer-offline --cache $NPM_CACHE" ] \
+  || fail "provisioning must run npm ci with the invoking cache and --prefer-offline"
+pass "FC-001: bounded npm ci positively provisions a mem-dependent sandbox fixture"
 
 mkdir -p "$TMP/poison-root" "$TMP/poison-home" "$TMP/poison-state"
 FM_ROOT_OVERRIDE="$TMP/poison-root" FM_HOME="$TMP/poison-home" \
   FM_STATE_OVERRIDE="$TMP/poison-state" FM_FAILURE_LEDGER="$LEDGER" \
-  FM_TEST_REAL_NPM="$REAL_NPM" PATH="$FAKEBIN:$PATH" "$VERIFY" \
+  FM_TEST_NPM_MODE=success FM_TEST_NPM_CACHE="$NPM_CACHE" PATH="$FAKEBIN:$PATH" "$VERIFY" \
   --out "$TMP/memdeps-env.json" --brief "$BRIEF" \
   --worktree "$RMD" --base main --sha "$MDSHA" --branch fm/g1 --task g1 >/dev/null 2>&1
 expect_code 0 "$?" "poisoned ambient home overrides are scrubbed from sandbox suites"
@@ -180,7 +193,7 @@ RME=$(build_memory_repo memory-deps-empty)
 mkdir -p "$RME/memory/node_modules"
 MESHA=$(git -C "$RME" rev-parse HEAD)
 EMPTY_NPM_LOG="$TMP/memdeps-empty-npm.log"
-FM_TEST_NPM_LOG="$EMPTY_NPM_LOG" FM_TEST_REAL_NPM="$REAL_NPM" \
+FM_TEST_NPM_LOG="$EMPTY_NPM_LOG" FM_TEST_NPM_CACHE="$NPM_CACHE" \
   PATH="$FAKEBIN:$PATH" FM_HOME="$TMP/nohome" "$VERIFY" \
   --out "$TMP/memdeps-empty.json" --brief "$BRIEF" \
   --worktree "$RME" --base main --sha "$MESHA" --branch fm/g1 --task g1 >/dev/null 2>&1
@@ -191,15 +204,32 @@ expect_code 1 "$?" "empty source node_modules fails closed when npm ci also fail
   || fail "empty source node_modules must yield tests/deps-unprovisioned"
 [ "$(bget "$TMP/memdeps-empty.json" '.gates[]|select(.gate=="tests")|.details.suites_executed')" = 0 ] \
   || fail "empty source node_modules must stop suite fan-out"
-[ "$(sed -n '1p' "$EMPTY_NPM_LOG")" = "ls --prefix memory --all --silent" ] \
-  || fail "copied dependencies must receive a bounded npm ls validation"
-[ "$(sed -n '2p' "$EMPTY_NPM_LOG")" = "ci --prefix memory --silent" ] \
-  || fail "failed copy validation must fall through to bounded npm ci"
-pass "FC-001: empty copied dependencies require positive validation and fall through to npm ci"
+[ "$(sed -n '2p' "$EMPTY_NPM_LOG")" = "ci --prefix memory --silent --prefer-offline --cache $NPM_CACHE" ] \
+  || fail "empty source node_modules must be ignored in favor of npm ci"
+pass "FC-001: empty source dependencies are ignored and failed npm ci stays fail closed"
+
+RML=$(build_memory_repo memory-deps-lock-divergent)
+mkdir -p "$RML/memory/node_modules/fixture-dep"
+cat > "$RML/memory/node_modules/fixture-dep/package.json" <<'EOF'
+{"name":"fixture-dep","version":"1.1.0","type":"module","exports":"./index.mjs"}
+EOF
+printf 'export default "wrong-source-version";\n' > "$RML/memory/node_modules/fixture-dep/index.mjs"
+MLSHA=$(git -C "$RML" rev-parse HEAD)
+LOCK_NPM_LOG="$TMP/memdeps-lock-npm.log"
+FM_TEST_NPM_MODE=success FM_TEST_NPM_CACHE="$NPM_CACHE" FM_TEST_NPM_LOG="$LOCK_NPM_LOG" \
+  PATH="$FAKEBIN:$PATH" FM_HOME="$TMP/nohome" "$VERIFY" \
+  --out "$TMP/memdeps-lock.json" --brief "$BRIEF" \
+  --worktree "$RML" --base main --sha "$MLSHA" --branch fm/g1 --task g1 >/dev/null 2>&1
+expect_code 0 "$?" "lock-divergent source node_modules is ignored and npm ci provisions green"
+[ "$(bget "$TMP/memdeps-lock.json" '.gates[]|select(.gate=="tests")|.details.dependency_provisioner')" = npm-ci ] \
+  || fail "lock-divergent source dependencies must not create another provisioner"
+[ "$(sed -n '2p' "$LOCK_NPM_LOG")" = "ci --prefix memory --silent --prefer-offline --cache $NPM_CACHE" ] \
+  || fail "lock-divergent source dependencies must be ignored in favor of npm ci"
+pass "FC-001: lock-divergent source dependencies cannot bypass npm ci"
 
 RMF=$(build_memory_repo memory-deps-fail)
 MFSHA=$(git -C "$RMF" rev-parse HEAD)
-PATH="$FAKEBIN:$PATH" FM_HOME="$TMP/nohome" "$VERIFY" \
+FM_TEST_NPM_CACHE="$NPM_CACHE" PATH="$FAKEBIN:$PATH" FM_HOME="$TMP/nohome" "$VERIFY" \
   --out "$TMP/memdeps-fail.json" --brief "$BRIEF" \
   --worktree "$RMF" --base main --sha "$MFSHA" --branch fm/g1 --task g1 >/dev/null 2>&1
 expect_code 1 "$?" "memory dependency provisioning failure exits 1"

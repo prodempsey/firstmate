@@ -162,7 +162,7 @@ case "$FORMAT" in json|text) ;; *) refuse "--format must be json or text" ;; esa
 [ -n "$OUT" ] || refuse "--out or --task is required to place (and invalidate) the bundle"
 
 # --- prerequisites (FC-004: a missing tool is a refusal, not a skipped check) --
-for tool in git jq awk grep sed cmp env; do
+for tool in git jq awk grep sed env; do
   command -v "$tool" >/dev/null 2>&1 || refuse "missing prerequisite tool: $tool (fail closed, FC-004)"
 done
 
@@ -355,44 +355,32 @@ run_bounded() {
 
 # A detached worktree contains only tracked files, so provision the ignored
 # memory package dependencies before discovering or executing any suite.
-# A byte-identical lockfile lets us copy the authority-bearing worktree's
-# installed tree, but copy success is not proof of dependency conformance.
-# A bounded npm ls must positively validate the copied tree before reuse.
-# Otherwise npm ci is bounded by the same hard deadline as a suite. Failure
-# blocks the whole tests gate with one finding instead of cascading into
-# misleading per-suite failures (FC-001/FC-004).
+# Bounded npm ci against the sandbox lockfile is the single atomic positive
+# proof of dependency conformance. --prefer-offline reuses the invoking npm
+# cache without admitting an unproven source node_modules tree. Failure blocks
+# the whole tests gate with one finding instead of cascading into misleading
+# per-suite failures (FC-001/FC-004).
 if [ -n "$EXEC_DIR" ] && [ -f "$EXEC_DIR/memory/package.json" ]; then
   DEPS_PROVISIONED=no
   DEPS_PROVISIONER=npm-ci
-  if [ -f "$WORKTREE/memory/package-lock.json" ] \
-    && [ -f "$EXEC_DIR/memory/package-lock.json" ] \
-    && [ -d "$WORKTREE/memory/node_modules" ] \
-    && cmp -s "$WORKTREE/memory/package-lock.json" "$EXEC_DIR/memory/package-lock.json"
-  then
-    if cp -a "$WORKTREE/memory/node_modules" "$EXEC_DIR/memory/node_modules" 2>"$WORK/deps.err"; then
-      if command -v npm >/dev/null 2>&1; then
-        if run_bounded "$TEST_TIMEOUT" "$WORK/deps.err" npm ls --prefix memory --all --silent; then
-          DEPS_PROVISIONED=yes
-          DEPS_PROVISIONER=source-copy
-        fi
-      fi
-    fi
-  fi
-  if [ "$DEPS_PROVISIONED" = no ]; then
-    rm -rf "$EXEC_DIR/memory/node_modules"
-    if command -v npm >/dev/null 2>&1; then
-      run_bounded "$TEST_TIMEOUT" "$WORK/deps.err" npm ci --prefix memory --silent
-      deps_rc=$?
-      if [ "$deps_rc" -eq 0 ]; then
-        DEPS_PROVISIONED=yes
-      elif [ "$BOUNDED_TIMEOUT" = yes ]; then
-        deps_reason="npm ci exceeded the ${TEST_TIMEOUT}s hard deadline"
-      else
-        deps_reason="npm ci exited $deps_rc"
-      fi
+  if command -v npm >/dev/null 2>&1; then
+    npm_cache=$(npm config get cache 2>/dev/null | sed -n '1p')
+    if [ -n "$npm_cache" ]; then
+      run_bounded "$TEST_TIMEOUT" "$WORK/deps.err" \
+        npm ci --prefix memory --silent --prefer-offline --cache "$npm_cache"
     else
-      deps_reason="npm is not installed"
+      run_bounded "$TEST_TIMEOUT" "$WORK/deps.err" npm ci --prefix memory --silent --prefer-offline
     fi
+    deps_rc=$?
+    if [ "$deps_rc" -eq 0 ]; then
+      DEPS_PROVISIONED=yes
+    elif [ "$BOUNDED_TIMEOUT" = yes ]; then
+      deps_reason="npm ci exceeded the ${TEST_TIMEOUT}s hard deadline"
+    else
+      deps_reason="npm ci exited $deps_rc"
+    fi
+  else
+    deps_reason="npm is not installed"
   fi
   if [ "$DEPS_PROVISIONED" = no ]; then
     emit_finding tests deps-unprovisioned fail "memory dependencies could not be provisioned in the isolated checkout: $deps_reason (fail closed, FC-004)"
