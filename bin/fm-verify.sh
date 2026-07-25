@@ -162,7 +162,7 @@ case "$FORMAT" in json|text) ;; *) refuse "--format must be json or text" ;; esa
 [ -n "$OUT" ] || refuse "--out or --task is required to place (and invalidate) the bundle"
 
 # --- prerequisites (FC-004: a missing tool is a refusal, not a skipped check) --
-for tool in git jq awk grep sed cmp; do
+for tool in git jq awk grep sed cmp env; do
   command -v "$tool" >/dev/null 2>&1 || refuse "missing prerequisite tool: $tool (fail closed, FC-004)"
 done
 
@@ -429,7 +429,8 @@ run_one() {
     refuse "test runner '$interp' for suite '$label' is not installed (fail closed, FC-004)"
   fi
   local tout="$WORK/transcript.$RANDOM.txt" rc ok notok skip timedout=no
-  run_bounded "$TEST_TIMEOUT" "$tout" "$@"
+  run_bounded "$TEST_TIMEOUT" "$tout" \
+    env -u FM_ROOT_OVERRIDE -u FM_HOME -u FM_STATE_OVERRIDE "$@"
   rc=$?
   [ "$BOUNDED_TIMEOUT" = yes ] && timedout=yes
   ok=$(grep -cE '^ok([[:space:]]|$)' "$tout" 2>/dev/null || true)

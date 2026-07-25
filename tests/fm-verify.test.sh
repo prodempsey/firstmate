@@ -126,6 +126,9 @@ if (value !== "ready") process.exit(1);
 EOF
   printf 'memory/node_modules/\n' > "$repo/.gitignore"
   cat >> "$repo/tests/t.test.sh" <<'EOF'
+[ -z "${FM_ROOT_OVERRIDE+x}" ] || { echo "not ok - FM_ROOT_OVERRIDE leaked into sandbox"; exit 1; }
+[ -z "${FM_HOME+x}" ] || { echo "not ok - FM_HOME leaked into sandbox"; exit 1; }
+[ -z "${FM_STATE_OVERRIDE+x}" ] || { echo "not ok - FM_STATE_OVERRIDE leaked into sandbox"; exit 1; }
 node memory/bin/mem.mjs
 echo "ok - memory CLI dependency loaded"
 EOF
@@ -156,6 +159,17 @@ expect_code 0 "$?" "source memory dependencies make the isolated fixture pass"
 [ "$(bget "$TMP/memdeps-copy.json" '.gates[]|select(.gate=="tests")|.details.dependency_provisioner')" = source-copy ] \
   || fail "byte-identical memory lockfiles must prefer source node_modules"
 pass "FC-005: provisioned memory dependencies make a mem-dependent sandbox fixture pass"
+
+mkdir -p "$TMP/poison-root" "$TMP/poison-home" "$TMP/poison-state"
+FM_ROOT_OVERRIDE="$TMP/poison-root" FM_HOME="$TMP/poison-home" \
+  FM_STATE_OVERRIDE="$TMP/poison-state" FM_FAILURE_LEDGER="$LEDGER" \
+  PATH="$FAKEBIN:$PATH" "$VERIFY" \
+  --out "$TMP/memdeps-env.json" --brief "$BRIEF" \
+  --worktree "$RMD" --base main --sha "$MDSHA" --branch fm/g1 --task g1 >/dev/null 2>&1
+expect_code 0 "$?" "poisoned ambient home overrides are scrubbed from sandbox suites"
+[ "$(bget "$TMP/memdeps-env.json" '.gates[]|select(.gate=="tests")|.status')" = pass ] \
+  || fail "poisoned ambient home overrides must not reach the mem-dependent fixture"
+pass "FC-004: poisoned ambient home overrides are scrubbed from sandbox suite execution"
 
 RMF=$(build_memory_repo memory-deps-fail)
 MFSHA=$(git -C "$RMF" rev-parse HEAD)
