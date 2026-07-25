@@ -54,8 +54,8 @@ four honest fail-closed infra codes.
 | `FABLE_MODEL_UNGOVERNED` | `model` contains `fable` on a non-empty ungoverned `subagent_type` | line-39 refinement |
 | `GUARD_ENGINE_UNAVAILABLE` | `jq` missing | fail-closed infra |
 | `GUARD_PAYLOAD_UNREADABLE` | empty/unparseable payload | fail-closed infra |
-| `GUARD_MANIFEST_UNAVAILABLE` | S3 matrix missing/corrupt | fail-closed infra |
-| `GUARD_SCHEMA_UNAVAILABLE` | S4 request schema missing/corrupt (only when a justification gate needs it) | fail-closed infra |
+| `GUARD_MANIFEST_UNVERIFIED` | the S3 matrix did not pass its landed validator (missing, corrupt, schema-invalid, injected/duplicate/tampered profile, projection drift, or validator engine absent) | fail-closed authority |
+| `GUARD_SCHEMA_UNVERIFIED` | the S4 request schema is not the authoritative committed one (missing, non-object, wrong `$id`, or a non-canonical request-id pattern); checked only when a justification gate needs it | fail-closed authority |
 
 ## Design decisions (deviations from §J's sketch, and why)
 
@@ -105,16 +105,34 @@ four honest fail-closed infra codes.
    and they are the nesting-permitted ones, so the deny path is rarely reached —
    but the ordering makes the caller-authority guarantee unconditional.
 
-5. **Fail closed on absent engine/matrix/schema.** The maintenance guard fails
-   OPEN on absent `jq` because it is narrowly maintenance-scoped and must not touch
-   unrelated work. The permanent guard is the fleet-wide policy floor: absent `jq`,
-   a missing/corrupt matrix, or a missing schema needed to prove a marker is a
-   refusal-to-discharge (deny), never a warn-and-pass — matching S4's "refuse if the
-   engine is absent" and FC-002 (absent/corrupt coverage RETAINS the prior fact; a
-   guard cannot clear a dispatch it cannot prove). The infra codes are honest about
-   the real reason (a load failure), never a fabricated policy verdict. If a matrix
-   corruption ever did halt governed dispatch fleet-wide, the mitigation is the same
-   instant unregistration in "Cutover" — not a fail-open in the guard.
+5. **Fail closed on an artifact it cannot PROVE authoritative — via the artifacts'
+   own landed validators (QA qa-me-s5-q163).** The guard treats the S3 matrix and the
+   S4 request schema as policy authority, so it must prove each authoritative before
+   reading a single value — a shallow field check is not proof. A manifest that keeps
+   `schema_version`/`profiles`/`models_allowed` but injects a `fable-xhigh` past the
+   ceiling, or a schema that keeps its `$id` but weakens the request-id `pattern` to
+   `^.*$`, would pass a shallow check and produce a **false allow**. So:
+   - the S3 matrix is proven by delegating to the LANDED validator
+     `bin/fm-profile-matrix-check.sh` (closed schema, the eleven-profile set,
+     duplicate keys, the prohibited-name rule, and the frontmatter projection) — never
+     a re-implemented partial check; any non-zero exit → `GUARD_MANIFEST_UNVERIFIED`;
+   - the S4 request schema is proven by an identity (`$id`) + canonical-pattern
+     cross-check against the guard's OWN pinned `CANONICAL_REQUEST_ID_PATTERN` (kept
+     byte-identical to the committed schema), and the marker is matched against that
+     pinned value, not the mutable file; any divergence → `GUARD_SCHEMA_UNVERIFIED`.
+
+   The maintenance guard fails OPEN on absent tooling because it is narrowly
+   maintenance-scoped; the permanent guard is the fleet-wide policy floor and fails
+   CLOSED on absent `jq`, absent `python3`/`jsonschema` (the S3 validator's engine),
+   or any unproven artifact — matching S3/S4's "refuse if the engine is absent" and
+   FC-002/FC-004 (a guard cannot clear a dispatch it cannot prove; absent/corrupt
+   coverage retains "not authoritative"). The infra codes are honest about the real
+   reason, never a fabricated policy verdict. Cost: the S3 validator runs in ~0.2 s,
+   acceptable on a hook that gates a multi-second subagent spawn; if a hot path ever
+   needs it cheaper, the validator's `--write-sidecar` attestation (verify a fresh
+   `<manifest>.fingerprint` instead of re-running the validator) is the documented
+   optimization. If a matrix corruption ever did halt governed dispatch fleet-wide,
+   the mitigation is the same instant unregistration in "Cutover" — not a fail-open.
 
 ## Scope boundaries / deferrals
 

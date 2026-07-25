@@ -21,9 +21,11 @@ set -u
 
 G="$ROOT/bin/fm-agent-dispatch-pretool.sh"
 MANIFEST="$ROOT/docs/model-economy/governed-profiles.manifest.json"
+SCHEMA="$ROOT/docs/model-economy/schemas/governed-dispatch-request.schema.json"
 TMP_ROOT=$(fm_test_tmproot fm-agent-dispatch-pretool)
 
 command -v jq >/dev/null 2>&1 || fail "test host must provide jq"
+command -v python3 >/dev/null 2>&1 || fail "test host must provide python3 (the guard delegates matrix proof to the S3 validator)"
 
 # A well-formed justification marker: a real UUIDv4 in the exact form the S4
 # request schema pins for dispatch_request_id.
@@ -167,9 +169,11 @@ run_case "SCOPE tool_name=Agent explicit, omitted model -> MODEL_REQUIRED" \
   2 MODEL_REQUIRED '{"tool_name":"Agent","tool_input":{"subagent_type":"opus-high"}}'
 
 # ---------------------------------------------------------------------------
-# Fail-closed engine/artifact paths (FC-002: refuse to discharge, never warn-and-
-# pass, never a fabricated policy verdict). Sandbox copies only — no committed
-# file is touched.
+# Fail-closed artifact-AUTHORITY paths (FC-002/FC-004: an invalid/corrupt policy
+# artifact must DENY, never fall through to allow — QA qa-me-s5-q163). The guard
+# proves each artifact through its own landed validator/authority cross-check
+# BEFORE reading a value, so a corrupt-but-shallowly-plausible artifact cannot
+# create a false allow. Sandbox copies only — no committed file is touched.
 # ---------------------------------------------------------------------------
 
 # Empty / unparseable payload.
@@ -178,33 +182,82 @@ run_case "FC empty payload -> GUARD_PAYLOAD_UNREADABLE" \
 run_case "FC non-JSON payload -> GUARD_PAYLOAD_UNREADABLE" \
   2 GUARD_PAYLOAD_UNREADABLE 'not json at all'
 
-# Missing manifest.
+# --- S3 matrix authority (QA finding 1). The guard delegates to the landed S3
+#     validator, so ANY manifest that validator rejects is a fail-closed deny, never
+#     a false allow. Fixtures project from the committed matrix and mutate one thing.
+guard_manifest_case() {  # <label> <jq-mutation>
+  local label=$1 prog=$2 bad="$TMP_ROOT/m.$RANDOM.json" out rc
+  jq "$prog" "$MANIFEST" > "$bad"
+  out=$(printf '%s' '{"tool_input":{"subagent_type":"opus-high","model":"opus"}}' \
+    | "$G" --manifest "$bad" 2>"$TMP_ROOT/err"); rc=$?
+  expect_code 2 "$rc" "$label exit"
+  assert_contains "$(cat "$TMP_ROOT/err")" GUARD_MANIFEST_UNVERIFIED "$label code"
+  [ -z "$out" ] || fail "$label leaked stdout on a deny: $out"
+  pass "$label"
+}
+# The exact finding-1 repro: a prohibited profile inserted into .profiles would
+# bypass the ceiling under a shallow check; the landed validator rejects it.
+guard_manifest_case "FC injected fable-xhigh profile -> GUARD_MANIFEST_UNVERIFIED" \
+  '.profiles["fable-xhigh"] = (.profiles["fable-high"] | .effort = "xhigh")'
+guard_manifest_case "FC wrong field type (models_allowed as string) -> GUARD_MANIFEST_UNVERIFIED" \
+  '.models_allowed = "haiku"'
+guard_manifest_case "FC tampered pin (opus-high model->fable) -> GUARD_MANIFEST_UNVERIFIED" \
+  '.profiles["opus-high"].model = "fable"'
+guard_manifest_case "FC wrong schema_version -> GUARD_MANIFEST_UNVERIFIED" \
+  '.schema_version = "bogus/v9"'
+
+# Duplicate profile key (raw text — jq would dedupe; the validator has a duplicate-key
+# guard). Inject a second top-level "profile_version" after the opening brace.
+dupe="$TMP_ROOT/dupe-manifest.json"
+awk 'NR==1{print; print "  \"profile_version\": 2,"; next} 1' "$MANIFEST" > "$dupe"
+out=$(printf '%s' '{"tool_input":{"subagent_type":"opus-high","model":"opus"}}' \
+  | "$G" --manifest "$dupe" 2>"$TMP_ROOT/err"); rc=$?
+expect_code 2 "$rc" "FC duplicate manifest key exit"
+assert_contains "$(cat "$TMP_ROOT/err")" GUARD_MANIFEST_UNVERIFIED "FC duplicate manifest key code"
+pass "FC duplicate manifest key -> GUARD_MANIFEST_UNVERIFIED"
+
+# Missing manifest file.
 out=$(printf '%s' '{"tool_input":{"subagent_type":"opus-high","model":"opus"}}' \
   | "$G" --manifest "$TMP_ROOT/nope.json" 2>"$TMP_ROOT/err"); rc=$?
 expect_code 2 "$rc" "FC missing manifest exit"
-assert_contains "$(cat "$TMP_ROOT/err")" GUARD_MANIFEST_UNAVAILABLE "FC missing manifest code"
-pass "FC missing manifest -> GUARD_MANIFEST_UNAVAILABLE"
+assert_contains "$(cat "$TMP_ROOT/err")" GUARD_MANIFEST_UNVERIFIED "FC missing manifest code"
+pass "FC missing manifest -> GUARD_MANIFEST_UNVERIFIED"
 
-# Corrupt manifest (valid JSON, wrong schema_version).
-printf '{"schema_version":"bogus/v9","profiles":{},"models_allowed":[]}' > "$TMP_ROOT/bad-manifest.json"
-out=$(printf '%s' '{"tool_input":{"subagent_type":"opus-high","model":"opus"}}' \
-  | "$G" --manifest "$TMP_ROOT/bad-manifest.json" 2>"$TMP_ROOT/err"); rc=$?
-expect_code 2 "$rc" "FC corrupt manifest exit"
-assert_contains "$(cat "$TMP_ROOT/err")" GUARD_MANIFEST_UNAVAILABLE "FC corrupt manifest code"
-pass "FC corrupt manifest -> GUARD_MANIFEST_UNAVAILABLE"
+# --- S4 request-schema authority (QA finding 2). A gated dispatch with a VALID
+#     marker is used, so the ONLY possible denial is the schema-authority check —
+#     proving it fires before (and independent of) the marker match.
+guard_schema_case() {  # <label> <jq-mutation>
+  local label=$1 prog=$2 bad="$TMP_ROOT/s.$RANDOM.json" out rc
+  jq "$prog" "$SCHEMA" > "$bad"
+  out=$(printf '%s' "{\"tool_input\":{\"subagent_type\":\"fable-high\",\"model\":\"fable\",\"description\":\"$MK\"}}" \
+    | "$G" --request-schema "$bad" 2>"$TMP_ROOT/err"); rc=$?
+  expect_code 2 "$rc" "$label exit"
+  assert_contains "$(cat "$TMP_ROOT/err")" GUARD_SCHEMA_UNVERIFIED "$label code"
+  [ -z "$out" ] || fail "$label leaked stdout on a deny: $out"
+  pass "$label"
+}
+# The exact finding-2 repro: a permissive pattern would turn the Fable gate into an
+# allow under a shallow check; the canonical cross-check rejects it.
+guard_schema_case "FC permissive request-id pattern -> GUARD_SCHEMA_UNVERIFIED" \
+  '.properties.dispatch_request_id.pattern = "^.*$"'
+# shellcheck disable=SC2016  # single quotes are intentional: this is a jq program, and $id is jq's field-name literal, not a shell variable
+guard_schema_case "FC wrong schema \$id -> GUARD_SCHEMA_UNVERIFIED" \
+  '.["$id"] = "firstmate/not-the-request/v9"'
+guard_schema_case "FC removed request-id pattern -> GUARD_SCHEMA_UNVERIFIED" \
+  'del(.properties.dispatch_request_id.pattern)'
 
-# Missing request schema, but ONLY a justification-gated profile needs it: a
-# non-gated dispatch still passes (the schema is loaded lazily).
+# Missing request schema — but ONLY a justification-gated profile consults it, so a
+# non-gated dispatch still passes (the schema is proven lazily, inside require_marker).
 out=$(printf '%s' '{"tool_input":{"subagent_type":"fable-low","model":"fable","description":"'"$MK"'"}}' \
   | "$G" --request-schema "$TMP_ROOT/nope-schema.json" 2>"$TMP_ROOT/err"); rc=$?
 expect_code 2 "$rc" "FC missing schema (gated) exit"
-assert_contains "$(cat "$TMP_ROOT/err")" GUARD_SCHEMA_UNAVAILABLE "FC missing schema (gated) code"
-pass "FC missing schema on gated profile -> GUARD_SCHEMA_UNAVAILABLE"
+assert_contains "$(cat "$TMP_ROOT/err")" GUARD_SCHEMA_UNVERIFIED "FC missing schema (gated) code"
+pass "FC missing schema on gated profile -> GUARD_SCHEMA_UNVERIFIED"
 
 out=$(printf '%s' '{"tool_input":{"subagent_type":"opus-high","model":"opus"}}' \
   | "$G" --request-schema "$TMP_ROOT/nope-schema.json" 2>"$TMP_ROOT/err"); rc=$?
 expect_code 0 "$rc" "FC missing schema (ungated) allow"
-pass "FC missing schema on non-gated profile -> allow (lazy schema load)"
+pass "FC missing schema on non-gated profile -> allow (schema proven lazily, only when gated)"
 
 # jq absent -> fail closed. Shadow PATH so jq cannot be found.
 FAKEBIN=$(fm_fakebin "$TMP_ROOT")

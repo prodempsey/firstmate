@@ -35,15 +35,25 @@
 # carries a well-formed justification marker, and the calling agent (if any) is
 # permitted to nest. In EVERY other state — no model, an unpinned governed-prefix
 # name, a Fable model on a non-Fable profile, a missing marker, a nesting-barred
-# caller, or a missing/corrupt engine/matrix/schema this pass needs to prove any of
-# that — authority defaults to NONE and the dispatch is DENIED. Authority is never
-# inferred from the absence of a failing check; an engine/artifact we cannot load
-# is a refusal-to-discharge (deny), never a warn-and-pass.
+# caller, or an engine/matrix/schema this pass cannot PROVE authoritative — authority
+# defaults to NONE and the dispatch is DENIED. Authority is never inferred from the
+# absence of a failing check; an artifact we cannot positively prove authoritative is
+# a refusal-to-discharge (deny), never a warn-and-pass.
 #
-# Engine: jq is a hard prerequisite. Absent → fail closed (deny). This is a
-# DELIBERATE difference from the maintenance guard, which fails OPEN on absent jq
-# because it is narrowly maintenance-scoped; the permanent guard is the fleet-wide
-# policy floor and fails closed, matching S4's "refuse if the engine is absent".
+# Artifacts are proven through their OWN landed validators before any value is read
+# from them (QA qa-me-s5-q163): the S3 matrix through bin/fm-profile-matrix-check.sh
+# (closed schema + eleven-profile set + duplicate keys + prohibited-name rule +
+# frontmatter projection), and the S4 request schema through an identity ($id) and
+# canonical-pattern cross-check against the guard's own pinned root of trust. A shallow
+# field check is NOT proof and would let a corrupt-but-plausible artifact create a
+# false allow (an injected profile past the ceiling, or a weakened request-id pattern).
+#
+# Engine: jq is a hard prerequisite of the guard; python3+jsonschema are hard
+# prerequisites of the S3 validator the guard delegates to. Any absent → fail closed
+# (deny). This is a DELIBERATE difference from the maintenance guard, which fails OPEN
+# on absent tooling because it is narrowly maintenance-scoped; the permanent guard is
+# the fleet-wide policy floor and fails closed, matching S3/S4's "refuse if the engine
+# is absent".
 #
 # I/O contract (matches the repo's PreToolUse convention — bin/fm-arm-pretool-
 # check.sh, and the temp guard this replaces):
@@ -75,12 +85,17 @@
 #                                            Fable child smuggled past the fable-*
 #                                            justification gate
 #   Fail-closed engine/artifact refusals (honest infra codes, never a fabricated
-#   policy verdict — FC-002: refuse-to-discharge, do not invent a block):
+#   policy verdict — FC-002/FC-004: refuse-to-discharge, do not invent a block):
 #     GUARD_ENGINE_UNAVAILABLE               jq missing
 #     GUARD_PAYLOAD_UNREADABLE               empty/unparseable PreToolUse payload
-#     GUARD_MANIFEST_UNAVAILABLE             S3 matrix missing/corrupt
-#     GUARD_SCHEMA_UNAVAILABLE               S4 request schema missing/corrupt
-#                                            (only when a justification gate needs it)
+#     GUARD_MANIFEST_UNVERIFIED              the S3 matrix did not pass its landed
+#                                            validator (missing/corrupt/schema-invalid/
+#                                            injected profile/projection drift/validator
+#                                            engine unavailable) — carries its reason
+#     GUARD_SCHEMA_UNVERIFIED                the S4 request schema is not the authoritative
+#                                            committed one (missing/non-object/wrong $id/
+#                                            non-canonical request-id pattern); checked
+#                                            only when a justification gate needs it
 set -u
 
 SCRIPT_DIR="$(cd "${BASH_SOURCE[0]%/*}" && pwd)"
@@ -125,6 +140,15 @@ fi
 [ -n "$MANIFEST" ] || MANIFEST="$FM_ROOT/docs/model-economy/governed-profiles.manifest.json"
 [ -n "$REQUEST_SCHEMA" ] || REQUEST_SCHEMA="$FM_ROOT/docs/model-economy/schemas/governed-dispatch-request.schema.json"
 
+# The canonical dispatch_request_id form (S4 request schema, §F), pinned here as the
+# guard's OWN root of trust. The guard proves the S4 request schema is authoritative
+# by cross-checking its identity and this exact pattern before honoring a justification
+# marker, and matches the marker against THIS pinned value — never the mutable file —
+# so a schema altered to a permissive pattern cannot weaken the gate (QA qa-me-s5-q163
+# #2). Keep byte-identical to .properties.dispatch_request_id.pattern in the committed
+# governed-dispatch-request.schema.json; the guard fails closed if the two diverge.
+CANONICAL_REQUEST_ID_PATTERN='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'
+
 # --- allow / deny transports ------------------------------------------------
 # deny: one stable "CODE: reason" line to stderr, exit 2, stdout untouched.
 deny() {
@@ -162,20 +186,27 @@ description=$(jq -r '.tool_input.description // empty' <<<"$payload")
 calling_agent=$(jq -r '.agent_type // empty' <<<"$payload")
 lcmodel=$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')
 
-# --- matrix (fail closed) ---------------------------------------------------
-# Consume the LANDED S3 matrix as the single source of truth (S4 precedent).
-# Positively prove it is the governed-profiles matrix before trusting it: the
-# guard never infers the governed set from a merely-parseable file. Deep schema
-# conformance of the matrix is slice S3's owned gate (bin/fm-profile-matrix-check.
-# sh) — not re-run here, which would duplicate S3 into a forbidden second surface.
-[ -f "$MANIFEST" ] || deny GUARD_MANIFEST_UNAVAILABLE "S3 profile matrix not found: $MANIFEST"
+# --- matrix authority (fail closed via the LANDED S3 validator) -------------
+# The guard consumes the S3 matrix as its authority for the governed set, each
+# profile's pinned model, and each nesting flag, so it must POSITIVELY PROVE the
+# matrix is authoritative before reading a single value. A shallow field check is
+# not proof: an artifact that keeps schema_version/profiles/models_allowed but
+# injects an extra profile (e.g. a fable-xhigh past the ceiling), duplicates a key,
+# or corrupts a field would pass a shallow check and produce a FALSE ALLOW (QA
+# qa-me-s5-q163 #1). So the guard delegates to the LANDED S3 validator
+# bin/fm-profile-matrix-check.sh, which proves the manifest against its closed
+# schema, the eleven-profile set, duplicate keys, the prohibited-name rule, and the
+# frontmatter projection. Any non-zero exit — missing file, corrupt JSON, schema
+# violation, projection drift, or the validator's own engine (python3/jsonschema)
+# being unavailable — means authority is NOT proven, which is a refusal-to-discharge:
+# the dispatch is DENIED fail-closed (FC-002/FC-004), never allowed by fall-through.
+MATRIX_CHECK="$SCRIPT_DIR/fm-profile-matrix-check.sh"
+[ -x "$MATRIX_CHECK" ] || deny GUARD_MANIFEST_UNVERIFIED "S3 matrix validator not found or not executable: $MATRIX_CHECK"
+if ! matrix_err=$("$MATRIX_CHECK" --manifest "$MANIFEST" --quiet 2>&1 >/dev/null); then
+  deny GUARD_MANIFEST_UNVERIFIED "S3 profile matrix failed its landed validator: ${matrix_err:-non-zero exit from $MATRIX_CHECK}"
+fi
+# Proven authoritative: now it is safe to read values out of the same file.
 manifest=$(cat "$MANIFEST")
-jq -e '
-  (.schema_version == "firstmate/governed-profiles/v1")
-  and (.profiles | type == "object") and ((.profiles | length) > 0)
-  and (.models_allowed | type == "array") and ((.models_allowed | length) > 0)
-' >/dev/null 2>&1 <<<"$manifest" \
-  || deny GUARD_MANIFEST_UNAVAILABLE "S3 profile matrix missing/corrupt or not firstmate/governed-profiles/v1: $MANIFEST"
 
 # manifest accessors (the matrix is the authority for every one of these)
 is_pinned() { jq -e --arg p "$1" '.profiles | has($p)' >/dev/null 2>&1 <<<"$manifest"; }
@@ -192,21 +223,35 @@ is_governed_tier_alias() {
   jq -e --arg m "$1" '.models_allowed | index($m) != null' >/dev/null 2>&1 <<<"$manifest"
 }
 
-# --- justification marker (validated against the S4 request-id form) ---------
-# The dispatcher injects [governed:dispatch_request_id=<uuid>] into the Agent
-# call's description for every Opus-xhigh and Fable dispatch, referencing a request
-# that already passed S4 schema validation (§J step 8/9). The hook proves the
-# marker is present AND carries a well-formed dispatch_request_id — the exact
-# pattern the S4 request schema pins — so an empty or malformed marker cannot
-# false-satisfy the gate. It does not (and cannot) re-validate the referenced
-# request's content; that is S4's owned pass at request-build time.
+# --- justification marker (S4 schema authority proven before use) ------------
+# The dispatcher injects [governed:dispatch_request_id=<uuid>] into the Agent call's
+# description for every Opus-xhigh and Fable dispatch, referencing a request that
+# already passed S4 schema validation (§J step 8/9). Before honoring a marker the
+# guard PROVES the S4 request schema is authoritative — otherwise an artifact that
+# keeps a plausible shape but weakens .properties.dispatch_request_id.pattern (e.g.
+# to ^.*$) would silently turn the Fable/Opus-xhigh denial into an ALLOW (QA
+# qa-me-s5-q163 #2). Proof: the file parses as a JSON object, its $id is the pinned
+# firstmate/governed-dispatch-request/v1, and its dispatch_request_id pattern is
+# BYTE-EQUAL to the guard's own pinned CANONICAL_REQUEST_ID_PATTERN. The marker is
+# then matched against that PINNED canonical form, never the mutable file. Any
+# divergence — missing file, non-object, wrong $id, non-canonical pattern — is a
+# refusal-to-discharge and the dispatch is DENIED fail-closed. The guard does not
+# (and cannot) re-validate the referenced request's content; that is S4's owned pass.
 require_marker() {
-  local gate_code="$1" pat core
-  [ -f "$REQUEST_SCHEMA" ] || deny GUARD_SCHEMA_UNAVAILABLE "S4 request schema not found; cannot prove the justification marker for '$subagent_type': $REQUEST_SCHEMA"
+  local gate_code="$1" sid pat core
+  [ -f "$REQUEST_SCHEMA" ] || deny GUARD_SCHEMA_UNVERIFIED "S4 request schema not found; cannot prove the justification marker for '$subagent_type': $REQUEST_SCHEMA"
+  jq -e 'type == "object"' >/dev/null 2>&1 <"$REQUEST_SCHEMA" \
+    || deny GUARD_SCHEMA_UNVERIFIED "S4 request schema is not a parseable JSON object: $REQUEST_SCHEMA"
+  sid=$(jq -r '."$id" // empty' "$REQUEST_SCHEMA" 2>/dev/null)
+  [ "$sid" = "firstmate/governed-dispatch-request/v1" ] \
+    || deny GUARD_SCHEMA_UNVERIFIED "S4 request schema \$id is '${sid:-<absent>}', not the pinned firstmate/governed-dispatch-request/v1 (schema not authoritative)"
   pat=$(jq -r '.properties.dispatch_request_id.pattern // empty' "$REQUEST_SCHEMA" 2>/dev/null)
-  [ -n "$pat" ] || deny GUARD_SCHEMA_UNAVAILABLE "S4 request schema missing dispatch_request_id.pattern; cannot prove the justification marker for '$subagent_type'"
-  # strip the ^…$ anchors so the id form can be embedded inside the marker literal
-  core=${pat#^}
+  [ "$pat" = "$CANONICAL_REQUEST_ID_PATTERN" ] \
+    || deny GUARD_SCHEMA_UNVERIFIED "S4 request schema dispatch_request_id.pattern diverges from the canonical committed form (schema altered/weakened?)"
+  # Proven authoritative: match the marker against the PINNED canonical pattern
+  # (byte-equal to the schema's). Strip the ^…$ anchors so the id form embeds inside
+  # the marker literal.
+  core=${CANONICAL_REQUEST_ID_PATTERN#^}
   core=${core%$}
   printf '%s' "$description" | grep -Eq "\[governed:dispatch_request_id=${core}\]" \
     || deny "$gate_code" "profile '$subagent_type' requires a well-formed [governed:dispatch_request_id=<uuid>] justification marker in the Agent call description"
