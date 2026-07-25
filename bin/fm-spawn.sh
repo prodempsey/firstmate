@@ -873,7 +873,7 @@ EOF2
   fi
 fi
 
-# --- governed memory injection (Memory PR-4 / Compounding Fleet stage B) -----
+# --- governed memory injection (Memory PR-4 / Seasoning stage B) -----
 # For a ship/scout task, recall governed fleet memory for the finalized brief and
 # inject a bounded, POINTER-ONLY block plus a spawn-time proof - BEFORE any backend
 # window, worktree lease, or agent launch, so the recalled pack is proven against

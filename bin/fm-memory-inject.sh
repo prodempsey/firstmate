@@ -8,7 +8,7 @@
 # brief, leaving a spawn-time proof at data/<id>/memory-proof.json.
 #
 # Three layers keep this safe:
-#   1. Recall at every dispatch (Compounding Fleet stage B). Injection is ON by
+#   1. Recall at every dispatch (Seasoning stage B). Injection is ON by
 #      default: every ship/scout dispatch recalls governed fleet memory for the
 #      brief so last night's failure classes and prior solutions ride into the
 #      crew's brief, cited. An operator can still force it OFF - env

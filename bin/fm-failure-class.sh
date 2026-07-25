@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The failure-class ledger: a durable, append-only catalogue of the RECURRING
 # failure classes the fleet keeps rediscovering, distilled from binding design
-# rulings and QA FAIL reports (Compounding Fleet stage C, ORD-274).
+# rulings and QA FAIL reports (Seasoning stage C, ORD-274).
 #
 # Each class carries a stable id, a name, a one-line INVARIANT (the closed rule
 # that makes the class structurally unlikely), DETECTION CUES (what a task brief
@@ -41,15 +41,15 @@
 #   fm-failure-class.sh refinements [--json]   # classes at/over the refinement threshold, with provenance
 #   fm-failure-class.sh register [--id <FC-NNN> ...] [--live] [--gate <ref>] [--json]
 #
-# Stage E - captain-gated self-refinement (Compounding Fleet, ORD-274). When a
+# Stage E - captain-gated self-refinement (Seasoning, ORD-274). When a
 # `bump` (occurrence event) pushes a class's DERIVED occurrence count across the
 # refinement threshold, the bump prints a bordered REFINEMENT DUE banner naming the
-# class, its invariant, and the instruction to draft a brief-template / QA-checklist
-# amendment for CAPTAIN approval - the same pull-based stderr banner idiom as
-# fm-triage-duty.sh: it never blocks the bump and the verb still exits 0. The banner
-# fires exactly ONCE, on the crossing bump; later bumps of an already-over class stay
-# silent. The `refinements` verb lists every class at/over threshold with its full
-# provenance, so a draft has its citations ready.
+# Seasoning class, its invariant, and the instruction to draft a brief-template /
+# QA-checklist amendment for CAPTAIN approval - the same pull-based stderr banner
+# idiom as fm-triage-duty.sh: it never blocks the bump and the verb still exits 0.
+# The banner fires exactly ONCE, on the crossing bump; later bumps of an already-over
+# class stay silent. The `refinements` verb lists every class at/over threshold with
+# its full provenance, so a draft has its citations ready.
 #
 # register sets a distinct, typed `sourceType=failure-class` (mem propose
 # --source-type) on every registered record so curation can filter failure classes
@@ -171,9 +171,9 @@ refine_threshold() {
   printf '%s' "$t"
 }
 
-# Print the bordered REFINEMENT DUE banner for a class that just crossed the
-# threshold. Same pull-based stderr idiom as fm-triage-duty.sh: it names the class,
-# its invariant, and the instruction to draft a process amendment for CAPTAIN
+# Print the bordered REFINEMENT DUE banner for a Seasoning class that just crossed
+# the threshold. Same pull-based stderr idiom as fm-triage-duty.sh: it names the
+# class, its invariant, and the instruction to draft a process amendment for CAPTAIN
 # approval, and lists the provenance so the draft's citations are ready. It writes
 # only to stderr and returns 0, so it never blocks or fails the bump.
 emit_refinement_banner() { # <record-json> <count> <threshold>
@@ -184,7 +184,7 @@ emit_refinement_banner() { # <record-json> <count> <threshold>
   provlist=$(printf '%s' "$rec" | jq -r '.provenance[] | "[\(.type)] \(.ref)\(if .note then " - \(.note)" else "" end)"')
   {
     printf '●%s\n' "$REFINE_RULE"
-    printf '●  REFINEMENT DUE - %s: %s\n' "$id" "$name"
+    printf '●  REFINEMENT DUE (Seasoning) - %s: %s\n' "$id" "$name"
     printf '●  Occurrence count %s crossed the refinement threshold (%s). This class\n' "$count" "$threshold"
     printf '●  keeps recurring, so the lesson should graduate from recall into the process.\n'
     printf '●  invariant: %s\n' "$inv"

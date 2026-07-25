@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The failure-class ledger CLI (Compounding Fleet stage C, ORD-274). Covers the
+# The failure-class ledger CLI (Seasoning stage C, ORD-274). Covers the
 # sanctioned-writer discipline (append-only, provenance-required, duplicate/unknown
 # refusals, fail-closed on a corrupt ledger), the committed seed ledger's integrity,
 # and the register flow (dry-run writes nothing; --live activates records against an
@@ -199,9 +199,10 @@ if [ "$cross_count" = 1 ]; then
 else fail "crossing bump fired the banner $cross_count times (want 1)"; fi
 # The banner is stderr-only: stdout still carries just the ordinary bump line.
 assert_not_contains "$(cat "$TMP_ROOT/cross.out")" "REFINEMENT DUE" "the banner goes to stderr, not stdout"
-# Banner content: the class id, its invariant, and the captain-approval instruction.
+# Banner content: the class id, its invariant, Seasoning program name, and the captain-approval instruction.
 assert_contains "$cross_err" "FC-100" "banner names the class id"
 assert_contains "$cross_err" "authority = positive proof, fail closed" "banner names the invariant"
+assert_contains "$cross_err" "Seasoning" "banner names the Seasoning program (ORD-285 rename)"
 assert_contains "$cross_err" "CAPTAIN" "banner instructs to draft an amendment for CAPTAIN approval"
 assert_contains "$cross_err" "data/qa-b/report.md#2" "banner lists the provenance for the draft's citations"
 

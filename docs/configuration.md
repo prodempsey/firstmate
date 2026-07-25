@@ -167,7 +167,7 @@ The tool resolves the same overrides from the environment (`control-plane/bin/cp
 
 The postmortem-capture hook (`bin/fm-postmortem-stow.sh`, wired at the universal task closeout in `bin/fm-teardown.sh`) distills each finished ship/scout task into a structured postmortem memory record - what worked, what failed, sharp edges, closure evidence, and task/SHA/PR/report provenance under `source_type=task-postmortem` - via `mem propose`.
 It is inert unless `FM_POSTMORTEM_STOW=1` is set in the environment.
-Enabling it is firstmate's operational act (the Compounding Fleet program's write half), never shipped on by default, and the same inert-until-opted-in posture as the shadow run and spawn-time memory injection.
+Enabling it is firstmate's operational act (the Seasoning program's write half), never shipped on by default, and the same inert-until-opted-in posture as the shadow run and spawn-time memory injection.
 The record lands as a CANDIDATE only: the hook never auto-activates, so activation policy stays curated (a candidate is inert to governed recall until a captain-authorized `mem activate`).
 The write is backgrounded and detached and the hook always exits 0, so a slow, wedged, or unavailable memory write can never block or fail a closeout; a missing memory CLI is a silent no-op.
 

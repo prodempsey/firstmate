@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fm-postmortem-stow.sh - the thin, optional, gate-controlled HOOK POINT that distills a
 # finished task's closeout into a STRUCTURED POSTMORTEM MEMORY RECORD, fire-and-forget, in
-# parallel with the legacy closeout (ORD-274 Compounding Fleet stage A - postmortem capture).
+# parallel with the legacy closeout (ORD-274 Seasoning stage A - postmortem capture).
 #
 # INERT BY DEFAULT. This hook is a no-op unless FM_POSTMORTEM_STOW=1 is set in the environment
 # (or in the file gate below). Shipping the hook is the template's job; ENABLING it in a runtime

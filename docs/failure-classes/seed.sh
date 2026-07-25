@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The canonical seed set for the failure-class ledger (Compounding Fleet stage C,
+# The canonical seed set for the failure-class ledger (Seasoning stage C,
 # ORD-274): the seven failure classes distilled from the binding design rulings and
 # the 2026-07-22..24 QA FAIL corpus, each with a one-line invariant, detection cues,
 # a fix pattern, and cited provenance.

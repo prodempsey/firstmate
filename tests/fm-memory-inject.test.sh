@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Memory PR-4 spawn-time injection + Compounding Fleet stage B dispatch recall.
+# Memory PR-4 spawn-time injection + Seasoning stage B dispatch recall.
 # Three layers:
 #   * the fm-memory-inject.sh wrapper contract (default ON, config/env disable,
 #     fail-open, a portable spawn-safe deadline, real injection against a fixture),
@@ -357,7 +357,7 @@ EOF
   pass "fm-spawn: a recall failure fails open (no injection) without breaking dispatch"
 }
 
-# --- dispatch recall of a failure class (Compounding Fleet stage B) ----------
+# --- dispatch recall of a failure class (Seasoning stage B) ----------
 test_spawn_failure_class_recall() {
   local rec home proj wt fakebin launchlog reg id out status
   rec=$(build_home spawn-fc ship-fc-1 "$FC_BRIEF")

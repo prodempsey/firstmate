@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Colocated unit tests for bin/fm-postmortem-stow.sh (ORD-274 Compounding Fleet stage A -
+# Colocated unit tests for bin/fm-postmortem-stow.sh (ORD-274 Seasoning stage A -
 # postmortem capture at closeout).
 #
 # The hook distills a finished task's closeout into a STRUCTURED POSTMORTEM memory CANDIDATE via

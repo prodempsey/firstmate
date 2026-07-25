@@ -34,7 +34,7 @@ FM_TEST_LIB_SOURCED=1
 # strips this to verify real refusal.
 export FM_GATE_REFUSE_BYPASS=1
 
-# Dispatch-recall (Compounding Fleet stage B) is ON by default for real fm-spawn
+# Dispatch-recall (Seasoning stage B) is ON by default for real fm-spawn
 # dispatch, so a spawn test that keeps node on PATH would otherwise recall against
 # the operator's PRODUCTION memory registry ($HOME/fleet/state/memory) and write a
 # proof sidecar into its brief dir. Pin it OFF for the general suite so every

@@ -1260,7 +1260,7 @@ else
   "$SCRIPT_DIR/fm-cp-shadow.sh" teardown --task "$ID" || true
 fi
 
-# ORD-274 Compounding Fleet stage A: postmortem capture at closeout. Distill this finished task's
+# ORD-274 Seasoning stage A: postmortem capture at closeout. Distill this finished task's
 # report/closeout evidence into a STRUCTURED POSTMORTEM memory CANDIDATE (what worked, what failed,
 # sharp edges, closure evidence, and task/SHA/PR/report provenance under source_type=task-postmortem).
 # Teardown is the ONE universal closeout every ship and scout task passes through exactly once, with

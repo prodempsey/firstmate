@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Integration test for the postmortem-capture chokepoint WIRING in bin/fm-teardown.sh (ORD-274
-# Compounding Fleet stage A). Drives the REAL bin/fm-teardown.sh end-to-end against a scratch
+# Seasoning stage A). Drives the REAL bin/fm-teardown.sh end-to-end against a scratch
 # project/worktree/store and asserts the closeout distills a structured postmortem CANDIDATE into
 # a FIXTURE registry - proving the hook is actually wired at the universal closeout, not merely
 # unit-tested in isolation. Two standing contracts are pinned at the real call site:

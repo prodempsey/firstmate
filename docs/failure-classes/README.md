@@ -1,7 +1,7 @@
 # The failure-class ledger
 
 A durable, append-only catalogue of the recurring failure classes the fleet keeps rediscovering, distilled from binding design rulings and QA FAIL reports.
-This is stage C of the Compounding Fleet program (ORD-274): the exponential kicker.
+This is stage C of the Seasoning program (ORD-274): the exponential kicker.
 Every QA FAIL is distilled into a typed class with its fix invariant, and dispatch recall injects the applicable invariants into a crew's brief, so last night's recurrences become structurally unlikely.
 
 Design authority: `data/kl-improve-scout-f5/compounding-fleet.kd.html` (stage C) and `data/kl-improve-scout-f5/report.md` improvement 3, in the firstmate-runtime home.
