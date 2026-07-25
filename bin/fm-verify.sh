@@ -100,6 +100,11 @@ SCANNER_BUDGET="${FM_VERIFY_SCANNER_BUDGET:-30}"
 SCANNER_DIR="${FM_SCANNER_DIR:-$FM_HOME/tools/scanners}"
 SCANNER_OSV_DB="${FM_SCANNER_OSV_DB:-$SCANNER_DIR/osv-db}"
 
+# The ONE authority on detection-row validity, shared with the sanctioned writer so the cue
+# lint proves the SAME thing before it executes a row (JSON + closed schema + pattern compiles).
+# shellcheck source=bin/fm-cue-lib.sh
+. "$SCRIPT_DIR/fm-cue-lib.sh"
+
 usage() { sed -n '/^# Usage:/,/^set -u$/p' "$0" | sed 's/^# \{0,1\}//;$d'; }
 
 # refuse() aborts with exit 2. Once the outputs are known they have already been
@@ -763,14 +768,18 @@ fi
 # built-in fallback table - a class the ledger gives no detection for is reported
 # advisory-only, never silently enforced from a duplicate source.
 #
-# FC-004: the ledger is the cue-lint AUTHORITY, so a broken authority input must fail
-# CLOSED with one loud finding - never fall through to a silent pass. The whole ledger
-# is folded ONCE, up front, through its sanctioned writer (bin/fm-failure-class.sh, the
-# single fold owner), which parses every event and exits non-zero on ANY malformed line,
-# unknown-schema row, duplicate id, or amendment against an undefined class. A substring
-# grep is NOT a parse: it would let invalid JSON before a valid class row silently empty
-# the lint. Enumeration then reads from that VALIDATED folded snapshot, so no downstream
-# error-suppressed jq can turn a corrupt ledger into an all-clear.
+# FC-004 / FC-001: the ledger is the cue-lint AUTHORITY, so a broken authority input must
+# fail CLOSED with one loud finding - never fall through to a silent pass. Two layers, both
+# fail-closed:
+#   1. The whole ledger is folded ONCE, up front, through its sanctioned writer
+#      (bin/fm-failure-class.sh, the single fold owner), which parses every event and exits
+#      non-zero on ANY malformed line, unknown-schema row, duplicate id, or amendment against
+#      an undefined class. A substring grep is NOT a parse.
+#   2. Every detection row of that folded snapshot must pass fm_validate_cue_row
+#      (bin/fm-cue-lib.sh) - the SAME closed-schema + pattern-compiles proof the writer applies
+#      - BEFORE it is linted or executed. So an unsupported engine cannot silently downgrade a
+#      class to advisory, and an invalid ERE cannot crash awk into an empty hit stream; either
+#      is one fail-closed cue-lint finding. No path consults a row that has not passed the gate.
 cue_status=pass
 LEDGER_OK=no
 FOLDED="$WORK/ledger-folded.json"
@@ -791,27 +800,47 @@ ADVISORY_FILE="$WORK/advisory.txt"
 if [ "$LEDGER_OK" = yes ]; then
   while IFS= read -r cid; do
     [ -n "$cid" ] || continue
-    got=no
-    while IFS=$'\t' read -r engine pattern cueref; do
-      [ -n "$pattern" ] || continue
-      [ "$engine" = "awk-ere" ] || continue
+    got=no; invalid=no
+    while IFS= read -r row; do
+      [ -n "$row" ] || continue
+      # The ONE gate (bin/fm-cue-lib.sh): no path consults - or executes - a cue row that has
+      # not passed fm_validate_cue_row (JSON + closed schema with engine in the supported set +
+      # the pattern actually COMPILES under awk-ere). A failure is a single loud fail-closed
+      # finding, never a silently-skipped row (an unsupported engine) or an empty hit stream (an
+      # invalid ERE that crashes awk). This is the SAME proof the sanctioned writer applies.
+      if ! reason=$(fm_validate_cue_row "$row" 2>&1); then
+        emit_finding cue_lint "$cid" fail "$cid: invalid detection row ($reason) - fail closed"
+        cue_status=fail; invalid=yes
+        continue
+      fi
+      pattern=$(printf '%s' "$row" | jq -r '.pattern')
+      cueref=$(printf '%s' "$row" | jq -r '.cue_ref')
       printf '%s\t%s\t%s\n' "$cid" "$pattern" "$cueref" >> "$EFFECTIVE"
       got=yes
-    done < <(jq -r --arg id "$cid" '.[] | select(.id==$id) | (.detection // [])[]
-      | [ (.engine // "awk-ere"), (.pattern // ""), (.cue_ref // "") ] | @tsv' "$FOLDED" 2>/dev/null)
-    if [ "$got" = yes ]; then printf '%s\n' "$cid" >> "$LINTED_FILE"; else printf '%s\n' "$cid" >> "$ADVISORY_FILE"; fi
+    done < <(jq -c --arg id "$cid" '.[] | select(.id==$id) | (.detection // [])[]' "$FOLDED" 2>/dev/null)
+    if [ "$got" = yes ]; then printf '%s\n' "$cid" >> "$LINTED_FILE"
+    elif [ "$invalid" = no ]; then printf '%s\n' "$cid" >> "$ADVISORY_FILE"; fi
   done < <(jq -r '.[].id' "$FOLDED" 2>/dev/null)
 fi
 
 CUE_HITS=0
 if [ "$LEDGER_OK" = yes ] && [ -s "$ADDED_FILE" ] && [ -s "$EFFECTIVE" ]; then
+  HITS_TMP="$WORK/cue-hits.tsv"
   while IFS=$'\t' read -r cid pattern cueref; do
     [ -n "$cid" ] || continue
     class_name=$(jq -r --arg id "$cid" '.[]|select(.id==$id)|.name' "$FOLDED" 2>/dev/null | head -1)
+    # Every pattern here already passed fm_validate_cue_row's compile probe, but defence in
+    # depth: if the EXECUTING engine (awk) still errors, that is a fail-closed finding, never an
+    # empty hit stream read as a pass. The exit status is checked, not discarded.
+    if ! awk -F'\t' -v ere="$pattern" '$3 ~ ere { print }' "$ADDED_FILE" > "$HITS_TMP" 2>/dev/null; then
+      emit_finding cue_lint "$cid" fail "$cid ($class_name): detection pattern failed to execute under awk-ere (fail closed): $pattern"
+      cue_status=fail
+      continue
+    fi
     while IFS=$'\t' read -r hfile hline _; do
       emit_finding cue_lint "$cid" finding "$cid ($class_name): ${cueref:-detection cue}" "$hfile" "$hline"
       CUE_HITS=$((CUE_HITS + 1))
-    done < <(awk -F'\t' -v ere="$pattern" '$3 ~ ere { print }' "$ADDED_FILE")
+    done < "$HITS_TMP"
   done < "$EFFECTIVE"
   [ "$CUE_HITS" -gt 0 ] && cue_status=fail
 fi

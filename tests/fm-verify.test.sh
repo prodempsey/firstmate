@@ -620,6 +620,31 @@ expect_code 1 "$?" "a malformed ledger fails the verifier closed (never exit 0)"
 [ "$(bget "$TMP/cues3.json" '[.findings[]|select(.gate=="cue_lint" and .severity=="finding")]|length')" = 0 ] || fail "a malformed ledger must not silently emit mechanical cue findings off a half-parsed authority"
 pass "F5/FC-004: a malformed ledger fails the cue lint closed with a loud finding, never a silent pass"
 
+# --- FC-001/FC-004: the live reader proves the SAME closed cue-row schema the writer does ----
+# (qa-scg1r2-q173) A parse-VALID ledger can still carry a detection row that is invalid on the
+# read path: an unsupported engine (silently skipped -> advisory -> pass, F2) or a syntactically
+# invalid ERE (crashes awk in an unchecked process substitution -> empty hit stream -> pass, F1).
+# Both are hand-injected class-amended rows the sanctioned writer would now refuse, exercising
+# corruption on the live read side. Each must fail the cue lint CLOSED with one loud finding.
+# F1 - an invalid awk-ere pattern must not become a silent empty-hit pass:
+BADERE="$TMP/ledger-bad-ere.jsonl"; cp "$LEDGER" "$BADERE"
+printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-amended","id":"FC-001","detection":[{"engine":"awk-ere","pattern":"[","cue_ref":"invalid ERE"}]}\n' >> "$BADERE"
+FM_HOME="$TMP/nohome" FM_FAILURE_LEDGER="$BADERE" "$VERIFY" --out "$TMP/badere.json" --brief "$BRIEF" \
+  --worktree "$RCu" --base main --sha "$USHA" --branch fm/g1 --task g1 >/dev/null 2>&1
+expect_code 1 "$?" "an invalid ERE in the ledger fails the verifier closed"
+[ "$(bget "$TMP/badere.json" '.gates[]|select(.gate=="cue_lint")|.status')" = fail ] || fail "an invalid ERE must fail the cue_lint gate closed, never a silent empty-hit pass"
+[ "$(bget "$TMP/badere.json" '[.findings[]|select(.gate=="cue_lint" and .severity=="fail")]|length')" -ge 1 ] || fail "an invalid ERE must emit a loud fail-closed cue-lint finding"
+pass "F1: an invalid awk-ere pattern fails the cue lint closed, never a silent empty-hit pass"
+# F2 - an unsupported engine on the LIVE read path must fail closed, not downgrade to advisory:
+BADENG="$TMP/ledger-bad-engine.jsonl"; cp "$LEDGER" "$BADENG"
+printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-amended","id":"FC-001","detection":[{"engine":"regex-pcre","pattern":"feature","cue_ref":"unsupported"}]}\n' >> "$BADENG"
+FM_HOME="$TMP/nohome" FM_FAILURE_LEDGER="$BADENG" "$VERIFY" --out "$TMP/badeng.json" --brief "$BRIEF" \
+  --worktree "$RCu" --base main --sha "$USHA" --branch fm/g1 --task g1 >/dev/null 2>&1
+expect_code 1 "$?" "an unsupported engine on the read path fails the verifier closed"
+[ "$(bget "$TMP/badeng.json" '.gates[]|select(.gate=="cue_lint")|.status')" = fail ] || fail "the live reader must fail closed on an unsupported engine, not downgrade the class to advisory and pass"
+[ "$(bget "$TMP/badeng.json" '[.findings[]|select(.gate=="cue_lint" and .severity=="fail")]|length')" -ge 1 ] || fail "an unsupported engine must emit a loud fail-closed finding on the read path"
+pass "F2: the live cue lint enforces the closed engine set on its read path (fail closed, one finding)"
+
 # --- FC-007: EVERY refusal invalidates the prior pass in BOTH artifacts --------
 seed_pass() { # <out>  - seed an authoritative pass bundle + pass summary
   jq -n '{schema:"firstmate/verify-bundle/1",verdict:"pass"}' > "$1"

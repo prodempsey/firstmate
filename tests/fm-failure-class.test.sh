@@ -115,7 +115,19 @@ BE="$TMP_ROOT/validate-badengine.jsonl"; seed_one "$BE"
 printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-amended","id":"FC-001","detection":[{"engine":"regex-pcre","pattern":"x","cue_ref":"c"}]}\n' >> "$BE"
 FM_FC_LEDGER="$BE" "$FC" validate >/dev/null 2>&1
 expect_code 1 $? "validate refuses a detection row whose engine is outside the supported set"
-pass "closed detection schema enforced by amend, add, and validate (engine in supported set, non-empty pattern and cue_ref)"
+# The pattern must actually COMPILE under its engine (qa-scg1r2-q173 F1): a syntactically
+# invalid ERE that a naive non-empty check accepts would crash awk in the live lint and be
+# read as an empty hit stream, so the writer and validate must reject it up front.
+FM_FC_LEDGER="$A" "$FC" amend FC-001 --detection '{"engine":"awk-ere","pattern":"[","cue_ref":"invalid ERE"}' >/dev/null 2>&1
+expect_code 1 $? "amend refuses a pattern that does not compile as an ERE"
+FM_FC_LEDGER="$TMP_ROOT/badere-add.jsonl" "$FC" add --id FC-061 --name n --invariant i --fix f --cue c \
+  --provenance "qa:data/y#1" --detection '{"engine":"awk-ere","pattern":"(unclosed","cue_ref":"c"}' >/dev/null 2>&1
+expect_code 1 $? "add refuses an inline pattern that does not compile as an ERE"
+IE="$TMP_ROOT/validate-badere.jsonl"; seed_one "$IE"
+printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-amended","id":"FC-001","detection":[{"engine":"awk-ere","pattern":"[","cue_ref":"c"}]}\n' >> "$IE"
+FM_FC_LEDGER="$IE" "$FC" validate >/dev/null 2>&1
+expect_code 1 $? "validate refuses a detection whose pattern does not compile as an ERE"
+pass "closed detection schema (incl. pattern compilation) enforced by amend, add, and validate"
 # A class-amended event against an id no class-defined ever declared is corrupt: fail closed.
 Cam="$TMP_ROOT/corrupt-amend.jsonl"
 printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-amended","id":"FC-777","detection":[{"engine":"awk-ere","pattern":"x"}]}\n' > "$Cam"
