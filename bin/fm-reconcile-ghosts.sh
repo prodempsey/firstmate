@@ -10,9 +10,11 @@
 # A corrupt legacy shape where worktree= points at the active firstmate home
 # cannot prove either task lineage or landed state. It is reported separately
 # and preserved without calling teardown or deleting any task record.
-# Metadata names are captured by one successful directory-enumeration pass
-# before cleanup begins. Missing, unreadable, or partially enumerated state is
-# an error, never proof that the fleet is empty.
+# bin/fm-backend.sh's fm_enumerate_task_records owns the closed enumeration
+# contract: one canonical state directory, a complete name snapshot, every
+# entry attested regular/read-complete/parsed, and a trailing count before this
+# script may enter disposition. Failure is total and mutation-free; a completed
+# zero-count proof is the only source of the empty-fleet message.
 #
 # Confirm-twice safeguard (bug-20260710152159-d3f294fa): a live,
 # actively-working crew can transiently read as a dead endpoint - e.g. a tmux
@@ -51,36 +53,37 @@ worktree_is_active_home() {  # <worktree>
   [ "$wt_abs" = "$home_abs" ]
 }
 
-enumeration_failed() {  # <reason>
-  local reason=$1
-  printf 'GHOST_RECONCILE: ATTENTION: cannot enumerate task metadata in %s (%s); no task records were touched.\n' "$STATE" "$reason"
+enumeration_failed() {  # <reason> [canonical-or-input-path]
+  local reason=$1 path=${2:-$STATE}
+  printf 'GHOST_RECONCILE: ATTENTION: cannot enumerate task metadata in %s (%s); no task records were touched.\n' "$path" "$reason"
   printf 'GHOST_RECONCILE: summary enumeration=failed cleared=0 corrupt_preserved=unknown preserved=unknown\n'
   exit 1
 }
 
-META_LIST=$(mktemp "${TMPDIR:-/tmp}/fm-ghost-metas.XXXXXX" 2>/dev/null) \
+TASK_SNAPSHOT=$(mktemp "${TMPDIR:-/tmp}/fm-ghost-records.XXXXXX" 2>/dev/null) \
   || enumeration_failed "could not create a complete enumeration snapshot"
-trap 'rm -f "$META_LIST"' EXIT
-
-[ -d "$STATE" ] \
-  || enumeration_failed "state path is not a directory"
-[ -r "$STATE" ] && [ -x "$STATE" ] \
-  || enumeration_failed "state directory is not readable and searchable"
-if ! find "$STATE" -maxdepth 1 -type f -name '*.meta' -print0 > "$META_LIST" 2>/dev/null; then
-  enumeration_failed "directory scan failed"
+trap 'rm -f "$TASK_SNAPSHOT"' EXIT
+if ! fm_enumerate_task_records "$STATE" "$TASK_SNAPSHOT"; then
+  enumeration_failed "$FM_TASK_ENUM_REASON" "$FM_TASK_ENUM_CANONICAL_STATE"
 fi
 
-META_FOUND=0
 DEAD_FOUND=0
 CLEARED=0
 CORRUPT_PRESERVED=0
 PRESERVED=0
 
-while IFS= read -r -d '' meta; do
-  META_FOUND=1
-  id=$(basename "$meta" .meta)
-  backend=$(fm_backend_of_meta "$meta")
-  target=$(fm_backend_target_of_meta "$meta")
+record_index=0
+exec 8< "$TASK_SNAPSHOT" \
+  || enumeration_failed "completed enumeration snapshot could not be opened" "$FM_TASK_ENUM_CANONICAL_STATE"
+while [ "$record_index" -lt "$FM_TASK_ENUM_COUNT" ]; do
+  fm_task_record_snapshot_read 8 \
+    || enumeration_failed "completed enumeration snapshot could not be read" "$FM_TASK_ENUM_CANONICAL_STATE"
+  id=$FM_TASK_RECORD_ID
+  meta=$FM_TASK_RECORD_META
+  backend=$FM_TASK_RECORD_BACKEND
+  target=$FM_TASK_RECORD_TARGET
+  worktree=$FM_TASK_RECORD_WORKTREE
+  record_index=$((record_index + 1))
 
   if [ -z "$target" ]; then
     PRESERVED=$((PRESERVED + 1))
@@ -102,7 +105,6 @@ while IFS= read -r -d '' meta; do
   fi
 
   DEAD_FOUND=1
-  worktree=$(fm_meta_get "$meta" worktree)
   if worktree_is_active_home "$worktree"; then
     PRESERVED=$((PRESERVED + 1))
     CORRUPT_PRESERVED=$((CORRUPT_PRESERVED + 1))
@@ -119,9 +121,10 @@ while IFS= read -r -d '' meta; do
     printf 'GHOST_RECONCILE: ATTENTION: %s endpoint is dead but teardown refused or failed; state preserved.\n' "$id"
     printf '%s\n' "$out" | sed 's/^/  /'
   fi
-done < "$META_LIST"
+done
+exec 8<&-
 
-if [ "$META_FOUND" -eq 0 ]; then
+if [ "$FM_TASK_ENUM_COUNT" -eq 0 ]; then
   printf 'GHOST_RECONCILE: no in-flight metadata found.\n'
 elif [ "$DEAD_FOUND" -eq 0 ] && [ "$PRESERVED" -eq 0 ]; then
   printf 'GHOST_RECONCILE: no dead task endpoints found.\n'

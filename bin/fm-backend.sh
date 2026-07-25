@@ -332,6 +332,342 @@ fm_backend_required_tool_available() {  # <backend> <tool>
   esac
 }
 
+# fm_enumerate_task_records: the single atomic task-record enumeration
+# primitive. It canonicalizes <state-dir> exactly once, captures every
+# top-level *.meta name without filtering by type, then attests every entry as
+# a stable regular file that can be read to completion and parsed before it
+# publishes <snapshot>. An optional <target-id> selects exactly one required
+# record for single-task closeout; a missing target is failure, not an empty
+# proof.
+#
+# Success returns 0, sets FM_TASK_ENUM_CANONICAL_STATE and
+# FM_TASK_ENUM_COUNT, and atomically publishes a NUL-delimited artifact:
+#   record\0<25 parsed fields, in fm_task_record_snapshot_read order>\0
+#   ...
+#   count\0<N>\0
+# A completed zero-record artifact is the only proof of emptiness.
+#
+# Failure returns nonzero, sets FM_TASK_ENUM_REASON, removes any partial
+# artifact, and emits nothing. The consumer owns its one context-specific
+# ATTENTION line. No consumer may act on the artifact unless this function
+# returned success.
+FM_TASK_ENUM_CANONICAL_STATE=""
+FM_TASK_ENUM_COUNT=""
+FM_TASK_ENUM_REASON=""
+# Result globals are read by scripts that source this library.
+: "$FM_TASK_ENUM_CANONICAL_STATE" "$FM_TASK_ENUM_COUNT" "$FM_TASK_ENUM_REASON"
+
+fm_task_record_reset() {
+  FM_TASK_RECORD_ID=""
+  FM_TASK_RECORD_META=""
+  FM_TASK_RECORD_BACKEND=""
+  FM_TASK_RECORD_WINDOW=""
+  FM_TASK_RECORD_TERMINAL=""
+  FM_TASK_RECORD_TARGET=""
+  FM_TASK_RECORD_WORKTREE=""
+  FM_TASK_RECORD_PROJECT=""
+  FM_TASK_RECORD_BRANCH=""
+  FM_TASK_RECORD_HARNESS=""
+  FM_TASK_RECORD_KIND=""
+  FM_TASK_RECORD_MODE=""
+  FM_TASK_RECORD_YOLO=""
+  FM_TASK_RECORD_HOME=""
+  FM_TASK_RECORD_PR=""
+  FM_TASK_RECORD_PR_HEAD=""
+  FM_TASK_RECORD_TASKTMP=""
+  FM_TASK_RECORD_MODEL=""
+  FM_TASK_RECORD_EFFORT=""
+  FM_TASK_RECORD_PROVIDER=""
+  FM_TASK_RECORD_SPAWNED_AT=""
+  FM_TASK_RECORD_CTIME_EPOCH=""
+  FM_TASK_RECORD_ORCA_WORKTREE_ID=""
+  FM_TASK_RECORD_ZELLIJ_TAB_ID=""
+  FM_TASK_RECORD_PROJECTS=""
+}
+
+fm_task_record_parse_file() {  # <read-complete-copy>
+  local source=$1 line key value
+  fm_task_record_reset
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      *=*)
+        key=${line%%=*}
+        value=${line#*=}
+        case "$key" in
+          backend) FM_TASK_RECORD_BACKEND=$value ;;
+          window) FM_TASK_RECORD_WINDOW=$value ;;
+          terminal) FM_TASK_RECORD_TERMINAL=$value ;;
+          worktree) FM_TASK_RECORD_WORKTREE=$value ;;
+          project) FM_TASK_RECORD_PROJECT=$value ;;
+          branch) FM_TASK_RECORD_BRANCH=$value ;;
+          harness) FM_TASK_RECORD_HARNESS=$value ;;
+          kind) FM_TASK_RECORD_KIND=$value ;;
+          mode) FM_TASK_RECORD_MODE=$value ;;
+          yolo) FM_TASK_RECORD_YOLO=$value ;;
+          home) FM_TASK_RECORD_HOME=$value ;;
+          pr) FM_TASK_RECORD_PR=$value ;;
+          pr_head) FM_TASK_RECORD_PR_HEAD=$value ;;
+          tasktmp) FM_TASK_RECORD_TASKTMP=$value ;;
+          model) FM_TASK_RECORD_MODEL=$value ;;
+          effort) FM_TASK_RECORD_EFFORT=$value ;;
+          provider) FM_TASK_RECORD_PROVIDER=$value ;;
+          spawned_at) FM_TASK_RECORD_SPAWNED_AT=$value ;;
+          orca_worktree_id) FM_TASK_RECORD_ORCA_WORKTREE_ID=$value ;;
+          zellij_tab_id) FM_TASK_RECORD_ZELLIJ_TAB_ID=$value ;;
+          projects) FM_TASK_RECORD_PROJECTS=$value ;;
+        esac
+        ;;
+    esac
+  done < "$source"
+  [ -n "$FM_TASK_RECORD_BACKEND" ] || FM_TASK_RECORD_BACKEND=tmux
+  if [ "$FM_TASK_RECORD_BACKEND" = orca ] && [ -n "$FM_TASK_RECORD_TERMINAL" ]; then
+    FM_TASK_RECORD_TARGET=$FM_TASK_RECORD_TERMINAL
+  else
+    FM_TASK_RECORD_TARGET=$FM_TASK_RECORD_WINDOW
+  fi
+}
+
+fm_task_record_stat_token() {  # <regular-file>
+  if [ "$(uname 2>/dev/null)" = Darwin ]; then
+    stat -f '%d:%i:%z:%m:%c:%p' "$1" 2>/dev/null
+  else
+    stat -c '%d:%i:%s:%Y:%Z:%f' "$1" 2>/dev/null
+  fi
+}
+
+fm_task_record_snapshot_write() {  # <snapshot-work-file>
+  local snapshot=$1
+  {
+    printf 'record\0'
+    printf '%s\0' \
+      "$FM_TASK_RECORD_ID" \
+      "$FM_TASK_RECORD_META" \
+      "$FM_TASK_RECORD_BACKEND" \
+      "$FM_TASK_RECORD_WINDOW" \
+      "$FM_TASK_RECORD_TERMINAL" \
+      "$FM_TASK_RECORD_TARGET" \
+      "$FM_TASK_RECORD_WORKTREE" \
+      "$FM_TASK_RECORD_PROJECT" \
+      "$FM_TASK_RECORD_BRANCH" \
+      "$FM_TASK_RECORD_HARNESS" \
+      "$FM_TASK_RECORD_KIND" \
+      "$FM_TASK_RECORD_MODE" \
+      "$FM_TASK_RECORD_YOLO" \
+      "$FM_TASK_RECORD_HOME" \
+      "$FM_TASK_RECORD_PR" \
+      "$FM_TASK_RECORD_PR_HEAD" \
+      "$FM_TASK_RECORD_TASKTMP" \
+      "$FM_TASK_RECORD_MODEL" \
+      "$FM_TASK_RECORD_EFFORT" \
+      "$FM_TASK_RECORD_PROVIDER" \
+      "$FM_TASK_RECORD_SPAWNED_AT" \
+      "$FM_TASK_RECORD_CTIME_EPOCH" \
+      "$FM_TASK_RECORD_ORCA_WORKTREE_ID" \
+      "$FM_TASK_RECORD_ZELLIJ_TAB_ID" \
+      "$FM_TASK_RECORD_PROJECTS"
+  } >> "$snapshot"
+}
+
+fm_task_record_snapshot_read() {  # <fd>
+  local fd=$1 marker
+  fm_task_record_reset
+  IFS= read -r -d '' marker <&"$fd" || return 1
+  [ "$marker" = record ] || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_ID <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_META <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_BACKEND <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_WINDOW <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_TERMINAL <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_TARGET <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_WORKTREE <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_PROJECT <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_BRANCH <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_HARNESS <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_KIND <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_MODE <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_YOLO <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_HOME <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_PR <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_PR_HEAD <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_TASKTMP <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_MODEL <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_EFFORT <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_PROVIDER <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_SPAWNED_AT <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_CTIME_EPOCH <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_ORCA_WORKTREE_ID <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_ZELLIJ_TAB_ID <&"$fd" || return 1
+  IFS= read -r -d '' FM_TASK_RECORD_PROJECTS <&"$fd" || return 1
+}
+
+fm_task_record_snapshot_validate() {  # <snapshot> <expected-count>
+  local snapshot=$1 expected=$2 i=0 marker count
+  exec 8< "$snapshot" || return 1
+  while [ "$i" -lt "$expected" ]; do
+    fm_task_record_snapshot_read 8 || { exec 8<&-; return 1; }
+    i=$((i + 1))
+  done
+  IFS= read -r -d '' marker <&8 || { exec 8<&-; return 1; }
+  IFS= read -r -d '' count <&8 || { exec 8<&-; return 1; }
+  [ "$marker" = count ] && [ "$count" = "$expected" ] \
+    || { exec 8<&-; return 1; }
+  if IFS= read -r -d '' _ <&8; then
+    exec 8<&-
+    return 1
+  fi
+  exec 8<&-
+}
+
+fm_enumerate_task_records() {  # <state-dir> <snapshot> [target-id]
+  local state=$1 snapshot=$2 target_id=${3:-} canonical work names raw
+  local entry base id before after ctime count=0
+  # shellcheck disable=SC2034 # result globals are consumed by sourcing callers.
+  FM_TASK_ENUM_CANONICAL_STATE=$state
+  FM_TASK_ENUM_COUNT=""
+  # shellcheck disable=SC2034 # result globals are consumed by sourcing callers.
+  FM_TASK_ENUM_REASON=""
+  rm -f "$snapshot"
+
+  [ -n "$state" ] || {
+    FM_TASK_ENUM_REASON="state path is empty"
+    return 1
+  }
+  canonical=$(cd "$state" 2>/dev/null && pwd -P) || {
+    FM_TASK_ENUM_REASON="state path could not be canonicalized to a directory"
+    return 1
+  }
+  FM_TASK_ENUM_CANONICAL_STATE=$canonical
+  [ -d "$canonical" ] || {
+    FM_TASK_ENUM_REASON="canonical state path is not a directory"
+    return 1
+  }
+  [ -r "$canonical" ] && [ -x "$canonical" ] || {
+    FM_TASK_ENUM_REASON="canonical state directory is not readable and searchable"
+    return 1
+  }
+
+  work=$(mktemp -d "${TMPDIR:-/tmp}/fm-task-enumerate.XXXXXX" 2>/dev/null) || {
+    FM_TASK_ENUM_REASON="could not create enumeration workspace"
+    return 1
+  }
+  names="$work/names"
+  raw="$work/raw"
+  : > "$names"
+  : > "$work/snapshot"
+
+  if [ -n "$target_id" ]; then
+    case "$target_id" in
+      */*|''|.|..) FM_TASK_ENUM_REASON="target task id is invalid"; rm -rf "$work"; return 1 ;;
+    esac
+    entry="$canonical/$target_id.meta"
+    if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then
+      FM_TASK_ENUM_REASON="target metadata is missing"
+      rm -rf "$work"
+      return 1
+    fi
+    printf '%s\0' "$entry" > "$names"
+  elif ! find "$canonical" -mindepth 1 -maxdepth 1 -name '*.meta' -print0 > "$names" 2>/dev/null; then
+    FM_TASK_ENUM_REASON="directory scan failed"
+    rm -rf "$work"
+    return 1
+  fi
+
+  if [ -n "${FM_TASK_ENUM_TEST_AFTER_LIST_HOOK:-}" ]; then
+    if [ ! -x "$FM_TASK_ENUM_TEST_AFTER_LIST_HOOK" ] \
+      || ! "$FM_TASK_ENUM_TEST_AFTER_LIST_HOOK" "$canonical"; then
+      FM_TASK_ENUM_REASON="after-list test hook failed"
+      rm -rf "$work"
+      return 1
+    fi
+  fi
+
+  while IFS= read -r -d '' entry; do
+    base=${entry##*/}
+    id=${base%.meta}
+    if [ -z "$id" ] || [ "$base" != "$id.meta" ]; then
+      FM_TASK_ENUM_REASON="metadata entry has no canonical task id"
+      rm -rf "$work"
+      return 1
+    fi
+    if [ -L "$entry" ] || [ ! -f "$entry" ]; then
+      FM_TASK_ENUM_REASON="metadata entry $base is not a regular file"
+      rm -rf "$work"
+      return 1
+    fi
+    before=$(fm_task_record_stat_token "$entry") || {
+      FM_TASK_ENUM_REASON="metadata entry $base could not be attested"
+      rm -rf "$work"
+      return 1
+    }
+    if [ "$(uname 2>/dev/null)" = Darwin ]; then
+      ctime=$(stat -f %c "$entry" 2>/dev/null) || {
+        FM_TASK_ENUM_REASON="metadata entry $base creation time could not be attested"
+        rm -rf "$work"
+        return 1
+      }
+    else
+      ctime=$(stat -c %Z "$entry" 2>/dev/null) || {
+        FM_TASK_ENUM_REASON="metadata entry $base creation time could not be attested"
+        rm -rf "$work"
+        return 1
+      }
+    fi
+    if ! cat -- "$entry" > "$raw"; then
+      FM_TASK_ENUM_REASON="metadata entry $base could not be read to completion"
+      rm -rf "$work"
+      return 1
+    fi
+    if [ -L "$entry" ] || [ ! -f "$entry" ]; then
+      FM_TASK_ENUM_REASON="metadata entry $base vanished or changed type during enumeration"
+      rm -rf "$work"
+      return 1
+    fi
+    after=$(fm_task_record_stat_token "$entry") || {
+      FM_TASK_ENUM_REASON="metadata entry $base vanished during enumeration"
+      rm -rf "$work"
+      return 1
+    }
+    if [ "$before" != "$after" ]; then
+      FM_TASK_ENUM_REASON="metadata entry $base changed during enumeration"
+      rm -rf "$work"
+      return 1
+    fi
+    fm_task_record_parse_file "$raw" || {
+      FM_TASK_ENUM_REASON="metadata entry $base could not be parsed"
+      rm -rf "$work"
+      return 1
+    }
+    FM_TASK_RECORD_CTIME_EPOCH=$ctime
+    FM_TASK_RECORD_ID=$id
+    FM_TASK_RECORD_META="$canonical/$base"
+    fm_task_record_snapshot_write "$work/snapshot" || {
+      FM_TASK_ENUM_REASON="could not write complete enumeration snapshot"
+      rm -rf "$work"
+      return 1
+    }
+    count=$((count + 1))
+  done < "$names"
+
+  printf 'count\0%s\0' "$count" >> "$work/snapshot" || {
+    FM_TASK_ENUM_REASON="could not attest enumeration count"
+    rm -rf "$work"
+    return 1
+  }
+  fm_task_record_snapshot_validate "$work/snapshot" "$count" || {
+    FM_TASK_ENUM_REASON="enumeration snapshot validation failed"
+    rm -rf "$work"
+    return 1
+  }
+  mv "$work/snapshot" "$snapshot" || {
+    FM_TASK_ENUM_REASON="could not publish complete enumeration snapshot"
+    rm -rf "$work"
+    return 1
+  }
+  rm -rf "$work"
+  # shellcheck disable=SC2034 # result globals are consumed by sourcing callers.
+  FM_TASK_ENUM_COUNT=$count
+}
+
 # fm_meta_get: the LAST value of `key=` in <meta-file>, or empty (never
 # errors) if the file or key is absent. Mirrors the ad hoc `grep '^key=' |
 # tail -1 | cut -d= -f2-` snippet every fm-*.sh script used to repeat inline.

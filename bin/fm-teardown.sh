@@ -107,32 +107,67 @@ FM_LOCK_LOG_PREFIX=teardown
 ID=$1
 FORCE=${2:-}
 
-META="$STATE/$ID.meta"
-[ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
-WT=$(grep '^worktree=' "$META" | cut -d= -f2-)
-T=$(grep '^window=' "$META" | cut -d= -f2-)
-PROJ=$(grep '^project=' "$META" | cut -d= -f2-)
-BACKEND=$(fm_backend_of_meta "$META")
-if [ "$BACKEND" = orca ]; then
-  T_ORCA=$(grep '^terminal=' "$META" | tail -1 | cut -d= -f2- || true)
-  [ -n "$T_ORCA" ] && T=$T_ORCA
-fi
-HOME_PATH=$(grep '^home=' "$META" | cut -d= -f2- || true)
-PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
+teardown_enumeration_attention() {
+  printf 'GHOST_RECONCILE: ATTENTION: cannot enumerate task metadata in %s (%s); no task records were touched.\n' \
+    "$FM_TASK_ENUM_CANONICAL_STATE" "$FM_TASK_ENUM_REASON" >&2
+  printf 'GHOST_RECONCILE: summary enumeration=failed cleared=0 corrupt_preserved=unknown preserved=unknown\n' >&2
+}
+
+teardown_enumeration_failed() {
+  teardown_enumeration_attention
+  exit 1
+}
+
+TEARDOWN_TASK_SNAPSHOT=$(mktemp "${TMPDIR:-/tmp}/fm-teardown-record.XXXXXX" 2>/dev/null) || {
+  FM_TASK_ENUM_CANONICAL_STATE=$STATE
+  FM_TASK_ENUM_REASON="could not create a complete enumeration snapshot"
+  teardown_enumeration_failed
+}
+trap 'rm -f "$TEARDOWN_TASK_SNAPSHOT"' EXIT
+fm_enumerate_task_records "$STATE" "$TEARDOWN_TASK_SNAPSHOT" "$ID" \
+  || teardown_enumeration_failed
+exec 8< "$TEARDOWN_TASK_SNAPSHOT" || {
+  FM_TASK_ENUM_REASON="completed target snapshot could not be opened"
+  teardown_enumeration_failed
+}
+fm_task_record_snapshot_read 8 || {
+  exec 8<&-
+  FM_TASK_ENUM_REASON="completed target snapshot could not be read"
+  teardown_enumeration_failed
+}
+exec 8<&-
+
+META=$FM_TASK_RECORD_META
+WT=$FM_TASK_RECORD_WORKTREE
+T=$FM_TASK_RECORD_TARGET
+PROJ=$FM_TASK_RECORD_PROJECT
+BACKEND=$FM_TASK_RECORD_BACKEND
+HOME_PATH=$FM_TASK_RECORD_HOME
+PR_URL=$FM_TASK_RECORD_PR
 # tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root
 # (/tmp/fm-<id>/); absent for tasks spawned before that change, so tolerate empty.
-TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
-ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
+TASK_TMP=$FM_TASK_RECORD_TASKTMP
+ORCA_WORKTREE_ID=$FM_TASK_RECORD_ORCA_WORKTREE_ID
 ORCA_PATH_MATCH_VERIFIED=0
 TASK_RUN_BRANCH="fm/$ID"
 TASK_RUN_REF="refs/heads/$TASK_RUN_BRANCH"
-RECORDED_TASK_BRANCH=$(grep '^branch=' "$META" | tail -1 | cut -d= -f2- || true)
+RECORDED_TASK_BRANCH=$FM_TASK_RECORD_BRANCH
 DURABLE_CLOSE_EVIDENCE=
 
-KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
+KIND=$FM_TASK_RECORD_KIND
 [ -n "$KIND" ] || KIND=ship
-MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
+MODE=$FM_TASK_RECORD_MODE
 [ -n "$MODE" ] || MODE=no-mistakes
+
+META_HARNESS=$FM_TASK_RECORD_HARNESS
+META_MODEL=$FM_TASK_RECORD_MODEL
+META_EFFORT=$FM_TASK_RECORD_EFFORT
+META_PROVIDER=$FM_TASK_RECORD_PROVIDER
+META_SPAWNED_AT=$FM_TASK_RECORD_SPAWNED_AT
+META_CTIME_EPOCH=$FM_TASK_RECORD_CTIME_EPOCH
+META_PR_HEAD=$FM_TASK_RECORD_PR_HEAD
+META_TERMINAL=$FM_TASK_RECORD_TERMINAL
+META_ZELLIJ_TAB_ID=$FM_TASK_RECORD_ZELLIJ_TAB_ID
 
 default_branch() {
   local ref branch
@@ -152,7 +187,28 @@ default_branch() {
 
 meta_value() {
   local meta=$1 key=$2
-  fm_meta_get "$meta" "$key"
+  [ "$meta" = "$META" ] || return 1
+  case "$key" in
+    backend) printf '%s' "$BACKEND" ;;
+    window) printf '%s' "$FM_TASK_RECORD_WINDOW" ;;
+    terminal) printf '%s' "$META_TERMINAL" ;;
+    worktree) printf '%s' "$WT" ;;
+    project) printf '%s' "$PROJ" ;;
+    branch) printf '%s' "$RECORDED_TASK_BRANCH" ;;
+    harness) printf '%s' "$META_HARNESS" ;;
+    kind) printf '%s' "$KIND" ;;
+    mode) printf '%s' "$MODE" ;;
+    home) printf '%s' "$HOME_PATH" ;;
+    pr) printf '%s' "$PR_URL" ;;
+    pr_head) printf '%s' "$META_PR_HEAD" ;;
+    tasktmp) printf '%s' "$TASK_TMP" ;;
+    model) printf '%s' "$META_MODEL" ;;
+    effort) printf '%s' "$META_EFFORT" ;;
+    provider) printf '%s' "$META_PROVIDER" ;;
+    spawned_at) printf '%s' "$META_SPAWNED_AT" ;;
+    orca_worktree_id) printf '%s' "$ORCA_WORKTREE_ID" ;;
+    zellij_tab_id) printf '%s' "$META_ZELLIJ_TAB_ID" ;;
+  esac
 }
 
 iso_utc_from_epoch() {
@@ -161,14 +217,6 @@ iso_utc_from_epoch() {
     date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%SZ'
   else
     date -u -d "@$epoch" '+%Y-%m-%dT%H:%M:%SZ'
-  fi
-}
-
-meta_ctime_epoch() {
-  if [ "$(uname)" = Darwin ]; then
-    stat -f %c "$1" 2>/dev/null
-  else
-    stat -c %Z "$1" 2>/dev/null
   fi
 }
 
@@ -186,7 +234,7 @@ append_task_run_ledger() {
   worktree=$(meta_value "$META" worktree)
   spawned_at=$(meta_value "$META" spawned_at)
   if [ -z "$spawned_at" ]; then
-    ctime=$(meta_ctime_epoch "$META" || true)
+    ctime=$META_CTIME_EPOCH
     if [ -n "$ctime" ]; then
       spawned_at=$(iso_utc_from_epoch "$ctime" || true)
     fi
@@ -1033,81 +1081,147 @@ remove_firstmate_home() {
   safe_rm_rf "$abs_home_path" "$label"
 }
 
-validate_firstmate_home_children_removal() {
-  local home=$1 sub_state child_meta child_id child_wt child_proj child_kind child_home child_backend child_orca_worktree_id
-  sub_state="$home/state"
-  [ -d "$sub_state" ] || return 0
-  for child_meta in "$sub_state"/*.meta; do
-    [ -e "$child_meta" ] || continue
-    child_id=$(basename "$child_meta" .meta)
-    child_wt=$(meta_value "$child_meta" worktree)
-    child_kind=$(meta_value "$child_meta" kind)
-    [ -n "$child_kind" ] || child_kind=ship
-    child_backend=$(fm_backend_of_meta "$child_meta")
-    if [ "$child_kind" = secondmate ]; then
-      child_home=$(meta_value "$child_meta" home)
-      [ -n "$child_home" ] || child_home=$child_wt
-      validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" >/dev/null || return 1
-      validate_firstmate_home_children_removal "$child_home" || return 1
-    elif [ "$child_backend" = orca ]; then
-      child_orca_worktree_id=$(require_orca_worktree_id "$child_meta") || return 1
-      if [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
-        child_proj=$(meta_value "$child_meta" project)
-        validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
-        require_orca_worktree_path_match "$child_orca_worktree_id" "$child_wt" || return 1
-      fi
-    elif [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
-      child_proj=$(meta_value "$child_meta" project)
-      validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
-    fi
+teardown_snapshot_open_at() {  # <snapshot> <records-already-read>
+  local snapshot=$1 consumed=$2 skipped=0
+  exec 7< "$snapshot" || return 1
+  while [ "$skipped" -lt "$consumed" ]; do
+    fm_task_record_snapshot_read 7 || { exec 7<&-; return 1; }
+    skipped=$((skipped + 1))
   done
 }
 
-cleanup_firstmate_home_children() {
-  local home=$1 sub_state child_meta child_id child_t child_wt child_proj child_kind child_home child_backend child_orca_worktree_id child_return_rc
+validate_firstmate_home_children_removal() {
+  local home=$1 sub_state snapshot index=0
+  local child_meta child_id child_wt child_proj child_kind child_home child_backend child_orca_worktree_id
   sub_state="$home/state"
   [ -d "$sub_state" ] || return 0
-  for child_meta in "$sub_state"/*.meta; do
-    [ -e "$child_meta" ] || continue
-    child_id=$(basename "$child_meta" .meta)
-    child_wt=$(meta_value "$child_meta" worktree)
-    child_proj=$(meta_value "$child_meta" project)
-    child_kind=$(meta_value "$child_meta" kind)
+  snapshot=$(mktemp "${TMPDIR:-/tmp}/fm-teardown-children.XXXXXX" 2>/dev/null) || {
+    FM_TASK_ENUM_CANONICAL_STATE=$sub_state
+    FM_TASK_ENUM_REASON="could not create a complete child enumeration snapshot"
+    teardown_enumeration_attention
+    return 1
+  }
+  if ! fm_enumerate_task_records "$sub_state" "$snapshot"; then
+    teardown_enumeration_attention
+    rm -f "$snapshot"
+    return 1
+  fi
+  exec 7< "$snapshot" || { rm -f "$snapshot"; return 1; }
+  while [ "$index" -lt "$FM_TASK_ENUM_COUNT" ]; do
+    fm_task_record_snapshot_read 7 || { exec 7<&-; rm -f "$snapshot"; return 1; }
+    index=$((index + 1))
+    child_meta=$FM_TASK_RECORD_META
+    child_id=$FM_TASK_RECORD_ID
+    child_wt=$FM_TASK_RECORD_WORKTREE
+    child_kind=$FM_TASK_RECORD_KIND
     [ -n "$child_kind" ] || child_kind=ship
-    child_backend=$(fm_backend_of_meta "$child_meta")
-    if [ "$child_backend" = orca ]; then
-      child_t=$(meta_value "$child_meta" terminal)
-    else
-      child_t=$(fm_backend_target_of_meta "$child_meta")
-    fi
-    if [ "$child_backend" = orca ] && [ "$child_kind" != secondmate ]; then
-      child_orca_worktree_id=$(require_orca_worktree_id "$child_meta") || return 1
+    child_backend=$FM_TASK_RECORD_BACKEND
+    if [ "$child_kind" = secondmate ]; then
+      child_home=$FM_TASK_RECORD_HOME
+      [ -n "$child_home" ] || child_home=$child_wt
+      validate_firstmate_home_for_removal "$child_home" "child firstmate home" "$child_id" >/dev/null \
+        || { exec 7<&-; rm -f "$snapshot"; return 1; }
+      exec 7<&-
+      validate_firstmate_home_children_removal "$child_home" \
+        || { rm -f "$snapshot"; return 1; }
+      teardown_snapshot_open_at "$snapshot" "$index" \
+        || { rm -f "$snapshot"; return 1; }
+    elif [ "$child_backend" = orca ]; then
+      child_orca_worktree_id=$FM_TASK_RECORD_ORCA_WORKTREE_ID
+      [ -n "$child_orca_worktree_id" ] || {
+        echo "error: missing orca_worktree_id in $child_meta; cannot remove Orca worktree" >&2
+        exec 7<&-
+        rm -f "$snapshot"
+        return 1
+      }
       if [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
-        validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
+        child_proj=$FM_TASK_RECORD_PROJECT
+        validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null \
+          || { exec 7<&-; rm -f "$snapshot"; return 1; }
+        require_orca_worktree_path_match "$child_orca_worktree_id" "$child_wt" \
+          || { exec 7<&-; rm -f "$snapshot"; return 1; }
+      fi
+    elif [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
+      child_proj=$FM_TASK_RECORD_PROJECT
+      validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null \
+        || { exec 7<&-; rm -f "$snapshot"; return 1; }
+    fi
+  done
+  exec 7<&-
+  rm -f "$snapshot"
+}
+
+cleanup_firstmate_home_children() {
+  local home=$1 sub_state snapshot index=0
+  local child_meta child_id child_t child_wt child_proj child_kind child_home child_backend
+  local child_orca_worktree_id child_zellij_tab_id child_return_rc
+  sub_state="$home/state"
+  [ -d "$sub_state" ] || return 0
+  snapshot=$(mktemp "${TMPDIR:-/tmp}/fm-teardown-children.XXXXXX" 2>/dev/null) || {
+    FM_TASK_ENUM_CANONICAL_STATE=$sub_state
+    FM_TASK_ENUM_REASON="could not create a complete child enumeration snapshot"
+    teardown_enumeration_attention
+    return 1
+  }
+  if ! fm_enumerate_task_records "$sub_state" "$snapshot"; then
+    teardown_enumeration_attention
+    rm -f "$snapshot"
+    return 1
+  fi
+  exec 7< "$snapshot" || { rm -f "$snapshot"; return 1; }
+  while [ "$index" -lt "$FM_TASK_ENUM_COUNT" ]; do
+    fm_task_record_snapshot_read 7 || { exec 7<&-; rm -f "$snapshot"; return 1; }
+    index=$((index + 1))
+    child_meta=$FM_TASK_RECORD_META
+    child_id=$FM_TASK_RECORD_ID
+    child_wt=$FM_TASK_RECORD_WORKTREE
+    child_proj=$FM_TASK_RECORD_PROJECT
+    child_kind=$FM_TASK_RECORD_KIND
+    [ -n "$child_kind" ] || child_kind=ship
+    child_backend=$FM_TASK_RECORD_BACKEND
+    child_t=$FM_TASK_RECORD_TARGET
+    child_zellij_tab_id=$FM_TASK_RECORD_ZELLIJ_TAB_ID
+    if [ "$child_backend" = orca ] && [ "$child_kind" != secondmate ]; then
+      child_orca_worktree_id=$FM_TASK_RECORD_ORCA_WORKTREE_ID
+      [ -n "$child_orca_worktree_id" ] || {
+        echo "error: missing orca_worktree_id in $child_meta; cannot remove Orca worktree" >&2
+        exec 7<&-
+        rm -f "$snapshot"
+        return 1
+      }
+      if [ -n "$child_wt" ] && [ -e "$child_wt" ]; then
+        validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null \
+          || { exec 7<&-; rm -f "$snapshot"; return 1; }
       fi
     fi
     if [ -n "$child_t" ]; then
       if [ "$child_backend" = zellij ]; then
         # Zellij titles are scoped by the owning home tag, so forced secondmate
         # cleanup must verify child tabs as that child home, not the parent.
-        ( unset FM_ROOT_OVERRIDE; FM_HOME=$home FM_ROOT=$home fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" ) 2>/dev/null || true
+        ( unset FM_ROOT_OVERRIDE; FM_HOME=$home FM_ROOT=$home fm_backend_kill "$child_backend" "$child_t" "$child_zellij_tab_id" "fm-$child_id" ) 2>/dev/null || true
       else
-        fm_backend_kill "$child_backend" "$child_t" "$(meta_value "$child_meta" zellij_tab_id)" "fm-$child_id" 2>/dev/null || true
+        fm_backend_kill "$child_backend" "$child_t" "$child_zellij_tab_id" "fm-$child_id" 2>/dev/null || true
       fi
     fi
     if [ "$child_kind" = secondmate ]; then
-      child_home=$(meta_value "$child_meta" home)
+      child_home=$FM_TASK_RECORD_HOME
       [ -n "$child_home" ] || child_home=$child_wt
       if [ -n "$child_home" ] && [ -d "$child_home" ]; then
-        cleanup_firstmate_home_children "$child_home"
-        remove_firstmate_home "$child_home" "child firstmate home" "$child_id"
+        exec 7<&-
+        cleanup_firstmate_home_children "$child_home" \
+          || { rm -f "$snapshot"; return 1; }
+        remove_firstmate_home "$child_home" "child firstmate home" "$child_id" \
+          || { rm -f "$snapshot"; return 1; }
+        teardown_snapshot_open_at "$snapshot" "$index" \
+          || { rm -f "$snapshot"; return 1; }
       fi
     elif [ "$child_backend" = orca ]; then
       if [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
         validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
         rm -f "$child_wt/.claude/settings.local.json" "$child_wt/.opencode/plugins/fm-turn-end.js" "$child_wt/.fm-grok-turnend"
       fi
-      fm_backend_remove_worktree "$child_backend" "$child_orca_worktree_id" || return 1
+      fm_backend_remove_worktree "$child_backend" "$child_orca_worktree_id" \
+        || { exec 7<&-; rm -f "$snapshot"; return 1; }
     elif [ -n "$child_wt" ] && [ -d "$child_wt" ]; then
       validate_child_worktree_for_removal "$child_wt" "$child_proj" >/dev/null || return 1
       rm -f "$child_wt/.claude/settings.local.json" "$child_wt/.opencode/plugins/fm-turn-end.js" "$child_wt/.fm-grok-turnend"
@@ -1117,6 +1231,8 @@ cleanup_firstmate_home_children() {
         else
           child_return_rc=$?
           if [ "$child_return_rc" -eq "$TEARDOWN_TREEHOUSE_LOCK_REFUSED" ]; then
+            exec 7<&-
+            rm -f "$snapshot"
             return "$child_return_rc"
           fi
           safe_rm_rf_child_worktree "$child_wt" "$child_proj"
@@ -1128,6 +1244,8 @@ cleanup_firstmate_home_children() {
     remove_grok_turnend_auth "$sub_state" "$child_id"
     rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token"
   done
+  exec 7<&-
+  rm -f "$snapshot"
 }
 
 remove_secondmate_registry_entry() {
@@ -1149,12 +1267,32 @@ fi
 if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
   SUB_STATE="$HOME_PATH/state"
   if [ -d "$SUB_STATE" ]; then
-    for child_meta in "$SUB_STATE"/*.meta; do
-      [ -e "$child_meta" ] || continue
+    CHILD_CHECK_SNAPSHOT=$(mktemp "${TMPDIR:-/tmp}/fm-teardown-child-check.XXXXXX" 2>/dev/null) || {
+      FM_TASK_ENUM_CANONICAL_STATE=$SUB_STATE
+      FM_TASK_ENUM_REASON="could not create a complete child enumeration snapshot"
+      teardown_enumeration_failed
+    }
+    if ! fm_enumerate_task_records "$SUB_STATE" "$CHILD_CHECK_SNAPSHOT"; then
+      rm -f "$CHILD_CHECK_SNAPSHOT"
+      teardown_enumeration_failed
+    fi
+    if [ "$FM_TASK_ENUM_COUNT" -gt 0 ]; then
+      exec 7< "$CHILD_CHECK_SNAPSHOT" || {
+        rm -f "$CHILD_CHECK_SNAPSHOT"
+        exit 1
+      }
+      fm_task_record_snapshot_read 7 || {
+        exec 7<&-
+        rm -f "$CHILD_CHECK_SNAPSHOT"
+        exit 1
+      }
+      exec 7<&-
       echo "REFUSED: secondmate $ID still has in-flight work in $SUB_STATE." >&2
-      echo "Found $(basename "$child_meta"). Let that home finish or explicitly discard with --force." >&2
+      echo "Found $FM_TASK_RECORD_ID.meta. Let that home finish or explicitly discard with --force." >&2
+      rm -f "$CHILD_CHECK_SNAPSHOT"
       exit 1
-    done
+    fi
+    rm -f "$CHILD_CHECK_SNAPSHOT"
   fi
 fi
 
@@ -1297,9 +1435,16 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 TEARDOWN_FINALIZE_LOCK="$STATE/.teardown-finalize.lock"
 if ! (
   flock -x 9 || exit 1
+  if ! fm_enumerate_task_records "$STATE" "$TEARDOWN_TASK_SNAPSHOT" "$ID"; then
+    printf 'GHOST_RECONCILE: ATTENTION: cannot enumerate task metadata in %s (%s); no task records were touched.\n' \
+      "$FM_TASK_ENUM_CANONICAL_STATE" "$FM_TASK_ENUM_REASON" >&2
+    printf 'GHOST_RECONCILE: summary enumeration=failed cleared=0 corrupt_preserved=unknown preserved=unknown\n' >&2
+    exit 1
+  fi
   "$SCRIPT_DIR/fm-task-events.sh" "$ID" "$CLOSE_DISPOSITION" "$CLOSE_OUTCOME" "$CLOSE_BRANCH" "$CLOSE_MODE" "$CLOSE_EVIDENCE" >/dev/null || exit 1
   append_task_run_ledger
-  rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" || exit 1
+  rm "$STATE/$ID.meta" || exit 1
+  rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" || exit 1
 ) 9> "$TEARDOWN_FINALIZE_LOCK"; then
   echo "REFUSED: durable visibility closeout/finalize failed for $ID; volatile state remains intact." >&2
   exit 1

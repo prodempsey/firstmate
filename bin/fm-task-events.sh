@@ -21,6 +21,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+# shellcheck source=bin/fm-backend.sh
+. "$SCRIPT_DIR/fm-backend.sh"
 
 visibility_cli() {
   local candidate
@@ -38,19 +40,11 @@ visibility_cli() {
   return 1
 }
 
-meta_value() {
-  local key=$1 file=$2 line
-  [ -f "$file" ] || return 0
-  line=$(grep -m1 "^${key}=" "$file" 2>/dev/null) || return 0
-  printf '%s\n' "${line#*=}"
-}
-
 # The CLI's default home comes from fleet-bridge's own config, so record and close must
 # agree on one explicit home; otherwise a backfilled record can land in a different home
 # than the close reads. A secondmate task's meta names its home; everything else is here.
 home_name() {
-  local home
-  home=$(meta_value home "$META")
+  local home=$TASK_META_HOME
   [ -n "$home" ] || home=$FM_HOME
   basename "$home"
 }
@@ -83,6 +77,25 @@ terminal_record_has_valid_evidence() {
 [ "$#" -ge 6 ] || { echo "usage: fm-task-events.sh <id> <disposition> <outcome> <branch> <mode> <sha-or-report>" >&2; exit 2; }
 ID=$1 DISPOSITION=$2 OUTCOME=$3 BRANCH=$4 MODE=$5 EVIDENCE=$6
 
+TASK_EVENT_SNAPSHOT=$(mktemp "${TMPDIR:-/tmp}/fm-task-event-record.XXXXXX" 2>/dev/null) || {
+  printf 'GHOST_RECONCILE: ATTENTION: cannot enumerate task metadata in %s (could not create a complete target snapshot); no task records were touched.\n' "$STATE" >&2
+  printf 'GHOST_RECONCILE: summary enumeration=failed cleared=0 corrupt_preserved=unknown preserved=unknown\n' >&2
+  exit 1
+}
+trap 'rm -f "$TASK_EVENT_SNAPSHOT"' EXIT
+if ! fm_enumerate_task_records "$STATE" "$TASK_EVENT_SNAPSHOT" "$ID"; then
+  printf 'GHOST_RECONCILE: ATTENTION: cannot enumerate task metadata in %s (%s); no task records were touched.\n' \
+    "$FM_TASK_ENUM_CANONICAL_STATE" "$FM_TASK_ENUM_REASON" >&2
+  printf 'GHOST_RECONCILE: summary enumeration=failed cleared=0 corrupt_preserved=unknown preserved=unknown\n' >&2
+  exit 1
+fi
+exec 8< "$TASK_EVENT_SNAPSHOT" || exit 1
+fm_task_record_snapshot_read 8 || { exec 8<&-; exit 1; }
+exec 8<&-
+KIND=$FM_TASK_RECORD_KIND
+[ -n "$KIND" ] || KIND=ship
+TASK_META_HOME=$FM_TASK_RECORD_HOME
+
 # CW2 shadow-run mirror (ORD-256): every durable task lifecycle event flows through here, so
 # this is the TERMINAL-OUTCOME + status-transition chokepoint. Map the COMMITTED legacy
 # disposition to the matching control-plane action - a `failed` closeout must drive the
@@ -99,9 +112,6 @@ shadow_mirror_disposition() {
 }
 CLI=$(visibility_cli) || { echo "blocked: fleet-bridge visibility CLI not found" >&2; exit 1; }
 
-META="$STATE/$ID.meta"
-KIND=$(meta_value kind "$META")
-[ -n "$KIND" ] || KIND=ship
 HOME_NAME=$(home_name)
 
 CLOSE_ARGS=(close "$ID" --disposition "$DISPOSITION" --outcome "$OUTCOME" --branch "$BRANCH" --mode "$MODE" --home "$HOME_NAME")

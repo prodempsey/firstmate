@@ -945,16 +945,31 @@ test_spawn_symlinked_project_prefix_avoids_false_refusal() {
 make_teardown_fakebin() {  # <dir> -> echoes fakebin dir; logs tmux+treehouse calls
   local dir=$1 fb="$1/fakebin"
   mkdir -p "$fb"
-  cat > "$fb/tmux" <<'SH'
+cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
 { printf 'tmux'; for a in "$@"; do printf '\x1f%s' "$a"; done; printf '\n'; } >> "${FM_TMUX_LOG:?}"
+case "${1:-}" in
+  list-windows)
+    [ ! -f "${FM_TMUX_LOG}.killed" ] || exit 0
+    case "$*" in
+      *session_name*window_name*) printf '%s\n' "${FM_TEST_TEARDOWN_TARGET:?}" ;;
+      *session_name*window_index*) printf 'firstmate:0\n' ;;
+    esac
+    ;;
+  kill-window)
+    : > "${FM_TMUX_LOG}.killed"
+    ;;
+esac
 exit 0
 SH
-  cat > "$fb/treehouse" <<'SH'
+cat > "$fb/treehouse" <<'SH'
 #!/usr/bin/env bash
 set -u
 { printf 'treehouse'; for a in "$@"; do printf '\x1f%s' "$a"; done; printf '\n'; } >> "${FM_TMUX_LOG:?}"
+if [ "${1:-}" = status ] && [ -n "${FM_FAKE_TREEHOUSE_STATUS:-}" ]; then
+  cat "$FM_FAKE_TREEHOUSE_STATUS"
+fi
 exit 0
 SH
   chmod +x "$fb/tmux" "$fb/treehouse"
@@ -979,9 +994,12 @@ SH
 run_teardown_case() {
   local script=$1 fmroot=$2 fb=$3 log=$4 state=$5 data=$6 config=$7 id=$8
   : > "$log"
+  rm -f "$log.killed"
   env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$fmroot" \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_TMUX_LOG="$log" FM_VISIBILITY_CLI="$TMP_ROOT/teardown-visibility.mjs" \
+    FM_FAKE_TREEHOUSE_STATUS="${FM_FAKE_TREEHOUSE_STATUS:-}" \
+    FM_TEST_TEARDOWN_TARGET="firstmate:fm-$id" \
     "$script" "$id"
 }
 
@@ -1018,6 +1036,9 @@ test_teardown_conformance_old_vs_new() {
   touch "$state_old/.last-watcher-beat" "$state_new/.last-watcher-beat"
 
   log_old="$TMP_ROOT/teardown-old.log"; log_new="$TMP_ROOT/teardown-new.log"
+  printf '1 leased %s (held by fm-%s)\n' "$wt" "$id" > "$TMP_ROOT/teardown-treehouse-status"
+  FM_FAKE_TREEHOUSE_STATUS="$TMP_ROOT/teardown-treehouse-status"
+  export FM_FAKE_TREEHOUSE_STATUS
   out_old=$(run_teardown_case "$old_bin/bin/fm-teardown.sh" "$old_bin" "$fb" "$log_old" "$state_old" "$data" "$config_old" "$id" 2>&1)
   rc_old=$?
   out_new=$(run_teardown_case "$ROOT/bin/fm-teardown.sh" "$old_bin" "$fb" "$log_new" "$state_new" "$data" "$config_new" "$id" 2>&1)
@@ -1025,14 +1046,16 @@ test_teardown_conformance_old_vs_new() {
 
   expect_code 0 "$rc_old" "old fm-teardown.sh (scout, report present) should succeed"$'\n'"$out_old"
   expect_code 0 "$rc_new" "new fm-teardown.sh (scout, report present) should succeed"$'\n'"$out_new"
-  diff -u "$log_old" "$log_new" > "$TMP_ROOT/teardown-diff.txt" 2>&1 \
+  grep -E $'^(treehouse\\x1freturn|tmux\\x1fkill-window)' "$log_old" > "$TMP_ROOT/teardown-old-actions.log"
+  grep -E $'^(treehouse\\x1freturn|tmux\\x1fkill-window)' "$log_new" > "$TMP_ROOT/teardown-new-actions.log"
+  diff -u "$TMP_ROOT/teardown-old-actions.log" "$TMP_ROOT/teardown-new-actions.log" > "$TMP_ROOT/teardown-diff.txt" 2>&1 \
     || fail "fm-teardown.sh: tmux+treehouse command log differs old vs new"$'\n'"$(cat "$TMP_ROOT/teardown-diff.txt")"
   assert_contains "$(cat "$log_new")" "treehouse"$'\x1f''return'$'\x1f''--force'$'\x1f'"$wt" \
     "teardown did not call treehouse return --force <worktree>"
   assert_contains "$(cat "$log_new")" "tmux"$'\x1f''kill-window'$'\x1f''-t'$'\x1f'"firstmate:fm-$id" \
     "teardown did not call tmux kill-window -t <window>"
 
-  pass "fm-teardown.sh: treehouse return + tmux kill-window command log is byte-identical old vs new for a scout task"
+  pass "fm-teardown.sh: destructive treehouse return + tmux kill-window calls remain byte-identical after added safety probes"
 }
 
 # --- backend selection loudly refuses an unknown backend --------------------

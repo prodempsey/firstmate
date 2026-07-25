@@ -66,6 +66,8 @@ PR_CHECK="$ROOT/bin/fm-pr-check.sh"
 TMP_ROOT=$(fm_test_tmproot fm-teardown-tests)
 REAL_GIT_FOR_TEST=$(command -v git)
 export REAL_GIT_FOR_TEST
+REAL_STAT_FOR_TEST=$(command -v stat)
+export REAL_STAT_FOR_TEST
 
 # Build a fresh sandbox for one test case. Sets up:
 #   $CASE/state/        - firstmate state dir (with a fresh watcher beacon)
@@ -476,8 +478,16 @@ add_stat_error() {
   local case_dir=$1
   cat > "$case_dir/fakebin/stat" <<'SH'
 #!/usr/bin/env bash
-echo "stat: simulated failure" >&2
-exit 1
+real=${REAL_STAT_FOR_TEST:?}
+last=
+for arg in "$@"; do last=$arg; done
+case "$last" in
+  *index.lock)
+    echo "stat: simulated failure" >&2
+    exit 1
+    ;;
+esac
+exec "$real" "$@"
 SH
   chmod +x "$case_dir/fakebin/stat"
 }
@@ -1755,7 +1765,31 @@ JS
   pass "already-terminal record with valid evidence lets teardown proceed"
 }
 
+test_unreadable_target_meta_blocks_single_record_closeout() {
+  local case_dir rc=0 attention_count
+  case_dir=$(make_case unreadable-target-meta)
+  write_meta "$case_dir" local-only ship
+  touch "$case_dir/state/task-x1.status"
+  chmod 000 "$case_dir/state/task-x1.meta"
+
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  chmod 600 "$case_dir/state/task-x1.meta"
+
+  expect_code 1 "$rc" "single-record teardown must fail when its target meta is unreadable"
+  assert_present "$case_dir/state/task-x1.meta" "unreadable target meta must remain"
+  assert_present "$case_dir/state/task-x1.status" "unreadable target status must remain"
+  assert_grep 'GHOST_RECONCILE: ATTENTION:' "$case_dir/stderr" \
+    "unreadable target closeout must emit the shared loud failure"
+  assert_grep 'no task records were touched' "$case_dir/stderr" \
+    "unreadable target closeout must state the mutation-free result"
+  attention_count=$(grep -c '^GHOST_RECONCILE: ATTENTION:' "$case_dir/stderr")
+  [ "$attention_count" -eq 1 ] \
+    || fail "unreadable target closeout must emit exactly one ATTENTION, got $attention_count"
+  pass "single-record teardown consumes the shared attestation before volatile removal"
+}
+
 test_local_only_fork_remote_allows
+test_unreadable_target_meta_blocks_single_record_closeout
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
 test_local_only_truly_unpushed_refuses
