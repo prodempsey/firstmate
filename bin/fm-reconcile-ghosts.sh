@@ -10,6 +10,9 @@
 # A corrupt legacy shape where worktree= points at the active firstmate home
 # cannot prove either task lineage or landed state. It is reported separately
 # and preserved without calling teardown or deleting any task record.
+# Metadata names are captured by one successful directory-enumeration pass
+# before cleanup begins. Missing, unreadable, or partially enumerated state is
+# an error, never proof that the fleet is empty.
 #
 # Confirm-twice safeguard (bug-20260710152159-d3f294fa): a live,
 # actively-working crew can transiently read as a dead endpoint - e.g. a tmux
@@ -48,14 +51,32 @@ worktree_is_active_home() {  # <worktree>
   [ "$wt_abs" = "$home_abs" ]
 }
 
+enumeration_failed() {  # <reason>
+  local reason=$1
+  printf 'GHOST_RECONCILE: ATTENTION: cannot enumerate task metadata in %s (%s); no task records were touched.\n' "$STATE" "$reason"
+  printf 'GHOST_RECONCILE: summary enumeration=failed cleared=0 corrupt_preserved=unknown preserved=unknown\n'
+  exit 1
+}
+
+META_LIST=$(mktemp "${TMPDIR:-/tmp}/fm-ghost-metas.XXXXXX" 2>/dev/null) \
+  || enumeration_failed "could not create a complete enumeration snapshot"
+trap 'rm -f "$META_LIST"' EXIT
+
+[ -d "$STATE" ] \
+  || enumeration_failed "state path is not a directory"
+[ -r "$STATE" ] && [ -x "$STATE" ] \
+  || enumeration_failed "state directory is not readable and searchable"
+if ! find "$STATE" -maxdepth 1 -type f -name '*.meta' -print0 > "$META_LIST" 2>/dev/null; then
+  enumeration_failed "directory scan failed"
+fi
+
 META_FOUND=0
 DEAD_FOUND=0
 CLEARED=0
 CORRUPT_PRESERVED=0
 PRESERVED=0
 
-for meta in "$STATE"/*.meta; do
-  [ -f "$meta" ] || continue
+while IFS= read -r -d '' meta; do
   META_FOUND=1
   id=$(basename "$meta" .meta)
   backend=$(fm_backend_of_meta "$meta")
@@ -98,7 +119,7 @@ for meta in "$STATE"/*.meta; do
     printf 'GHOST_RECONCILE: ATTENTION: %s endpoint is dead but teardown refused or failed; state preserved.\n' "$id"
     printf '%s\n' "$out" | sed 's/^/  /'
   fi
-done
+done < "$META_LIST"
 
 if [ "$META_FOUND" -eq 0 ]; then
   printf 'GHOST_RECONCILE: no in-flight metadata found.\n'

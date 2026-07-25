@@ -254,6 +254,54 @@ test_corrupt_home_worktree_preserves_every_record_without_proof() {
   pass "corrupt-home reconciliation performs zero deletions without positive landed/closed proof"
 }
 
+test_unreadable_state_directory_fails_loud_without_touching_records() {
+  local dir fakebin fake_root home windows tmux_log treehouse_log dm_calls out rc before after attention_count
+  dir="$TMP_ROOT/unreadable-state"
+  mkdir -p "$dir"
+  fakebin=$(make_fake_tooling "$dir")
+  fake_root=$(make_fake_root "$dir/fake-root")
+  home=$(setup_home "$dir/home")
+  windows="$dir/windows"
+  tmux_log="$dir/tmux.log"
+  treehouse_log="$dir/treehouse.log"
+  dm_calls="$dir/dm-calls"
+  : > "$windows"
+  : > "$tmux_log"
+  : > "$treehouse_log"
+  fm_write_meta "$home/state/unreadable.meta" \
+    "window=fleet:fm-unreadable" \
+    "worktree=$home" \
+    "project=$dir/project" \
+    "harness=echo" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "yolo=off"
+  printf 'working: retained obligation\n' > "$home/state/unreadable.status"
+  before=$(cksum "$home/state/unreadable.meta" "$home/state/unreadable.status")
+
+  chmod 000 "$home/state"
+  out=$(run_reconcile "$fakebin" "$home" "$fake_root" "$windows" "$tmux_log" "$treehouse_log" "$dm_calls" 2>&1)
+  rc=$?
+  chmod 700 "$home/state"
+  after=$(cksum "$home/state/unreadable.meta" "$home/state/unreadable.status")
+
+  [ "$rc" -ne 0 ] || fail "an unreadable state directory must make reconciliation exit nonzero"
+  [ "$after" = "$before" ] || fail "an unreadable state directory must leave task records byte-identical"
+  [ ! -s "$tmux_log" ] || fail "an unreadable state directory must not probe or kill a backend endpoint"
+  [ ! -s "$treehouse_log" ] || fail "an unreadable state directory must not call treehouse"
+  assert_contains "$out" "GHOST_RECONCILE: ATTENTION:" \
+    "an unreadable state directory must emit a loud finding"
+  assert_contains "$out" "cannot enumerate task metadata" \
+    "the finding must identify failed enumeration"
+  assert_contains "$out" "no task records were touched" \
+    "the finding must state the mutation-free outcome"
+  assert_not_contains "$out" "no in-flight metadata found" \
+    "failed enumeration must never be reported as a provably empty fleet"
+  attention_count=$(printf '%s\n' "$out" | grep -c '^GHOST_RECONCILE: ATTENTION:')
+  [ "$attention_count" -eq 1 ] || fail "enumeration failure must emit exactly one ATTENTION finding, got $attention_count"
+  pass "unreadable state-directory enumeration fails loud and nonzero without touching any record"
+}
+
 test_unlanded_dead_meta_is_preserved() {
   local dir fakebin fake_root home repo wt windows tmux_log treehouse_log dm_calls out
   dir="$TMP_ROOT/unlanded"
@@ -449,6 +497,7 @@ test_transient_dead_read_is_not_reaped() {
 
 test_landed_dead_meta_is_cleared
 test_corrupt_home_worktree_preserves_every_record_without_proof
+test_unreadable_state_directory_fails_loud_without_touching_records
 test_unlanded_dead_meta_is_preserved
 test_landed_meta_in_recycled_slot_is_cleared_without_touching_new_holder
 test_valid_terminal_proof_clears_when_task_branch_is_already_gone
