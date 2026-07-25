@@ -364,7 +364,12 @@ if [ -n "$EXEC_DIR" ] && [ -f "$EXEC_DIR/memory/package.json" ]; then
   DEPS_PROVISIONED=no
   DEPS_PROVISIONER=npm-ci
   if command -v npm >/dev/null 2>&1; then
-    npm_cache=$(npm config get cache 2>/dev/null | sed -n '1p')
+    npm_cache=""
+    cache_budget=5
+    [ "$TEST_TIMEOUT" -lt "$cache_budget" ] && cache_budget=$TEST_TIMEOUT
+    if run_bounded "$cache_budget" "$WORK/npm-cache.out" npm config get cache; then
+      npm_cache=$(sed -n '1p' "$WORK/npm-cache.out")
+    fi
     if [ -n "$npm_cache" ]; then
       run_bounded "$TEST_TIMEOUT" "$WORK/deps.err" \
         npm ci --prefix memory --silent --prefer-offline --cache "$npm_cache"

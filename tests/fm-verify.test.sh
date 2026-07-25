@@ -143,6 +143,7 @@ cat > "$FAKEBIN/npm" <<'EOF'
 #!/usr/bin/env bash
 [ -z "${FM_TEST_NPM_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_TEST_NPM_LOG"
 if [ "${1:-}" = config ] && [ "${2:-}" = get ] && [ "${3:-}" = cache ]; then
+  [ "${FM_TEST_NPM_CONFIG_MODE:-}" != hang ] || { sleep 30; exit 91; }
   [ -n "${FM_TEST_NPM_CACHE:-}" ] || exit 91
   printf '%s\n' "$FM_TEST_NPM_CACHE"
   exit 0
@@ -177,6 +178,26 @@ expect_code 0 "$?" "npm ci provisions the isolated memory fixture"
 [ "$(sed -n '2p' "$GREEN_NPM_LOG")" = "ci --prefix memory --silent --prefer-offline --cache $NPM_CACHE" ] \
   || fail "provisioning must run npm ci with the invoking cache and --prefer-offline"
 pass "FC-001: bounded npm ci positively provisions a mem-dependent sandbox fixture"
+
+RHC=$(build_memory_repo memory-deps-cache-hang)
+HCSHA=$(git -C "$RHC" rev-parse HEAD)
+HANG_CACHE_LOG="$TMP/memdeps-cache-hang-npm.log"
+start=$SECONDS
+FM_VERIFY_TEST_TIMEOUT=1 FM_TEST_NPM_CONFIG_MODE=hang FM_TEST_NPM_LOG="$HANG_CACHE_LOG" \
+  PATH="$FAKEBIN:$PATH" FM_HOME="$TMP/nohome" "$VERIFY" \
+  --out "$TMP/memdeps-cache-hang.json" --brief "$BRIEF" \
+  --worktree "$RHC" --base main --sha "$HCSHA" --branch fm/g1 --task g1 >/dev/null 2>&1
+rc=$?
+elapsed=$((SECONDS - start))
+expect_code 1 "$rc" "hung npm cache lookup falls back to bounded npm ci failure"
+[ "$elapsed" -lt 10 ] || fail "npm cache lookup escaped its short deadline (${elapsed}s)"
+[ "$(bget "$TMP/memdeps-cache-hang.json" .finding_count)" = 1 ] \
+  || fail "hung npm cache lookup plus failed npm ci must yield exactly one finding"
+[ "$(bget "$TMP/memdeps-cache-hang.json" '.findings[0]|(.gate + "/" + .code)')" = tests/deps-unprovisioned ] \
+  || fail "hung npm cache lookup plus failed npm ci must yield tests/deps-unprovisioned"
+[ "$(sed -n '2p' "$HANG_CACHE_LOG")" = "ci --prefix memory --silent --prefer-offline" ] \
+  || fail "failed cache lookup must fall back to npm ci without a --cache argument"
+pass "FC-006: npm cache lookup is bounded and failure falls back without a cache argument"
 
 mkdir -p "$TMP/poison-root" "$TMP/poison-home" "$TMP/poison-state"
 FM_ROOT_OVERRIDE="$TMP/poison-root" FM_HOME="$TMP/poison-home" \
