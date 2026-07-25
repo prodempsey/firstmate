@@ -162,7 +162,7 @@ case "$FORMAT" in json|text) ;; *) refuse "--format must be json or text" ;; esa
 [ -n "$OUT" ] || refuse "--out or --task is required to place (and invalidate) the bundle"
 
 # --- prerequisites (FC-004: a missing tool is a refusal, not a skipped check) --
-for tool in git jq awk grep sed; do
+for tool in git jq awk grep sed cmp; do
   command -v "$tool" >/dev/null 2>&1 || refuse "missing prerequisite tool: $tool (fail closed, FC-004)"
 done
 
@@ -316,38 +316,12 @@ tests_status=pass
 TOTAL_OK=0
 TOTAL_NOTOK=0
 TOTAL_SKIP=0
+DEPS_PROVISIONED=yes
+DEPS_PROVISIONER=not-required
 SUITE_JSONL="$WORK/suites.jsonl"
 DECLARED_FILE="$WORK/declared.tsv"    # <label>\t<kind>\t<arg>  - built BEFORE execution
 EXECUTED_FILE="$WORK/executed.txt"
 : > "$SUITE_JSONL"; : > "$DECLARED_FILE"; : > "$EXECUTED_FILE"
-
-# --- independent discovery (FC-002): enumerate from authoritative structures ---
-if [ -n "$EXEC_DIR" ]; then
-  if [ "$TESTS_CMD_SET" = yes ]; then
-    printf 'explicit\texplicit\t\n' >> "$DECLARED_FILE"
-  else
-    if compgen -G "$EXEC_DIR/tests/*.test.sh" >/dev/null 2>&1; then
-      for t in "$EXEC_DIR"/tests/*.test.sh; do
-        printf 'shell:%s\tshell\t%s\n' "$(basename "$t")" "$t" >> "$DECLARED_FILE"
-      done
-    fi
-    if [ -f "$EXEC_DIR/package.json" ] && jq -e '.scripts.test' "$EXEC_DIR/package.json" >/dev/null 2>&1; then
-      printf 'npm test\tnpm\t\n' >> "$DECLARED_FILE"
-    fi
-    if [ -f "$EXEC_DIR/Makefile" ] || [ -f "$EXEC_DIR/makefile" ] || [ -f "$EXEC_DIR/GNUmakefile" ]; then
-      # Query Make's OWN parsed target database, not a single source spelling, so
-      # `test :`, `.PHONY: test`, and pattern rules are all seen. A Makefile with
-      # no tool to parse it is ambiguous discovery => fail closed (FC-004/FC-002).
-      if ! command -v make >/dev/null 2>&1; then
-        refuse "a Makefile is present but make is unavailable to enumerate its targets (fail closed, FC-004)"
-      fi
-      if make -C "$EXEC_DIR" -pn 2>/dev/null | grep -qE '^test:'; then
-        printf 'make test\tmake\t\n' >> "$DECLARED_FILE"
-      fi
-    fi
-  fi
-fi
-DECLARED_N=$(grep -c . "$DECLARED_FILE" 2>/dev/null || true); DECLARED_N=${DECLARED_N:-0}
 
 TIMEOUT_BIN=""
 for tb in timeout gtimeout; do command -v "$tb" >/dev/null 2>&1 && { TIMEOUT_BIN=$tb; break; }; done
@@ -378,6 +352,75 @@ run_bounded() {
   rm -f "$flag"
   return "$rc"
 }
+
+# A detached worktree contains only tracked files, so provision the ignored
+# memory package dependencies before discovering or executing any suite.
+# A byte-identical lockfile lets us reuse the authority-bearing worktree's
+# installed tree. Otherwise npm ci is bounded by the same hard deadline as a
+# suite. Failure blocks the whole tests gate with one finding instead of
+# cascading into misleading per-suite failures (FC-004).
+if [ -n "$EXEC_DIR" ] && [ -f "$EXEC_DIR/memory/package.json" ]; then
+  DEPS_PROVISIONED=no
+  DEPS_PROVISIONER=npm-ci
+  if [ -f "$WORKTREE/memory/package-lock.json" ] \
+    && [ -f "$EXEC_DIR/memory/package-lock.json" ] \
+    && [ -d "$WORKTREE/memory/node_modules" ] \
+    && cmp -s "$WORKTREE/memory/package-lock.json" "$EXEC_DIR/memory/package-lock.json"
+  then
+    if cp -a "$WORKTREE/memory/node_modules" "$EXEC_DIR/memory/node_modules" 2>"$WORK/deps.err"; then
+      DEPS_PROVISIONED=yes
+      DEPS_PROVISIONER=source-copy
+    fi
+  fi
+  if [ "$DEPS_PROVISIONED" = no ]; then
+    rm -rf "$EXEC_DIR/memory/node_modules"
+    if command -v npm >/dev/null 2>&1; then
+      run_bounded "$TEST_TIMEOUT" "$WORK/deps.err" npm ci --prefix memory --silent
+      deps_rc=$?
+      if [ "$deps_rc" -eq 0 ]; then
+        DEPS_PROVISIONED=yes
+      elif [ "$BOUNDED_TIMEOUT" = yes ]; then
+        deps_reason="npm ci exceeded the ${TEST_TIMEOUT}s hard deadline"
+      else
+        deps_reason="npm ci exited $deps_rc"
+      fi
+    else
+      deps_reason="npm is not installed"
+    fi
+  fi
+  if [ "$DEPS_PROVISIONED" = no ]; then
+    emit_finding tests deps-unprovisioned fail "memory dependencies could not be provisioned in the isolated checkout: $deps_reason (fail closed, FC-004)"
+    tests_status=fail
+  fi
+fi
+
+# --- independent discovery (FC-002): enumerate from authoritative structures ---
+if [ -n "$EXEC_DIR" ] && [ "$DEPS_PROVISIONED" = yes ]; then
+  if [ "$TESTS_CMD_SET" = yes ]; then
+    printf 'explicit\texplicit\t\n' >> "$DECLARED_FILE"
+  else
+    if compgen -G "$EXEC_DIR/tests/*.test.sh" >/dev/null 2>&1; then
+      for t in "$EXEC_DIR"/tests/*.test.sh; do
+        printf 'shell:%s\tshell\t%s\n' "$(basename "$t")" "$t" >> "$DECLARED_FILE"
+      done
+    fi
+    if [ -f "$EXEC_DIR/package.json" ] && jq -e '.scripts.test' "$EXEC_DIR/package.json" >/dev/null 2>&1; then
+      printf 'npm test\tnpm\t\n' >> "$DECLARED_FILE"
+    fi
+    if [ -f "$EXEC_DIR/Makefile" ] || [ -f "$EXEC_DIR/makefile" ] || [ -f "$EXEC_DIR/GNUmakefile" ]; then
+      # Query Make's OWN parsed target database, not a single source spelling, so
+      # `test :`, `.PHONY: test`, and pattern rules are all seen. A Makefile with
+      # no tool to parse it is ambiguous discovery => fail closed (FC-004/FC-002).
+      if ! command -v make >/dev/null 2>&1; then
+        refuse "a Makefile is present but make is unavailable to enumerate its targets (fail closed, FC-004)"
+      fi
+      if make -C "$EXEC_DIR" -pn 2>/dev/null | grep -qE '^test:'; then
+        printf 'make test\tmake\t\n' >> "$DECLARED_FILE"
+      fi
+    fi
+  fi
+fi
+DECLARED_N=$(grep -c . "$DECLARED_FILE" 2>/dev/null || true); DECLARED_N=${DECLARED_N:-0}
 
 # run_one <label> <interp> <cmd...>: execute one declared suite and record it.
 run_one() {
@@ -437,7 +480,7 @@ while IFS=$'\t' read -r label kind arg; do
 done < "$DECLARED_FILE"
 
 EXECUTED_N=$(grep -c . "$EXECUTED_FILE" 2>/dev/null || true); EXECUTED_N=${EXECUTED_N:-0}
-if [ "$DECLARED_N" -eq 0 ]; then
+if [ "$DECLARED_N" -eq 0 ] && [ "$DEPS_PROVISIONED" = yes ]; then
   emit_finding tests no-tests fail "no test suite was discovered or executed; nothing was proven (never a pass)"
   tests_status=fail
 fi
@@ -452,8 +495,10 @@ emit_gate tests "$tests_status" "$(jq -nc \
   --arg dn "$DECLARED_N" --arg en "$EXECUTED_N" \
   --arg ok "$TOTAL_OK" --arg notok "$TOTAL_NOTOK" --arg skip "$TOTAL_SKIP" \
   --arg budget "$TEST_TIMEOUT" --arg isolated "$([ -n "$EXEC_DIR" ] && echo true || echo false)" \
+  --arg deps "$DEPS_PROVISIONED" --arg provisioner "$DEPS_PROVISIONER" \
   --slurpfile suites "$SUITE_JSONL" \
   '{isolated_checkout:($isolated=="true"),
+    dependencies_provisioned:($deps=="yes"),dependency_provisioner:$provisioner,
     declared_suites:$declared,suites_declared:($dn|tonumber),suites_executed:($en|tonumber),
     executed:($dn|tonumber>0),per_suite_timeout_s:($budget|tonumber),
     totals:{ok:($ok|tonumber),not_ok:($notok|tonumber),skip:($skip|tonumber)},

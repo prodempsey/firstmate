@@ -108,6 +108,69 @@ expect_code 0 "$rc" "isolated synchronous mutation still exits 0"
 [ -z "$(git -C "$RS5" status --porcelain)" ] || fail "FC-005: the authoritative worktree was dirtied by a synchronous suite"
 pass "FC-005: a synchronous tree-dirtying suite is contained in the isolated checkout"
 
+# --- FC-004/005: memory dependencies are provisioned before suite execution ---
+build_memory_repo() {
+  local name=$1
+  local repo
+  repo=$(build_repo "$name")
+  mkdir -p "$repo/memory/bin"
+  cat > "$repo/memory/package.json" <<'EOF'
+{"name":"memory-fixture","private":true,"type":"module","dependencies":{"fixture-dep":"1.0.0"}}
+EOF
+  cat > "$repo/memory/package-lock.json" <<'EOF'
+{"name":"memory-fixture","lockfileVersion":3,"requires":true,"packages":{"":{"dependencies":{"fixture-dep":"1.0.0"}},"node_modules/fixture-dep":{"version":"1.0.0"}}}
+EOF
+  cat > "$repo/memory/bin/mem.mjs" <<'EOF'
+import value from "fixture-dep";
+if (value !== "ready") process.exit(1);
+EOF
+  printf 'memory/node_modules/\n' > "$repo/.gitignore"
+  cat >> "$repo/tests/t.test.sh" <<'EOF'
+node memory/bin/mem.mjs
+echo "ok - memory CLI dependency loaded"
+EOF
+  git -C "$repo" add -A
+  git -C "$repo" commit -qm "memory fixture"
+  printf '%s\n' "$repo"
+}
+
+FAKEBIN="$TMP/fake-npm"
+mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/npm" <<'EOF'
+#!/usr/bin/env bash
+exit 91
+EOF
+chmod +x "$FAKEBIN/npm"
+
+RMD=$(build_memory_repo memory-deps-copy)
+mkdir -p "$RMD/memory/node_modules/fixture-dep"
+cat > "$RMD/memory/node_modules/fixture-dep/package.json" <<'EOF'
+{"name":"fixture-dep","version":"1.0.0","type":"module","exports":"./index.mjs"}
+EOF
+printf 'export default "ready";\n' > "$RMD/memory/node_modules/fixture-dep/index.mjs"
+MDSHA=$(git -C "$RMD" rev-parse HEAD)
+PATH="$FAKEBIN:$PATH" FM_HOME="$TMP/nohome" "$VERIFY" \
+  --out "$TMP/memdeps-copy.json" --brief "$BRIEF" \
+  --worktree "$RMD" --base main --sha "$MDSHA" --branch fm/g1 --task g1 >/dev/null 2>&1
+expect_code 0 "$?" "source memory dependencies make the isolated fixture pass"
+[ "$(bget "$TMP/memdeps-copy.json" '.gates[]|select(.gate=="tests")|.details.dependency_provisioner')" = source-copy ] \
+  || fail "byte-identical memory lockfiles must prefer source node_modules"
+pass "FC-005: provisioned memory dependencies make a mem-dependent sandbox fixture pass"
+
+RMF=$(build_memory_repo memory-deps-fail)
+MFSHA=$(git -C "$RMF" rev-parse HEAD)
+PATH="$FAKEBIN:$PATH" FM_HOME="$TMP/nohome" "$VERIFY" \
+  --out "$TMP/memdeps-fail.json" --brief "$BRIEF" \
+  --worktree "$RMF" --base main --sha "$MFSHA" --branch fm/g1 --task g1 >/dev/null 2>&1
+expect_code 1 "$?" "memory dependency provisioning failure exits 1"
+[ "$(bget "$TMP/memdeps-fail.json" .finding_count)" = 1 ] \
+  || fail "dependency provisioning failure must yield exactly one finding"
+[ "$(bget "$TMP/memdeps-fail.json" '.findings[0]|(.gate + "/" + .code)')" = tests/deps-unprovisioned ] \
+  || fail "dependency provisioning failure must yield tests/deps-unprovisioned"
+[ "$(bget "$TMP/memdeps-fail.json" '.gates[]|select(.gate=="tests")|.details.suites_executed')" = 0 ] \
+  || fail "dependency provisioning failure must stop suite fan-out"
+pass "FC-004: dependency provisioning failure yields one fail-closed finding"
+
 # --- mandatory bindings are required; absence refuses (exit 2) ----------------
 rc=$(verify "$TMP/no-sha.json" --worktree "$R" --base main --branch fm/g1 --task g1)
 expect_code 2 "$rc" "missing --sha refuses"
