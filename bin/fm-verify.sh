@@ -355,10 +355,12 @@ run_bounded() {
 
 # A detached worktree contains only tracked files, so provision the ignored
 # memory package dependencies before discovering or executing any suite.
-# A byte-identical lockfile lets us reuse the authority-bearing worktree's
-# installed tree. Otherwise npm ci is bounded by the same hard deadline as a
-# suite. Failure blocks the whole tests gate with one finding instead of
-# cascading into misleading per-suite failures (FC-004).
+# A byte-identical lockfile lets us copy the authority-bearing worktree's
+# installed tree, but copy success is not proof of dependency conformance.
+# A bounded npm ls must positively validate the copied tree before reuse.
+# Otherwise npm ci is bounded by the same hard deadline as a suite. Failure
+# blocks the whole tests gate with one finding instead of cascading into
+# misleading per-suite failures (FC-001/FC-004).
 if [ -n "$EXEC_DIR" ] && [ -f "$EXEC_DIR/memory/package.json" ]; then
   DEPS_PROVISIONED=no
   DEPS_PROVISIONER=npm-ci
@@ -368,8 +370,12 @@ if [ -n "$EXEC_DIR" ] && [ -f "$EXEC_DIR/memory/package.json" ]; then
     && cmp -s "$WORKTREE/memory/package-lock.json" "$EXEC_DIR/memory/package-lock.json"
   then
     if cp -a "$WORKTREE/memory/node_modules" "$EXEC_DIR/memory/node_modules" 2>"$WORK/deps.err"; then
-      DEPS_PROVISIONED=yes
-      DEPS_PROVISIONER=source-copy
+      if command -v npm >/dev/null 2>&1; then
+        if run_bounded "$TEST_TIMEOUT" "$WORK/deps.err" npm ls --prefix memory --all --silent; then
+          DEPS_PROVISIONED=yes
+          DEPS_PROVISIONER=source-copy
+        fi
+      fi
     fi
   fi
   if [ "$DEPS_PROVISIONED" = no ]; then

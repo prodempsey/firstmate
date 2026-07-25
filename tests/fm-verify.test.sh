@@ -139,8 +139,13 @@ EOF
 
 FAKEBIN="$TMP/fake-npm"
 mkdir -p "$FAKEBIN"
+REAL_NPM=$(command -v npm) || fail "npm is required for memory dependency validation fixtures"
 cat > "$FAKEBIN/npm" <<'EOF'
 #!/usr/bin/env bash
+[ -z "${FM_TEST_NPM_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_TEST_NPM_LOG"
+if [ "${1:-}" = ls ] && [ -n "${FM_TEST_REAL_NPM:-}" ]; then
+  exec "$FM_TEST_REAL_NPM" "$@"
+fi
 exit 91
 EOF
 chmod +x "$FAKEBIN/npm"
@@ -152,7 +157,7 @@ cat > "$RMD/memory/node_modules/fixture-dep/package.json" <<'EOF'
 EOF
 printf 'export default "ready";\n' > "$RMD/memory/node_modules/fixture-dep/index.mjs"
 MDSHA=$(git -C "$RMD" rev-parse HEAD)
-PATH="$FAKEBIN:$PATH" FM_HOME="$TMP/nohome" "$VERIFY" \
+FM_TEST_REAL_NPM="$REAL_NPM" PATH="$FAKEBIN:$PATH" FM_HOME="$TMP/nohome" "$VERIFY" \
   --out "$TMP/memdeps-copy.json" --brief "$BRIEF" \
   --worktree "$RMD" --base main --sha "$MDSHA" --branch fm/g1 --task g1 >/dev/null 2>&1
 expect_code 0 "$?" "source memory dependencies make the isolated fixture pass"
@@ -163,13 +168,34 @@ pass "FC-005: provisioned memory dependencies make a mem-dependent sandbox fixtu
 mkdir -p "$TMP/poison-root" "$TMP/poison-home" "$TMP/poison-state"
 FM_ROOT_OVERRIDE="$TMP/poison-root" FM_HOME="$TMP/poison-home" \
   FM_STATE_OVERRIDE="$TMP/poison-state" FM_FAILURE_LEDGER="$LEDGER" \
-  PATH="$FAKEBIN:$PATH" "$VERIFY" \
+  FM_TEST_REAL_NPM="$REAL_NPM" PATH="$FAKEBIN:$PATH" "$VERIFY" \
   --out "$TMP/memdeps-env.json" --brief "$BRIEF" \
   --worktree "$RMD" --base main --sha "$MDSHA" --branch fm/g1 --task g1 >/dev/null 2>&1
 expect_code 0 "$?" "poisoned ambient home overrides are scrubbed from sandbox suites"
 [ "$(bget "$TMP/memdeps-env.json" '.gates[]|select(.gate=="tests")|.status')" = pass ] \
   || fail "poisoned ambient home overrides must not reach the mem-dependent fixture"
 pass "FC-004: poisoned ambient home overrides are scrubbed from sandbox suite execution"
+
+RME=$(build_memory_repo memory-deps-empty)
+mkdir -p "$RME/memory/node_modules"
+MESHA=$(git -C "$RME" rev-parse HEAD)
+EMPTY_NPM_LOG="$TMP/memdeps-empty-npm.log"
+FM_TEST_NPM_LOG="$EMPTY_NPM_LOG" FM_TEST_REAL_NPM="$REAL_NPM" \
+  PATH="$FAKEBIN:$PATH" FM_HOME="$TMP/nohome" "$VERIFY" \
+  --out "$TMP/memdeps-empty.json" --brief "$BRIEF" \
+  --worktree "$RME" --base main --sha "$MESHA" --branch fm/g1 --task g1 >/dev/null 2>&1
+expect_code 1 "$?" "empty source node_modules fails closed when npm ci also fails"
+[ "$(bget "$TMP/memdeps-empty.json" .finding_count)" = 1 ] \
+  || fail "empty source node_modules must yield exactly one finding"
+[ "$(bget "$TMP/memdeps-empty.json" '.findings[0]|(.gate + "/" + .code)')" = tests/deps-unprovisioned ] \
+  || fail "empty source node_modules must yield tests/deps-unprovisioned"
+[ "$(bget "$TMP/memdeps-empty.json" '.gates[]|select(.gate=="tests")|.details.suites_executed')" = 0 ] \
+  || fail "empty source node_modules must stop suite fan-out"
+[ "$(sed -n '1p' "$EMPTY_NPM_LOG")" = "ls --prefix memory --all --silent" ] \
+  || fail "copied dependencies must receive a bounded npm ls validation"
+[ "$(sed -n '2p' "$EMPTY_NPM_LOG")" = "ci --prefix memory --silent" ] \
+  || fail "failed copy validation must fall through to bounded npm ci"
+pass "FC-001: empty copied dependencies require positive validation and fall through to npm ci"
 
 RMF=$(build_memory_repo memory-deps-fail)
 MFSHA=$(git -C "$RMF" rev-parse HEAD)
