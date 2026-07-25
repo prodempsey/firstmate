@@ -103,13 +103,16 @@ REPO=${POS[1]:-}
 
 [ -n "$BUNDLE" ] || BUNDLE="$DATA/$ID/verify-bundle.json"
 
-# One durable, greppable line per QA dispatch decision - the waiver is never silent.
+# One durable, greppable line per QA dispatch decision. Returns the write status
+# so the caller can fail closed: a waiver whose log line was NOT durably written
+# is invalid and must not proceed (FC-005 - the attestation must be atomic with
+# the thing it attests). Nothing here is swallowed with `|| true`.
 log_dispatch() {
   local verb=$1; shift
   local ts
   ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "-")
-  mkdir -p "$STATE" 2>/dev/null || true
-  printf '%s\t%s\t%s\t%s\n' "$ts" "$verb" "$ID" "$*" >> "$STATE/gauntlet-dispatch.log" 2>/dev/null || true
+  mkdir -p "$STATE" 2>/dev/null || return 1
+  printf '%s\t%s\t%s\t%s\n' "$ts" "$verb" "$ID" "$*" >> "$STATE/gauntlet-dispatch.log"
 }
 
 # A refusal always names the one-line remedy (run fm-verify) so the operator's
@@ -128,7 +131,14 @@ if [ "$NO_GAUNTLET" = 1 ]; then
   case "$WAIVER_REASON" in
     ""|--*) echo "error: --no-gauntlet requires a non-empty reason (the non-code-scout justification)" >&2; exit 2 ;;
   esac
-  log_dispatch WAIVED "reason=$WAIVER_REASON"
+  # Fail closed (finding 1): the waiver is valid ONLY if its log line was durably
+  # written. If the log write fails, the waiver is NOT recorded, so it must NOT
+  # proceed - an unlogged waiver would be exactly the silent bypass the log exists
+  # to prevent.
+  if ! log_dispatch WAIVED "reason=$WAIVER_REASON"; then
+    echo "fm-qa-dispatch: QA dispatch REFUSED - the waiver could not be durably logged to $STATE/gauntlet-dispatch.log; an unlogged waiver is invalid (fail closed, FC-005)" >&2
+    exit 3
+  fi
   echo "fm-qa-dispatch: Gauntlet gate WAIVED for $ID (reason: $WAIVER_REASON); waiver logged to $STATE/gauntlet-dispatch.log" >&2
 else
   [ -n "$SHA" ] || { echo "error: --sha <candidate-sha> is required (the exact SHA under review); use --no-gauntlet <reason> only for a non-code scout" >&2; exit 2; }
@@ -147,7 +157,11 @@ else
   esac
   [ "$head_sha" = "$SHA" ] || refuse_gate "verify bundle is stale: bundle SHA ${head_sha:-<none>} does not match candidate $SHA"
 
-  log_dispatch PASS "sha=$SHA bundle=$BUNDLE"
+  # A passing gate's durable proof is the bundle itself, so the trail line is
+  # best-effort here (unlike the waiver, whose only proof IS the log line) - but
+  # a failed write is surfaced, never swallowed.
+  log_dispatch PASS "sha=$SHA bundle=$BUNDLE" \
+    || echo "warning: could not write the dispatch trail to $STATE/gauntlet-dispatch.log (the passing bundle remains the durable proof)" >&2
   echo "fm-qa-dispatch: Gauntlet gate PASSED for $ID @ ${SHA:0:12} (bundle $BUNDLE)" >&2
 fi
 
@@ -166,8 +180,17 @@ if [ ! -f "$BRIEF" ]; then
   else
     echo "fm-qa-dispatch: scaffolded QA brief at $BRIEF (references the evidence bundle); replace {TASK} with the QA charge, then re-run to spawn." >&2
   fi
-elif [ "$NO_GAUNTLET" != 1 ] && ! grep -Fq "$BUNDLE" "$BRIEF"; then
-  echo "warning: existing brief $BRIEF does not reference the evidence bundle ($BUNDLE); re-scaffold with fm-brief --scout --gauntlet-bundle to embed it." >&2
+fi
+
+# Finding 2: a GATED dispatch must reference the evidence bundle in the brief that
+# actually spawns - checked here, at dispatch time, NOT assumed from the scaffold.
+# A brief authored before this slice (or hand-edited to drop the reference) would
+# otherwise smuggle a QA scout past the reviewer's executed evidence. The freshly
+# scaffolded brief above always passes this; a pre-existing one that does not is
+# refused with the fix named.
+if [ "$NO_GAUNTLET" != 1 ] && ! grep -Fq "$BUNDLE" "$BRIEF"; then
+  echo "fm-qa-dispatch: QA dispatch REFUSED - brief $BRIEF does not reference the evidence bundle ($BUNDLE); re-scaffold with 'bin/fm-brief.sh $ID $REPO --scout --gauntlet-bundle $BUNDLE' (or add the reference) so the reviewer starts from executed evidence." >&2
+  exit 3
 fi
 
 # --- spawn --------------------------------------------------------------------

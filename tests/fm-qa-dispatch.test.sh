@@ -257,14 +257,53 @@ EOF
   FM_HOME="$h" "$ROOT/bin/fm-verify.sh" --worktree "$R" --sha "$sha" --branch fm/qa-p --task qa-p --base main >/dev/null 2>&1
   [ "$(jq -r .verdict "$h/data/qa-p/verify-bundle.json")" = pass ] \
     || fail "the real verifier should produce a passing bundle"
-  # Exact SHA clears; wrong SHA is stale.
+  # fm-verify wrote the candidate's own brief at data/qa-p/brief.md; the QA scout's
+  # brief is a DIFFERENT task. Scaffold it through the wrapper so it references the
+  # bundle, then author {TASK}, then spawn.
   local rc
-  run_dispatch "$h" qa-p projects/foo --sha "$sha" --branch fm/qa-p >/dev/null 2>&1; rc=$?
-  expect_code 0 "$rc" "the real passing bundle must clear the gate at its exact SHA"
+  run_dispatch "$h" qa-int projects/foo --sha "$sha" --branch fm/qa-p --bundle "$h/data/qa-p/verify-bundle.json" --no-spawn >/dev/null 2>&1
+  assert_grep "$h/data/qa-p/verify-bundle.json" "$h/data/qa-int/brief.md" "scaffolded QA brief must reference the real bundle"
+  sed -i 's/{TASK}/Review the change./' "$h/data/qa-int/brief.md"
+  run_dispatch "$h" qa-int projects/foo --sha "$sha" --branch fm/qa-p --bundle "$h/data/qa-p/verify-bundle.json" >/dev/null 2>&1; rc=$?
+  expect_code 0 "$rc" "the real passing bundle must clear the gate and spawn at its exact SHA"
   assert_present "$h/spawn.args" "an authored, gated QA scout must spawn"
-  run_dispatch "$h" qa-p projects/foo --sha 0000000000000000 --branch fm/qa-p --no-spawn >/dev/null 2>&1; rc=$?
+  run_dispatch "$h" qa-int projects/foo --sha 0000000000000000 --branch fm/qa-p --bundle "$h/data/qa-p/verify-bundle.json" --no-spawn >/dev/null 2>&1; rc=$?
   expect_code 3 "$rc" "the real bundle must be stale against a different SHA"
   pass "integration: consumes a real fm-verify.sh bundle (fresh clears, wrong SHA is stale)"
+}
+
+# --- finding 1: an un-loggable waiver fails closed ---------------------------
+# The waiver's only durable proof is its log line, so a waiver that cannot be
+# logged must NOT proceed - otherwise it is exactly the silent bypass the log
+# exists to prevent. A directory at the log path makes the append fail portably.
+test_waiver_fails_closed_when_unloggable() {
+  local h; h=$(new_home waiverfailclosed)
+  mkdir -p "$h/state/gauntlet-dispatch.log"
+  local out rc
+  out=$(run_dispatch "$h" qa-w projects/foo --no-gauntlet "docs-only audit" --no-spawn 2>&1); rc=$?
+  expect_code 3 "$rc" "an un-loggable waiver must fail closed"
+  assert_contains "$out" "unlogged waiver is invalid" "refusal must explain the fail-closed reason"
+  assert_absent "$h/spawn.args" "an un-loggable waiver must never reach fm-spawn"
+  assert_absent "$h/data/qa-w/brief.md" "an un-loggable waiver must not scaffold a brief either"
+  pass "finding 1: an un-loggable waiver fails closed (no silent bypass)"
+}
+
+# --- finding 2: a pre-existing brief without the bundle reference is refused --
+# A brief authored before this slice (or hand-edited to drop the reference) has
+# {TASK} filled and is otherwise ready to spawn, but must NOT dispatch a gated QA
+# scout without pointing the reviewer at the executed evidence. The gate is
+# enforced at dispatch time, not assumed from the scaffold.
+test_prebrief_without_reference_refused_at_spawn() {
+  local h; h=$(new_home prebriefnoref)
+  write_bundle "$h" qa-r pass abcd1234
+  mkdir -p "$h/data/qa-r"
+  printf '# Task\nReview the widget change.\n# Definition of done\nreport\n' > "$h/data/qa-r/brief.md"
+  local out rc
+  out=$(run_dispatch "$h" qa-r projects/foo --sha abcd1234 2>&1); rc=$?
+  expect_code 3 "$rc" "a gated dispatch on a brief lacking the bundle reference must refuse"
+  assert_contains "$out" "does not reference the evidence bundle" "refusal must name the missing reference"
+  assert_absent "$h/spawn.args" "the reviewer-evidence gate must block the spawn"
+  pass "finding 2: pre-existing brief without the bundle reference is refused at spawn time"
 }
 
 test_script_parses
@@ -285,5 +324,7 @@ test_missing_positionals
 test_unknown_option
 test_custom_bundle_path
 test_real_verify_bundle_integration
+test_waiver_fails_closed_when_unloggable
+test_prebrief_without_reference_refused_at_spawn
 
 echo "all fm-qa-dispatch tests passed"
