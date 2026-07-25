@@ -1288,6 +1288,7 @@ META_WINDOW=$T
   echo "window=$META_WINDOW"
   echo "worktree=$WT"
   echo "project=$PROJ_ABS"
+  echo "branch=fm/$ID"
   echo "harness=$HARNESS"
   echo "kind=$KIND"
   echo "mode=$MODE"

@@ -93,6 +93,9 @@ set -u
   for arg in "$@"; do printf '\x1f%s' "$arg"; done
   printf '\n'
 } >> "$FM_FAKE_TREEHOUSE_LOG"
+if [ "${1:-}" = status ] && [ -n "${FM_FAKE_TREEHOUSE_STATUS:-}" ]; then
+  cat "$FM_FAKE_TREEHOUSE_STATUS"
+fi
 exit 0
 SH
   chmod +x "$fakebin/treehouse"
@@ -112,6 +115,7 @@ SH
 exit 0
 SH
   chmod +x "$root/bin/fm-fleet-sync.sh"
+  printf '%s\n' '#!/usr/bin/env node' 'process.exit(0);' > "$root/visibility.mjs"
   printf '%s\n' "$root"
 }
 
@@ -145,10 +149,12 @@ run_reconcile() {
   env PATH="$fakebin:$BASE_PATH" \
     FM_HOME="$home" \
     FM_ROOT_OVERRIDE="$fake_root" \
+    FM_VISIBILITY_CLI="$fake_root/visibility.mjs" \
     FM_GHOST_SETTLE_SECS=0 \
     FM_FAKE_TMUX_WINDOWS="$windows" \
     FM_FAKE_TMUX_LOG="$tmux_log" \
     FM_FAKE_TREEHOUSE_LOG="$treehouse_log" \
+    FM_FAKE_TREEHOUSE_STATUS="${FM_FAKE_TREEHOUSE_STATUS:-}" \
     FM_FAKE_TMUX_DM_CALLS="$dm_calls" \
     FM_FAKE_TMUX_FORCE_DEAD_CALLS="$force_dead" \
     "$RECONCILE"
@@ -170,11 +176,11 @@ test_landed_dead_meta_is_cleared() {
   : > "$windows"
   : > "$tmux_log"
   : > "$treehouse_log"
-  setup_project_with_worktree "$repo" "$wt" fm-landed
+  setup_project_with_worktree "$repo" "$wt" fm/landed
   printf 'landed\n' > "$wt/landed.txt"
   git -C "$wt" add landed.txt
   git -C "$wt" commit -qm landed
-  git -C "$repo" merge -q --ff-only fm-landed
+  git -C "$repo" merge -q --ff-only fm/landed
   fm_write_meta "$home/state/landed.meta" \
     "window=fleet:fm-landed" \
     "worktree=$wt" \
@@ -246,8 +252,10 @@ test_unlanded_dead_meta_is_preserved() {
   : > "$windows"
   : > "$tmux_log"
   : > "$treehouse_log"
-  setup_project_with_worktree "$repo" "$wt" fm-unlanded
-  printf 'dirty\n' > "$wt/dirty.txt"
+  setup_project_with_worktree "$repo" "$wt" fm/unlanded
+  printf 'unlanded\n' > "$wt/unlanded.txt"
+  git -C "$wt" add unlanded.txt
+  git -C "$wt" commit -qm unlanded
   fm_write_meta "$home/state/unlanded.meta" \
     "window=fleet:fm-unlanded" \
     "worktree=$wt" \
@@ -263,9 +271,118 @@ test_unlanded_dead_meta_is_preserved() {
   assert_present "$home/state/unlanded.meta" "unlanded ghost meta should be preserved"
   assert_present "$home/state/unlanded.status" "unlanded ghost status should be preserved"
   assert_contains "$out" "GHOST_RECONCILE: ATTENTION: unlanded endpoint is dead but teardown refused or failed" "unlanded ghost should be surfaced loudly"
-  assert_contains "$out" "REFUSED: local-only worktree" "teardown refusal should be included in reconcile output"
-  [ ! -s "$treehouse_log" ] || fail "unlanded ghost should not return the worktree"
+  assert_contains "$out" "REFUSED: no positive landed proof" "teardown's fail-closed reason should be included in reconcile output"
+  assert_not_contains "$(cat "$treehouse_log")" $'\x1freturn\x1f' "unlanded ghost should not return the worktree"
   pass "ghost reconciliation preserves and surfaces a CONFIRMED dead meta with unlanded work (fm-teardown.sh's independent safety layer)"
+}
+
+test_landed_meta_in_recycled_slot_is_cleared_without_touching_new_holder() {
+  local dir fakebin fake_root home repo wt windows tmux_log treehouse_log dm_calls status out occupant_head
+  dir="$TMP_ROOT/recycled"
+  mkdir -p "$dir"
+  fakebin=$(make_fake_tooling "$dir")
+  fake_root=$(make_fake_root "$dir/fake-root")
+  home=$(setup_home "$dir/home")
+  repo="$dir/project"
+  wt="$dir/.treehouse/pool/worktree"
+  windows="$dir/windows"
+  tmux_log="$dir/tmux.log"
+  treehouse_log="$dir/treehouse.log"
+  dm_calls="$dir/dm-calls"
+  status="$dir/treehouse-status"
+  : > "$windows"
+  : > "$tmux_log"
+  : > "$treehouse_log"
+  setup_project_with_worktree "$repo" "$wt" fm/recycled
+  printf 'landed\n' > "$wt/landed.txt"
+  git -C "$wt" add landed.txt
+  git -C "$wt" commit -qm landed
+  git -C "$repo" merge -q --ff-only fm/recycled
+
+  # Recycle the same pool residency to another task with unrelated work.
+  git -C "$wt" checkout -qb fm/occupant main
+  printf 'occupant\n' > "$wt/occupant.txt"
+  git -C "$wt" add occupant.txt
+  git -C "$wt" commit -qm occupant
+  occupant_head=$(git -C "$wt" rev-parse HEAD)
+  printf '1 leased %s (held by fm-occupant)\n' "$wt" > "$status"
+
+  fm_write_meta "$home/state/recycled.meta" \
+    "window=fleet:fm-recycled" \
+    "worktree=$wt" \
+    "project=$repo" \
+    "harness=echo" \
+    "kind=ship" \
+    "mode=local-only" \
+    "yolo=off"
+  touch "$home/state/recycled.status"
+
+  out=$(FM_FAKE_TREEHOUSE_STATUS="$status" run_reconcile \
+    "$fakebin" "$home" "$fake_root" "$windows" "$tmux_log" "$treehouse_log" "$dm_calls")
+
+  assert_absent "$home/state/recycled.meta" "landed recycled ghost meta should be removed"
+  assert_absent "$home/state/recycled.status" "landed recycled ghost status should be removed"
+  assert_contains "$out" "GHOST_RECONCILE: recycled torn down cleanly" "recycled ghost should close end-to-end"
+  assert_not_contains "$(cat "$treehouse_log")" $'\x1freturn\x1f' "recycled slot must not be returned under the stale task"
+  [ "$(git -C "$wt" rev-parse --abbrev-ref HEAD)" = "fm/occupant" ] \
+    || fail "recycled slot's new branch was changed"
+  [ "$(git -C "$wt" rev-parse HEAD)" = "$occupant_head" ] \
+    || fail "recycled slot's new commit was changed"
+  pass "landed task in a recycled slot clears end-to-end without touching the new holder"
+}
+
+test_valid_terminal_proof_clears_when_task_branch_is_already_gone() {
+  local dir fakebin fake_root home repo wt windows tmux_log treehouse_log dm_calls status out sha
+  dir="$TMP_ROOT/terminal-proof"
+  mkdir -p "$dir"
+  fakebin=$(make_fake_tooling "$dir")
+  fake_root=$(make_fake_root "$dir/fake-root")
+  home=$(setup_home "$dir/home")
+  repo="$dir/project"
+  wt="$dir/.treehouse/pool/worktree"
+  windows="$dir/windows"
+  tmux_log="$dir/tmux.log"
+  treehouse_log="$dir/treehouse.log"
+  dm_calls="$dir/dm-calls"
+  status="$dir/treehouse-status"
+  : > "$windows"
+  : > "$tmux_log"
+  : > "$treehouse_log"
+  setup_project_with_worktree "$repo" "$wt" fm/occupant
+  sha=$(git -C "$repo" rev-parse main)
+  printf '1 leased %s (held by fm-occupant)\n' "$wt" > "$status"
+  {
+    jq -nc --arg sha "$sha" '{
+      schema:"fleet-bridge/task-event/v1",home:"home",id:"terminal-proof",
+      event:"closure_evidence",branch:"fm/terminal-proof",mode:"local-only",
+      outcome:"landed before cleanup",sha:$sha
+    }'
+    jq -nc '{
+      schema:"fleet-bridge/task-event/v1",home:"home",id:"terminal-proof",
+      event:"closed",disposition:"landed",outcome:"landed before cleanup",
+      closed_at:"2026-07-25T00:00:00Z"
+    }'
+  } > "$home/state/task-lifecycle.jsonl"
+  fm_write_meta "$home/state/terminal-proof.meta" \
+    "window=fleet:fm-terminal-proof" \
+    "worktree=$wt" \
+    "project=$repo" \
+    "harness=echo" \
+    "kind=ship" \
+    "mode=local-only" \
+    "yolo=off"
+  touch "$home/state/terminal-proof.status"
+
+  out=$(FM_FAKE_TREEHOUSE_STATUS="$status" run_reconcile \
+    "$fakebin" "$home" "$fake_root" "$windows" "$tmux_log" "$treehouse_log" "$dm_calls")
+
+  assert_absent "$home/state/terminal-proof.meta" "valid terminal proof should clear meta"
+  assert_absent "$home/state/terminal-proof.status" "valid terminal proof should clear status"
+  assert_contains "$out" "GHOST_RECONCILE: terminal-proof torn down cleanly" \
+    "valid terminal proof should recover cleanup after branch pruning"
+  assert_not_contains "$(cat "$treehouse_log")" $'\x1freturn\x1f' \
+    "terminal recovery must not return the recycled occupant's slot"
+  pass "a complete durable landed/closed proof clears lingering volatile state after the task branch is gone"
 }
 
 # --- confirm-twice safeguard (bug-20260710152159-d3f294fa) ------------------
@@ -291,7 +408,7 @@ test_transient_dead_read_is_not_reaped() {
   printf 'fleet:fm-engine-room\n' > "$windows"
   : > "$tmux_log"
   : > "$treehouse_log"
-  setup_project_with_worktree "$repo" "$wt" fm-engine-room
+  setup_project_with_worktree "$repo" "$wt" fm/engine-room
   fm_write_meta "$home/state/engine-room.meta" \
     "window=fleet:fm-engine-room" \
     "worktree=$wt" \
@@ -315,4 +432,6 @@ test_transient_dead_read_is_not_reaped() {
 test_landed_dead_meta_is_cleared
 test_corrupt_home_worktree_clears_state_only
 test_unlanded_dead_meta_is_preserved
+test_landed_meta_in_recycled_slot_is_cleared_without_touching_new_holder
+test_valid_terminal_proof_clears_when_task_branch_is_already_gone
 test_transient_dead_read_is_not_reaped

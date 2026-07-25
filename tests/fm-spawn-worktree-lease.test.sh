@@ -114,6 +114,8 @@ test_meta_records_leased_worktree_path() {
   meta_wt=$(grep '^worktree=' "$home/state/$id.meta" | cut -d= -f2-)
   [ "$meta_wt" = "$leased" ] \
     || fail "meta worktree is '$meta_wt', expected the leased treehouse path '$leased'"
+  assert_grep "branch=fm/$id" "$home/state/$id.meta" \
+    "spawn must durably bind the task id to its authoritative branch"
   # The launch cwd / firstmate home must never be recorded as the worktree.
   [ "$meta_wt" != "$home" ] \
     || fail "meta worktree is the firstmate home (the original bug)"

@@ -62,6 +62,16 @@ make_fake_root() {
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   # fm-worktree-lib.sh: teardown sources it for the shared pool-slot predicate.
   ln -s "$ROOT/bin/fm-worktree-lib.sh" "$fake/bin/fm-worktree-lib.sh"
+  # fm-lease-lib.sh: teardown sources it for positive pool-slot ownership.
+  ln -s "$ROOT/bin/fm-lease-lib.sh" "$fake/bin/fm-lease-lib.sh"
+  cat > "$fake/bin/fm-role-context-lib.sh" <<'SH'
+fm_require_primary() { return 0; }
+SH
+  cat > "$fake/bin/fm-task-events.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fake/bin/fm-task-events.sh"
   # fm-triage-duty.sh: stub (teardown prompts the triage duty with `|| true`,
   # and this suite is about the temp-root contract, not the duty).
   cat > "$fake/bin/fm-triage-duty.sh" <<'SH'
@@ -148,7 +158,7 @@ test_teardown_removes_tasktmp_dir() {
   # Sanity: dir + contents exist before teardown.
   [ -d "$task_tmp/gotmp" ] || fail "precondition: gotmp missing before teardown"
   # Run the REAL teardown against the fake root.
-  FM_HOME="$fake" bash "$fake/bin/fm-teardown.sh" "$id" >/dev/null 2>&1 \
+  FM_HOME="$fake" bash "$fake/bin/fm-teardown.sh" "$id" --force >/dev/null 2>&1 \
     || fail "teardown exited non-zero with a valid tasktmp"
   [ ! -e "$task_tmp" ] \
     || fail "teardown did not remove the tasktmp dir ($task_tmp still exists)"
@@ -167,6 +177,15 @@ test_teardown_skips_gracefully_without_tasktmp() {
   ln -s "$ROOT/bin/fm-tmux-lib.sh" "$fake/bin/fm-tmux-lib.sh"
   ln -s "$ROOT/bin/fm-lock-lib.sh" "$fake/bin/fm-lock-lib.sh"
   ln -s "$ROOT/bin/fm-worktree-lib.sh" "$fake/bin/fm-worktree-lib.sh"
+  ln -s "$ROOT/bin/fm-lease-lib.sh" "$fake/bin/fm-lease-lib.sh"
+  cat > "$fake/bin/fm-role-context-lib.sh" <<'SH'
+fm_require_primary() { return 0; }
+SH
+  cat > "$fake/bin/fm-task-events.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fake/bin/fm-task-events.sh"
   cat > "$fake/bin/fm-triage-duty.sh" <<'SH'
 #!/usr/bin/env bash
 exit 0
@@ -197,7 +216,7 @@ kind=ship
 mode=no-mistakes
 yolo=off
 META
-  FM_HOME="$fake" bash "$fake/bin/fm-teardown.sh" "$id" >/dev/null 2>&1 \
+  FM_HOME="$fake" bash "$fake/bin/fm-teardown.sh" "$id" --force >/dev/null 2>&1 \
     || fail "teardown exited non-zero when tasktmp= was absent"
   pass "fm-teardown skips gracefully when tasktmp= is absent (backward compat)"
 }
@@ -210,7 +229,7 @@ test_teardown_skips_gracefully_when_dir_missing() {
   [ ! -e "$task_tmp" ] || fail "precondition: task_tmp should not exist yet"
   local fake
   fake=$(make_fake_root "$id" "$task_tmp")
-  FM_HOME="$fake" bash "$fake/bin/fm-teardown.sh" "$id" >/dev/null 2>&1 \
+  FM_HOME="$fake" bash "$fake/bin/fm-teardown.sh" "$id" --force >/dev/null 2>&1 \
     || fail "teardown exited non-zero when tasktmp dir was missing"
   [ ! -e "$task_tmp" ] || fail "teardown created/left the tasktmp dir unexpectedly"
   pass "fm-teardown skips gracefully when tasktmp= points to a nonexistent dir"

@@ -2,10 +2,10 @@
 # Tests for bin/fm-teardown.sh's landed-work safety and stale-lock recovery.
 #
 # The check refuses to tear down a worktree whose work has not LANDED, because
-# treehouse return hard-resets the worktree. "Landed" means reachable from a remote
-# OR - for a normal ship task whose commits are not so reachable - its PR is merged
-# and GitHub reports a PR head that contains the current local work, or its content
-# is already in the up-to-date default branch.
+# treehouse return hard-resets the worktree. "Landed" is proven from the task's
+# refs/heads/fm/<id>, never recycled worktree HEAD: a remote contains the ref,
+# `git cherry` proves all its patches are in the authoritative base, or a merged
+# PR positively contains it.
 #
 # Covers three fixes:
 #   - local-only fork-remote: a fork IS a remote, so fork-pushed upstream-
@@ -641,6 +641,27 @@ test_local_only_truly_unpushed_refuses() {
   pass "local-only worktree with truly unpushed work is refused (safety preserved)"
 }
 
+test_missing_worktree_does_not_bypass_unlanded_branch_refusal() {
+  local case_dir rc missing_wt
+  case_dir=$(make_case missing-worktree-unlanded)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "unlanded work"
+  git -C "$case_dir/project" worktree remove --force "$case_dir/wt"
+  missing_wt="$case_dir/wt"
+  [ ! -d "$missing_wt" ] || fail "missing-worktree-unlanded: setup did not remove worktree"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "missing-worktree-unlanded: teardown must still require positive branch proof"
+  assert_grep "REFUSED: no positive landed proof" "$case_dir/stderr" \
+    "missing-worktree-unlanded: missing residency bypassed the branch proof"
+  assert_present "$case_dir/state/task-x1.meta" "missing-worktree-unlanded: refusal must preserve meta"
+  pass "a missing worktree cannot bypass fail-closed proof for an unlanded task branch"
+}
+
 test_local_only_merged_to_local_main_allows() {
   local case_dir rc
   case_dir=$(make_case merged-main)
@@ -1062,7 +1083,7 @@ test_stale_nontreehouse_worktree_degrades_gracefully() {
   set -e
 
   expect_code 0 "$rc" "stale-nontreehouse: teardown must not abort on a non-treehouse worktree"
-  grep -q "not a treehouse-managed worktree" "$case_dir/stderr" \
+  grep -q "missing, unsafe, or no longer positively owned" "$case_dir/stderr" \
     || fail "stale-nontreehouse: expected a graceful warning about the non-treehouse worktree"$'\n'"$(cat "$case_dir/stderr")"
   assert_absent "$case_dir/state/task-x1.meta" "stale-nontreehouse: meta should be cleared after teardown"
   pass "teardown degrades gracefully when the recorded worktree is not a treehouse worktree"
@@ -1090,7 +1111,7 @@ test_project_own_checkout_worktree_degrades_gracefully() {
   set -e
 
   expect_code 0 "$rc" "project-own-checkout: teardown must not abort when worktree=project"
-  grep -q "not a treehouse-managed worktree" "$case_dir/stderr" \
+  grep -q "missing, unsafe, or no longer positively owned" "$case_dir/stderr" \
     || fail "project-own-checkout: expected a graceful warning about the project's own checkout"$'\n'"$(cat "$case_dir/stderr")"
   head_branch=$(git -C "$case_dir/project" rev-parse --abbrev-ref HEAD)
   [ "$head_branch" = main ] \
@@ -1128,7 +1149,7 @@ SH
   set -e
 
   expect_code 0 "$rc" "same-repo-sibling: teardown must skip a registered sibling outside the pool"
-  assert_grep "not a treehouse-managed worktree" "$case_dir/stderr" \
+  assert_grep "missing, unsafe, or no longer positively owned" "$case_dir/stderr" \
     "same-repo-sibling: expected a graceful warning about the non-pool sibling"
   head_branch=$(git -C "$sibling" rev-parse --abbrev-ref HEAD)
   [ "$head_branch" = serving-live ] \
@@ -1138,10 +1159,9 @@ SH
   pass "same-repo sibling outside the treehouse pool is preserved and return is skipped"
 }
 
-# When the recorded worktree IS a registered worktree but `treehouse return`
-# itself fails (e.g. already returned, or a transient treehouse error), teardown
-# must warn and continue rather than aborting mid-cleanup.
-test_registered_worktree_return_failure_is_nonfatal() {
+# When the recorded worktree IS positively owned but `treehouse return` fails,
+# teardown must fail before writing terminal proof or clearing volatile state.
+test_registered_worktree_return_failure_preserves_state() {
   local case_dir rc
   case_dir=$(make_case return-failure-nonfatal)
   write_meta "$case_dir" no-mistakes ship
@@ -1155,11 +1175,11 @@ test_registered_worktree_return_failure_is_nonfatal() {
   rc=$?
   set -e
 
-  expect_code 0 "$rc" "return-failure-nonfatal: a failed treehouse return must not abort teardown"
+  expect_code 1 "$rc" "return-failure: a failed treehouse return must abort teardown"
   grep -q "treehouse return failed" "$case_dir/stderr" \
-    || fail "return-failure-nonfatal: expected a non-fatal warning about the failed return"$'\n'"$(cat "$case_dir/stderr")"
-  assert_absent "$case_dir/state/task-x1.meta" "return-failure-nonfatal: meta should be cleared after teardown"
-  pass "a failed treehouse return warns but does not abort teardown"
+    || fail "return-failure: expected a refusal naming the failed return"$'\n'"$(cat "$case_dir/stderr")"
+  assert_present "$case_dir/state/task-x1.meta" "return-failure: meta must remain after incomplete lease cleanup"
+  pass "a failed treehouse return preserves volatile state and writes no successful teardown"
 }
 
 
@@ -1334,7 +1354,7 @@ test_unregistered_worktree_lock_is_left_untouched() {
   set -e
 
   expect_code 0 "$rc" "unregistered-worktree-lock: teardown should still complete (window kill + state clear)"
-  assert_grep "not a treehouse-managed worktree" "$case_dir/stderr" \
+  assert_grep "missing, unsafe, or no longer positively owned" "$case_dir/stderr" \
     "unregistered-worktree-lock: teardown did not warn that the recorded worktree is unregistered"
   assert_not_contains "$(cat "$case_dir/stderr")" "removed provably-stale git lock" \
     "unregistered-worktree-lock: teardown must not touch git state inside an unregistered worktree"
@@ -1541,21 +1561,28 @@ test_local_only_force_overrides_unpushed() {
 }
 
 test_herdr_teardown_clears_escalation_marker() {
-  local case_dir marker
+  local case_dir marker endpoint
   case_dir=$(make_case herdr-marker-cleanup)
   write_meta "$case_dir" local-only ship
   sed -i.bak 's/^window=.*/window=default:wG:pQ/' "$case_dir/state/task-x1.meta"
   rm -f "$case_dir/state/task-x1.meta.bak"
   printf '%s\n' 'backend=herdr' >> "$case_dir/state/task-x1.meta"
+  endpoint="$case_dir/herdr-endpoint"
+  : > "$endpoint"
   cat > "$case_dir/fakebin/herdr" <<'SH'
 #!/usr/bin/env bash
+case " $* " in
+  *" status --json "*) printf '%s\n' '{"server":{"running":true}}'; exit 0 ;;
+  *" pane close "*) rm -f "$FM_FAKE_HERDR_ENDPOINT"; exit 0 ;;
+  *" pane get "*) [ -f "$FM_FAKE_HERDR_ENDPOINT" ]; exit ;;
+esac
 exit 0
 SH
   chmod +x "$case_dir/fakebin/herdr"
   marker="$case_dir/state/.herdr-escalated-default_wG_pQ"
   : > "$marker"
 
-  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" \
+  FM_FAKE_HERDR_ENDPOINT="$endpoint" run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" \
     || fail "herdr-marker-cleanup: forced teardown failed"
   [ ! -e "$marker" ] || fail "herdr-marker-cleanup: teardown left the pane's escalation marker behind"
   pass "herdr teardown removes pane-owned escalation dedupe state"
@@ -1574,8 +1601,99 @@ test_closeout_failure_preserves_volatile_state() {
   expect_code 1 "$rc" "closeout failure must refuse teardown"
   assert_present "$case_dir/state/task-x1.meta" "closeout failure must preserve meta"
   assert_present "$case_dir/state/task-x1.status" "closeout failure must preserve status"
-  assert_grep 'durable visibility closeout failed' "$case_dir/stderr" "refusal should name closeout failure"
+  assert_grep 'durable visibility closeout/finalize failed' "$case_dir/stderr" "refusal should name closeout failure"
   pass "closure-evidence failure preserves volatile task state"
+}
+
+test_successful_finalize_orders_lease_window_close_and_state_removal() {
+  local case_dir order_log endpoint return_line kill_line close_line
+  case_dir=$(make_case finalize-order)
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' 'done: ready' > "$case_dir/state/task-x1.status"
+  wt_commit "$case_dir" "landed work"
+  git -C "$case_dir/project" update-ref refs/heads/main "$(git -C "$case_dir/wt" rev-parse HEAD)"
+  order_log="$case_dir/finalize-order.log"
+  endpoint="$case_dir/tmux-endpoint"
+  : > "$order_log"
+  : > "$endpoint"
+
+  cat > "$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = return ]; then printf '%s\n' return >> "$FM_CLEANUP_ORDER_LOG"; fi
+exit 0
+SH
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list-windows)
+    [ -f "$FM_FAKE_TMUX_ENDPOINT" ] && printf '%s\n' fm-task-x1
+    ;;
+  kill-window)
+    printf '%s\n' kill >> "$FM_CLEANUP_ORDER_LOG"
+    rm -f "$FM_FAKE_TMUX_ENDPOINT"
+    ;;
+esac
+exit 0
+SH
+  cat > "$case_dir/visibility.mjs" <<'JS'
+#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+if (process.argv[2] === 'close') appendFileSync(process.env.FM_CLEANUP_ORDER_LOG, 'close\n');
+process.exit(0);
+JS
+  chmod +x "$case_dir/fakebin/treehouse" "$case_dir/fakebin/tmux"
+
+  FM_CLEANUP_ORDER_LOG="$order_log" FM_FAKE_TMUX_ENDPOINT="$endpoint" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" \
+    || fail "finalize-order: teardown failed"
+
+  return_line=$(grep -n '^return$' "$order_log" | cut -d: -f1)
+  kill_line=$(grep -n '^kill$' "$order_log" | cut -d: -f1)
+  close_line=$(grep -n '^close$' "$order_log" | cut -d: -f1)
+  [ "$return_line" -lt "$kill_line" ] && [ "$kill_line" -lt "$close_line" ] \
+    || fail "finalize-order: expected return -> kill -> close, got $(tr '\n' ' ' < "$order_log")"
+  assert_absent "$case_dir/state/task-x1.meta" "finalize-order: successful close must remove meta"
+  assert_absent "$case_dir/state/task-x1.status" "finalize-order: successful close must remove status"
+  pass "successful teardown writes terminal proof only after lease/window cleanup, then removes volatile state"
+}
+
+test_runtime_endpoint_that_survives_kill_preserves_state_and_has_no_close() {
+  local case_dir endpoint order_log rc=0
+  case_dir=$(make_case endpoint-survives)
+  write_meta "$case_dir" local-only ship
+  printf '%s\n' 'done: ready' > "$case_dir/state/task-x1.status"
+  wt_commit "$case_dir" "landed work"
+  git -C "$case_dir/project" update-ref refs/heads/main "$(git -C "$case_dir/wt" rev-parse HEAD)"
+  endpoint="$case_dir/tmux-endpoint"
+  order_log="$case_dir/finalize-order.log"
+  : > "$endpoint"
+  : > "$order_log"
+
+  cat > "$case_dir/fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list-windows) [ -f "$FM_FAKE_TMUX_ENDPOINT" ] && printf '%s\n' fm-task-x1 ;;
+  kill-window) printf '%s\n' kill >> "$FM_CLEANUP_ORDER_LOG" ;;
+esac
+exit 0
+SH
+  cat > "$case_dir/visibility.mjs" <<'JS'
+#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+if (process.argv[2] === 'close') appendFileSync(process.env.FM_CLEANUP_ORDER_LOG, 'close\n');
+process.exit(0);
+JS
+  chmod +x "$case_dir/fakebin/tmux"
+
+  FM_CLEANUP_ORDER_LOG="$order_log" FM_FAKE_TMUX_ENDPOINT="$endpoint" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "endpoint-survives: teardown must refuse when the endpoint remains"
+  assert_present "$case_dir/state/task-x1.meta" "endpoint-survives: meta must remain"
+  assert_present "$case_dir/state/task-x1.status" "endpoint-survives: status must remain"
+  assert_not_contains "$(cat "$order_log")" "close" "endpoint-survives: no terminal event may precede verified endpoint removal"
+  assert_grep "still exists after removal" "$case_dir/stderr" "endpoint-survives: refusal must name the surviving endpoint"
+  pass "a runtime endpoint that survives kill cannot produce a closed event or volatile-state removal"
 }
 
 # The gate must not trap tasks whose durable record is merely absent: every task that ran
@@ -1641,6 +1759,7 @@ test_local_only_fork_remote_allows
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
 test_local_only_truly_unpushed_refuses
+test_missing_worktree_does_not_bypass_unlanded_branch_refusal
 test_local_only_merged_to_local_main_allows
 test_teardown_prompts_the_fleet_triage_duty
 test_scout_teardown_prompts_the_scout_completion_duty
@@ -1649,6 +1768,8 @@ test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_herdr_teardown_clears_escalation_marker
 test_closeout_failure_preserves_volatile_state
+test_successful_finalize_orders_lease_window_close_and_state_removal
+test_runtime_endpoint_that_survives_kill_preserves_state_and_has_no_close
 test_missing_task_record_is_backfilled_and_teardown_proceeds
 test_already_terminal_record_allows_teardown
 test_squash_merged_branch_deleted_allows
@@ -1677,4 +1798,4 @@ test_fractional_legacy_retry_wait_refuses_without_arithmetic_error
 test_stale_nontreehouse_worktree_degrades_gracefully
 test_project_own_checkout_worktree_degrades_gracefully
 test_same_repo_sibling_outside_pool_degrades_gracefully
-test_registered_worktree_return_failure_is_nonfatal
+test_registered_worktree_return_failure_preserves_state

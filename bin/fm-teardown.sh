@@ -5,26 +5,26 @@
 # tasks, then print a backlog-refresh reminder for ship and scout teardowns
 # (a secondmate teardown prints none, since secondmates are not backlog items).
 # REFUSES if the worktree holds work that has not LANDED, because cleanup
-# hard-resets/removes the worktree and kills its processes. Work has landed when it is
-# reachable from any remote-tracking branch (a fork counts as a remote, so
-# upstream-contribution PRs pushed to a fork satisfy this in any mode), OR - for a
-# normal ship task whose commits are not so reachable - when its PR is merged and
-# GitHub reports a PR head that contains the current local work, or its content is
-# already present in the up-to-date default branch. This recognizes the common
-# squash-merge-then-delete-branch flow, where the branch's own commits live nowhere
-# on a remote yet the change is fully in main.
+# hard-resets/removes the worktree and kills its processes. Work has landed when
+# the task's own refs/heads/fm/<id> is reachable from any remote-tracking branch
+# (a fork counts), every patch on that ref is contained in the project's
+# authoritative base (`git cherry` has no '+' row), OR - for a normal PR-backed
+# ship task - its merged PR positively contains the task ref. The landed proof
+# never reads recorded worktree HEAD: pool residency is reusable and may now
+# belong to another task.
 # The PR itself is resolved from the task's recorded pr= when present, or - when
 # no pr= was ever recorded (e.g. a yolo-authorized merge on a repo with no PR CI,
 # where the usual "checks green" fm-pr-check.sh trigger never fires) - by looking
-# up a merged PR whose head branch matches the worktree's branch, fetching its head
+# up a merged PR whose head branch matches the task's branch, fetching its head
 # via refs/pull/<n>/head when the branch itself was deleted. So a missing pr= never
 # by itself causes a false refusal of landed work.
-# A gh lookup error falls back to the content check; if that is also inconclusive,
-# teardown refuses rather than risk discarding unlanded work.
+# Spawn records branch=fm/<id> for new tasks. Legacy meta without branch= uses
+# that same closed-schema convention; any conflicting value or missing ref
+# refuses rather than falling back to worktree residency.
+# A gh lookup error falls back to branch containment; if that and durable
+# terminal proof are inconclusive, teardown refuses.
 # Uncommitted changes are never landed.
-# local-only projects additionally accept work merged into the local default
-# branch (firstmate performs that merge on the captain's approval) as a fallback
-# for the common case where there is no remote at all.
+# local-only projects use the local default branch as the authoritative base.
 # Scout tasks (kind=scout in meta) carve out of that check: their worktree is
 # declared scratch and the report at data/<task-id>/report.md is the work
 # product - teardown proceeds once the report exists, and refuses without it.
@@ -36,8 +36,10 @@
 # is the approved discard path that prevalidates child removal targets, discards
 # child work, kills child runtime endpoints, and removes the retired home. Removing a
 # leased home releases its durable treehouse lease so the pool slot is freed,
-# never left leased forever. If the treehouse return fails, teardown leaves the
-# leased home and state in place instead of hiding a still-held lease.
+# never left leased forever. If a lease return or runtime-endpoint removal fails,
+# teardown leaves volatile state in place and writes no terminal event. A
+# successful cleanup writes the closed lifecycle event and removes meta/status
+# under one finalize lock, then prunes the task branch best-effort.
 # Usage: fm-teardown.sh <task-id> [--force]
 #   --force skips ordinary-task dirty and landed-work checks, skips scout report
 #   checks, and discards secondmate child work for kind=secondmate. Only use it
@@ -99,6 +101,8 @@ fm_refuse_if_gate_agent
 FM_LOCK_LOG_PREFIX=teardown
 # shellcheck source=bin/fm-worktree-lib.sh
 . "$SCRIPT_DIR/fm-worktree-lib.sh"
+# shellcheck source=bin/fm-lease-lib.sh
+. "$SCRIPT_DIR/fm-lease-lib.sh"
 "$FM_ROOT/bin/fm-guard.sh" || true
 ID=$1
 FORCE=${2:-}
@@ -120,10 +124,10 @@ PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
 ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
 ORCA_PATH_MATCH_VERIFIED=0
-TASK_RUN_BRANCH=
-if [ -d "$WT" ]; then
-  TASK_RUN_BRANCH=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
-fi
+TASK_RUN_BRANCH="fm/$ID"
+TASK_RUN_REF="refs/heads/$TASK_RUN_BRANCH"
+RECORDED_TASK_BRANCH=$(grep '^branch=' "$META" | tail -1 | cut -d= -f2- || true)
+DURABLE_CLOSE_EVIDENCE=
 
 KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
@@ -273,13 +277,13 @@ remove_grok_turnend_auth() {
   rm -f "$hooks_dir/$token"
 }
 
-# Resolve the PR number for a worktree branch via gh-axi. Echoes the number on a
+# Resolve the PR number for a task branch via gh-axi. Echoes the number on a
 # single match and returns 0; returns non-zero on no match or any lookup failure,
 # so the caller treats it as "no PR found" (fail-safe).
 pr_number_from_branch() {
   local branch=$1 out n
   [ -n "$branch" ] && [ "$branch" != HEAD ] || return 1
-  out=$( cd "$WT" && gh-axi pr list --state all --head "$branch" --limit 1 2>/dev/null ) || return 1
+  out=$( cd "$PROJ" && gh-axi pr list --state all --head "$branch" --limit 1 2>/dev/null ) || return 1
   n=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*\([0-9][0-9]*\),.*/\1/p' | head -1)
   [ -n "$n" ] || return 1
   printf '%s' "$n"
@@ -304,26 +308,26 @@ pr_number_from_target() {
 
 ensure_commit_object() {
   local target=$1 commit=$2 n
-  git -C "$WT" cat-file -e "$commit^{commit}" 2>/dev/null && return 0
+  git -C "$PROJ" cat-file -e "$commit^{commit}" 2>/dev/null && return 0
   n=$(pr_number_from_target "$target") || return 1
-  git -C "$WT" remote get-url origin >/dev/null 2>&1 || return 1
-  git -C "$WT" fetch --quiet origin "refs/pull/$n/head" >/dev/null 2>&1 || return 1
-  git -C "$WT" cat-file -e "$commit^{commit}" 2>/dev/null
+  git -C "$PROJ" remote get-url origin >/dev/null 2>&1 || return 1
+  git -C "$PROJ" fetch --quiet origin "refs/pull/$n/head" >/dev/null 2>&1 || return 1
+  git -C "$PROJ" cat-file -e "$commit^{commit}" 2>/dev/null
 }
 
 patch_id_for_commit() {
   local commit=$1
-  git -C "$WT" show --pretty=medium --no-ext-diff "$commit" 2>/dev/null \
+  git -C "$PROJ" show --pretty=medium --no-ext-diff "$commit" 2>/dev/null \
     | git patch-id --stable 2>/dev/null \
     | awk 'NR == 1 { print $1 }'
 }
 
 unpushed_patches_are_in_pr_head() {
   local pr_head=$1 current base pr_patch_ids commit patch_id unpushed
-  current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
-  base=$(git -C "$WT" merge-base "$current" "$pr_head" 2>/dev/null) || return 1
+  current=$(git -C "$PROJ" rev-parse --verify "$TASK_RUN_REF^{commit}" 2>/dev/null) || return 1
+  base=$(git -C "$PROJ" merge-base "$current" "$pr_head" 2>/dev/null) || return 1
   pr_patch_ids=$(
-    git -C "$WT" log --format=%H "$base..$pr_head" -- 2>/dev/null \
+    git -C "$PROJ" log --format=%H "$base..$pr_head" -- 2>/dev/null \
       | while IFS= read -r commit; do
           patch_id_for_commit "$commit"
         done \
@@ -331,7 +335,7 @@ unpushed_patches_are_in_pr_head() {
       | sort -u
   ) || return 1
   [ -n "$pr_patch_ids" ] || return 1
-  unpushed=$(git -C "$WT" log --format=%H HEAD --not --remotes -- 2>/dev/null) || return 1
+  unpushed=$(git -C "$PROJ" log --format=%H "$TASK_RUN_REF" --not --remotes -- 2>/dev/null) || return 1
   [ -n "$unpushed" ] || return 1
   while IFS= read -r commit; do
     [ -n "$commit" ] || continue
@@ -360,18 +364,18 @@ pr_view_reports_merged() {  # <gh-axi-pr-view-output>
 # shared FETCH_HEAD to race (unlike the finding-3 hazard fm-review-diff had).
 pr_head_oid_from_remote() {  # <pr-number>
   local n=$1 sha
-  git -C "$WT" remote get-url origin >/dev/null 2>&1 || return 1
-  sha=$(git -C "$WT" ls-remote origin "refs/pull/$n/head" 2>/dev/null | awk 'NR==1 {print $1}')
+  git -C "$PROJ" remote get-url origin >/dev/null 2>&1 || return 1
+  sha=$(git -C "$PROJ" ls-remote origin "refs/pull/$n/head" 2>/dev/null | awk 'NR==1 {print $1}')
   case "$sha" in ''|*[!0-9a-fA-F]*) return 1 ;; esac
   printf '%s' "$sha"
 }
 
-# Is the worktree's PR merged for local work contained in that PR? Resolves the
+# Is the task branch's PR merged with that branch contained in its PR head? Resolves the
 # PR from the recorded pr= URL first, then from the branch name. Merged-state comes
 # from gh-axi (the fleet GitHub client, via its real `pr view` output contract); the
 # head OID comes from git's refs/pull/<n>/head. Returns non-zero when the PR is not
-# merged, the current work is not contained in the PR head, no PR is found, or any
-# lookup fails - the caller then falls back to the content check.
+# merged, the task branch is not contained in the PR head, no PR is found, or any
+# lookup fails.
 pr_is_merged() {
   local branch=$1 target n view head current
   if [ -n "$PR_URL" ]; then
@@ -381,49 +385,104 @@ pr_is_merged() {
   fi
   [ -n "$target" ] || return 1
   n=$(pr_number_from_target "$target") || return 1
-  view=$(cd "$WT" && gh-axi pr view "$n" 2>/dev/null) || return 1
+  view=$(cd "$PROJ" && gh-axi pr view "$n" 2>/dev/null) || return 1
   pr_view_reports_merged "$view" || return 1
   head=$(pr_head_oid_from_remote "$n") || return 1
   ensure_commit_object "$target" "$head" || return 1
-  current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
-  git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null && return 0
+  current=$(git -C "$PROJ" rev-parse --verify "$TASK_RUN_REF^{commit}" 2>/dev/null) || return 1
+  git -C "$PROJ" merge-base --is-ancestor "$current" "$head" 2>/dev/null && return 0
   unpushed_patches_are_in_pr_head "$head"
 }
 
-# Is the branch's content already present in the up-to-date default branch? Fetches
-# first, then 3-way merges the default branch with HEAD: when HEAD introduces nothing
-# the default branch does not already contain (e.g. its change landed via squash) the
-# merged tree equals the default branch's tree. This isolates branch-only changes, so
-# unrelated commits the default branch gained past the merge-base do not count as
-# "added". Returns non-zero when inconclusive (no default ref, or a merge conflict),
-# so the caller refuses rather than guesses.
-content_in_default() {
-  local name ref default_tree merged_tree
+# Resolve the project's authoritative base for teardown proof. Local-only mode is
+# governed by the local default branch. PR-backed modes refresh and prefer the
+# remote-tracking default. Any missing or unreadable ref is inconclusive.
+authoritative_base_ref() {
+  local name ref
   name=$(default_branch) || return 1
-  if git -C "$WT" remote get-url origin >/dev/null 2>&1; then
-    git -C "$WT" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" >/dev/null 2>&1 || return 1
+  if [ "$MODE" != local-only ] && git -C "$PROJ" remote get-url origin >/dev/null 2>&1; then
+    git -C "$PROJ" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" >/dev/null 2>&1 || return 1
     ref="refs/remotes/origin/$name"
-  elif git -C "$WT" rev-parse --quiet --verify "refs/heads/$name" >/dev/null 2>&1; then
+  elif git -C "$PROJ" rev-parse --quiet --verify "refs/heads/$name^{commit}" >/dev/null 2>&1; then
     ref="refs/heads/$name"
   else
     return 1
   fi
-  default_tree=$(git -C "$WT" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || return 1
-  [ -n "$default_tree" ] || return 1
-  merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
-  merged_tree=$(printf '%s\n' "$merged_tree" | head -1)
-  [ "$merged_tree" = "$default_tree" ]
+  git -C "$PROJ" rev-parse --quiet --verify "$ref^{commit}" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$ref"
 }
 
-# Has the worktree's committed work actually LANDED, though its commits are not
-# reachable from any remote-tracking branch? True when a merged PR proves the
-# current local work is contained in the PR head, OR the content is already in the
-# default branch (fallback, which also covers the no-PR and gh-error paths). False
-# only for genuinely unlanded work.
+# Positive patch-id/commit containment proof that every commit on the task's
+# durable branch is already represented by the authoritative base. `git cherry`
+# emits '+' for a missing patch and '-' for an equivalent patch. An empty result
+# means ordinary commit ancestry. Any command/ref failure remains a refusal.
+task_branch_is_contained_in_authoritative_base() {
+  local base out
+  base=$(authoritative_base_ref) || return 1
+  out=$(git -C "$PROJ" cherry "$base" "$TASK_RUN_REF" 2>/dev/null) || return 1
+  ! printf '%s\n' "$out" | grep -q '^+ '
+}
+
+task_branch_is_on_remote() {
+  git -C "$PROJ" for-each-ref --format='%(refname)' --contains "$TASK_RUN_REF" refs/remotes 2>/dev/null \
+    | grep -q '^refs/remotes/'
+}
+
+# Positive terminal proof from the append-only lifecycle ledger. This is the
+# recovery path for an earlier teardown generation that durably closed the task
+# but crashed before removing volatile state (or pruned the branch first). One
+# atomic jq pass must read a valid JSONL snapshot and emit the exact SHA from a
+# complete closure_evidence -> closed(landed) sequence for this home/task.
+durable_terminal_closeout_proves_landed() {
+  local ledger="$STATE/task-lifecycle.jsonl" home proof
+  [ -s "$ledger" ] || return 1
+  home=$(basename "$FM_HOME")
+  proof=$(jq -sr --arg home "$home" --arg id "$ID" --arg branch "$TASK_RUN_BRANCH" '
+    to_entries as $events
+    | [ $events[]
+        | select(.value.schema == "fleet-bridge/task-event/v1"
+          and .value.home == $home
+          and .value.id == $id
+          and .value.event == "closure_evidence"
+          and .value.branch == $branch
+          and (.value.mode == "local-only" or .value.mode == "PR")
+          and (.value.outcome | type == "string" and length > 0)
+          and (.value.sha | type == "string" and test("^[0-9a-fA-F]{40}$")))
+      ] as $evidence
+    | [ $events[]
+        | select(.value.schema == "fleet-bridge/task-event/v1"
+          and .value.home == $home
+          and .value.id == $id
+          and .value.event == "closed"
+          and .value.disposition == "landed"
+          and (.value.outcome | type == "string" and length > 0)
+          and (.value.closed_at | type == "string" and length > 0))
+      ] as $closed
+    | [ $evidence[] as $e
+        | $closed[]
+        | select(.key > $e.key)
+        | $e.value.sha
+      ]
+    | last // empty
+  ' "$ledger" 2>/dev/null) || return 1
+  [ -n "$proof" ] || return 1
+  DURABLE_CLOSE_EVIDENCE=$proof
+  return 0
+}
+
+# Has this task's own durable branch landed? This never reads recorded worktree
+# HEAD. The exact fm/<id> ref is the lineage authority; a conflicting recorded
+# branch or an unresolvable ref fails closed.
 work_is_landed() {
-  local branch=$1
-  pr_is_merged "$branch" && return 0
-  content_in_default
+  [ -z "$RECORDED_TASK_BRANCH" ] || [ "$RECORDED_TASK_BRANCH" = "$TASK_RUN_BRANCH" ] || return 1
+  if git -C "$PROJ" rev-parse --quiet --verify "$TASK_RUN_REF^{commit}" >/dev/null 2>&1; then
+    task_branch_is_on_remote && return 0
+    task_branch_is_contained_in_authoritative_base && return 0
+    if [ "$MODE" != local-only ] && pr_is_merged "$TASK_RUN_BRANCH"; then
+      return 0
+    fi
+  fi
+  durable_terminal_closeout_proves_landed
 }
 
 backlog_refresh_reminder() {
@@ -672,79 +731,47 @@ teardown_treehouse_return() {
 }
 
 validate_worktree_teardown_safety() {
-  local dirty_raw dirty unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch fm_owned_untracked
-  [ -d "$WT" ] || return 0
+  local dirty_raw dirty fm_owned_untracked
   [ "$FORCE" != "--force" ] || return 0
   case "$KIND" in
     secondmate|scout) return 0 ;;
   esac
 
-  if ! dirty_raw=$(git -C "$WT" status --porcelain 2>/dev/null); then
-    if worktree_safety_blocked_by_lock "uncommitted changes"; then
-      return "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED"
-    fi
-    echo "REFUSED: cannot inspect worktree $WT for uncommitted changes." >&2
-    echo "Restore the git index state, or get the captain's explicit OK to discard, then --force." >&2
-    return 1
-  fi
-  # Firstmate-owned, gitignored worktree files that spawn creates and adds to the
-  # worktree's info/exclude (bin/fm-spawn.sh: exclude_path). Teardown must not count
-  # these as crewmate "dirty" work if info/exclude ever fails to hide them - but it
-  # must cover ALL of them symmetrically (every harness's turn-end hook plus the
-  # crew-role marker), and ONLY them by EXACT name. The former broad `.claude/`
-  # prefix was both too loose (a crewmate's own untracked file under .claude/ was
-  # silently discardable) and asymmetric (it ignored claude's hook but not
-  # opencode's .opencode/plugins/fm-turn-end.js, so an exclude failure there refused
-  # teardown while claude's did not). Keep this list in lockstep with fm-spawn.sh's
-  # exclude_path calls.
-  fm_owned_untracked='^\?\? (\.claude/settings\.local\.json|\.opencode/plugins/fm-turn-end\.js|\.fm-grok-turnend|\.fm-crew-role)$'
-  dirty=$(printf '%s\n' "$dirty_raw" | grep -vE "$fm_owned_untracked" | head -1 || true)
-
-  if ! unpushed_raw=$(git -C "$WT" log --oneline HEAD --not --remotes -- 2>/dev/null); then
-    if worktree_safety_blocked_by_lock "commits not on a remote"; then
-      return "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED"
-    fi
-    echo "REFUSED: cannot inspect worktree $WT for commits not on a remote." >&2
-    echo "Restore the git index state, or get the captain's explicit OK to discard, then --force." >&2
-    return 1
-  fi
-  unpushed=$(printf '%s\n' "$unpushed_raw" | head -5)
-
-  if [ -n "$unpushed" ] && [ "$MODE" = local-only ]; then
-    DEFAULT=$(default_branch) || { echo "REFUSED: cannot determine default branch for $PROJ; expected origin/HEAD, main, or master." >&2; return 1; }
-    if ! unmerged_raw=$(git -C "$WT" log --oneline HEAD --not "$DEFAULT" -- 2>/dev/null); then
-      if worktree_safety_blocked_by_lock "commits not on $DEFAULT"; then
+  # A recycled pool path no longer belongs to this task. Never inspect its
+  # residency as task evidence and never let unrelated dirt veto a proven
+  # closure. If ownership is positive, uncommitted task work still blocks.
+  if task_owns_recorded_worktree; then
+    if ! dirty_raw=$(git -C "$WT" status --porcelain 2>/dev/null); then
+      if worktree_safety_blocked_by_lock "uncommitted changes"; then
         return "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED"
       fi
-      echo "REFUSED: cannot inspect worktree $WT for commits not on $DEFAULT." >&2
+      echo "REFUSED: cannot inspect task-owned worktree $WT for uncommitted changes." >&2
       echo "Restore the git index state, or get the captain's explicit OK to discard, then --force." >&2
       return 1
     fi
-    unmerged=$(printf '%s\n' "$unmerged_raw" | head -5)
-    if [ -n "$dirty" ] || [ -n "$unmerged" ]; then
-      echo "REFUSED: local-only worktree $WT has work not yet merged into $DEFAULT and not on any remote." >&2
-      [ -n "$dirty" ] && echo "uncommitted changes present" >&2
-      [ -n "$unmerged" ] && printf 'commits not yet on %s:\n%s\n' "$DEFAULT" "$unmerged" >&2
-      echo "Merge the branch into local $DEFAULT first (bin/fm-merge-local.sh after the captain approves), or push to a fork/remote, or get the captain's explicit OK to discard, then --force." >&2
+    # Firstmate-owned, gitignored worktree files that spawn creates and adds to
+    # info/exclude. Keep this exact list in lockstep with fm-spawn.sh.
+    fm_owned_untracked='^\?\? (\.claude/settings\.local\.json|\.opencode/plugins/fm-turn-end\.js|\.fm-grok-turnend|\.fm-crew-role)$'
+    dirty=$(printf '%s\n' "$dirty_raw" | grep -vE "$fm_owned_untracked" | head -1 || true)
+    if [ -n "$dirty" ]; then
+      echo "REFUSED: task-owned worktree $WT has uncommitted changes." >&2
+      echo "uncommitted changes present" >&2
+      echo "Commit them (or get the captain's explicit OK to discard, then --force)." >&2
       return 1
     fi
-  elif [ -n "$dirty" ]; then
-    echo "REFUSED: worktree $WT has uncommitted changes." >&2
-    echo "uncommitted changes present" >&2
-    echo "Commit them (or get the captain's explicit OK to discard, then --force)." >&2
+  fi
+
+  if ! work_is_landed; then
+    echo "REFUSED: no positive landed proof for $TASK_RUN_REF against the project's authoritative base." >&2
+    if [ -n "$RECORDED_TASK_BRANCH" ] && [ "$RECORDED_TASK_BRANCH" != "$TASK_RUN_BRANCH" ]; then
+      echo "recorded branch '$RECORDED_TASK_BRANCH' conflicts with required task branch '$TASK_RUN_BRANCH'" >&2
+    elif ! git -C "$PROJ" rev-parse --quiet --verify "$TASK_RUN_REF^{commit}" >/dev/null 2>&1; then
+      echo "missing or unresolvable task branch $TASK_RUN_REF" >&2
+    else
+      echo "one or more task patches are absent from the authoritative base, no remote contains the branch, and no merged PR proves containment" >&2
+    fi
+    echo "Land or push the task branch, or get the captain's explicit OK to discard, then --force." >&2
     return 1
-  elif [ -n "$unpushed" ]; then
-    branch=${TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY:-}
-    if [ -z "$branch" ]; then
-      branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
-      TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY=$branch
-    fi
-    if ! work_is_landed "$branch"; then
-      echo "REFUSED: worktree $WT has work not on any remote and not landed." >&2
-      printf 'unpushed commits:\n%s\n' "$unpushed" >&2
-      echo "Push the branch, land its PR, or get the captain's explicit OK to discard, then --force." >&2
-      return 1
-    fi
   fi
 }
 
@@ -775,6 +802,28 @@ safe_task_worktree() {  # <project> <wt>
   proj_abs=$(canonical_existing_dir "$project") || return 1
   [ "$wt_abs" != "$proj_abs" ] || return 1
   return 0
+}
+
+# Positive ownership of the recorded pool slot. Prefer treehouse's durable lease
+# holder, falling back to the exact task branch only for older/test providers
+# whose status output has no lease row. A path leased to another task is a
+# recycled residency artifact and must never be returned or inspected as ours.
+task_owns_recorded_worktree() {
+  local status_out path holder _procs wt_abs path_abs current
+  [ -n "$WT" ] && [ -d "$WT" ] || return 1
+  safe_task_worktree "$PROJ" "$WT" || return 1
+  wt_abs=$(canonical_existing_dir "$WT") || return 1
+  status_out=$( (cd "$PROJ" && treehouse status) 2>/dev/null || true)
+  while IFS=$'\t' read -r path holder _procs; do
+    [ -n "$path" ] || continue
+    path=$(fm_lease_expand_tilde "$path")
+    path_abs=$(canonical_existing_dir "$path" 2>/dev/null || true)
+    [ "$path_abs" = "$wt_abs" ] || continue
+    [ "$holder" = "fm-$ID" ]
+    return
+  done < <(printf '%s\n' "$status_out" | fm_lease_parse_status)
+  current=$(git -C "$WT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  [ "$current" = "$TASK_RUN_BRANCH" ]
 }
 
 require_orca_worktree_path_match() {
@@ -1132,7 +1181,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] &&
   ORCA_PATH_MATCH_VERIFIED=1
 fi
 
-if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
+if [ "$FORCE" != "--force" ]; then
   if validate_worktree_teardown_safety; then
     :
   else
@@ -1161,52 +1210,46 @@ if [ "$KIND" = scout ]; then
   [ "$FORCE" = --force ] && CLOSE_DISPOSITION=forced
   CLOSE_EVIDENCE="$DATA/$ID/report.md"
 else
-  CLOSE_EVIDENCE=$(git -C "$WT" rev-parse HEAD 2>/dev/null || meta_value "$META" pr_head)
+  CLOSE_EVIDENCE=$(git -C "$PROJ" rev-parse --verify "$TASK_RUN_REF^{commit}" 2>/dev/null || printf '%s' "$DURABLE_CLOSE_EVIDENCE")
+  [ -n "$CLOSE_EVIDENCE" ] || CLOSE_EVIDENCE=$(meta_value "$META" pr_head)
   [ -n "$CLOSE_EVIDENCE" ] || CLOSE_EVIDENCE=$(git -C "$PROJ" rev-parse HEAD 2>/dev/null || true)
 fi
-if ! "$SCRIPT_DIR/fm-task-events.sh" "$ID" "$CLOSE_DISPOSITION" "$CLOSE_OUTCOME" "$CLOSE_BRANCH" "$CLOSE_MODE" "$CLOSE_EVIDENCE" >/dev/null; then
-  echo "REFUSED: durable visibility closeout failed for $ID; volatile state remains intact." >&2
-  exit 1
-fi
 
-# Best-effort: drop the local task branch so the shared repo does not accumulate refs.
+# Cleanup must finish before the terminal lifecycle event says it did. Every
+# destructive target is bound to the same task lineage/lease proof validated
+# above. A failed lease return or endpoint kill leaves meta/status intact and
+# writes no closed event, so the session-start sweeper can retry without a false
+# terminal record.
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ]; then
     require_orca_worktree_path_match_if_present "$ORCA_WORKTREE_ID" "$WT" || exit 1
     ORCA_PATH_MATCH_VERIFIED=1
   fi
-  if [ -d "$WT" ]; then
-    branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
-    if [ "$branch" != "HEAD" ]; then
-      if git -C "$WT" checkout --detach -q 2>/dev/null; then
-        git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
-      fi
+  if fm_backend_target_exists "$BACKEND" "$T" "fm-$ID"; then
+    if ! fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID"; then
+      echo "REFUSED: failed to remove runtime endpoint $T for $ID; volatile state remains intact." >&2
+      exit 1
     fi
-    rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
+    if fm_backend_target_exists "$BACKEND" "$T" "fm-$ID"; then
+      echo "REFUSED: runtime endpoint $T for $ID still exists after removal; volatile state remains intact." >&2
+      exit 1
+    fi
   fi
-  [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
-  fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
+  fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID" || {
+    echo "REFUSED: failed to remove Orca worktree $ORCA_WORKTREE_ID for $ID; volatile state remains intact." >&2
+    exit 1
+  }
 elif [ "$KIND" != secondmate ]; then
-  # Return the leased worktree to the pool. Degrade gracefully rather than
-  # aborting: a missing, stale, or non-treehouse WT (e.g. a meta written before
-  # the worktree-path fix, which recorded the launch cwd instead of the leased
-  # worktree) must not brick teardown - warn and fall through so the window is
-  # still killed and volatile state cleared.
-  if [ -n "$WT" ] && [ -d "$WT" ] && safe_task_worktree "$PROJ" "$WT"; then
-    branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
-    if [ "$branch" != "HEAD" ]; then
-      if git -C "$WT" checkout --detach -q 2>/dev/null; then
-        git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
-      fi
-    fi
+  # Return only a slot positively owned by this task. A stale meta may point at
+  # a slot now leased to another task; in that case the old task's branch proof
+  # can close its own lifecycle, but the new holder's residency is untouched.
+  if task_owns_recorded_worktree; then
     # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
     # Kills remaining processes in the worktree (including the agent), resets, returns
     # to pool. treehouse resolves the pool from the working directory, so run it from
     # the project. teardown_treehouse_return tolerates transient and stale git locks
     # left by a killed crew process; see the script header for retry and stale-lock proof.
-    # A non-lock return failure is non-fatal so a stuck pool slot never bricks
-    # the rest of teardown (window kill + volatile state clear still run).
     post_lock_cleanup_check=
     if [ "$FORCE" != "--force" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ]; then
       post_lock_cleanup_check=validate_worktree_teardown_safety
@@ -1216,19 +1259,25 @@ elif [ "$KIND" != secondmate ]; then
     return_rc=$?
     set -e
     if [ "$return_rc" -ne 0 ]; then
-      if [ "$return_rc" -eq "$TEARDOWN_TREEHOUSE_LOCK_REFUSED" ]; then
-        echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
-        exit 1
-      fi
-      echo "warning: treehouse return failed for worktree '$WT'; the pool slot may still be leased - inspect with 'treehouse status'. Continuing teardown." >&2
+      echo "REFUSED: treehouse return failed for task-owned worktree $WT; lease/window/meta cleanup is incomplete and volatile state remains intact." >&2
+      exit 1
     fi
   else
-    echo "warning: recorded worktree '${WT:-<empty>}' for $ID is missing, not a directory, or not a treehouse-managed worktree of $PROJ; skipping worktree return and continuing teardown (window will be killed and volatile state cleared)." >&2
+    echo "teardown: recorded worktree '${WT:-<empty>}' is missing, unsafe, or no longer positively owned by $ID; skipping worktree mutation." >&2
   fi
 fi
 
 if [ "$BACKEND" != orca ]; then
-  fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+  if fm_backend_target_exists "$BACKEND" "$T" "fm-$ID"; then
+    if ! fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID"; then
+      echo "REFUSED: failed to remove runtime endpoint $T for $ID; volatile state remains intact." >&2
+      exit 1
+    fi
+    if fm_backend_target_exists "$BACKEND" "$T" "fm-$ID"; then
+      echo "REFUSED: runtime endpoint $T for $ID still exists after removal; volatile state remains intact." >&2
+      exit 1
+    fi
+  fi
 fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
@@ -1240,8 +1289,27 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
-append_task_run_ledger
-rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
+
+# Serialize the durable terminal proof and volatile-record removal as one
+# finalize transaction after window/lease cleanup. A closeout failure leaves all
+# volatile records intact. The branch ref is retained until this transaction
+# succeeds, so a retry can re-prove landed containment without worktree residency.
+TEARDOWN_FINALIZE_LOCK="$STATE/.teardown-finalize.lock"
+if ! (
+  flock -x 9 || exit 1
+  "$SCRIPT_DIR/fm-task-events.sh" "$ID" "$CLOSE_DISPOSITION" "$CLOSE_OUTCOME" "$CLOSE_BRANCH" "$CLOSE_MODE" "$CLOSE_EVIDENCE" >/dev/null || exit 1
+  append_task_run_ledger
+  rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" || exit 1
+) 9> "$TEARDOWN_FINALIZE_LOCK"; then
+  echo "REFUSED: durable visibility closeout/finalize failed for $ID; volatile state remains intact." >&2
+  exit 1
+fi
+
+# Best-effort branch pruning happens only after the terminal proof and volatile
+# cleanup commit. A failure cannot invalidate the landed proof already recorded.
+if [ "$KIND" != scout ] && [ "$KIND" != secondmate ]; then
+  git -C "$PROJ" branch -D "$TASK_RUN_BRANCH" >/dev/null 2>&1 || true
+fi
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi

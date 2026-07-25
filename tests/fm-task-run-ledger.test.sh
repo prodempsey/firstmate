@@ -14,11 +14,12 @@ FAKEBIN="$TMP_ROOT/fakebin"
 mkdir -p "$HOME_ROOT/state" "$HOME_ROOT/data" "$HOME_ROOT/config" "$HOME_ROOT/projects" "$FAKEBIN"
 printf '%s\n' manual > "$HOME_ROOT/config/backlog-backend"
 fm_fake_exit0 "$FAKEBIN" tmux treehouse gh-axi gh
+printf '%s\n' '#!/usr/bin/env node' 'process.exit(0);' > "$TMP_ROOT/visibility.mjs"
 
 make_task() {
   local id=$1 include_spawned_at=${2:-yes} complete_meta=${3:-yes}
-  local project="$HOME_ROOT/projects/$id" worktree="$TMP_ROOT/$id-wt"
-  mkdir -p "$project"
+  local project="$HOME_ROOT/projects/$id" worktree="$TMP_ROOT/.treehouse/$id-pool/1/$id"
+  mkdir -p "$project" "$(dirname "$worktree")"
   git -C "$project" init -q -b main
   printf '%s\n' "$id" > "$project/README.md"
   git -C "$project" add README.md
@@ -46,6 +47,7 @@ make_task() {
 run_teardown() {
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_HOME="$HOME_ROOT" \
+  FM_VISIBILITY_CLI="$TMP_ROOT/visibility.mjs" \
   PATH="$FAKEBIN:$PATH" \
     "$TEARDOWN" "$@"
 }
@@ -166,7 +168,7 @@ test_unlanded_and_dirty_work_still_refuse_without_logging() {
   local unlanded=ledger-refuse-g7 dirty=ledger-refuse-h8 rc
   reset_ledger
   make_task "$unlanded"
-  git -C "$TMP_ROOT/$unlanded-wt" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+  git -C "$TMP_ROOT/.treehouse/$unlanded-pool/1/$unlanded" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
     commit -q --allow-empty -m unlanded
 
   set +e
@@ -179,7 +181,7 @@ test_unlanded_and_dirty_work_still_refuse_without_logging() {
   assert_absent "$HOME_ROOT/state/task-runs.jsonl" "unlanded refusal wrote a ledger record"
 
   make_task "$dirty"
-  printf '%s\n' dirty >> "$TMP_ROOT/$dirty-wt/README.md"
+  printf '%s\n' dirty >> "$TMP_ROOT/.treehouse/$dirty-pool/1/$dirty/README.md"
   set +e
   run_teardown "$dirty" > "$TMP_ROOT/$dirty.stdout" 2> "$TMP_ROOT/$dirty.stderr"
   rc=$?
