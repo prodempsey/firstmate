@@ -107,6 +107,23 @@ per closed-schema property, and one fixture per §F dedicated denial code (the f
 T.1 must-reject list). Scope boundaries and the S7-deferred pieces are recorded in
 `docs/model-economy/slice4-notes.md`.
 
+## The PreToolUse anti-inheritance guard (S5)
+
+The validator above proves a full dispatch-request document before dispatch. The
+harness-enforced backstop that makes model omission structurally impossible on the
+live Agent surface is `bin/fm-agent-dispatch-pretool.sh` (slice S5, §J): a
+PreToolUse hook (matcher `Agent`) that sees only the runtime-visible payload
+(`subagent_type`, `model`, `description`, and a nested call's `agent_type`),
+projects the governed set / pinned model / nesting flag from the same landed S3
+matrix, and denies fail-closed with the 8 pinned §J codes plus the line-39
+`FABLE_MODEL_UNGOVERNED` refinement. It carries the justification marker's
+`dispatch_request_id` against this schema's own pinned form. The guard is the
+PERMANENT replacement for the temporary ORD-227 maintenance guard; the script is
+landed and proven, but its REGISTRATION and the maintenance guard's atomic
+stand-down are a captain-gated go-live, designed (not performed) in
+`docs/model-economy/slice5-notes.md` ("Cutover"). Coverage:
+`tests/fm-agent-dispatch-pretool.test.sh` (T.3 in full).
+
 ## Maintaining this file
 
 Keep this to what almost every future session touching governed dispatch needs.
