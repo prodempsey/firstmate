@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kraken-failure-class/ledger-event/v1",
+  "title": "A failure-class ledger event (envelope)",
+  "description": "One line of docs/failure-classes/ledger.jsonl. CLOSED at every object level (additionalProperties:false), schema pinned, required complete per event kind. Detection rows are additionally proven against detection-row.schema.json by the validator. Duplicate member names at any depth are rejected on the raw bytes BEFORE this schema runs.",
+  "$defs": {
+    "provenanceItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "ref"],
+      "properties": {
+        "type": { "type": "string", "minLength": 1 },
+        "ref": { "type": "string", "minLength": 1 },
+        "note": { "type": "string" }
+      }
+    },
+    "registry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["memory_type", "scope", "confidence", "keywords"],
+      "properties": {
+        "memory_type": { "type": "string", "minLength": 1 },
+        "scope": { "type": "string", "minLength": 1 },
+        "confidence": { "type": "string", "minLength": 1 },
+        "keywords": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "detectionArray": {
+      "type": "array",
+      "items": { "type": "object" }
+    }
+  },
+  "oneOf": [
+    {
+      "title": "class-defined",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "event", "id", "name", "invariant", "cues", "fix", "provenance", "registry"],
+      "properties": {
+        "schema": { "const": "kraken-failure-class/ledger-event/v1" },
+        "event": { "const": "class-defined" },
+        "id": { "type": "string", "pattern": "^FC-[0-9]{3,}$" },
+        "name": { "type": "string", "minLength": 1 },
+        "invariant": { "type": "string", "minLength": 1 },
+        "cues": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "fix": { "type": "string", "minLength": 1 },
+        "provenance": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/provenanceItem" } },
+        "registry": { "$ref": "#/$defs/registry" },
+        "detection": { "$ref": "#/$defs/detectionArray" }
+      }
+    },
+    {
+      "title": "occurrence",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "event", "id", "provenance"],
+      "properties": {
+        "schema": { "const": "kraken-failure-class/ledger-event/v1" },
+        "event": { "const": "occurrence" },
+        "id": { "type": "string", "pattern": "^FC-[0-9]{3,}$" },
+        "provenance": { "$ref": "#/$defs/provenanceItem" }
+      }
+    },
+    {
+      "title": "class-amended",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "event", "id"],
+      "anyOf": [
+        { "required": ["detection"], "properties": { "detection": { "type": "array", "minItems": 1 } } },
+        { "required": ["cues"], "properties": { "cues": { "type": "array", "minItems": 1 } } }
+      ],
+      "properties": {
+        "schema": { "const": "kraken-failure-class/ledger-event/v1" },
+        "event": { "const": "class-amended" },
+        "id": { "type": "string", "pattern": "^FC-[0-9]{3,}$" },
+        "detection": { "$ref": "#/$defs/detectionArray" },
+        "cues": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    }
+  ]
+}

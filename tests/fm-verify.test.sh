@@ -656,6 +656,51 @@ expect_code 1 "$?" "an undeclared detection property fails the verifier closed"
 [ "$(bget "$TMP/badkey.json" '[.findings[]|select(.gate=="cue_lint" and .severity=="fail")]|length')" -ge 1 ] || fail "an undeclared detection property must emit a loud fail-closed finding on the read path"
 pass "F3: the live cue lint enforces additionalProperties:false on its read path (fail closed, one finding)"
 
+# --- R5: the binding ruling's READ-path matrix (data/seasoning-cues-g1/design-ruling.md sec 4) ----
+# Every corruption class - proven by the single authority over RAW bytes before any fold - fails the
+# cue lint CLOSED with a ledger-unreadable fail finding and NO hit. Duplicate members (jq cannot see
+# them) are the kill shot; the engine is a hard prerequisite. Each fixture hand-injects exactly one
+# mutation onto the committed ledger and asserts (verify rc=1, cue_lint fail, a fail finding, no hit).
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import jsonschema' 2>/dev/null; then
+  read_fail_closed() { # <ledger-file> <label> [extra-env]
+    local led=$1 label=$2 env=${3:-} rc
+    # shellcheck disable=SC2086
+    env $env FM_HOME="$TMP/nohome$RANDOM" FM_FAILURE_LEDGER="$led" "$VERIFY" --out "$TMP/rf.json" --brief "$BRIEF" \
+      --worktree "$RCu" --base main --sha "$USHA" --branch fm/g1 --task g1 >/dev/null 2>&1
+    rc=$?
+    [ "$rc" = 1 ] || fail "$label: verify must exit 1 (got $rc)"
+    [ "$(bget "$TMP/rf.json" '.gates[]|select(.gate=="cue_lint")|.status')" = fail ] || fail "$label: cue_lint must fail closed"
+    [ "$(bget "$TMP/rf.json" '[.findings[]|select(.gate=="cue_lint" and .severity=="fail")]|length')" -ge 1 ] || fail "$label: must emit a fail-closed finding"
+    [ "$(bget "$TMP/rf.json" '[.findings[]|select(.gate=="cue_lint" and .severity=="finding")]|length')" = 0 ] || fail "$label: must produce no hit off a refused authority"
+    pass "$label"
+  }
+  inject() { cp "$LEDGER" "$1"; printf '%s\n' "$2" >> "$1"; }   # <dest> <extra-line>
+  amline() { printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-amended","id":"FC-001","detection":[%s]}' "$1"; }
+  L="$TMP/rd-dup1.jsonl"; inject "$L" "$(amline '{"engine":"awk-ere","engine":"regex-pcre","pattern":"x","cue_ref":"c"}')"; read_fail_closed "$L" "R5 read: DUP engine top-level (first-valid/last-invalid)"
+  L="$TMP/rd-dup2.jsonl"; inject "$L" "$(amline '{"engine":"regex-pcre","engine":"awk-ere","pattern":"x","cue_ref":"c"}')"; read_fail_closed "$L" "R5 read: DUP engine top-level (first-invalid/last-valid)"
+  L="$TMP/rd-dupp.jsonl"; inject "$L" "$(amline '{"engine":"awk-ere","pattern":"a","pattern":"b","cue_ref":"c"}')"; read_fail_closed "$L" "R5 read: DUP pattern on a detection row"
+  L="$TMP/rd-envdup.jsonl"; inject "$L" '{"schema":"kraken-failure-class/ledger-event/v1","event":"occurrence","id":"FC-001","id":"FC-002","provenance":{"type":"q","ref":"r"}}'; read_fail_closed "$L" "R5 read: DUP member on the ledger envelope"
+  L="$TMP/rd-nestdup.jsonl"; inject "$L" '{"schema":"kraken-failure-class/ledger-event/v1","event":"occurrence","id":"FC-001","provenance":{"type":"q","ref":"r","ref":"r2"}}'; read_fail_closed "$L" "R5 read: DUP member nested in a value object"
+  L="$TMP/rd-dupid.jsonl"; cp "$LEDGER" "$L"; grep '"event":"class-defined".*"id":"FC-001"' "$LEDGER" | head -1 >> "$L"; read_fail_closed "$L" "R5 read: duplicate class id"
+  L="$TMP/rd-bom.jsonl"; printf '\xef\xbb\xbf' > "$L"; cat "$LEDGER" >> "$L"; read_fail_closed "$L" "R5 read: leading UTF-8 BOM"
+  L="$TMP/rd-ctl.jsonl"; cp "$LEDGER" "$L"; printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"occurrence","id":"FC-001","provenance":{"type":"q","ref":"r"}}\x07\n' >> "$L"; read_fail_closed "$L" "R5 read: control byte in a line"
+  L="$TMP/rd-trail.jsonl"; cp "$LEDGER" "$L"; printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"occurrence","id":"FC-001","provenance":{"type":"q","ref":"r"}} garbage\n' >> "$L"; read_fail_closed "$L" "R5 read: trailing garbage after a valid object"
+  read_fail_closed "$TMP/rd-missing-does-not-exist.jsonl" "R5 read: a MISSING ledger fails closed (distinct from empty)"
+  read_fail_closed "$LEDGER" "R5 read: python3 absent fails closed" "FM_CUE_SIMULATE_MISSING=python3"
+  read_fail_closed "$LEDGER" "R5 read: jsonschema absent fails closed" "FM_CUE_SIMULATE_MISSING=jsonschema"
+  # An EMPTY-but-present ledger is valid-empty on the read path: no cues to lint, gate passes, no hit.
+  EMPTYL="$TMP/rd-empty.jsonl"; : > "$EMPTYL"
+  FM_HOME="$TMP/nohomeE" FM_FAILURE_LEDGER="$EMPTYL" "$VERIFY" --out "$TMP/rfe.json" --brief "$BRIEF" \
+    --worktree "$RCu" --base main --sha "$USHA" --branch fm/g1 --task g1 >/dev/null 2>&1
+  if [ "$(bget "$TMP/rfe.json" '.gates[]|select(.gate=="cue_lint")|.status')" = pass ]; then
+    pass "R5 read: an empty-but-present ledger is valid-empty (cue_lint passes, no hit)"
+  else
+    fail "an empty-but-present ledger must be valid-empty on the read path"
+  fi
+else
+  echo "SKIP fm-verify: python3+jsonschema absent - read-path matrix not exercised" >&2
+fi
+
 # --- FC-007: EVERY refusal invalidates the prior pass in BOTH artifacts --------
 seed_pass() { # <out>  - seed an authoritative pass bundle + pass summary
   jq -n '{schema:"firstmate/verify-bundle/1",verdict:"pass"}' > "$1"

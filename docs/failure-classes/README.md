@@ -41,14 +41,26 @@ The `class-defined` event carries these fields.
 The `occurrence` event is `{id, provenance:{type, ref, note?}}`: one more citation for `id`.
 The `class-amended` event is `{id, detection?, cues?}`: it appends `detection` tripwires and/or natural-language `cues` onto an existing `id`, folded (concatenated) onto the class record at read.
 
-The writer refuses a duplicate id, an occurrence or amendment against an unknown id, an amendment that adds nothing, and any event missing provenance, so the ledger cannot drift into an unprovenanced or self-contradictory state.
-Detection-row validity is the job of ONE shared authority, `bin/fm-cue-lib.sh`'s `fm_validate_cue_row`, which both the sanctioned writer (`add`/`ensure`/`amend`/`validate`) and the live reader (`bin/fm-verify.sh`'s cue lint) call before they ever write, fold, or execute a row.
-In one atomic pass it proves a row (a) is a JSON object, (b) conforms to the closed schema (`additionalProperties:false`) - its key set is exactly `{engine, pattern, cue_ref}` with no undeclared key, `engine` in the supported set, non-empty string `pattern` and `cue_ref` - and (c) whose `pattern` actually COMPILES under its engine (an ERE is probed with `grep -E`).
-Because both paths prove the same thing, an unsupported engine or a syntactically invalid ERE can never be written, and can never be silently skipped to advisory or crash `awk` into an empty hit stream on the read path: any failure is one loud fail-closed finding.
-A malformed line, an unknown-schema line, or an occurrence/amendment for an undefined id makes `list` and `validate` fail closed rather than fold silently.
-`bin/fm-verify.sh`'s cue lint additionally folds the whole ledger through the sanctioned writer once, up front, and fails its gate closed on any parse/fold failure - a broken authority input is one loud finding, never a silent pass.
+### Validation authority (committed JSON Schema + python3, hard prerequisites)
 
-Every mutation (`add`, `ensure`, `bump`, `amend`) serializes its whole read-check-append under a portable, abandoned-owner-aware lock (the fleet's `fm-wake-lib.sh` discipline) co-located with the ledger, so two concurrent sanctioned writers can never both pass the duplicate check and append the same id.
+Per the binding ruling (`data/seasoning-cues-g1/design-ruling.md`; precedents me-s3-profiles and dj-orders-s2), validation is NOT a per-row shell/jq predicate.
+It is a single atomic fail-closed pass over the RAW ledger bytes, owned by ONE authority, `bin/fm-cue-validate.sh` (`python3` + `jsonschema` Draft 2020-12), against two committed closed schemas under `schema/`: `ledger-event.schema.json` (the event envelope, per kind) and `detection-row.schema.json` (the `{engine, pattern, cue_ref}` row).
+Both are `additionalProperties:false` and total, so a field the schema does not positively admit fails closed - `engine` is an `enum`, `pattern`/`cue_ref` non-empty strings.
+
+**jq is disqualified as the validation parser**: it collapses a duplicate JSON member name (last-wins) before any filter runs, so it structurally cannot detect a duplicate `engine`/`pattern`/`cue_ref` or a duplicate envelope key.
+Duplicate members are rejected on the RAW bytes at ANY depth by python's `object_pairs_hook`, BEFORE any normalizing parse.
+The authority proves, in one pass: every line is one JSON object (no BOM, control byte, blank line, or trailing garbage); no duplicate member at any depth; the event schema; every detection row's schema AND that its pattern actually COMPILES under its engine (an ERE is probed with `grep -E`); no duplicate class id; and a coherent fold.
+It returns EITHER the proven folded snapshot OR one loud refusal (`CUE_VALIDATOR_UNAVAILABLE` | `CUE_LEDGER_MISSING` | `CUE_LEDGER_INVALID`).
+If `python3` or `jsonschema` is absent it refuses - never a weaker check, never a pass.
+
+**One shared entrypoint, no reimplementation.** Every consumer proves the same whole-document validity through `bin/fm-cue-lib.sh`'s `fm_cue_ledger_prove` and executes ONLY rows from the proven snapshot: the sanctioned writer (`add`/`ensure`/`amend`/`bump`/`register`/`validate`/`list`/`show`/`refinements`) and the live reader (`bin/fm-verify.sh`'s `cue_lint`).
+No consumer re-parses the ledger; jq only shapes already-proven data.
+A missing ledger is a distinct explicit refusal (never valid-empty); an empty-but-present ledger is valid-empty (no cues to lint).
+
+**The write is a validate-then-atomic-rename transaction.** Every writer, inside the ledger lock, first proves the ENTIRE existing ledger valid - as a standalone call whose non-zero return is independently fatal, never on the left of a pipe or inside an `if` condition - then stages existing + the new line into a temp file, proves the whole result, and only then atomically renames it into place.
+Any failure leaves the original byte-identical; the ledger is never appended to in place.
+A raw `--detection` argument is proven on its raw bytes (`fm_cue_check_raw_row`) before jq can shape it, so a duplicate member can never be collapsed into a valid-looking row and written.
+
 There is no destructive path: `add` refuses a duplicate, `ensure` skips an existing id, `bump` and `amend` only append, and the seed builder never deletes or rewrites the ledger, so no supported command can drop an appended occurrence or amendment.
 
 A class carries a `detection` tripwire only where a **sound** single-line ERE exists - one that matches the failure shape without false-positiving on legitimate code (verify each candidate against the tree before seeding it). `FC-003` (digest/verification not covering the whole document) deliberately carries none: its manifestations - a projection-digest, or a per-field-equality ladder - are indistinguishable by syntax alone from legitimate uses, so it stays advisory rather than enforce an unsound check (which would itself be an `FC-001` move).

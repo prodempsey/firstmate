@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kraken-failure-class/detection-row/v1",
+  "title": "A failure-class detection (cue) row",
+  "description": "One machine-readable tripwire. CLOSED: the key set is exactly {engine, pattern, cue_ref}; any undeclared key fails. engine is an enum over the supported set; pattern and cue_ref are non-empty strings. Pattern compilation under its engine is a separate defence-in-depth probe (grep -E), applied by the validator AFTER this schema conformance.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["engine", "pattern", "cue_ref"],
+  "properties": {
+    "engine": { "type": "string", "enum": ["awk-ere"] },
+    "pattern": { "type": "string", "minLength": 1 },
+    "cue_ref": { "type": "string", "minLength": 1 }
+  }
+}

@@ -330,4 +330,73 @@ assert_contains "$empty" "no classes at/over the refinement threshold" "refineme
 if FM_FC_REFINE_THRESHOLD=bogus FM_FC_LEDGER="$E4" "$FC" refinements --json | jq -e '.threshold == 3' >/dev/null; then
   pass "an invalid FM_FC_REFINE_THRESHOLD falls back to the default"; else fail "invalid threshold did not fall back to default"; fi
 
+# ============================================================================
+# The binding ruling's WRITE-path matrix (data/seasoning-cues-g1/design-ruling.md sec 4): every
+# writer proves the ENTIRE existing ledger valid before any append, refusing byte-identically on
+# failure; the round-5 canaries APPEND-to-malformed and DUP-engine-toplevel both reject; the engine
+# is a hard prerequisite. Each mutation asserts BOTH rc!=0 AND the ledger byte-identical.
+# ============================================================================
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import jsonschema' 2>/dev/null; then
+  VALID_LINE='{"schema":"kraken-failure-class/ledger-event/v1","event":"class-defined","id":"FC-001","name":"n","invariant":"i","cues":["c"],"fix":"f","provenance":[{"type":"qa","ref":"r"}],"registry":{"memory_type":"procedural","scope":"fleet","confidence":"guarded","keywords":["k"]}}'
+  # refuses_byte_identical <ledger-file> <label> -- run every writer verb; each must exit !=0 and
+  # leave the ledger byte-identical. (register reads the ledger to distil it; it too must refuse.)
+  refuses_byte_identical() {
+    local led=$1 label=$2 before ok=1
+    before=$(md5sum "$led" | cut -d' ' -f1)
+    _try() {  # each writer verb must refuse (a success is a contract failure) and never mutate the ledger
+      if MEM_CLI="true" FM_FC_LEDGER="$led" "$FC" "$@" >/dev/null 2>&1; then ok=0; fi
+      [ "$before" = "$(md5sum "$led" | cut -d' ' -f1)" ] || ok=0
+    }
+    _try add --id FC-050 --name n --invariant i --fix f --cue c --provenance qa:d#1
+    _try ensure --id FC-050 --name n --invariant i --fix f --cue c --provenance qa:d#1
+    _try amend FC-001 --detection '{"engine":"awk-ere","pattern":"x","cue_ref":"c"}'
+    _try bump FC-001 --provenance qa:d#9
+    _try register --id FC-001
+    if [ "$ok" = 1 ]; then pass "$label: every writer verb refuses, ledger byte-identical"
+    else fail "$label: a writer verb either succeeded or mutated the ledger"; fi
+  }
+  # CANARY APPEND-to-malformed: first line {broken-json, a valid line second.
+  MAL="$TMP_ROOT/mal-append.jsonl"; { printf '{broken-json\n'; printf '%s\n' "$VALID_LINE"; } > "$MAL"
+  refuses_byte_identical "$MAL" "APPEND-to-malformed canary"
+  # A BOM'd and a control-byte'd existing ledger are equally un-appendable.
+  BOMED="$TMP_ROOT/mal-bom.jsonl"; printf '\xef\xbb\xbf%s\n' "$VALID_LINE" > "$BOMED"
+  refuses_byte_identical "$BOMED" "append to a BOM'd ledger"
+  CTLED="$TMP_ROOT/mal-ctl.jsonl"; printf '%s\x07\n' "$VALID_LINE" > "$CTLED"
+  refuses_byte_identical "$CTLED" "append to a control-byte ledger"
+  # A hand-injected duplicate class id makes the whole ledger invalid -> every verb refuses.
+  DUPID="$TMP_ROOT/mal-dupid.jsonl"; printf '%s\n%s\n' "$VALID_LINE" "$VALID_LINE" > "$DUPID"
+  refuses_byte_identical "$DUPID" "append to a duplicate-class-id ledger"
+
+  # CANARY DUP-engine-toplevel via the writer, BOTH orderings: a duplicate member must never be
+  # jq-collapsed into a valid row and written. The ledger must not be created.
+  for row in \
+    '{"engine":"awk-ere","engine":"regex-pcre","pattern":"x","cue_ref":"c"}' \
+    '{"engine":"regex-pcre","engine":"awk-ere","pattern":"x","cue_ref":"c"}' \
+    '{"engine":"awk-ere","pattern":"a","pattern":"b","cue_ref":"c"}'; do
+    DL="$TMP_ROOT/dupwrite.$RANDOM.jsonl"
+    if FM_FC_LEDGER="$DL" "$FC" add --id FC-060 --name n --invariant i --fix f --cue c --provenance qa:d#1 --detection "$row" >/dev/null 2>&1; then
+      fail "a duplicate-member detection was written via add: $row"
+    elif [ ! -f "$DL" ]; then pass "DUP-engine canary via add rejects (ledger not created): $row"
+    else fail "add refused but left a ledger: $row"; fi
+  done
+  # DUP via amend against an existing valid class must also reject byte-identical.
+  AL="$TMP_ROOT/dupamend.jsonl"; FM_FC_LEDGER="$AL" "$FC" add --id FC-001 --name n --invariant i --fix f --cue c --provenance qa:d#1 >/dev/null
+  b=$(md5sum "$AL"|cut -d' ' -f1)
+  if FM_FC_LEDGER="$AL" "$FC" amend FC-001 --detection '{"engine":"regex-pcre","engine":"awk-ere","pattern":"x","cue_ref":"c"}' >/dev/null 2>&1; then
+    fail "a duplicate-member detection was written via amend"
+  elif [ "$b" = "$(md5sum "$AL"|cut -d' ' -f1)" ]; then pass "DUP-engine canary via amend rejects, ledger byte-identical"
+  else fail "amend refused but mutated the ledger"; fi
+
+  # Engine is a HARD prerequisite on the write path too: absent -> CUE_VALIDATOR_UNAVAILABLE, refuse.
+  EL="$TMP_ROOT/engine-absent.jsonl"; FM_FC_LEDGER="$EL" "$FC" add --id FC-001 --name n --invariant i --fix f --cue c --provenance qa:d#1 >/dev/null
+  b=$(md5sum "$EL"|cut -d' ' -f1)
+  if FM_CUE_SIMULATE_MISSING=python3 FM_FC_LEDGER="$EL" "$FC" bump FC-001 --provenance qa:d#2 >/dev/null 2>"$TMP_ROOT/ea.err"; then
+    fail "engine-absent write must refuse"
+  elif [ "$b" = "$(md5sum "$EL"|cut -d' ' -f1)" ] && grep -q CUE_VALIDATOR_UNAVAILABLE "$TMP_ROOT/ea.err"; then
+    pass "engine absent on the write path -> CUE_VALIDATOR_UNAVAILABLE, ledger byte-identical"
+  else fail "engine-absent write must refuse byte-identically with CUE_VALIDATOR_UNAVAILABLE"; fi
+else
+  echo "SKIP fm-failure-class: python3+jsonschema absent - write-path matrix not exercised" >&2
+fi
+
 pass "fm-failure-class: all checks passed"

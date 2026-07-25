@@ -19,10 +19,13 @@
 #     without rewriting its durable class-defined line.
 # `list`/`show` fold the log; no verb ever rewrites or deletes a prior line.
 #
-# This script is the SANCTIONED WRITER. It refuses a duplicate id, an occurrence or
-# amendment against an unknown id, an amendment that adds nothing, and any event
-# missing provenance, so the ledger cannot drift into an unprovenanced or
-# self-contradictory state.
+# This script is the SANCTIONED WRITER, but it is NOT the validation authority. Validity is
+# proven by ONE shared authority - bin/fm-cue-validate.sh (python3 + jsonschema over the RAW
+# bytes; jq disqualified because it collapses duplicate member names) - reached through
+# bin/fm-cue-lib.sh's fm_cue_ledger_prove. Every read here proves the whole ledger through it;
+# every write first proves the ENTIRE existing ledger (a standalone call, never swallowed by a
+# pipe/if), then appends the new event via validate-then-atomic-rename, so an invalid ledger is
+# refused byte-identically and is never appended to in place (design-ruling.md).
 #
 # Retrieval is delegated: `register` distils each class into the LIVE memory
 # registry through the activated propose/activate flow (mem propose | mem activate)
@@ -114,42 +117,21 @@ trap release_ledger_lock EXIT
 lock_ledger() { mkdir -p "$(dirname "$LEDGER")"; fm_lock_acquire_wait "$LEDGER_LOCK"; FM_FC_LOCK_HELD="$LEDGER_LOCK"; }
 unlock_ledger() { fm_lock_release "$LEDGER_LOCK"; FM_FC_LOCK_HELD=""; }
 
-# ---- fold -----------------------------------------------------------------
-# Fold the append-only event log into one record per class id. class-defined sets
-# the base fields; every occurrence event appends its provenance. occurrence_count
-# is the length of the merged provenance array. A malformed line, an unknown-schema
-# line, an occurrence against an undefined id, or a duplicate class-defined id is a
-# hard error, so a corrupt ledger fails closed rather than folding silently.
-fold() {
-  [ -f "$LEDGER" ] || { echo '[]'; return 0; }
-  jq -s '
-    reduce .[] as $e ({defs:{}, order:[]};
-      ($e.schema // "") as $s
-      | if $s != "'"$SCHEMA"'" then error("bad schema on event: \($e)")
-        elif $e.event == "class-defined" then
-          if (.defs[$e.id] != null) then error("duplicate class id: \($e.id)")
-          else .defs[$e.id] = ($e | del(.event)) | .order += [$e.id] end
-        elif $e.event == "occurrence" then
-          if (.defs[$e.id] == null) then error("occurrence for unknown class id: \($e.id)")
-          elif ($e.provenance | type) != "object" then error("occurrence missing provenance: \($e.id)")
-          else .defs[$e.id].provenance += [$e.provenance] end
-        elif $e.event == "class-amended" then
-          if (.defs[$e.id] == null) then error("amendment for unknown class id: \($e.id)")
-          elif ((($e.detection // []) | length) == 0) and ((($e.cues // []) | length) == 0)
-            then error("amendment adds nothing (no detection, no cues): \($e.id)")
-          else .defs[$e.id] |= (
-              (if (($e.detection // []) | length) > 0 then .detection = ((.detection // []) + $e.detection) else . end)
-            | (if (($e.cues // []) | length) > 0 then .cues = ((.cues // []) + $e.cues) else . end)
-          ) end
-        else error("unknown event: \($e.event)") end)
-    | [ .order[] as $id | .defs[$id] | .occurrence_count = (.provenance | length) ]
-  ' "$LEDGER"
-}
-
+# ---- the proven snapshot (single entrypoint) ------------------------------
+# Every read of the ledger goes through fm_cue_ledger_prove (bin/fm-cue-lib.sh ->
+# bin/fm-cue-validate.sh): one atomic fail-closed pass over the RAW bytes (python3 + jsonschema;
+# raw duplicate-member rejection jq cannot do) that returns the proven folded snapshot. This is the
+# ONLY validation authority; no verb here re-parses the ledger with jq. A missing or invalid ledger
+# is an explicit, loud refusal - never a silent valid-empty fold. jq below only shapes the
+# already-proven snapshot, which the ruling explicitly permits.
 fold_or_die() {
-  local out
-  out=$(fold) || die "ledger is corrupt (see error above): $LEDGER"
-  printf '%s' "$out"
+  local out err marker detail
+  err=$(mktemp "${TMPDIR:-/tmp}/fm-fc-prove.XXXXXX") || die "cannot create temp file"
+  if out=$(fm_cue_ledger_prove "$LEDGER" 2>"$err"); then
+    rm -f "$err"; printf '%s' "$out"; return 0
+  fi
+  marker=$(sed -n 1p "$err" 2>/dev/null); detail=$(sed -n 2p "$err" 2>/dev/null); rm -f "$err"
+  die "ledger refused (${marker:-refusal}): ${detail:-$LEDGER}"
 }
 
 # ---- provenance parsing ---------------------------------------------------
@@ -170,29 +152,28 @@ prov_json() {
   fi
 }
 
+# ---- transactional append (validate-then-atomic-rename) -------------------
+# Append <event-json> as one new line WITHOUT ever appending in place (the ruling's MUST NOT #6):
+# stage existing + the new line into a temp file in the ledger's own directory, prove the WHOLE
+# resulting ledger valid through the single authority, and only then atomically rename it into
+# place. Any failure - a staging error or a refusal - leaves the original ledger byte-identical.
+# Callers hold the ledger lock and have already proven the existing ledger (the FC-002 precondition).
 append_event() { # <compact-json-object>
-  mkdir -p "$(dirname "$LEDGER")"
-  printf '%s\n' "$1" >> "$LEDGER"
-}
-
-# ---- detection schema -----------------------------------------------------
-# 0 iff every element of the detection JSON array passes fm_validate_cue_row (bin/fm-cue-lib.sh):
-# a JSON object conforming to the closed schema (engine in FM_CUE_ENGINES, non-empty string
-# pattern, non-empty string cue_ref) WHOSE PATTERN ACTUALLY COMPILES under its engine. On the
-# first failure it prints that row's reason to stderr and returns 1. This is the ONE check the
-# write paths (`add`/`ensure`, `amend`) and `validate` share with the live reader, so a row
-# that would be inert - or crash the engine - in the live cue lint can never be written.
-detection_array_conforms() { # <detection-array-json>
-  local n i row
-  n=$(printf '%s' "$1" | jq 'if type=="array" then length else -1 end' 2>/dev/null) || n=-1
-  [ "$n" -ge 0 ] 2>/dev/null || { echo "detection is not a JSON array" >&2; return 1; }
-  i=0
-  while [ "$i" -lt "$n" ]; do
-    row=$(printf '%s' "$1" | jq -c ".[$i]" 2>/dev/null)
-    fm_validate_cue_row "$row" || return 1
-    i=$((i + 1))
-  done
-  return 0
+  local event=$1 dir tmp err marker detail
+  dir=$(dirname "$LEDGER"); mkdir -p "$dir"
+  tmp=$(mktemp "$LEDGER.wip.XXXXXX") || die "cannot create temp ledger in $dir"
+  err="$tmp.err"
+  if [ -f "$LEDGER" ]; then
+    cat "$LEDGER" > "$tmp" || { rm -f "$tmp" "$err"; die "cannot stage the existing ledger"; }
+  fi
+  printf '%s\n' "$event" >> "$tmp" || { rm -f "$tmp" "$err"; die "cannot stage the new event"; }
+  if ! "$FM_CUE_VALIDATOR" prove "$tmp" >/dev/null 2>"$err"; then
+    marker=$(sed -n 1p "$err" 2>/dev/null); detail=$(sed -n 2p "$err" 2>/dev/null)
+    rm -f "$tmp" "$err"
+    die "refusing to write: the resulting ledger would be invalid (${marker:-refusal}): ${detail:-}"
+  fi
+  rm -f "$err"
+  mv -f "$tmp" "$LEDGER" || { rm -f "$tmp"; die "atomic rename into place failed for $LEDGER"; }
 }
 
 # ---- stage E: captain-gated refinement ------------------------------------
@@ -253,7 +234,8 @@ cmd_show() {
   local id=${1:-}; shift || true
   [ -n "$id" ] || die "show requires a class id"
   local json=0; [ "${1:-}" = "--json" ] && json=1
-  local rec; rec=$(fold_or_die | jq -c --arg id "$id" '.[] | select(.id==$id)')
+  local snap rec; snap=$(fold_or_die)
+  rec=$(printf '%s' "$snap" | jq -c --arg id "$id" '.[] | select(.id==$id)')
   [ -n "$rec" ] || die "class not found: $id"
   if [ "$json" = 1 ]; then printf '%s\n' "$rec" | jq .; return 0; fi
   printf '%s\n' "$rec" | jq -r '
@@ -275,37 +257,13 @@ cmd_show() {
 }
 
 cmd_validate() {
-  local folded; folded=$(fold_or_die)
-  local n; n=$(printf '%s\n' "$folded" | jq 'length')
-  # Every class must carry a non-empty name/invariant/fix, at least one cue, and at
-  # least one provenance citation. A class that fails any of these is a defect in
-  # the ledger, not a soft warning.
-  local bad
-  bad=$(printf '%s\n' "$folded" | jq -r '.[] | select(
-      (.name|type)!="string" or (.name|length)==0 or
-      (.invariant|type)!="string" or (.invariant|length)==0 or
-      (.fix|type)!="string" or (.fix|length)==0 or
-      (.cues|type)!="array" or (.cues|length)==0 or
-      (.provenance|type)!="array" or (.provenance|length)==0 or
-      (.id|test("^FC-[0-9]{3,}$")|not)
-    ) | .id')
-  [ -z "$bad" ] || die "invalid class record(s): $bad"
-  # A class MAY carry no detection (advisory-only), but every detection row it does carry must
-  # pass the ONE shared validator (fm_validate_cue_row): the closed schema AND a pattern that
-  # actually compiles under its engine, so a row that reads as valid can never be silently
-  # inert - or crash the engine - in the live cue lint (bin/fm-verify.sh).
-  local det_bad
-  det_bad=$(
-    printf '%s\n' "$folded" | jq -r '.[].id' | while IFS= read -r cid; do
-      [ -n "$cid" ] || continue
-      printf '%s\n' "$folded" | jq -c --arg id "$cid" '.[]|select(.id==$id)|(.detection//[])[]' \
-      | while IFS= read -r row; do
-          [ -n "$row" ] || continue
-          fm_validate_cue_row "$row" 2>/dev/null || printf '%s\n' "$cid"
-        done
-    done | sort -u | tr '\n' ' ' | sed 's/ *$//'
-  )
-  [ -z "$det_bad" ] || die "class record(s) with an invalid detection row (bad engine, empty pattern/cue_ref, or a pattern that does not compile): $det_bad"
+  # The single entrypoint IS the validation: it proves the whole ledger against the committed
+  # closed schemas (name/invariant/fix/cues/provenance/id/registry, detection rows, no duplicate
+  # members at any depth, no duplicate class ids, fold coherence) or refuses. Conformance to the
+  # committed schema is the enumeration; there is no separate shell/jq re-check to drift.
+  local folded n
+  folded=$(fold_or_die)
+  n=$(printf '%s' "$folded" | jq 'length')
   echo "FAILURE_CLASSES_OK=$n ($LEDGER)"
 }
 
@@ -352,16 +310,17 @@ build_class_event() {
   local slug; slug=$(echo "$name" | tr '[:upper:] /' '[:lower:]--' | tr -cd 'a-z0-9-' | tr -s '-' | cut -c1-40 | sed 's/-*$//')
   kw_json=$(printf '%s\n' "$MARKER_KEYWORD" "$id" "$slug" "${keywords[@]:-}" \
     | jq -R 'select(length>0)' | jq -s 'unique_by(.)')
-  # Optional machine-readable detection: each --detection is one JSON object
-  # ({engine, pattern, cue_ref, ...}) that graduates a natural-language cue into an
-  # executable check a verifier can run live from this ledger. The field is emitted
-  # only when supplied, so classes without detection stay byte-identical.
-  local dets_json="[]"
+  # Optional machine-readable detection. Each raw --detection is proven through the single authority
+  # on its RAW bytes FIRST (fm_cue_check_raw_row), so a duplicate member cannot be jq-collapsed into a
+  # valid-looking row before the proof sees it; only then is it shaped for the event. The whole
+  # resulting ledger is proven again at write time (validate-then-atomic-rename).
+  local dets_json="[]" d
   if [ "${#dets[@]}" -gt 0 ]; then
+    for d in "${dets[@]}"; do
+      fm_cue_check_raw_row "$d" || die "refusing: an invalid --detection (see the reason above)"
+    done
     dets_json=$(printf '%s\n' "${dets[@]}" | jq -c . 2>/dev/null | jq -sc .) \
       || die "each --detection must be one valid JSON object"
-    detection_array_conforms "$dets_json" \
-      || die "each --detection must have EXACTLY the keys {engine, pattern, cue_ref}, engine in the supported set ($FM_CUE_ENGINES), and a pattern that compiles"
   fi
   FC_EVENT=$(jq -cn \
     --arg schema "$SCHEMA" --arg id "$id" --arg name "$name" \
@@ -382,12 +341,22 @@ build_class_event() {
 # read-check-append runs inside one lock so two concurrent writers can never both
 # pass the check and append the same id.
 commit_class() {
-  local mode=$1 exists
+  local mode=$1 exists snap
   lock_ledger
+  # FC-002 whole-document precondition: prove the ENTIRE existing ledger valid BEFORE any append.
+  # Captured into a variable; its non-zero return is independently fatal via `|| { ...; exit 1; }`,
+  # NEVER on the left of a pipe, inside an `if` condition, or under `set +e`, so a corrupt ledger
+  # can never fall through to an append (the r4 F1 fall-through this replaces). A missing ledger is
+  # the create case: existing snapshot is empty.
+  snap='[]'
+  if [ -f "$LEDGER" ]; then
+    snap=$(fold_or_die) || { unlock_ledger; exit 1; }
+  fi
   exists=0
-  if [ -f "$LEDGER" ] && fold_or_die | jq -e --arg id "$FC_ID" 'any(.[]; .id==$id)' >/dev/null; then exists=1; fi
+  if printf '%s' "$snap" | jq -e --arg id "$FC_ID" 'any(.[]; .id==$id)' >/dev/null; then exists=1; fi
   if [ "$exists" = 1 ]; then
     if [ "$mode" = strict ]; then
+      unlock_ledger
       die "class id already defined: $FC_ID (append-only; use bump to add provenance)"
     fi
     unlock_ledger
@@ -429,15 +398,19 @@ cmd_bump() {
   local event
   event=$(jq -cn --arg schema "$SCHEMA" --arg id "$id" --argjson prov "$pj" \
     '{schema:$schema, event:"occurrence", id:$id, provenance:$prov}')
-  # The existence check and the occurrence append run under one lock, against one
-  # serialized generation, so bump can never append against a stale read.
+  # The whole-document precondition, existence check, and append run under one lock, against one
+  # serialized proven generation, so bump can never append against a stale or corrupt read. The
+  # precondition is captured standalone (`|| { ...; exit 1; }`), never on the left of a pipe.
+  local snap rec
   lock_ledger
-  fold_or_die | jq -e --arg id "$id" 'any(.[]; .id==$id)' >/dev/null \
-    || die "cannot bump unknown class id: $id (define it with add first)"
+  snap=$(fold_or_die) || { unlock_ledger; exit 1; }
+  printf '%s' "$snap" | jq -e --arg id "$id" 'any(.[]; .id==$id)' >/dev/null \
+    || { unlock_ledger; die "cannot bump unknown class id: $id (define it with add first)"; }
   append_event "$event"
   # Read the post-append record inside the same serialized generation so the count -
   # and therefore the crossing test - reflects exactly this bump, never a stale read.
-  local rec; rec=$(fold_or_die | jq -c --arg id "$id" '.[] | select(.id==$id)')
+  snap=$(fold_or_die) || { unlock_ledger; exit 1; }
+  rec=$(printf '%s' "$snap" | jq -c --arg id "$id" '.[] | select(.id==$id)')
   unlock_ledger
   local count; count=$(printf '%s' "$rec" | jq '.occurrence_count')
   echo "bumped $id -> occurrence_count=$count"
@@ -473,15 +446,16 @@ cmd_amend() {
   done
   [ "${#dets[@]}" -gt 0 ] || [ "${#cues[@]}" -gt 0 ] \
     || die "amend requires at least one --detection or --cue"
-  local dets_json="[]" cues_json="[]"
+  # Each raw --detection is proven through the single authority on its RAW bytes FIRST, so a duplicate
+  # member cannot be jq-collapsed into a valid-looking row before the proof; the whole resulting
+  # ledger is proven again by append_event (validate-then-atomic-rename).
+  local dets_json="[]" cues_json="[]" d
   if [ "${#dets[@]}" -gt 0 ]; then
+    for d in "${dets[@]}"; do
+      fm_cue_check_raw_row "$d" || die "refusing: an invalid --detection (see the reason above)"
+    done
     dets_json=$(printf '%s\n' "${dets[@]}" | jq -c . 2>/dev/null | jq -sc .) \
       || die "each --detection must be one valid JSON object"
-    # Fail closed on a detection that does not conform to the closed detection schema: a
-    # silently-inert tripwire (unsupported engine, empty pattern, or missing cue_ref) would
-    # let a class read as mechanically linted while enforcing nothing.
-    detection_array_conforms "$dets_json" \
-      || die "each --detection must have EXACTLY the keys {engine, pattern, cue_ref}, engine in the supported set ($FM_CUE_ENGINES), and a pattern that compiles"
   fi
   if [ "${#cues[@]}" -gt 0 ]; then
     cues_json=$(printf '%s\n' "${cues[@]}" | jq -R . | jq -s .)
@@ -492,10 +466,12 @@ cmd_amend() {
     '{schema:$schema, event:"class-amended", id:$id}
      + (if ($dets|length) > 0 then {detection:$dets} else {} end)
      + (if ($cues|length) > 0 then {cues:$cues} else {} end)')
+  local snap
   lock_ledger
-  # The id must already be defined; fold sees class-defined AND prior amendments, all under
-  # one serialized generation so the check cannot race an interleaved writer.
-  fold_or_die | jq -e --arg id "$id" 'any(.[]; .id==$id)' >/dev/null \
+  # Whole-document precondition captured standalone (never left-of-pipe): prove the entire existing
+  # ledger, then require the id already be defined against that proven snapshot.
+  snap=$(fold_or_die) || { unlock_ledger; exit 1; }
+  printf '%s' "$snap" | jq -e --arg id "$id" 'any(.[]; .id==$id)' >/dev/null \
     || { unlock_ledger; die "cannot amend unknown class id: $id (define it with add first)"; }
   append_event "$event"
   unlock_ledger
@@ -509,8 +485,9 @@ cmd_amend() {
 cmd_refinements() {
   local json=0; [ "${1:-}" = "--json" ] && json=1
   local threshold; threshold=$(refine_threshold)
-  local due
-  due=$(fold_or_die | jq -c --argjson t "$threshold" '[ .[] | select(.occurrence_count >= $t) ]')
+  local snap due
+  snap=$(fold_or_die)
+  due=$(printf '%s' "$snap" | jq -c --argjson t "$threshold" '[ .[] | select(.occurrence_count >= $t) ]')
   if [ "$json" = 1 ]; then
     printf '%s\n' "$due" | jq --argjson t "$threshold" '{threshold:$t, classes:.}'
     return 0

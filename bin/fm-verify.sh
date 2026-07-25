@@ -768,28 +768,27 @@ fi
 # built-in fallback table - a class the ledger gives no detection for is reported
 # advisory-only, never silently enforced from a duplicate source.
 #
-# FC-004 / FC-001: the ledger is the cue-lint AUTHORITY, so a broken authority input must
-# fail CLOSED with one loud finding - never fall through to a silent pass. Two layers, both
-# fail-closed:
-#   1. The whole ledger is folded ONCE, up front, through its sanctioned writer
-#      (bin/fm-failure-class.sh, the single fold owner), which parses every event and exits
-#      non-zero on ANY malformed line, unknown-schema row, duplicate id, or amendment against
-#      an undefined class. A substring grep is NOT a parse.
-#   2. Every detection row of that folded snapshot must pass fm_validate_cue_row
-#      (bin/fm-cue-lib.sh) - the SAME closed-schema + pattern-compiles proof the writer applies
-#      - BEFORE it is linted or executed. So an unsupported engine cannot silently downgrade a
-#      class to advisory, and an invalid ERE cannot crash awk into an empty hit stream; either
-#      is one fail-closed cue-lint finding. No path consults a row that has not passed the gate.
+# FC-004 / FC-001 / FC-002: the ledger is the cue-lint AUTHORITY, so a broken authority input must
+# fail CLOSED with one loud finding - never a silent pass, advisory downgrade, or empty hit stream.
+# The whole ledger is proven ONCE, up front, through the single shared entrypoint
+# (bin/fm-cue-lib.sh -> bin/fm-cue-validate.sh): a python3 + jsonschema pass over the RAW bytes that
+# rejects a malformed line, a schema violation, a duplicate member at ANY depth (jq structurally
+# cannot), a duplicate class id, or an uncompilable pattern, and returns the proven folded snapshot.
+# cue_lint consumes ONLY that snapshot - jq below merely shapes already-proven data - so no consumer
+# re-parses the ledger and no normalized structure that already lost the evidence is ever inspected.
+# If python3/jsonschema is absent the authority refuses (CUE_VALIDATOR_UNAVAILABLE) and so does this
+# gate; there is no degradation. A missing ledger is a distinct refusal; an empty-but-present ledger
+# is valid-empty (no cues to lint).
 cue_status=pass
 LEDGER_OK=no
 FOLDED="$WORK/ledger-folded.json"
-if [ -f "$LEDGER" ] \
-  && FM_FC_LEDGER="$LEDGER" "$SCRIPT_DIR/fm-failure-class.sh" list --json > "$FOLDED" 2>/dev/null \
-  && jq -e 'type=="array" and length>0' "$FOLDED" >/dev/null 2>&1; then
+PROVE_ERR="$WORK/ledger-prove.err"
+if fm_cue_ledger_prove "$LEDGER" > "$FOLDED" 2>"$PROVE_ERR"; then
   LEDGER_OK=yes
 fi
 if [ "$LEDGER_OK" != yes ]; then
-  emit_finding cue_lint ledger-unreadable fail "failure-class ledger is missing, unparseable, or has no class definition: $LEDGER (fail closed)"
+  marker=$(sed -n 1p "$PROVE_ERR" 2>/dev/null)
+  emit_finding cue_lint ledger-unreadable fail "failure-class cue ledger refused (${marker:-refusal}): $LEDGER (fail closed)"
   cue_status=fail
 fi
 
@@ -798,28 +797,19 @@ LINTED_FILE="$WORK/linted.txt"
 ADVISORY_FILE="$WORK/advisory.txt"
 : > "$EFFECTIVE"; : > "$LINTED_FILE"; : > "$ADVISORY_FILE"
 if [ "$LEDGER_OK" = yes ]; then
+  # Every detection row in the proven snapshot already conforms to the closed schema (engine in the
+  # supported set, non-empty pattern that compiles) and carries no duplicate member; consume it.
   while IFS= read -r cid; do
     [ -n "$cid" ] || continue
-    got=no; invalid=no
+    got=no
     while IFS= read -r row; do
       [ -n "$row" ] || continue
-      # The ONE gate (bin/fm-cue-lib.sh): no path consults - or executes - a cue row that has
-      # not passed fm_validate_cue_row (JSON + closed schema with engine in the supported set +
-      # the pattern actually COMPILES under awk-ere). A failure is a single loud fail-closed
-      # finding, never a silently-skipped row (an unsupported engine) or an empty hit stream (an
-      # invalid ERE that crashes awk). This is the SAME proof the sanctioned writer applies.
-      if ! reason=$(fm_validate_cue_row "$row" 2>&1); then
-        emit_finding cue_lint "$cid" fail "$cid: invalid detection row ($reason) - fail closed"
-        cue_status=fail; invalid=yes
-        continue
-      fi
       pattern=$(printf '%s' "$row" | jq -r '.pattern')
       cueref=$(printf '%s' "$row" | jq -r '.cue_ref')
       printf '%s\t%s\t%s\n' "$cid" "$pattern" "$cueref" >> "$EFFECTIVE"
       got=yes
     done < <(jq -c --arg id "$cid" '.[] | select(.id==$id) | (.detection // [])[]' "$FOLDED" 2>/dev/null)
-    if [ "$got" = yes ]; then printf '%s\n' "$cid" >> "$LINTED_FILE"
-    elif [ "$invalid" = no ]; then printf '%s\n' "$cid" >> "$ADVISORY_FILE"; fi
+    if [ "$got" = yes ]; then printf '%s\n' "$cid" >> "$LINTED_FILE"; else printf '%s\n' "$cid" >> "$ADVISORY_FILE"; fi
   done < <(jq -r '.[].id' "$FOLDED" 2>/dev/null)
 fi
 
@@ -829,9 +819,9 @@ if [ "$LEDGER_OK" = yes ] && [ -s "$ADDED_FILE" ] && [ -s "$EFFECTIVE" ]; then
   while IFS=$'\t' read -r cid pattern cueref; do
     [ -n "$cid" ] || continue
     class_name=$(jq -r --arg id "$cid" '.[]|select(.id==$id)|.name' "$FOLDED" 2>/dev/null | head -1)
-    # Every pattern here already passed fm_validate_cue_row's compile probe, but defence in
-    # depth: if the EXECUTING engine (awk) still errors, that is a fail-closed finding, never an
-    # empty hit stream read as a pass. The exit status is checked, not discarded.
+    # Every pattern here already passed the authority's grep -E compile probe, but defence in depth:
+    # if the EXECUTING engine (awk) still errors, that is a fail-closed finding, never an empty hit
+    # stream read as a pass. The exit status is checked, not discarded.
     if ! awk -F'\t' -v ere="$pattern" '$3 ~ ere { print }' "$ADDED_FILE" > "$HITS_TMP" 2>/dev/null; then
       emit_finding cue_lint "$cid" fail "$cid ($class_name): detection pattern failed to execute under awk-ere (fail closed): $pattern"
       cue_status=fail

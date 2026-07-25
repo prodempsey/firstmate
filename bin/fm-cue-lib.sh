@@ -1,68 +1,39 @@
 #!/usr/bin/env bash
-# fm-cue-lib.sh - the ONE authority on whether a failure-class detection ("cue") row is
-# valid. Both the sanctioned writer (bin/fm-failure-class.sh: add/ensure/amend/validate)
-# and the live reader (bin/fm-verify.sh's cue lint) consume ONLY rows that pass
-# fm_validate_cue_row, so no path ever writes, folds, or EXECUTES a cue row that has not
-# been proven - in ONE atomic pass - to:
-#   (a) parse as a JSON object,
-#   (b) conform to the CLOSED detection schema (additionalProperties:false): its key set is
-#       EXACTLY {engine, pattern, cue_ref} - any undeclared key is a failure - with engine in
-#       the supported set, a non-empty STRING pattern, and a non-empty STRING cue_ref,
-#   (c) actually COMPILE under the engine that will execute it.
-# Any failure is a single fail-closed verdict, never a silently-skipped row or an
-# empty-hit-stream pass (FC-001 closed-schema positive proof; the me-s3-profiles and
-# dj-orders design rulings: prove conformance in ONE pass, never spot-check piecemeal).
+# fm-cue-lib.sh - the ONE shared read entrypoint every cue-ledger consumer proves validity through.
 #
-# This file is a sourced library: it defines a constant and functions and runs nothing.
+# Per the binding ruling (data/seasoning-cues-g1/design-ruling.md), validation is NOT a per-row
+# shell/jq predicate: it is a single atomic fail-closed pass over the RAW ledger bytes, owned by
+# bin/fm-cue-validate.sh (python3 + jsonschema, HARD prerequisites; duplicate-member rejection via
+# object_pairs_hook because jq collapses duplicates before any check runs). This library is the thin
+# shell seam that every consumer - the sanctioned writer (add/ensure/amend/bump/register/validate/
+# list/show/refinements) and the live reader (bin/fm-verify.sh's cue_lint) - calls. No consumer
+# re-parses the ledger; all receive ONLY the proven, folded snapshot this entrypoint returns.
+#
+# fm_cue_ledger_prove <ledger-path>: on success prints the proven folded snapshot (a JSON array, one
+# record per class id) to stdout and returns 0. On failure prints exactly one marker + reason
+# (CUE_VALIDATOR_UNAVAILABLE | CUE_LEDGER_MISSING | CUE_LEDGER_INVALID) to stderr and returns
+# non-zero. There is no degradation and no valid-empty for a MISSING file; an empty-but-present
+# ledger returns "[]" with status 0.
 
-# The CLOSED set of supported detection engines (space-separated). awk-ere is the only
-# engine bin/fm-verify.sh can execute, so it is the only engine a valid cue row may name.
-FM_CUE_ENGINES="awk-ere"
+FM_CUE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve the validator by the library's own directory (the real bin/), never through an overridable
+# FM_ROOT, so FM_ROOT_OVERRIDE cannot redirect the authority.
+FM_CUE_VALIDATOR="${FM_CUE_VALIDATOR:-$FM_CUE_LIB_DIR/fm-cue-validate.sh}"
 
-# fm_cue_pattern_compiles <engine> <pattern>: 0 iff <pattern> compiles under <engine>.
-# For awk-ere the pattern is probed with `grep -E` against EMPTY input (/dev/null): a valid
-# ERE exits 0 or 1 (match / no match - and empty input can never match, so we only ever
-# exercise the COMPILE, never a match), while a syntactically invalid ERE exits >=2 with a
-# diagnostic. An unknown engine never compiles.
-fm_cue_pattern_compiles() {
-  local engine=$1 pattern=$2 rc
-  case "$engine" in
-    awk-ere)
-      grep -E -e "$pattern" /dev/null >/dev/null 2>&1
-      rc=$?
-      [ "$rc" -lt 2 ]
-      ;;
-    *) return 1 ;;
-  esac
+fm_cue_ledger_prove() { # <ledger-path>
+  "$FM_CUE_VALIDATOR" prove "$1"
 }
 
-# fm_validate_cue_row <row-json>: 0 iff the single detection row is a JSON object that
-# conforms to the closed schema AND whose pattern compiles under its engine. On failure it
-# prints a one-line reason to stderr and returns 1. This is the ONLY gate: callers MUST
-# refuse (write path) or fail closed with a finding (read path) on a non-zero return, and
-# MUST never consult, fold, or execute a row that has not returned 0 here.
-fm_validate_cue_row() {
-  local row=$1 reason engine pattern
-  # (a) JSON object + (b) closed schema, proven in one jq pass. A row that is not valid JSON
-  # at all makes jq exit non-zero, which is itself a fail-closed verdict.
-  reason=$(printf '%s' "$row" | jq -r --arg engines "$FM_CUE_ENGINES" '
-    . as $d | ($engines | split(" ")) as $ok
-    | (["cue_ref","engine","pattern"]) as $allowed
-    | if ($d|type) != "object" then "not a JSON object"
-      elif (($d|keys) - $allowed) != []
-        then "undeclared propert\(if ((($d|keys) - $allowed)|length) > 1 then "ies" else "y" end): "
-             + ((($d|keys) - $allowed)|join(", ")) + " (allowed exactly: \($allowed|join(", ")))"
-      elif ($d.engine|type) != "string" or (($ok | index($d.engine)) | not)
-        then "unsupported engine \($d.engine|tojson) (supported: \($ok|join(",")))"
-      elif ($d.pattern|type) != "string" or ($d.pattern|length) == 0 then "empty or non-string pattern"
-      elif ($d.cue_ref|type) != "string" or ($d.cue_ref|length) == 0 then "empty or missing cue_ref"
-      else "OK" end' 2>/dev/null) \
-    || { echo "detection row is not valid JSON" >&2; return 1; }
-  [ "$reason" = OK ] || { echo "detection row invalid: $reason" >&2; return 1; }
-  # (c) the pattern must actually COMPILE under the engine that will execute it.
-  engine=$(printf '%s' "$row" | jq -r '.engine')
-  pattern=$(printf '%s' "$row" | jq -r '.pattern')
-  fm_cue_pattern_compiles "$engine" "$pattern" \
-    || { echo "detection pattern does not compile under $engine: $pattern" >&2; return 1; }
-  return 0
+# fm_cue_check_raw_row <raw-detection-json>: prove a SINGLE raw detection-row string valid through the
+# same authority, on its RAW bytes, BEFORE any jq shaping can collapse a duplicate member. Returns 0
+# if valid; on failure the marker + reason are already on stderr and it returns non-zero. The writer
+# calls this on each raw --detection argument so a duplicate-key row can never be jq-normalized into a
+# valid-looking one and written.
+fm_cue_check_raw_row() { # <raw-detection-json>
+  local tmp rc
+  tmp=$(mktemp "${TMPDIR:-/tmp}/fm-cue-row.XXXXXX") || return 1
+  printf '%s' "$1" > "$tmp"
+  "$FM_CUE_VALIDATOR" check-row "$tmp"; rc=$?
+  rm -f "$tmp"
+  return "$rc"
 }
