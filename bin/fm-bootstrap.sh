@@ -248,6 +248,26 @@ lease_reclaim() {
   rm -f "$tmp"
 }
 
+BOOTSTRAP_TASK_SNAPSHOT=""
+BOOTSTRAP_TASK_COUNT=""
+
+# Acquire one complete, attested task-record snapshot before any metadata-driven
+# secondmate mutation. Sync, config propagation, and liveness all consume this
+# exact artifact; none may enumerate or reopen state/*.meta independently.
+bootstrap_task_snapshot_proof() {
+  BOOTSTRAP_TASK_SNAPSHOT=$(mktemp "${TMPDIR:-/tmp}/fm-bootstrap-tasks.XXXXXX" 2>/dev/null) || {
+    echo "BOOTSTRAP: ATTENTION: task-record enumeration failed: could not create snapshot; secondmate sync, config propagation, and liveness skipped; no metadata-driven secondmate mutation was attempted"
+    return 1
+  }
+  if ! fm_enumerate_task_records "$STATE" "$BOOTSTRAP_TASK_SNAPSHOT"; then
+    rm -f "$BOOTSTRAP_TASK_SNAPSHOT"
+    BOOTSTRAP_TASK_SNAPSHOT=""
+    echo "BOOTSTRAP: ATTENTION: task-record enumeration failed: $FM_TASK_ENUM_REASON; secondmate sync, config propagation, and liveness skipped; no metadata-driven secondmate mutation was attempted"
+    return 1
+  fi
+  BOOTSTRAP_TASK_COUNT=$FM_TASK_ENUM_COUNT
+}
+
 secondmate_sync() {
   # Local-HEAD secondmate sync: fast-forward every LIVE secondmate home
   # to the primary checkout's current default-branch commit. Purely LOCAL - no
@@ -259,23 +279,26 @@ secondmate_sync() {
   # version is never disturbed (AGENTS.md bootstrap + supervision). Mirrors
   # fm-update's nudge-secondmates: report so firstmate can live-converge the
   # listed fm-<id> selectors.
-  [ -d "$STATE" ] || return 0
   local primary_head
   if ! primary_head=$(primary_head_commit "$FM_ROOT"); then
-    local meta id
-    for meta in "$STATE"/*.meta; do
-      [ -f "$meta" ] || continue
-      grep -q '^kind=secondmate' "$meta" 2>/dev/null || continue
-      id=$(basename "$meta" .meta)
-      echo "SECONDMATE_SYNC: secondmate $id: skipped: primary default-branch commit cannot be resolved"
+    local i=0
+    exec 7< "$BOOTSTRAP_TASK_SNAPSHOT" || return 1
+    while [ "$i" -lt "$BOOTSTRAP_TASK_COUNT" ]; do
+      fm_task_record_snapshot_read 7 || { exec 7<&-; return 1; }
+      i=$((i + 1))
+      [ "$FM_TASK_RECORD_KIND" = secondmate ] || continue
+      echo "SECONDMATE_SYNC: secondmate $FM_TASK_RECORD_ID: skipped: primary default-branch commit cannot be resolved"
     done
+    exec 7<&-
     return 0
   fi
   FF_NUDGE_WINDOWS=""
   FF_SEEN_HOMES=""
   local tmp line
   tmp=$(mktemp "${TMPDIR:-/tmp}/fm-secondmate-sync.XXXXXX" 2>/dev/null) || return 0
-  sweep_live_secondmate_metas "$STATE" "$primary_head" yes >"$tmp"
+  sweep_live_secondmate_snapshot \
+    "$BOOTSTRAP_TASK_SNAPSHOT" "$BOOTSTRAP_TASK_COUNT" "$primary_head" yes \
+    "$FM_HOME/data/secondmates.md" >"$tmp"
   while IFS= read -r line; do
     case "$line" in
       secondmate\ *': skipped:'*) echo "SECONDMATE_SYNC: $line" ;;
@@ -305,7 +328,8 @@ secondmate_sync() {
     if ! propagate_inheritable_config "$CONFIG" "$home_real/config"; then
       echo "SECONDMATE_SYNC: secondmate $id: skipped: config inheritance failed"
     fi
-  done < <(live_secondmate_meta_records "$STATE" "$FM_HOME/data/secondmates.md")
+  done < <(live_secondmate_snapshot_records \
+    "$BOOTSTRAP_TASK_SNAPSHOT" "$BOOTSTRAP_TASK_COUNT" "$FM_HOME/data/secondmates.md")
   [ -n "$FF_NUDGE_WINDOWS" ] && echo "NUDGE_SECONDMATES:$FF_NUDGE_WINDOWS"
   return 0
 }
@@ -341,17 +365,18 @@ secondmate_liveness_sweep() {
   # Scope: session start (reboot/restart) only. A secondmate dying
   # MID-SESSION is a harder follow-on needing a periodic liveness beacon -
   # explicitly out of scope here.
-  [ -d "$STATE" ] || return 0
-  local meta id window harness backend target verdict out
-  for meta in "$STATE"/*.meta; do
-    [ -f "$meta" ] || continue
-    grep -q '^kind=secondmate$' "$meta" 2>/dev/null || continue
-    id=$(basename "$meta" .meta)
-    window=$(fm_meta_get "$meta" window)
+  local i=0 id window harness backend target verdict out
+  exec 7< "$BOOTSTRAP_TASK_SNAPSHOT" || return 1
+  while [ "$i" -lt "$BOOTSTRAP_TASK_COUNT" ]; do
+    fm_task_record_snapshot_read 7 || { exec 7<&-; return 1; }
+    i=$((i + 1))
+    [ "$FM_TASK_RECORD_KIND" = secondmate ] || continue
+    id=$FM_TASK_RECORD_ID
+    window=$FM_TASK_RECORD_WINDOW
     [ -n "$window" ] || continue
-    harness=$(fm_meta_get "$meta" harness)
-    backend=$(fm_backend_of_meta "$meta")
-    target=$(fm_backend_target_of_meta "$meta")
+    harness=$FM_TASK_RECORD_HARNESS
+    backend=$FM_TASK_RECORD_BACKEND
+    target=$FM_TASK_RECORD_TARGET
     [ -n "$target" ] || target="$window"
     verdict=$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null) || verdict="unknown"
     case "$harness" in
@@ -375,6 +400,7 @@ secondmate_liveness_sweep() {
         ;;
     esac
   done
+  exec 7<&-
   return 0
 }
 
@@ -722,12 +748,18 @@ crew_dispatch_validate
 if ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
   echo "TASKS_AXI: available"
 fi
+bootstrap_rc=0
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
-  secondmate_sync
-  secondmate_liveness_sweep
+  if bootstrap_task_snapshot_proof; then
+    secondmate_sync
+    secondmate_liveness_sweep
+  else
+    bootstrap_rc=1
+  fi
   x_mode_setup
   fleet_sync
   lease_reclaim
   test_tmp_sweep
 fi
-exit 0
+rm -f "$BOOTSTRAP_TASK_SNAPSHOT"
+exit "$bootstrap_rc"

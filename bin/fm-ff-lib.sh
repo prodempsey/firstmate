@@ -245,24 +245,47 @@ secondmate_registry_field() {
   printf '%s\n' "$value"
 }
 
-# List this home's LIVE secondmate direct reports from state/<id>.meta records.
-# The meta file is the liveness signal; data/secondmates.md is only the fallback
-# for durable fields such as home= when an older/incomplete meta lacks them.
+# List LIVE secondmate direct reports from an already-attested task-record
+# snapshot. The caller must first obtain that snapshot through
+# fm_enumerate_task_records; this helper never enumerates or reopens metadata.
+# data/secondmates.md remains only the fallback for a missing home= field.
 # Output is pipe-delimited: id|home|window|meta-file.
-live_secondmate_meta_records() {
-  local state=$1 registry=${2:-} meta id home window
-  [ -d "$state" ] || return 0
-  for meta in "$state"/*.meta; do
-    [ -f "$meta" ] || continue
-    grep -q '^kind=secondmate$' "$meta" 2>/dev/null || continue
-    id=$(basename "$meta" .meta)
-    home=$(grep '^home=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+live_secondmate_snapshot_records() {  # <snapshot> <count> [registry]
+  local snapshot=$1 count=$2 registry=${3:-} i=0 home
+  exec 7< "$snapshot" || return 1
+  while [ "$i" -lt "$count" ]; do
+    fm_task_record_snapshot_read 7 || { exec 7<&-; return 1; }
+    i=$((i + 1))
+    [ "$FM_TASK_RECORD_KIND" = secondmate ] || continue
+    home=$FM_TASK_RECORD_HOME
     if [ -z "$home" ] && [ -n "$registry" ]; then
-      home=$(secondmate_registry_field "$registry" "$id" home || true)
+      home=$(secondmate_registry_field "$registry" "$FM_TASK_RECORD_ID" home || true)
     fi
-    window=$(grep '^window=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
-    printf '%s|%s|%s|%s\n' "$id" "$home" "$window" "$meta"
+    printf '%s|%s|%s|%s\n' \
+      "$FM_TASK_RECORD_ID" "$home" "$FM_TASK_RECORD_WINDOW" "$FM_TASK_RECORD_META"
   done
+  exec 7<&-
+}
+
+# Compatibility entry point for non-bootstrap callers. Enumeration still has
+# exactly one owner: bin/fm-backend.sh. Bootstrap does not use this wrapper,
+# because its sync, config, and liveness consumers share one cached snapshot.
+live_secondmate_meta_records() {  # <state> [registry]
+  local state=$1 registry=${2:-} snapshot count
+  if ! command -v fm_enumerate_task_records >/dev/null 2>&1; then
+    # shellcheck source=bin/fm-backend.sh disable=SC1091
+    . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-backend.sh"
+  fi
+  snapshot=$(mktemp "${TMPDIR:-/tmp}/fm-live-secondmates.XXXXXX" 2>/dev/null) || return 1
+  if ! fm_enumerate_task_records "$state" "$snapshot"; then
+    rm -f "$snapshot"
+    return 1
+  fi
+  count=$FM_TASK_ENUM_COUNT
+  live_secondmate_snapshot_records "$snapshot" "$count" "$registry"
+  local rc=$?
+  rm -f "$snapshot"
+  return "$rc"
 }
 
 # Fast-forward one target to a base. Prints its status line. Sets globals for the
@@ -413,15 +436,34 @@ process_secondmate() {
   fi
 }
 
-# Sweep this home's LIVE secondmate direct reports - state/<id>.meta files with
-# kind=secondmate - fast-forwarding each to base_mode. Passes base_mode and
-# nudge_requires_instr through to process_secondmate. Accumulates into
-# FF_NUDGE_WINDOWS / FF_SEEN_HOMES, which the caller resets before and reads after.
-# The registry argument is only for home= fallback on older or incomplete meta records.
-sweep_live_secondmate_metas() {
-  local state=$1 base_mode=$2 nudge_requires_instr=${3:-no} registry=${4:-$FM_HOME/data/secondmates.md} id home window meta
-  [ -d "$state" ] || return 0
+# Sweep LIVE secondmates from one complete task-record snapshot, passing
+# base_mode and nudge_requires_instr through to process_secondmate.
+sweep_live_secondmate_snapshot() {  # <snapshot> <count> <base> [nudge] [registry]
+  local snapshot=$1 count=$2 base_mode=$3 nudge_requires_instr=${4:-no}
+  local registry=${5:-$FM_HOME/data/secondmates.md} id home window meta
   while IFS='|' read -r id home window meta; do
     process_secondmate "$id" "$home" "$window" "$base_mode" "$nudge_requires_instr"
-  done < <(live_secondmate_meta_records "$state" "$registry")
+  done < <(live_secondmate_snapshot_records "$snapshot" "$count" "$registry")
+}
+
+# Compatibility wrapper for callers that need their own fresh proof. Bootstrap
+# deliberately calls sweep_live_secondmate_snapshot so all of its consumers use
+# the same pass.
+sweep_live_secondmate_metas() {
+  local state=$1 base_mode=$2 nudge_requires_instr=${3:-no}
+  local registry=${4:-$FM_HOME/data/secondmates.md} snapshot count rc
+  if ! command -v fm_enumerate_task_records >/dev/null 2>&1; then
+    # shellcheck source=bin/fm-backend.sh disable=SC1091
+    . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-backend.sh"
+  fi
+  snapshot=$(mktemp "${TMPDIR:-/tmp}/fm-secondmate-sweep.XXXXXX" 2>/dev/null) || return 1
+  if ! fm_enumerate_task_records "$state" "$snapshot"; then
+    rm -f "$snapshot"
+    return 1
+  fi
+  count=$FM_TASK_ENUM_COUNT
+  sweep_live_secondmate_snapshot "$snapshot" "$count" "$base_mode" "$nudge_requires_instr" "$registry"
+  rc=$?
+  rm -f "$snapshot"
+  return "$rc"
 }

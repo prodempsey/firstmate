@@ -502,6 +502,71 @@ test_bootstrap_sweep_surfaces_skipped_home() {
   pass "T9 bootstrap surfaces a skipped dirty live secondmate home"
 }
 
+# --- T9b: one late unreadable record blocks every bootstrap consumer ----------
+test_bootstrap_snapshot_failure_is_atomic() {
+  local w c1 before fakebin out rc attention_count
+  w=$(new_world boot-late-unreadable)
+  c1=$(head_of "$w/main")
+  add_sm_worktree "$w" a-eligible "$c1"
+  bump_primary "$w" instr
+  before=$(head_of "$w/a-eligible")
+
+  mkdir -p "$w/home/config" "$w/a-eligible/config"
+  printf 'codex\n' > "$w/home/config/crew-harness"
+  {
+    printf 'window=firstmate:fm-z-late\n'
+    printf 'kind=ship\n'
+  } > "$w/home/state/z-late.meta"
+  chmod 000 "$w/home/state/z-late.meta"
+
+  fakebin=$(make_fake_toolchain "$w")
+  out=$(env -u FM_CREWMATE -u FM_TASK_ID \
+    FM_ROLE_OVERRIDE=primary \
+    FM_ROLE_OVERRIDE_REASON='bootstrap snapshot atomicity fixture' \
+    PATH="$fakebin:$BASE_PATH" FM_HOME="$w/home" FM_ROOT_OVERRIDE="$w/main" \
+    "$ROOT/bin/fm-bootstrap.sh" 2>&1)
+  rc=$?
+
+  [ "$rc" -ne 0 ] || fail "an unreadable late metadata entry must make bootstrap fail"
+  attention_count=$(printf '%s\n' "$out" | grep -c '^BOOTSTRAP: ATTENTION:' || true)
+  [ "$attention_count" -eq 1 ] \
+    || fail "enumeration failure must emit exactly one bootstrap ATTENTION, got $attention_count: $out"
+  assert_contains "$out" "metadata entry z-late.meta could not be read to completion" \
+    "the bootstrap finding identifies the unreadable entry"
+  assert_not_contains "$out" "SECONDMATE_SYNC:" \
+    "sync and config propagation must not start without a complete snapshot"
+  assert_not_contains "$out" "SECONDMATE_LIVENESS:" \
+    "liveness must not start without a complete snapshot"
+  [ "$(head_of "$w/a-eligible")" = "$before" ] \
+    || fail "an earlier eligible secondmate was fast-forwarded despite late enumeration failure"
+  [ ! -e "$w/a-eligible/config/crew-harness" ] \
+    || fail "config was propagated despite late enumeration failure"
+  [ -e "$w/home/state/a-eligible.meta" ] && [ -e "$w/home/state/z-late.meta" ] \
+    || fail "bootstrap enumeration failure removed task metadata"
+  chmod 600 "$w/home/state/z-late.meta"
+  pass "T9b bootstrap late-entry failure is one ATTENTION and zero sync/config/liveness mutation"
+}
+
+# The ruling permits one enumeration owner only. These consumers may call the
+# shared primitive, but may not scan, stat, or reopen metadata themselves.
+test_task_record_enumeration_has_one_owner() {
+  local violations bootstrap_calls
+  violations=$(grep -En \
+    'for .*[*]\.meta|find .*\.meta|fm_meta_get .*meta|fm_backend_(of|target_of)_meta' \
+    "$ROOT/bin/fm-bootstrap.sh" \
+    "$ROOT/bin/fm-ff-lib.sh" \
+    "$ROOT/bin/fm-reconcile-ghosts.sh" \
+    "$ROOT/bin/fm-teardown.sh" \
+    "$ROOT/bin/fm-task-events.sh" || true)
+  [ -z "$violations" ] \
+    || fail "task-record consumers retain an independent enumeration/read site: $violations"
+  bootstrap_calls=$(grep -c '^[[:space:]]*if ! fm_enumerate_task_records ' \
+    "$ROOT/bin/fm-bootstrap.sh" || true)
+  [ "$bootstrap_calls" -eq 1 ] \
+    || fail "bootstrap must acquire exactly one shared enumeration proof, found $bootstrap_calls call sites"
+  pass "T9c task-record enumeration has one owner and bootstrap acquires one proof"
+}
+
 # --- T10: spawning a secondmate fast-forwards its worktree before launch ------
 test_spawn_fast_forwards_before_launch() {
   local w c1 c2 fakebin
@@ -664,6 +729,8 @@ test_sweep_nudge_requires_instruction_change
 test_bootstrap_sweep_nudges_only_instruction_change
 test_nudge_selector_stable_after_herdr_respawn
 test_bootstrap_sweep_surfaces_skipped_home
+test_bootstrap_snapshot_failure_is_atomic
+test_task_record_enumeration_has_one_owner
 test_spawn_fast_forwards_before_launch
 test_spawn_warns_when_sync_skipped_before_launch
 test_seed_marker_clean_when_gitignored
