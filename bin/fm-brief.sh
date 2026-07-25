@@ -7,9 +7,17 @@
 # when the task genuinely deviates (e.g. working an existing external PR instead
 # of shipping a new one).
 # Usage: fm-brief.sh <task-id> <repo-name> [--scout] [--kd-review] [--herdr-lab]
+#            [--gauntlet-bundle <path> | --gauntlet-waived <reason>]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
+#   --gauntlet-bundle <path> (scout only) appends a "Gauntlet evidence" section
+#   that points the QA reviewer at the machine-checked verify bundle produced by
+#   bin/fm-verify.sh, so QA starts from executed evidence rather than re-linting.
+#   --gauntlet-waived <reason> (scout only, mutually exclusive) instead records
+#   that the Gauntlet gate was explicitly waived for a non-code scout, so the
+#   reviewer knows no mechanical proof backs the review. These flags are normally
+#   supplied by bin/fm-qa-dispatch.sh, the QA-dispatch chokepoint, not by hand.
 #   --kd-review (alias --visual-review) appends a visual-review contract: when a
 #   rendered UI/design/mockup is ready for captain review, produce ONE self-contained
 #   KrakenDesign HTML artifact under data/<task-id>/, register it with krakendesign,
@@ -78,21 +86,36 @@ KIND=ship
 HERDR_LAB=0
 NO_PROJECTS=0
 KD_REVIEW=0
+GAUNTLET_BUNDLE=""
+GAUNTLET_WAIVED=""
 POS=()
-for a in "$@"; do
-  case "$a" in
+while [ $# -gt 0 ]; do
+  case "$1" in
     --scout) KIND=scout ;;
     --secondmate) KIND=secondmate ;;
     --herdr-lab) HERDR_LAB=1 ;;
     --no-projects) NO_PROJECTS=1 ;;
     --kd-review|--visual-review) KD_REVIEW=1 ;;
-    *) POS+=("$a") ;;
+    --gauntlet-bundle) GAUNTLET_BUNDLE=${2:-}; shift ;;
+    --gauntlet-waived) GAUNTLET_WAIVED=${2:-}; shift ;;
+    *) POS+=("$1") ;;
   esac
+  shift
 done
 ID=${POS[0]}
 
 if [ "$KIND" = secondmate ] && [ "$HERDR_LAB" -eq 1 ]; then
   echo "error: --herdr-lab applies only to crewmate ship or scout briefs" >&2
+  exit 1
+fi
+
+if { [ -n "$GAUNTLET_BUNDLE" ] || [ -n "$GAUNTLET_WAIVED" ]; } && [ "$KIND" != scout ]; then
+  echo "error: --gauntlet-bundle/--gauntlet-waived apply only to scout briefs" >&2
+  exit 1
+fi
+
+if [ -n "$GAUNTLET_BUNDLE" ] && [ -n "$GAUNTLET_WAIVED" ]; then
+  echo "error: --gauntlet-bundle and --gauntlet-waived are mutually exclusive" >&2
   exit 1
 fi
 
@@ -115,12 +138,46 @@ STATUS_FILE=$(shell_quote "$STATE/$ID.status")
 
 KD_NOTE=""
 [ "$KD_REVIEW" = 1 ] && KD_NOTE=" +kd-review"
+[ -n "$GAUNTLET_BUNDLE" ] && KD_NOTE="$KD_NOTE +gauntlet"
+[ -n "$GAUNTLET_WAIVED" ] && KD_NOTE="$KD_NOTE +gauntlet-waived"
 
 # --kd-review/--visual-review appends this visual-review contract to a ship or
 # scout brief. It routes a rendered UI/design/mockup into one self-contained
 # KrakenDesign HTML artifact under data/<id>/ (register/poll procedure lives in
 # the krakendesign skill) instead of a folder of screenshots. Not applicable to a
 # secondmate charter, which is not a task brief.
+# --gauntlet-bundle appends this "Gauntlet evidence" section to a scout (QA) brief.
+# It points the reviewer at the machine-checked verify bundle bin/fm-verify.sh
+# produced for the exact candidate under review, so QA round 1 stops being the
+# fleet's de-facto linter and the reviewer spends its whole budget on semantics.
+emit_gauntlet_bundle_section() {
+  local bundle=$1 summary
+  summary="$(dirname "$bundle")/verify-summary.md"
+  cat <<EOF
+
+# Gauntlet evidence (read this first)
+This QA review starts from a machine-checked evidence bundle produced by the pre-QA verifier (\`fm-verify.sh\`), not from a blank slate.
+Read the human summary first: \`$summary\`
+The full bundle is \`$bundle\` (schema \`firstmate/verify-bundle/1\`). It binds the exact HEAD SHA and branch under review and records, per gate: a clean-tree attestation, base currency, the executed-test transcript (SKIP, TIMEOUT, and no-tests are findings, never passes), failure-class cue-lint results, and the dispatch-contract checklist.
+Those mechanical checks are already proven, so do not re-litigate them: spend your whole budget on the semantics a script cannot verify - whether the change does the right thing, whether the tests are meaningful, whether the edge cases are real.
+If the bundle's \`candidate.head_sha\` does not match the commit you are actually reviewing, stop and report it: the evidence is stale and the review is unsafe.
+EOF
+}
+
+# --gauntlet-waived appends this section instead, recording that the Gauntlet gate
+# was explicitly waived for a non-code scout so the reviewer knows nothing
+# mechanical was proven up front.
+emit_gauntlet_waived_section() {
+  local reason=$1
+  cat <<EOF
+
+# Gauntlet evidence: WAIVED
+The pre-QA verifier (\`fm-verify.sh\`) was explicitly waived for this scout.
+Reason: $reason
+No executed evidence bundle backs this review, so nothing mechanical has been proven up front. Treat test execution, SHA/branch identity, tree cleanliness, and base currency as unverified and check them yourself if they bear on your findings.
+EOF
+}
+
 emit_kd_review_section() {
   cat <<EOF
 
@@ -286,6 +343,8 @@ The report is the only thing that survives, so anything worth keeping must be in
 Frame this as software quality assurance: report defects in neutral engineering terms - correctness, conformance, missing coverage, regressions - not adversarial or attack framing, which trips provider content filters and stalls the run.
 For fleet-bridge rendered verification, drive the repo's own headless-Chrome rig (set \`CHROME_BIN\` per the header of \`test/bridge-card-open.mjs\`), never chrome-devtools-axi, whose target churn has repeatedly blocked these runs.
 EOF
+[ -n "$GAUNTLET_BUNDLE" ] && emit_gauntlet_bundle_section "$GAUNTLET_BUNDLE" >> "$BRIEF"
+[ -n "$GAUNTLET_WAIVED" ] && emit_gauntlet_waived_section "$GAUNTLET_WAIVED" >> "$BRIEF"
 [ "$KD_REVIEW" = 1 ] && emit_kd_review_section >> "$BRIEF"
 cat >> "$BRIEF" <<EOF
 
