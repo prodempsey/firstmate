@@ -26,11 +26,18 @@ case "$name" in
   gitleaks)
     if [ "$version" = true ]; then echo 'gitleaks version 8.30.1'; exit 0; fi
     report=""
+    baseline=""
     while [ "$#" -gt 0 ]; do
-      case "$1" in --report-path) report=${2:-}; shift ;; --report-path=*) report=${1#*=} ;; esac
+      case "$1" in
+        --report-path) report=${2:-}; shift ;;
+        --report-path=*) report=${1#*=} ;;
+        --baseline-path) baseline=${2:-}; shift ;;
+        --baseline-path=*) baseline=${1#*=} ;;
+      esac
       shift
     done
     [ -n "$report" ] || exit 2
+    full_report="$report.full"
     {
       printf '['
       comma=""
@@ -44,7 +51,19 @@ case "$name" in
         fi
       done
       printf ']\n'
-    } > "$report"
+    } > "$full_report"
+    if [ -n "$baseline" ]; then
+      "$REAL_JQ" --slurpfile baseline "$baseline" '
+        map(. as $candidate |
+          select(any($baseline[0][]?;
+            .RuleID==$candidate.RuleID
+            and .File==$candidate.File
+            and .Line==$candidate.Line
+          )|not))
+      ' "$full_report" > "$report"
+    else
+      mv "$full_report" "$report"
+    fi
     ;;
   oxlint)
     if [ "$version" = true ]; then echo 'oxlint 1.75.0'; exit 0; fi
@@ -232,6 +251,31 @@ expect_code 1 "$?" "declared schema violation fails"
 [ "$(jq '[.findings[]|select(.scanner=="jq" and .rule_id=="declared-schema" and .attribution=="candidate-new" and .blocking)]|length' "$TMP/schema-report.json")" -eq 1 ] ||
   fail "jq scanner did not validate a changed document against its declared schema"
 pass "jq scanner enforces changed documents against closed schema declarations"
+
+REPO="$TMP/json-values-repo"
+git init -q "$REPO"
+git -C "$REPO" checkout -q -b main
+printf 'base\n' > "$REPO/seed.txt"
+git -C "$REPO" add -A
+git -C "$REPO" commit -qm base
+BASE=$(git -C "$REPO" rev-parse HEAD)
+git -C "$REPO" checkout -q -b fm/json-values
+printf '{"ok":true}\n' > "$REPO/object.json"
+printf '[1,2,3]\n' > "$REPO/array.json"
+printf '"scalar"\n' > "$REPO/scalar.json"
+printf 'false\n' > "$REPO/false.json"
+printf 'null\n' > "$REPO/null.json"
+printf 'false\nnull\n{"ok":true}\n' > "$REPO/records.jsonl"
+git -C "$REPO" add -A
+git -C "$REPO" commit -qm "add valid JSON values"
+CANDIDATE=$(git -C "$REPO" rev-parse HEAD)
+run_scanner "$TOOLS" "$TMP/json-values-report.json"
+expect_code 0 "$?" "every valid JSON top-level value passes parse-only validation"
+[ "$(jq '[.findings[]|select(.scanner=="jq" and .rule_id=="well-formedness")]|length' \
+  "$TMP/json-values-report.json")" -eq 0 ] ||
+  fail "valid false, null, scalar, collection, or JSONL values were reported malformed"
+pass "jq parse-only validation accepts false, null, scalars, collections, and JSONL records"
+
 REPO=$MAIN_REPO
 BASE=$MAIN_BASE
 CANDIDATE=$MAIN_CANDIDATE

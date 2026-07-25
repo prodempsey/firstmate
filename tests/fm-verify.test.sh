@@ -71,6 +71,34 @@ if [ "${1:-}" = "--version" ]; then printf 'osv-scanner version: 2.4.0\n'; exit 
 printf '{"runs":[]}\n'
 SH
 chmod +x "$FM_SCANNER_DIR/bin/osv-scanner"
+cat > "$FM_SCANNER_DIR/bin/actionlint" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then printf '1.7.12\n'; exit 0; fi
+printf '[]\n'
+SH
+chmod +x "$FM_SCANNER_DIR/bin/actionlint"
+ln -s "$(command -v jq)" "$FM_SCANNER_DIR/bin/jq"
+cat > "$FM_SCANNER_DIR/bin/json-schema-scanner" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then printf 'ajv 8.17.1\n'; exit 0; fi
+printf '[]\n'
+SH
+chmod +x "$FM_SCANNER_DIR/bin/json-schema-scanner"
+cat > "$FM_SCANNER_DIR/bin/shellcheck" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+  printf 'ShellCheck - shell script analysis tool\nversion: 0.11.0\n'
+  exit 0
+fi
+printf '[]\n'
+SH
+chmod +x "$FM_SCANNER_DIR/bin/shellcheck"
+cat > "$FM_SCANNER_DIR/bin/ruff" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then printf 'ruff 0.16.0\n'; exit 0; fi
+printf '{"runs":[]}\n'
+SH
+chmod +x "$FM_SCANNER_DIR/bin/ruff"
 mkdir -p "$FM_SCANNER_DIR/osv-db/osv-scanner"
 printf '%s\n' \
   '{"schema":"firstmate/scanner-tools-ready/1","status":"ready","versions":{"actionlint":"1.7.12","ajv":"8.17.1","eslint":"9.39.5","eslint-plugin-n":"18.2.2","eslint-plugin-security":"4.0.1","eslint-plugin-sonarjs":"4.2.0","gitleaks":"8.30.1","jq":"1.7.1","osv-scanner":"2.4.0","oxlint":"1.75.0","ruff":"0.16.0","shellcheck":"0.11.0"}}' \
@@ -130,8 +158,19 @@ pass "scanner adoption: an unprovisioned environment passes with one visible not
 # Explicit adoption retains fail-closed behavior for a missing pinned scanner.
 mkdir -p "$TMP/adopted-config"
 printf 'enabled\n' > "$TMP/adopted-config/scanner-gate"
+mkdir -p "$TMP/ambient-bin"
+cat > "$TMP/ambient-bin/gitleaks" <<'SH'
+#!/usr/bin/env bash
+printf 'ambient gitleaks must not run\n' >> "$AMBIENT_GITLEAKS_MARKER"
+if [ "${1:-}" = "--version" ]; then printf 'gitleaks version 8.30.1\n'; exit 0; fi
+exit 0
+SH
+chmod +x "$TMP/ambient-bin/gitleaks"
+AMBIENT_GITLEAKS_MARKER="$TMP/ambient-gitleaks-ran"
+export AMBIENT_GITLEAKS_MARKER
 mv "$FM_SCANNER_DIR/bin/gitleaks" "$FM_SCANNER_DIR/bin/gitleaks.missing"
-rc=$(FM_CONFIG_OVERRIDE="$TMP/adopted-config" verify "$TMP/scanner-adopted-missing.json" \
+rc=$(PATH="$TMP/ambient-bin:$PATH" FM_CONFIG_OVERRIDE="$TMP/adopted-config" \
+  verify "$TMP/scanner-adopted-missing.json" \
   --worktree "$RUNADOPTED" --base main --sha "$UNADOPTED_SHA" --branch fm/g1 --task g1)
 mv "$FM_SCANNER_DIR/bin/gitleaks.missing" "$FM_SCANNER_DIR/bin/gitleaks"
 expect_code 1 "$rc" "explicitly adopted scanner gate fails closed on a missing scanner"
@@ -139,7 +178,9 @@ expect_code 1 "$rc" "explicitly adopted scanner gate fails closed on a missing s
   fail "explicit scanner config must record adopted=true"
 [ "$(bget "$TMP/scanner-adopted-missing.json" '[.findings[]|select(.gate=="scanner" and .code=="gitleaks/scanner-unavailable")]|length')" = 1 ] ||
   fail "an adopted missing scanner must produce one loud scanner-unavailable finding"
-pass "scanner adoption: a missing scanner fails closed after explicit adoption"
+[ ! -e "$AMBIENT_GITLEAKS_MARKER" ] ||
+  fail "an ambient matching-version gitleaks replaced the missing pinned executable"
+pass "scanner adoption: a missing pin fails closed and never falls back to ambient PATH"
 
 # --- clean candidate passes end to end ----------------------------------------
 R=$(build_repo clean)

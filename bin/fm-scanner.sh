@@ -188,10 +188,14 @@ resolve_tool() {
   local name=$1
   if [ -x "$SCANNER_DIR/bin/$name" ]; then
     printf '%s\n' "$SCANNER_DIR/bin/$name"
-  else
-    local resolved
-    if resolved=$(command -v "$name" 2>/dev/null); then printf '%s\n' "$resolved"; fi
   fi
+}
+
+# Node is a host runtime for the committed wrappers, not a scanner resolved from
+# PATH. The scanner implementations and their package graphs remain pinned under
+# SCANNER_DIR and every standalone scanner resolves only from SCANNER_DIR/bin.
+resolve_node_runtime() {
+  command -v node 2>/dev/null || true
 }
 
 tool_ready() {
@@ -365,7 +369,9 @@ run_sarif_scan() {
   return 0
 }
 
-# gitleaks: base-SHA history report is also the native --baseline-path.
+# Gitleaks runs raw against both snapshots.
+# The generic attributor is the only mechanism allowed to separate inherited
+# and candidate-new findings, so native baseline filtering is deliberately absent.
 scanner_begin
 GITLEAKS=$(resolve_tool gitleaks)
 if tool_ready gitleaks "$GITLEAKS" 8.30.1; then
@@ -390,12 +396,11 @@ if tool_ready gitleaks "$GITLEAKS" 8.30.1; then
     [ "$BASELINE_AVAILABLE" = true ] && log_opts="$BASE..$CANDIDATE"
     run_bounded "$(remaining_budget)" "$CANDIDATE_DIR" "$TMP/gitleaks-candidate-history.log" \
       "$GITLEAKS" git --no-banner --redact --exit-code 0 --report-format json \
-      --baseline-path "$BASELINE_REPORT" --report-path "$TMP/gitleaks-candidate-history.json" \
-      --log-opts="$log_opts"
+      --report-path "$TMP/gitleaks-candidate-history.json" --log-opts="$log_opts"
     if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -ne 0 ]; then GITLEAKS_OK=false; fi
     run_bounded "$(remaining_budget)" "$CANDIDATE_DIR" "$TMP/gitleaks-candidate-dir.log" \
       "$GITLEAKS" dir --no-banner --redact --exit-code 0 --report-format json \
-      --baseline-path "$BASELINE_REPORT" --report-path "$TMP/gitleaks-candidate-dir.json" .
+      --report-path "$TMP/gitleaks-candidate-dir.json" .
     if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -ne 0 ]; then GITLEAKS_OK=false; fi
   fi
   if [ "$GITLEAKS_OK" = true ] &&
@@ -441,7 +446,7 @@ fi
 if changed_matches '\.(js|mjs|cjs)$'; then
   scanner_begin
   ESLINT_EXECUTABLE=$(resolve_tool eslint-scanner)
-  NODE=$(resolve_tool node)
+  NODE=$(resolve_node_runtime)
   ESLINT_WRAPPER="$SCRIPT_DIR/fm-eslint-scanner.mjs"
   ESLINT_OK=true
   if [ -n "$ESLINT_EXECUTABLE" ] && [ -x "$ESLINT_EXECUTABLE" ]; then
@@ -593,7 +598,7 @@ if changed_matches "$JSON_RE"; then
       [ "$snapshot" = base ] && [ "$BASELINE_AVAILABLE" != true ] && continue
       for file in "${JSON_FILES[@]}"; do
         [ -f "$root/$file" ] || continue
-        run_bounded "$(remaining_budget)" "$root" "$TMP/jq-$snapshot.out" "$JQ" -e . "$file"
+        run_bounded "$(remaining_budget)" "$root" "$TMP/jq-$snapshot.out" "$JQ" empty "$file"
         if [ "$BOUNDED_TIMEOUT" = yes ]; then JQ_OK=false; break; fi
         if [ "$RUN_RC" -ne 0 ]; then
           jq -nc --arg path "$file" --arg message "JSON/JSONL is not well formed" \
@@ -641,7 +646,7 @@ if changed_matches "$JSON_RE"; then
         fi
         if [ "$SCHEMA_PROBED" = false ]; then
           SCHEMA_EXECUTABLE=$(resolve_tool json-schema-scanner)
-          NODE=$(resolve_tool node)
+          NODE=$(resolve_node_runtime)
           if [ -n "$SCHEMA_EXECUTABLE" ] && [ -x "$SCHEMA_EXECUTABLE" ]; then
             SCHEMA_COMMAND=("$SCHEMA_EXECUTABLE")
           elif [ -n "$NODE" ] && [ -x "$NODE" ] &&

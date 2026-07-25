@@ -3,8 +3,9 @@
 #
 # This is the one generic baseline-attribution mechanism for Shakedown gates.
 # Producers write closed-schema raw findings for the base and candidate snapshots.
-# This helper fingerprints rule id + path + normalized source-line content, then
-# labels every candidate finding candidate-new, inherited, or unattributed.
+# This helper fingerprints scanner identity + rule id + path + normalized
+# source-line content, then labels every candidate finding candidate-new,
+# inherited, or unattributed.
 #
 # FC-001 (closed-schema positive proof): A conclusion may be drawn only from ONE atomic pass that positively proves conformance to a single declared, closed schema; authority defaults to none and is NEVER inferred from the absence of a failing check.
 # FC-002 (absence is never discharge): An obligation is cleared ONLY by positive proof from a fresh, structurally-complete, authoritative snapshot that provably enumerates that obligation's status; absent/stale/corrupt/partial coverage RETAINS the prior fact unchanged (fail-open when CREATING a block, fail-closed when DISCHARGING one).
@@ -71,7 +72,7 @@ if [ -n "$BASE" ] && [ -f "$BASE" ] && validate_raw "$BASE"; then
   while IFS= read -r record; do
     [ -n "$record" ] || continue
     printf '%s\n' "$record" |
-      jq -r '[.rule_id,.path // "",((.content // "")|gsub("[[:space:]]+";" ")|ascii_downcase)]|@tsv' |
+      jq -r '[.scanner,.rule_id,.path // "",((.content // "")|gsub("[[:space:]]+";" ")|ascii_downcase)]|@tsv' |
       sha256sum | awk '{print $1}' >> "$BASE_FINGERPRINTS"
   done < "$BASE"
   sort -u -o "$BASE_FINGERPRINTS" "$BASE_FINGERPRINTS"
@@ -85,7 +86,7 @@ while IFS= read -r record; do
   [ -n "$record" ] || continue
   fingerprint=$(
     printf '%s\n' "$record" |
-      jq -r '[.rule_id,.path // "",((.content // "")|gsub("[[:space:]]+";" ")|ascii_downcase)]|@tsv' |
+      jq -r '[.scanner,.rule_id,.path // "",((.content // "")|gsub("[[:space:]]+";" ")|ascii_downcase)]|@tsv' |
       sha256sum | awk '{print $1}'
   )
   attribution=unattributed

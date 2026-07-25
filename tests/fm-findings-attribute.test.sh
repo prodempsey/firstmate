@@ -33,6 +33,20 @@ raw shellcheck SC2086 new.sh 'echo unquoted-value' >> "$CANDIDATE"
   fail "candidate-new finding did not remain blocking"
 pass "generic attribution separates inherited from candidate-new findings"
 
+# A fingerprint is closed over scanner identity as well as rule, path, and
+# normalized content.
+raw base-scanner same-rule same.txt 'same source' > "$TMP/cross-scanner-base.jsonl"
+raw candidate-scanner same-rule same.txt 'same source' > "$TMP/cross-scanner-candidate.jsonl"
+"$ATTRIBUTOR" --base "$TMP/cross-scanner-base.jsonl" \
+  --candidate "$TMP/cross-scanner-candidate.jsonl" --out "$TMP/cross-scanner.json"
+[ "$(jq '[.findings[]|select(
+    .scanner=="candidate-scanner"
+    and .attribution=="candidate-new"
+    and .blocking==true
+  )]|length' "$TMP/cross-scanner.json")" -eq 1 ] ||
+  fail "a base finding from another scanner suppressed a candidate-new finding"
+pass "FC-001: scanner identity is part of every attribution fingerprint"
+
 "$ATTRIBUTOR" --candidate "$CANDIDATE" --out "$TMP/unattributed.json"
 [ "$(jq -r '.baseline.available' "$TMP/unattributed.json")" = false ] ||
   fail "missing baseline was incorrectly treated as available"
