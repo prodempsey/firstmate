@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/fm-verify.test.sh - behavior tests for bin/fm-verify.sh, the Gauntlet
+# tests/fm-verify.test.sh - behavior tests for bin/fm-verify.sh, the Shakedown
 # pre-QA verifier. Every fixture is a deliberately-shaped candidate repo; the
 # verifier is LLM-free and execution-backed, so the tests assert on the machine
 # bundle it produces and on its exit code.
@@ -246,7 +246,7 @@ pass "F5: lint behavior changes from the ledger authority alone (strip FC-007 de
 # --- FC-007: EVERY refusal invalidates the prior pass in BOTH artifacts --------
 seed_pass() { # <out>  - seed an authoritative pass bundle + pass summary
   jq -n '{schema:"firstmate/verify-bundle/1",verdict:"pass"}' > "$1"
-  printf '# Gauntlet verify - pass\n' > "$(dirname "$1")/verify-summary.md"
+  printf '# Shakedown verify - pass\n' > "$(dirname "$1")/verify-summary.md"
 }
 for refusal in unknown-option bad-format missing-runner missing-binding; do
   SO="$TMP/refuse-$refusal/verify-bundle.json"; mkdir -p "$(dirname "$SO")"

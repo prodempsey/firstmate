@@ -11,11 +11,11 @@
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
-#   --gauntlet-bundle <path> (scout only) appends a "Gauntlet evidence" section
+#   --gauntlet-bundle <path> (scout only) appends a "Shakedown evidence" section
 #   that points the QA reviewer at the machine-checked verify bundle produced by
 #   bin/fm-verify.sh, so QA starts from executed evidence rather than re-linting.
 #   --gauntlet-waived <reason> (scout only, mutually exclusive) instead records
-#   that the Gauntlet gate was explicitly waived for a non-code scout, so the
+#   that the Shakedown gate was explicitly waived for a non-code scout, so the
 #   reviewer knows no mechanical proof backs the review. These flags are normally
 #   supplied by bin/fm-qa-dispatch.sh, the QA-dispatch chokepoint, not by hand.
 #   --kd-review (alias --visual-review) appends a visual-review contract: when a
@@ -138,15 +138,15 @@ STATUS_FILE=$(shell_quote "$STATE/$ID.status")
 
 KD_NOTE=""
 [ "$KD_REVIEW" = 1 ] && KD_NOTE=" +kd-review"
-[ -n "$GAUNTLET_BUNDLE" ] && KD_NOTE="$KD_NOTE +gauntlet"
-[ -n "$GAUNTLET_WAIVED" ] && KD_NOTE="$KD_NOTE +gauntlet-waived"
+[ -n "$GAUNTLET_BUNDLE" ] && KD_NOTE="$KD_NOTE +shakedown"
+[ -n "$GAUNTLET_WAIVED" ] && KD_NOTE="$KD_NOTE +shakedown-waived"
 
 # --kd-review/--visual-review appends this visual-review contract to a ship or
 # scout brief. It routes a rendered UI/design/mockup into one self-contained
 # KrakenDesign HTML artifact under data/<id>/ (register/poll procedure lives in
 # the krakendesign skill) instead of a folder of screenshots. Not applicable to a
 # secondmate charter, which is not a task brief.
-# --gauntlet-bundle appends this "Gauntlet evidence" section to a scout (QA) brief.
+# --gauntlet-bundle appends this "Shakedown evidence" section to a scout (QA) brief.
 # It points the reviewer at the machine-checked verify bundle bin/fm-verify.sh
 # produced for the exact candidate under review, so QA round 1 stops being the
 # fleet's de-facto linter and the reviewer spends its whole budget on semantics.
@@ -155,7 +155,7 @@ emit_gauntlet_bundle_section() {
   summary="$(dirname "$bundle")/verify-summary.md"
   cat <<EOF
 
-# Gauntlet evidence (read this first)
+# Shakedown evidence (read this first)
 This QA review starts from a machine-checked evidence bundle produced by the pre-QA verifier (\`fm-verify.sh\`), not from a blank slate.
 Read the human summary first: \`$summary\`
 The full bundle is \`$bundle\` (schema \`firstmate/verify-bundle/1\`). It binds the exact HEAD SHA and branch under review and records, per gate: a clean-tree attestation, base currency, the executed-test transcript (SKIP, TIMEOUT, and no-tests are findings, never passes), failure-class cue-lint results, and the dispatch-contract checklist.
@@ -164,14 +164,14 @@ If the bundle's \`candidate.head_sha\` does not match the commit you are actuall
 EOF
 }
 
-# --gauntlet-waived appends this section instead, recording that the Gauntlet gate
+# --gauntlet-waived appends this section instead, recording that the Shakedown gate
 # was explicitly waived for a non-code scout so the reviewer knows nothing
 # mechanical was proven up front.
 emit_gauntlet_waived_section() {
   local reason=$1
   cat <<EOF
 
-# Gauntlet evidence: WAIVED
+# Shakedown evidence: WAIVED
 The pre-QA verifier (\`fm-verify.sh\`) was explicitly waived for this scout.
 Reason: $reason
 No executed evidence bundle backs this review, so nothing mechanical has been proven up front. Treat test execution, SHA/branch identity, tree cleanliness, and base currency as unverified and check them yourself if they bear on your findings.

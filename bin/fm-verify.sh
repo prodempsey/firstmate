@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fm-verify.sh - the Gauntlet: a deterministic, LLM-free pre-QA verifier.
+# fm-verify.sh - the Shakedown: a deterministic, LLM-free pre-QA verifier.
 #
 # WHY THIS EXISTS
 # ---------------
@@ -121,7 +121,7 @@ if [ -n "$OUT" ]; then
     || refuse "cannot stage bundle invalidation marker"
   mv -f "$tmp" "$OUT" || { rm -f "$tmp"; refuse "cannot invalidate stale bundle at $OUT"; }
   stmp="$SUMMARY_OUT.invalidating.$$"
-  printf '%s\n' '# Gauntlet verify - invalidated' '' 'Verification started or refused; there is no authoritative result at this path.' > "$stmp" \
+  printf '%s\n' '# Shakedown verify - invalidated' '' 'Verification started or refused; there is no authoritative result at this path.' > "$stmp" \
     || refuse "cannot stage summary invalidation marker"
   mv -f "$stmp" "$SUMMARY_OUT" || { rm -f "$stmp"; refuse "cannot invalidate stale summary at $SUMMARY_OUT"; }
 fi
@@ -675,7 +675,7 @@ mv -f "$TMP_OUT" "$OUT" || { rm -f "$TMP_OUT"; refuse "cannot publish bundle to 
 # --- human summary (replaces the invalidated summary marker) ------------------
 SUMMARY="$WORK/summary.md"
 {
-  printf '# Gauntlet verify - %s\n\n' "$VERDICT"
+  printf '# Shakedown verify - %s\n\n' "$VERDICT"
   printf -- '- candidate: %s @ %s (%s)\n' "$ACTUAL_BRANCH" "${ACTUAL_SHA:0:12}" "$WORKTREE"
   printf -- '- task: %s\n' "$TASK"
   printf -- '- bundle: %s\n' "$OUT"

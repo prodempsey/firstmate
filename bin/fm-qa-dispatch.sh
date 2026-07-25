@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # fm-qa-dispatch.sh - the QA-dispatch chokepoint: gate a codex QA scout on the
-# Gauntlet evidence bundle before it is ever spawned.
+# Shakedown evidence bundle before it is ever spawned.
 #
 # WHY THIS EXISTS
 # ---------------
 # QA round 1 has become the fleet's de-facto linter: the QA scout is spent
 # rediscovering mechanically-detectable defects that bin/fm-verify.sh (the
-# Gauntlet) already proves or refutes. This wrapper is the single sanctioned path
+# Shakedown) already proves or refutes. This wrapper is the single sanctioned path
 # for dispatching a QA scout. It refuses to spawn one unless a FRESH, PASSING
 # verify bundle exists for the EXACT candidate SHA under review, and it scaffolds
 # the QA brief so it auto-references that bundle - so the reviewer starts from
@@ -18,21 +18,24 @@
 # refused, so a passing bundle for an older commit can never wave through code it
 # never saw. The refusal is fail-closed, the same idiom as fm_backend_validate_spawn.
 #
-# The escape hatch is explicit and never silent: --no-gauntlet <reason> waives the
+# The escape hatch is explicit and never silent: --no-shakedown <reason> waives the
 # gate for a genuine NON-CODE scout (a docs audit, a research question), and the
 # waiver is appended to state/gauntlet-dispatch.log AND written into the brief.
+# --no-gauntlet is accepted as a deprecated alias for --no-shakedown (logged once).
 #
 # Usage:
 #   fm-qa-dispatch.sh <qa-task-id> <repo> --sha <candidate-sha> [options]
 #     <qa-task-id>         The QA scout's own task id (the one that gets spawned).
 #     <repo>               Project dir (e.g. projects/foo), passed to brief + spawn.
-#     --sha <sha>          REQUIRED unless --no-gauntlet. The exact candidate HEAD
+#     --sha <sha>          REQUIRED unless --no-shakedown. The exact candidate HEAD
 #                          the QA scout will review; the bundle MUST be bound to it.
 #     --branch <name>      Candidate branch (echoed into the fm-verify remedy line).
 #     --bundle <path>      Verify bundle to gate on.
 #                          Default: data/<qa-task-id>/verify-bundle.json.
-#     --no-gauntlet <why>  Escape hatch for a NON-CODE scout: skip the gate. The
+#     --no-shakedown <why> Escape hatch for a NON-CODE scout: skip the gate. The
 #                          reason is REQUIRED and the waiver is logged (never silent).
+#     --no-gauntlet <why>  Deprecated alias for --no-shakedown (accepted; deprecation
+#                          is logged once per invocation).
 #     --no-spawn           Run the gate + brief scaffold only; do not spawn.
 #     --harness <name>     Forwarded to fm-spawn (required when crew-dispatch.json exists).
 #     --model <name>       Forwarded to fm-spawn.
@@ -70,6 +73,7 @@ BUNDLE=""
 NO_GAUNTLET=0
 WAIVER_REASON=""
 NO_SPAWN=0
+DEPRECATE_NO_GAUNTLET=0
 SPAWN_ARGS=()
 BRIEF_ARGS=()
 POS=()
@@ -80,7 +84,8 @@ while [ $# -gt 0 ]; do
     --sha) SHA=${2:-}; shift ;;
     --branch) BRANCH=${2:-}; shift ;;
     --bundle) BUNDLE=${2:-}; shift ;;
-    --no-gauntlet) NO_GAUNTLET=1; WAIVER_REASON=${2:-}; shift ;;
+    --no-shakedown) NO_GAUNTLET=1; WAIVER_REASON=${2:-}; shift ;;
+    --no-gauntlet) NO_GAUNTLET=1; WAIVER_REASON=${2:-}; DEPRECATE_NO_GAUNTLET=1; shift ;;
     --no-spawn) NO_SPAWN=1 ;;
     --harness) SPAWN_ARGS+=(--harness "${2:-}"); shift ;;
     --model)   SPAWN_ARGS+=(--model "${2:-}"); shift ;;
@@ -127,9 +132,13 @@ refuse_gate() {
   exit 3
 }
 
+if [ "$DEPRECATE_NO_GAUNTLET" = 1 ]; then
+  echo "fm-qa-dispatch: warning: --no-gauntlet is deprecated; use --no-shakedown (accepted as an alias this invocation)" >&2
+fi
+
 if [ "$NO_GAUNTLET" = 1 ]; then
   case "$WAIVER_REASON" in
-    ""|--*) echo "error: --no-gauntlet requires a non-empty reason (the non-code-scout justification)" >&2; exit 2 ;;
+    ""|--*) echo "error: --no-shakedown requires a non-empty reason (the non-code-scout justification)" >&2; exit 2 ;;
   esac
   # Fail closed (finding 1): the waiver is valid ONLY if its log line was durably
   # written. If the log write fails, the waiver is NOT recorded, so it must NOT
@@ -139,14 +148,14 @@ if [ "$NO_GAUNTLET" = 1 ]; then
     echo "fm-qa-dispatch: QA dispatch REFUSED - the waiver could not be durably logged to $STATE/gauntlet-dispatch.log; an unlogged waiver is invalid (fail closed, FC-005)" >&2
     exit 3
   fi
-  echo "fm-qa-dispatch: Gauntlet gate WAIVED for $ID (reason: $WAIVER_REASON); waiver logged to $STATE/gauntlet-dispatch.log" >&2
+  echo "fm-qa-dispatch: Shakedown gate WAIVED for $ID (reason: $WAIVER_REASON); waiver logged to $STATE/gauntlet-dispatch.log" >&2
 else
-  [ -n "$SHA" ] || { echo "error: --sha <candidate-sha> is required (the exact SHA under review); use --no-gauntlet <reason> only for a non-code scout" >&2; exit 2; }
+  [ -n "$SHA" ] || { echo "error: --sha <candidate-sha> is required (the exact SHA under review); use --no-shakedown <reason> only for a non-code scout" >&2; exit 2; }
   command -v jq >/dev/null 2>&1 || refuse_gate "jq is required to read the verify bundle but is not installed"
-  [ -f "$BUNDLE" ] || refuse_gate "no verify bundle at $BUNDLE (the Gauntlet has not run for this candidate)"
+  [ -f "$BUNDLE" ] || refuse_gate "no verify bundle at $BUNDLE (the Shakedown has not run for this candidate)"
 
   schema=$(jq -r '.schema // ""' "$BUNDLE" 2>/dev/null || echo "")
-  [ "$schema" = "firstmate/verify-bundle/1" ] || refuse_gate "$BUNDLE is not a readable Gauntlet bundle (schema '$schema')"
+  [ "$schema" = "firstmate/verify-bundle/1" ] || refuse_gate "$BUNDLE is not a readable Shakedown bundle (schema '$schema')"
 
   verdict=$(jq -r '.verdict // ""' "$BUNDLE" 2>/dev/null || echo "")
   head_sha=$(jq -r '.candidate.head_sha // ""' "$BUNDLE" 2>/dev/null || echo "")
@@ -162,7 +171,7 @@ else
   # a failed write is surfaced, never swallowed.
   log_dispatch PASS "sha=$SHA bundle=$BUNDLE" \
     || echo "warning: could not write the dispatch trail to $STATE/gauntlet-dispatch.log (the passing bundle remains the durable proof)" >&2
-  echo "fm-qa-dispatch: Gauntlet gate PASSED for $ID @ ${SHA:0:12} (bundle $BUNDLE)" >&2
+  echo "fm-qa-dispatch: Shakedown gate PASSED for $ID @ ${SHA:0:12} (bundle $BUNDLE)" >&2
 fi
 
 # --- brief: auto-reference the bundle (or record the waiver) ------------------
@@ -176,7 +185,7 @@ if [ ! -f "$BRIEF" ]; then
       || { echo "error: failed to scaffold QA brief" >&2; exit 2; }
   fi
   if [ "$NO_GAUNTLET" = 1 ]; then
-    echo "fm-qa-dispatch: scaffolded QA brief at $BRIEF (records the Gauntlet waiver); replace {TASK} with the QA charge, then re-run to spawn." >&2
+    echo "fm-qa-dispatch: scaffolded QA brief at $BRIEF (records the Shakedown waiver); replace {TASK} with the QA charge, then re-run to spawn." >&2
   else
     echo "fm-qa-dispatch: scaffolded QA brief at $BRIEF (references the evidence bundle); replace {TASK} with the QA charge, then re-run to spawn." >&2
   fi

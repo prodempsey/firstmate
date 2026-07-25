@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # tests/fm-qa-dispatch.test.sh - behavior tests for bin/fm-qa-dispatch.sh, the
-# QA-dispatch chokepoint (Gauntlet slice 2). The wrapper refuses to spawn a QA
+# QA-dispatch chokepoint (Shakedown slice 2). The wrapper refuses to spawn a QA
 # scout unless a FRESH, PASSING verify bundle exists for the EXACT candidate SHA,
 # scaffolds the QA brief so it auto-references that bundle, and offers an explicit,
-# logged --no-gauntlet escape hatch for non-code scouts.
+# logged --no-shakedown escape hatch for non-code scouts (--no-gauntlet remains a
+# deprecated alias).
 #
 # The real fm-spawn is never invoked: FM_QA_SPAWN points the final launch at a
 # recorder stub, so a refusal test never reaches a terminal backend and a pass
@@ -57,7 +58,8 @@ test_help_renders() {
   local out
   out=$("$DISPATCH" --help)
   assert_contains "$out" "QA scout's own task id" "help omitted its usage block"
-  assert_contains "$out" "--no-gauntlet" "help omitted the escape hatch"
+  assert_contains "$out" "--no-shakedown" "help omitted the escape hatch"
+  assert_contains "$out" "--no-gauntlet" "help omitted the deprecated alias note"
   pass "fm-qa-dispatch.sh: --help renders"
 }
 
@@ -111,7 +113,7 @@ test_refuse_wrong_schema() {
   local out rc
   out=$(run_dispatch "$h" qa-e projects/foo --sha abc123 --no-spawn 2>&1); rc=$?
   expect_code 3 "$rc" "wrong-schema bundle must refuse"
-  assert_contains "$out" "not a readable Gauntlet bundle" "refusal must reject the wrong schema"
+  assert_contains "$out" "not a readable Shakedown bundle" "refusal must reject the wrong schema"
   pass "refuse: wrong schema -> exit 3"
 }
 
@@ -136,7 +138,7 @@ test_pass_scaffolds_referencing_brief() {
   assert_present "$h/data/qa-g/brief.md" "the QA brief must be scaffolded"
   assert_grep "$h/data/qa-g/verify-bundle.json" "$h/data/qa-g/brief.md" \
     "the scaffolded brief must auto-reference the evidence bundle path"
-  assert_grep "Gauntlet evidence" "$h/data/qa-g/brief.md" "the brief must carry the Gauntlet evidence section"
+  assert_grep "Shakedown evidence" "$h/data/qa-g/brief.md" "the brief must carry the Shakedown evidence section"
   # {TASK} is unfilled, so the wrapper stops short of spawning.
   assert_absent "$h/spawn.args" "wrapper must not spawn a brief that still carries {TASK}"
   pass "pass: gate clears, brief auto-references the bundle, holds at {TASK}"
@@ -168,29 +170,40 @@ test_pass_logs_dispatch() {
   pass "pass: dispatch decision is logged"
 }
 
-# --- escape hatch: --no-gauntlet, logged, never silent -----------------------
+# --- escape hatch: --no-shakedown, logged, never silent -----------------------
 test_escape_hatch_bypasses_and_logs() {
   local h; h=$(new_home escape)
   # No bundle exists at all - the gate would refuse, but the waiver bypasses it.
   local out rc
-  out=$(run_dispatch "$h" qa-j projects/foo --no-gauntlet "docs-only audit, no code" --no-spawn 2>&1); rc=$?
+  out=$(run_dispatch "$h" qa-j projects/foo --no-shakedown "docs-only audit, no code" --no-spawn 2>&1); rc=$?
   expect_code 0 "$rc" "an explicit waiver must clear dispatch"
   assert_contains "$out" "WAIVED" "the waiver must be announced"
   assert_grep "WAIVED" "$h/state/gauntlet-dispatch.log" "the waiver must be logged (never silent)"
   assert_grep "docs-only audit, no code" "$h/state/gauntlet-dispatch.log" "the log must record the waiver reason"
-  assert_grep "WAIVED" "$h/data/qa-j/brief.md" "the brief must record that the Gauntlet was waived"
+  assert_grep "WAIVED" "$h/data/qa-j/brief.md" "the brief must record that the Shakedown was waived"
   assert_grep "docs-only audit, no code" "$h/data/qa-j/brief.md" "the brief must carry the waiver reason"
-  pass "escape hatch: --no-gauntlet bypasses the gate and logs the waiver"
+  pass "escape hatch: --no-shakedown bypasses the gate and logs the waiver"
+}
+
+test_escape_hatch_deprecated_alias() {
+  local h; h=$(new_home escape-alias)
+  local out rc
+  out=$(run_dispatch "$h" qa-j2 projects/foo --no-gauntlet "legacy docs-only audit" --no-spawn 2>&1); rc=$?
+  expect_code 0 "$rc" "deprecated --no-gauntlet alias must still clear dispatch"
+  assert_contains "$out" "deprecated" "the alias must log a deprecation warning once"
+  assert_contains "$out" "WAIVED" "the deprecated alias must still waive the gate"
+  assert_grep "WAIVED" "$h/state/gauntlet-dispatch.log" "the alias waiver must be logged"
+  pass "escape hatch: --no-gauntlet remains a deprecated alias"
 }
 
 test_escape_hatch_requires_reason() {
   local h; h=$(new_home escapenoreason)
   local rc
-  run_dispatch "$h" qa-k projects/foo --no-gauntlet --no-spawn >/dev/null 2>&1; rc=$?
-  expect_code 2 "$rc" "--no-gauntlet without a reason is a usage error"
-  # A bare --no-gauntlet followed by another flag must not silently swallow the flag as a reason.
-  run_dispatch "$h" qa-k projects/foo --no-gauntlet --harness codex --no-spawn >/dev/null 2>&1; rc=$?
-  expect_code 2 "$rc" "--no-gauntlet must not consume the next flag as its reason"
+  run_dispatch "$h" qa-k projects/foo --no-shakedown --no-spawn >/dev/null 2>&1; rc=$?
+  expect_code 2 "$rc" "--no-shakedown without a reason is a usage error"
+  # A bare --no-shakedown followed by another flag must not silently swallow the flag as a reason.
+  run_dispatch "$h" qa-k projects/foo --no-shakedown --harness codex --no-spawn >/dev/null 2>&1; rc=$?
+  expect_code 2 "$rc" "--no-shakedown must not consume the next flag as its reason"
   pass "escape hatch: reason is mandatory"
 }
 
@@ -201,7 +214,7 @@ test_missing_sha_without_waiver() {
   local rc
   run_dispatch "$h" qa-l projects/foo --no-spawn >/dev/null 2>&1; rc=$?
   expect_code 2 "$rc" "--sha is required for a gated dispatch"
-  pass "usage: --sha required unless --no-gauntlet"
+  pass "usage: --sha required unless --no-shakedown"
 }
 
 test_missing_positionals() {
@@ -280,7 +293,7 @@ test_waiver_fails_closed_when_unloggable() {
   local h; h=$(new_home waiverfailclosed)
   mkdir -p "$h/state/gauntlet-dispatch.log"
   local out rc
-  out=$(run_dispatch "$h" qa-w projects/foo --no-gauntlet "docs-only audit" --no-spawn 2>&1); rc=$?
+  out=$(run_dispatch "$h" qa-w projects/foo --no-shakedown "docs-only audit" --no-spawn 2>&1); rc=$?
   expect_code 3 "$rc" "an un-loggable waiver must fail closed"
   assert_contains "$out" "unlogged waiver is invalid" "refusal must explain the fail-closed reason"
   assert_absent "$h/spawn.args" "an un-loggable waiver must never reach fm-spawn"
@@ -318,6 +331,7 @@ test_pass_scaffolds_referencing_brief
 test_pass_spawns_after_task_authored
 test_pass_logs_dispatch
 test_escape_hatch_bypasses_and_logs
+test_escape_hatch_deprecated_alias
 test_escape_hatch_requires_reason
 test_missing_sha_without_waiver
 test_missing_positionals
