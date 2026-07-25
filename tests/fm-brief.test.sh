@@ -224,6 +224,72 @@ test_herdr_lab_contract_applies_to_scouts_but_not_secondmates() {
   pass "fm-brief.sh: Herdr lab contract covers scouts and rejects secondmate misuse"
 }
 
+# Ship briefs must carry the standing failure-class invariants (FC-001 and
+# FC-002) verbatim from the ledger, across every delivery mode, plus a pointer
+# to the full ledger. The invariant strings are quoted here so the test also
+# guards against silent paraphrase drift away from the ledger's wording.
+test_ship_standing_invariants_block() {
+  local home id brief
+  home="$TMP_ROOT/standing-invariants-home"
+  write_registry "$home"
+
+  local fc001 fc002
+  fc001='A conclusion may be drawn only from ONE atomic pass that positively proves conformance to a single declared, closed schema; authority defaults to none and is NEVER inferred from the absence of a failing check.'
+  fc002='An obligation is cleared ONLY by positive proof from a fresh, structurally-complete, authoritative snapshot that provably enumerates that obligation'\''s status; absent/stale/corrupt/partial coverage RETAINS the prior fact unchanged (fail-open when CREATING a block, fail-closed when DISCHARGING one).'
+
+  # Guard the ledger source too: the on-disk invariants must equal what the
+  # brief embeds, so this test fails if either the ledger or the brief drifts.
+  local led="$ROOT/docs/failure-classes/ledger.jsonl"
+  assert_present "$led" "failure-class ledger missing"
+  assert_grep "$fc001" "$led" "ledger FC-001 invariant text drifted from the test's expected string"
+  assert_grep "$fc002" "$led" "ledger FC-002 invariant text drifted from the test's expected string"
+
+  for id_proj in "brief-inv-nomistakes:no-registry-proj" "brief-inv-directpr:direct-proj" "brief-inv-localonly:local-proj"; do
+    id=${id_proj%%:*}
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" "${id_proj##*:}" >/dev/null 2>&1
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$id: brief was not scaffolded"
+    assert_grep "# Standing invariants" "$brief" "$id: ship brief missing the Standing invariants block"
+    assert_grep "FC-001 (closed-schema positive proof)" "$brief" "$id: ship brief missing the FC-001 label"
+    assert_grep "$fc001" "$brief" "$id: ship brief missing the FC-001 invariant verbatim"
+    assert_grep "FC-002 (absence is never discharge)" "$brief" "$id: ship brief missing the FC-002 label"
+    assert_grep "$fc002" "$brief" "$id: ship brief missing the FC-002 invariant verbatim"
+    assert_grep "docs/failure-classes/ledger.jsonl" "$brief" "$id: ship brief missing the full-ledger pointer"
+  done
+
+  # Scout briefs are not gated on implementation invariants; keep the block out.
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-inv-scout no-registry-proj --scout >/dev/null 2>&1
+  assert_no_grep "# Standing invariants" "$home/data/brief-inv-scout/brief.md" \
+    "scout brief must not carry the ship-only Standing invariants block"
+  pass "fm-brief.sh: ship briefs embed FC-001/FC-002 invariants verbatim with a ledger pointer"
+}
+
+# Scout/QA briefs must carry the Review practice block: neutral software-QA
+# framing (no adversarial/attack vocabulary that trips provider filters) and the
+# fleet-bridge headless-Chrome rig guidance in place of chrome-devtools-axi.
+test_scout_review_practice_block() {
+  local home brief
+  home="$TMP_ROOT/review-practice-home"
+  mkdir -p "$home/data"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-review-scout someproj --scout >/dev/null 2>&1
+  brief="$home/data/brief-review-scout/brief.md"
+  assert_present "$brief" "scout brief was not scaffolded"
+  assert_grep "# Review practice" "$brief" "scout brief missing the Review practice block"
+  assert_grep "software quality assurance" "$brief" "Review practice block lost the neutral-QA framing"
+  assert_grep "not adversarial or attack framing" "$brief" "Review practice block lost the no-adversarial-vocabulary guidance"
+  assert_grep "For fleet-bridge rendered verification" "$brief" "Review practice block lost the fleet-bridge browser guidance"
+  # shellcheck disable=SC2016 # Literal backticks must remain in the brief text.
+  assert_grep 'set `CHROME_BIN` per the header of `test/bridge-card-open.mjs`' "$brief" \
+    "Review practice block lost the CHROME_BIN headless-Chrome rig recipe pointer"
+  assert_grep "never chrome-devtools-axi" "$brief" "Review practice block must steer fleet-bridge verification off chrome-devtools-axi"
+
+  # Ship briefs get their own invariants block, not this scout/QA guidance.
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-review-ship someproj >/dev/null 2>&1
+  assert_no_grep "# Review practice" "$home/data/brief-review-ship/brief.md" \
+    "ship brief must not carry the scout-only Review practice block"
+  pass "fm-brief.sh: scout briefs carry neutral-QA framing and the fleet-bridge headless-Chrome recipe"
+}
+
 test_pause_verb_override_renders_all_brief_scaffolds() {
   local home kind id brief
   home="$TMP_ROOT/pause-verb-home"
@@ -270,4 +336,6 @@ test_herdr_lab_contract_quotes_foreign_firstmate_path
 test_herdr_lab_omission_is_loud_for_ship_and_scout
 test_herdr_lab_contract_applies_to_scouts_but_not_secondmates
 test_secondmate_no_projects_charter
+test_ship_standing_invariants_block
+test_scout_review_practice_block
 test_pause_verb_override_renders_all_brief_scaffolds
