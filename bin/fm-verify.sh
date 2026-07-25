@@ -41,6 +41,9 @@
 #                   isolated checkout under a hard deadline; PASS/FAIL/SKIP/TIMEOUT
 #                   parsed; SKIP, timeout, no-tests, and any declared!=executed
 #                   mismatch are findings, never passes
+#   scanner         pinned, offline deterministic scanners over the exact base
+#                   and candidate trees; only candidate-new findings block while
+#                   inherited findings are retained in a separately labeled set
 #   cue_lint        failure-class detection cues read LIVE from the ledger's
 #                   machine-readable `detection` field (docs/failure-classes/
 #                   ledger.jsonl) - no hardcoded patterns - grepped against the diff
@@ -75,6 +78,10 @@
 #   FM_VERIFY_FORCE_PID_WATCHDOG =1 forces the portable PID-watchdog deadline even
 #                                when timeout(1) exists, to regression-test the
 #                                no-timeout path required by FC-006.
+#   FM_VERIFY_SCANNER_TIMEOUT    per scanner-call deadline (default 8).
+#   FM_VERIFY_SCANNER_BUDGET     whole scanner battery deadline (default 30).
+#   FM_SCANNER_DIR               pinned scanner installation.
+#   FM_SCANNER_OSV_DB            pre-provisioned offline OSV database root.
 #   FM_FAILURE_LEDGER            override the failure-class ledger path.
 set -u
 
@@ -84,6 +91,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 LEDGER="${FM_FAILURE_LEDGER:-$FM_ROOT/docs/failure-classes/ledger.jsonl}"
 TEST_TIMEOUT="${FM_VERIFY_TEST_TIMEOUT:-600}"
+SCANNER_BUDGET="${FM_VERIFY_SCANNER_BUDGET:-30}"
 
 usage() { sed -n '/^# Usage:/,/^set -u$/p' "$0" | sed 's/^# \{0,1\}//;$d'; }
 
@@ -177,6 +185,8 @@ git -C "$WORKTREE" rev-parse --git-dir >/dev/null 2>&1 || refuse "worktree is no
 [ -f "$BRIEF" ] || refuse "brief not found or unreadable: $BRIEF (the dispatch contract must be present)"
 case "$TEST_TIMEOUT" in ''|*[!0-9]*) refuse "FM_VERIFY_TEST_TIMEOUT must be a positive integer: $TEST_TIMEOUT" ;; esac
 [ "$TEST_TIMEOUT" -gt 0 ] || refuse "FM_VERIFY_TEST_TIMEOUT must be a positive integer: $TEST_TIMEOUT"
+case "$SCANNER_BUDGET" in ''|*[!0-9]*) refuse "FM_VERIFY_SCANNER_BUDGET must be a positive integer: $SCANNER_BUDGET" ;; esac
+[ "$SCANNER_BUDGET" -gt 0 ] || refuse "FM_VERIFY_SCANNER_BUDGET must be a positive integer: $SCANNER_BUDGET"
 
 # --- scratch + guaranteed teardown of the disposable checkout -----------------
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/fm-verify.XXXXXX") || refuse "cannot create scratch dir"
@@ -575,7 +585,7 @@ emit_gate base_currency "$base_status" "$(jq -nc \
     base_sha:(if $sha=="" then null else $sha end),relation:$rel}')"
 
 # ============================================================================
-# Candidate diff (authoritative HEAD vs base); shared by cue_lint + brief
+# Candidate diff (authoritative HEAD vs base); shared by scanner + cue_lint + brief
 # ============================================================================
 DIFF_FILE="$WORK/candidate.diff"
 ADDED_FILE="$WORK/added.tsv"
@@ -596,6 +606,59 @@ awk '
   /^ /         { ln++; next }
   { next }
 ' "$DIFF_FILE" > "$ADDED_FILE"
+
+# ============================================================================
+# GATE: scanner - closed-schema, offline, bounded, baseline-attributed battery
+# ============================================================================
+scanner_status=pass
+SCANNER_REPORT="$WORK/scanner-report.json"
+scanner_outer_budget=$SCANNER_BUDGET
+SCANNER_ARGS=(--repo "$WORKTREE" --candidate "$ACTUAL_SHA")
+[ -n "$DIFF_BASE" ] && SCANNER_ARGS+=(--base "$DIFF_BASE")
+SCANNER_ARGS+=(--out "$SCANNER_REPORT")
+run_bounded "$scanner_outer_budget" "$WORK/scanner-driver.out" \
+  env FM_VERIFY_SCANNER_BUDGET="$SCANNER_BUDGET" \
+    FM_VERIFY_SCANNER_TIMEOUT="${FM_VERIFY_SCANNER_TIMEOUT:-8}" \
+    FM_SCANNER_DIR="${FM_SCANNER_DIR:-$FM_HOME/tools/scanners}" \
+    FM_SCANNER_OSV_DB="${FM_SCANNER_OSV_DB:-${FM_SCANNER_DIR:-$FM_HOME/tools/scanners}/osv-db}" \
+    "$SCRIPT_DIR/fm-scanner.sh" "${SCANNER_ARGS[@]}"
+scanner_rc=$?
+if [ "$BOUNDED_TIMEOUT" = yes ]; then
+  emit_finding scanner scanner-unavailable fail \
+    "SCANNER_UNAVAILABLE [battery]: exceeded the ${scanner_outer_budget}s outer hard deadline (FC-006/FC-004)"
+  scanner_status=fail
+elif [ ! -f "$SCANNER_REPORT" ] || ! jq -e '
+    .schema=="firstmate/scanner-report/1"
+    and (keys == ["base_sha","baseline","budget_s","candidate_sha","duration_ms","findings","schema","timings"])
+  ' "$SCANNER_REPORT" >/dev/null 2>&1; then
+  emit_finding scanner scanner-unavailable fail \
+    "SCANNER_UNAVAILABLE [battery]: scanner crashed or returned output outside firstmate/scanner-report/1 (rc=$scanner_rc; fail closed, FC-001/FC-004)"
+  scanner_status=fail
+else
+  while IFS= read -r finding; do
+    printf '%s\n' "$finding" | jq -c '{
+      gate:"scanner",
+      code:(.scanner+"/"+.rule_id),
+      severity:"fail",
+      message:("["+.attribution+"] "+.message),
+      file:.path,
+      line:.line
+    }' >> "$FINDINGS"
+    FINDING_COUNT=$((FINDING_COUNT + 1))
+    scanner_status=fail
+  done < <(jq -c '.findings[]|select(.blocking)' "$SCANNER_REPORT")
+  [ "$scanner_rc" -eq 0 ] || scanner_status=fail
+fi
+if [ -f "$SCANNER_REPORT" ] && jq -e '.schema=="firstmate/scanner-report/1"' "$SCANNER_REPORT" >/dev/null 2>&1; then
+  emit_gate scanner "$scanner_status" "$(jq -c '{
+    baseline:.baseline,budget_s:.budget_s,duration_ms:.duration_ms,
+    timings:.timings,findings:.findings
+  }' "$SCANNER_REPORT")"
+else
+  emit_gate scanner "$scanner_status" "$(jq -nc --arg budget "$SCANNER_BUDGET" \
+    '{baseline:{available:false,warning:"scanner report unavailable"},
+      budget_s:($budget|tonumber),duration_ms:0,timings:[],findings:[]}')"
+fi
 
 # ============================================================================
 # GATE: cue_lint - detections read LIVE from the ledger; no hardcoded patterns
@@ -730,6 +793,21 @@ SUMMARY="$WORK/summary.md"
   if [ "$FINDING_COUNT" -eq 0 ]; then printf 'none\n'; else
     jq -r '"- [" + .severity + "] " + .gate + " / " + .code + ": " + .message
            + (if .file then " (" + .file + (if .line then ":" + (.line|tostring) else "" end) + ")" else "" end)' "$FINDINGS"
+  fi
+  printf '\n## Scanner inherited findings\n'
+  if jq -e '.findings[]?|select(.attribution=="inherited")' "$SCANNER_REPORT" >/dev/null 2>&1; then
+    jq -r '.findings[]|select(.attribution=="inherited")|
+      "- ["+.scanner+"/"+.rule_id+"] "+.message+
+      (if .path then " ("+.path+(if .line then ":"+(.line|tostring) else "" end)+")" else "" end)' \
+      "$SCANNER_REPORT"
+  else
+    printf 'none\n'
+  fi
+  printf '\n## Scanner unattributed warning\n'
+  if [ -f "$SCANNER_REPORT" ]; then
+    jq -r '.baseline.warning // "none"' "$SCANNER_REPORT" 2>/dev/null || printf 'scanner report unavailable\n'
+  else
+    printf 'scanner report unavailable\n'
   fi
 } > "$SUMMARY"
 cp "$SUMMARY" "$SUMMARY_OUT" 2>/dev/null || true

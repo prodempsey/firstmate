@@ -31,6 +31,47 @@ VERIFY="$ROOT/bin/fm-verify.sh"
 LEDGER="$ROOT/docs/failure-classes/ledger.jsonl"
 fm_git_identity
 TMP=$(fm_test_tmproot fm-verify)
+FM_SCANNER_DIR="$TMP/scanners"
+export FM_SCANNER_DIR
+mkdir -p "$FM_SCANNER_DIR/bin"
+cat > "$FM_SCANNER_DIR/bin/gitleaks" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then printf 'gitleaks version 8.30.1\n'; exit 0; fi
+report=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --report-path) report=${2:-}; shift ;;
+    --report-path=*) report=${1#*=} ;;
+  esac
+  shift
+done
+[ -n "$report" ] || exit 2
+if grep -Rqs 'FM_TEST_NEW_SECRET' . --exclude-dir=.git; then
+  printf '[{"RuleID":"generic-api-key","File":"secret.txt","StartLine":1,"Description":"potential secret","Line":"FM_TEST_NEW_SECRET"}]\n' > "$report"
+else
+  printf '[]\n' > "$report"
+fi
+SH
+chmod +x "$FM_SCANNER_DIR/bin/gitleaks"
+cat > "$FM_SCANNER_DIR/bin/oxlint" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then printf 'oxlint 1.75.0\n'; exit 0; fi
+printf '{"runs":[]}\n'
+SH
+chmod +x "$FM_SCANNER_DIR/bin/oxlint"
+cat > "$FM_SCANNER_DIR/bin/eslint-scanner" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then printf '9.39.5\n'; exit 0; fi
+printf '[]\n'
+SH
+chmod +x "$FM_SCANNER_DIR/bin/eslint-scanner"
+cat > "$FM_SCANNER_DIR/bin/osv-scanner" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then printf 'osv-scanner version: 2.4.0\n'; exit 0; fi
+printf '{"runs":[]}\n'
+SH
+chmod +x "$FM_SCANNER_DIR/bin/osv-scanner"
+mkdir -p "$FM_SCANNER_DIR/osv-db/osv-scanner"
 
 BRIEF="$TMP/brief.md"
 cat > "$BRIEF" <<'EOF'
@@ -80,6 +121,21 @@ expect_code 0 "$rc" "clean candidate exits 0"
 [ "$(bget "$OUT" '.gates[]|select(.gate=="revalidation")|.status')" = pass ] || fail "revalidation should pass on a clean run"
 [ "$(bget "$OUT" .finding_count)" = 0 ] || fail "clean candidate should have zero findings"
 pass "clean candidate: verdict pass, isolated checkout, revalidation clean"
+
+# --- scanner integration: synthetic diff finding reaches the verifier gate ----
+RSCAN=$(build_repo scanner-integration)
+printf 'FM_TEST_NEW_SECRET\n' > "$RSCAN/secret.txt"
+git -C "$RSCAN" add secret.txt
+git -C "$RSCAN" commit -qm "add synthetic secret"
+SCANSHA=$(git -C "$RSCAN" rev-parse HEAD)
+rc=$(verify "$TMP/scanner-integration.json" --worktree "$RSCAN" --base main \
+  --sha "$SCANSHA" --branch fm/g1 --task g1)
+expect_code 1 "$rc" "scanner finding fails integrated verifier"
+[ "$(bget "$TMP/scanner-integration.json" '.gates[]|select(.gate=="scanner")|.status')" = fail ] ||
+  fail "scanner gate did not fail on the synthetic candidate finding"
+[ "$(bget "$TMP/scanner-integration.json" '.findings[]|select(.gate=="scanner" and .code=="gitleaks/generic-api-key")|.code')" = gitleaks/generic-api-key ] ||
+  fail "normalized scanner finding did not reach the top-level verifier findings"
+pass "scanner gate integration: a synthetic candidate diff blocks fm-verify"
 
 # --- FC-005: a delayed BACKGROUND mutation cannot dirty the authoritative tree -
 # (the exact round-2 escape: the suite launches a child that writes AFTER return)

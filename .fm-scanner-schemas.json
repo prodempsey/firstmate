@@ -1,0 +1,13 @@
+{
+  "schema": "firstmate/scanner-schema-map/1",
+  "mappings": [
+    {
+      "path": "docs/model-economy/governed-dispatch-policy.json",
+      "schema_path": "docs/model-economy/schemas/governed-dispatch-policy.schema.json"
+    },
+    {
+      "path": "docs/model-economy/governed-profiles.manifest.json",
+      "schema_path": "docs/model-economy/schemas/governed-profiles-manifest.schema.json"
+    }
+  ]
+}
