@@ -7,9 +7,9 @@
 # Ordinary cleanup is delegated to fm-teardown.sh so landed-work, scout-report,
 # local-only, dirty-worktree, and backend-specific removal safety stay in one
 # place.
-# The one bypass is a known corrupt legacy shape where worktree= points at the
-# active firstmate home itself; that is never a removable worktree, so only the
-# task's volatile state records are cleared.
+# A corrupt legacy shape where worktree= points at the active firstmate home
+# cannot prove either task lineage or landed state. It is reported separately
+# and preserved without calling teardown or deleting any task record.
 #
 # Confirm-twice safeguard (bug-20260710152159-d3f294fa): a live,
 # actively-working crew can transiently read as a dead endpoint - e.g. a tmux
@@ -48,21 +48,10 @@ worktree_is_active_home() {  # <worktree>
   [ "$wt_abs" = "$home_abs" ]
 }
 
-remove_task_state_records() {  # <id>
-  local id=$1
-  rm -f \
-    "$STATE/$id.status" \
-    "$STATE/$id.turn-ended" \
-    "$STATE/$id.check.sh" \
-    "$STATE/$id.meta" \
-    "$STATE/$id.pi-ext.ts" \
-    "$STATE/$id.grok-turnend-token"
-}
-
 META_FOUND=0
 DEAD_FOUND=0
 CLEARED=0
-CORRUPT_CLEARED=0
+CORRUPT_PRESERVED=0
 PRESERVED=0
 
 for meta in "$STATE"/*.meta; do
@@ -94,10 +83,9 @@ for meta in "$STATE"/*.meta; do
   DEAD_FOUND=1
   worktree=$(fm_meta_get "$meta" worktree)
   if worktree_is_active_home "$worktree"; then
-    remove_task_state_records "$id"
-    CLEARED=$((CLEARED + 1))
-    CORRUPT_CLEARED=$((CORRUPT_CLEARED + 1))
-    printf 'GHOST_RECONCILE: %s cleared corrupt-home ghost state only; worktree=%s matched FM_HOME and was not touched.\n' "$id" "$worktree"
+    PRESERVED=$((PRESERVED + 1))
+    CORRUPT_PRESERVED=$((CORRUPT_PRESERVED + 1))
+    printf 'GHOST_RECONCILE: ATTENTION: %s has corrupt worktree=%s matching FM_HOME; landed/closed state cannot be proven, so every task record was preserved.\n' "$id" "$worktree"
     continue
   fi
 
@@ -118,4 +106,4 @@ elif [ "$DEAD_FOUND" -eq 0 ] && [ "$PRESERVED" -eq 0 ]; then
   printf 'GHOST_RECONCILE: no dead task endpoints found.\n'
 fi
 
-printf 'GHOST_RECONCILE: summary cleared=%s corrupt_state_only=%s preserved=%s\n' "$CLEARED" "$CORRUPT_CLEARED" "$PRESERVED"
+printf 'GHOST_RECONCILE: summary cleared=%s corrupt_preserved=%s preserved=%s\n' "$CLEARED" "$CORRUPT_PRESERVED" "$PRESERVED"

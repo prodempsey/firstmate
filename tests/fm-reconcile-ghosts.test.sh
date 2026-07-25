@@ -201,8 +201,8 @@ test_landed_dead_meta_is_cleared() {
   pass "ghost reconciliation clears a landed dead meta (confirmed dead on both reads) through fm-teardown"
 }
 
-test_corrupt_home_worktree_clears_state_only() {
-  local dir fakebin fake_root home windows tmux_log treehouse_log dm_calls out
+test_corrupt_home_worktree_preserves_every_record_without_proof() {
+  local dir fakebin fake_root home windows tmux_log treehouse_log dm_calls out record
   dir="$TMP_ROOT/corrupt-home"
   mkdir -p "$dir"
   fakebin=$(make_fake_tooling "$dir")
@@ -224,16 +224,34 @@ test_corrupt_home_worktree_clears_state_only() {
     "kind=ship" \
     "mode=no-mistakes" \
     "yolo=off"
-  touch "$home/state/corrupt.status" "$home/state/corrupt.check.sh"
+  touch \
+    "$home/state/corrupt.status" \
+    "$home/state/corrupt.turn-ended" \
+    "$home/state/corrupt.check.sh" \
+    "$home/state/corrupt.pi-ext.ts" \
+    "$home/state/corrupt.grok-turnend-token"
 
   out=$(run_reconcile "$fakebin" "$home" "$fake_root" "$windows" "$tmux_log" "$treehouse_log" "$dm_calls")
 
-  assert_absent "$home/state/corrupt.meta" "corrupt-home ghost meta should be removed"
-  assert_absent "$home/state/corrupt.status" "corrupt-home ghost status should be removed"
+  for record in \
+    corrupt.meta \
+    corrupt.status \
+    corrupt.turn-ended \
+    corrupt.check.sh \
+    corrupt.pi-ext.ts \
+    corrupt.grok-turnend-token; do
+    assert_present "$home/state/$record" \
+      "corrupt-home reconciliation must preserve $record without positive landed/closed proof"
+  done
   assert_present "$home/KEEP_HOME" "corrupt-home reconciliation must not remove the active home"
   [ ! -s "$treehouse_log" ] || fail "corrupt-home reconciliation called treehouse unexpectedly"
-  assert_contains "$out" "cleared corrupt-home ghost state only" "corrupt-home ghost should report state-only cleanup"
-  pass "ghost reconciliation never returns or removes a worktree path that is the active home"
+  assert_contains "$out" "GHOST_RECONCILE: ATTENTION: corrupt has corrupt worktree=$home matching FM_HOME" \
+    "corrupt-home ghost should be listed loudly as its own finding"
+  assert_contains "$out" "landed/closed state cannot be proven, so every task record was preserved" \
+    "corrupt-home finding should state the fail-closed reason"
+  assert_contains "$out" "summary cleared=0 corrupt_preserved=1 preserved=1" \
+    "corrupt-home ghost should count as preserved, never cleared"
+  pass "corrupt-home reconciliation performs zero deletions without positive landed/closed proof"
 }
 
 test_unlanded_dead_meta_is_preserved() {
@@ -430,7 +448,7 @@ test_transient_dead_read_is_not_reaped() {
 }
 
 test_landed_dead_meta_is_cleared
-test_corrupt_home_worktree_clears_state_only
+test_corrupt_home_worktree_preserves_every_record_without_proof
 test_unlanded_dead_meta_is_preserved
 test_landed_meta_in_recycled_slot_is_cleared_without_touching_new_holder
 test_valid_terminal_proof_clears_when_task_branch_is_already_gone
