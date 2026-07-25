@@ -1,0 +1,40 @@
+{
+  "schema_version": "firstmate/governed-dispatch-policy/v1",
+  "source_authority": "data/model-economy/ord-223-report.md §F (dispatch request schema), §H (model-selection policy incl. the enumerated Opus-insufficiency denylist), §D5 (task-class taxonomy home); brief §6/§8. Authority pattern per data/me-s3-profiles/design-ruling.md. Slice S4 of ORD-224.",
+  "description": "Single machine-authoritative source for the governed-dispatch SEMANTIC data that the closed request schema cannot enumerate declaratively: the pinned request schema id the validator supports, the model tier order (for next_lower_model derivation), the committed governed task-class taxonomy (§F task_class field / §D5), and the enumerated Opus-insufficiency denylist phrases (§H, the authoritative list §F rule 6 defers to). Validated against docs/model-economy/schemas/governed-dispatch-policy.schema.json. The profile axis (model/effort/tools/writes/nesting/maxTurns bounds per profile) is NOT duplicated here — it lives in the landed S3 governed-profiles.manifest.json, which bin/fm-dispatch-validate.sh reads directly so the matrix stays the single source of truth for the profile projection. task_classes is S4's committed governed taxonomy (the crew-profiles.json committed classes plus the governed classes ord-223-report.md's canonical examples use); reconciling it into config/crew-profiles.json is the separate §D5 firstmate-repo change, out of S4 scope. insufficient_reason_phrases is a best-effort lowercase-substring screen per §F rule 6 / §H's own automation caveat — it catches the laziest violations; the real backstop for reasoning that sounds specific while still failing the gate is the calibration loop (§R, Part 2).",
+  "supported_request_schema_version": "firstmate/governed-dispatch-request/v1",
+  "policy_version": "routing-policy v1",
+  "model_tier_order": ["haiku", "sonnet", "opus", "fable"],
+  "task_classes": [
+    "file_discovery",
+    "ui_inventory",
+    "docs",
+    "simple_refactor",
+    "codebase_sweep",
+    "test_authoring",
+    "release_scribe",
+    "review_candidates",
+    "normal_code_change",
+    "architecture_review",
+    "final_governance_review",
+    "grok_build",
+    "routine_investigation",
+    "complex_bounded_engineering",
+    "exceptional_orchestration"
+  ],
+  "insufficient_reason_phrases": [
+    "this is important",
+    "it is important",
+    "is important",
+    "affects architecture",
+    "high blast radius",
+    "blast radius",
+    "fable is the strongest",
+    "fable is strongest",
+    "strongest model",
+    "this is a bug",
+    "this is a scout",
+    "this is a ship",
+    "this is an order"
+  ]
+}
