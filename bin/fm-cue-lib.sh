@@ -16,12 +16,15 @@
 # ledger returns "[]" with status 0.
 
 FM_CUE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Resolve the validator by the library's own directory (the real bin/), never through an overridable
-# FM_ROOT, so FM_ROOT_OVERRIDE cannot redirect the authority.
-FM_CUE_VALIDATOR="${FM_CUE_VALIDATOR:-$FM_CUE_LIB_DIR/fm-cue-validate.sh}"
+# The authority is bound UNCONDITIONALLY to THIS repo's validator, resolved by the library's own
+# directory (the real bin/) - no ambient environment variable can substitute a weaker, permissive,
+# or success-always authority for it, and no FM_ROOT_OVERRIDE can redirect it. The ONLY test
+# injection is the refusal-only FM_CUE_SIMULATE_MISSING seam inside the validator, which can force a
+# refusal but never a false pass. There is deliberately no override of this path.
+_FM_CUE_VALIDATOR="$FM_CUE_LIB_DIR/fm-cue-validate.sh"
 
 fm_cue_ledger_prove() { # <ledger-path>
-  "$FM_CUE_VALIDATOR" prove "$1"
+  "$_FM_CUE_VALIDATOR" prove "$1"
 }
 
 # fm_cue_check_raw_row <raw-detection-json>: prove a SINGLE raw detection-row string valid through the
@@ -33,7 +36,7 @@ fm_cue_check_raw_row() { # <raw-detection-json>
   local tmp rc
   tmp=$(mktemp "${TMPDIR:-/tmp}/fm-cue-row.XXXXXX") || return 1
   printf '%s' "$1" > "$tmp"
-  "$FM_CUE_VALIDATOR" check-row "$tmp"; rc=$?
+  "$_FM_CUE_VALIDATOR" check-row "$tmp"; rc=$?
   rm -f "$tmp"
   return "$rc"
 }

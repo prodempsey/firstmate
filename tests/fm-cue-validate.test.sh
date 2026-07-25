@@ -70,8 +70,10 @@ refuse_content '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-
 DR() { printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-defined","id":"FC-001","name":"n","invariant":"i","cues":["c"],"fix":"f","provenance":[{"type":"qa","ref":"r"}],"registry":{"memory_type":"procedural","scope":"fleet","confidence":"guarded","keywords":["k"]},"detection":[%s]}' "$1"; }
 refuse_content "$(DR '{"engine":"awk-ere","engine":"regex-pcre","pattern":"x","cue_ref":"c"}')" CUE_LEDGER_INVALID "CANARY DUP-engine-toplevel (first-valid/last-invalid)"
 refuse_content "$(DR '{"engine":"regex-pcre","engine":"awk-ere","pattern":"x","cue_ref":"c"}')" CUE_LEDGER_INVALID "DUP engine (first-invalid/last-valid)"
-refuse_content "$(DR '{"engine":"awk-ere","pattern":"a","pattern":"b","cue_ref":"c"}')" CUE_LEDGER_INVALID "DUP pattern"
-refuse_content "$(DR '{"engine":"awk-ere","pattern":"a","cue_ref":"a","cue_ref":"b"}')" CUE_LEDGER_INVALID "DUP cue_ref"
+refuse_content "$(DR '{"engine":"awk-ere","pattern":"feature","pattern":"[","cue_ref":"c"}')" CUE_LEDGER_INVALID "DUP pattern (first-valid/last-invalid)"
+refuse_content "$(DR '{"engine":"awk-ere","pattern":"[","pattern":"feature","cue_ref":"c"}')" CUE_LEDGER_INVALID "DUP pattern (first-invalid/last-valid)"
+refuse_content "$(DR '{"engine":"awk-ere","pattern":"a","cue_ref":"ok","cue_ref":""}')" CUE_LEDGER_INVALID "DUP cue_ref (first-valid/last-invalid)"
+refuse_content "$(DR '{"engine":"awk-ere","pattern":"a","cue_ref":"","cue_ref":"ok"}')" CUE_LEDGER_INVALID "DUP cue_ref (first-invalid/last-valid)"
 refuse_content '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-defined","id":"FC-001","name":"n","invariant":"i","cues":["c"],"fix":"f","provenance":[{"type":"qa","ref":"r","ref":"r2"}],"registry":{"memory_type":"procedural","scope":"fleet","confidence":"guarded","keywords":["k"]}}' CUE_LEDGER_INVALID "DUP member nested in a value object (provenance.ref)"
 refuse_content '{"schema":"kraken-failure-class/ledger-event/v1","event":"occurrence","id":"FC-001","id":"FC-002","provenance":{"type":"q","ref":"r"}}' CUE_LEDGER_INVALID "DUP member on the ledger envelope (id)"
 

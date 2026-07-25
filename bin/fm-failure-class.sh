@@ -167,7 +167,7 @@ append_event() { # <compact-json-object>
     cat "$LEDGER" > "$tmp" || { rm -f "$tmp" "$err"; die "cannot stage the existing ledger"; }
   fi
   printf '%s\n' "$event" >> "$tmp" || { rm -f "$tmp" "$err"; die "cannot stage the new event"; }
-  if ! "$FM_CUE_VALIDATOR" prove "$tmp" >/dev/null 2>"$err"; then
+  if ! fm_cue_ledger_prove "$tmp" >/dev/null 2>"$err"; then
     marker=$(sed -n 1p "$err" 2>/dev/null); detail=$(sed -n 2p "$err" 2>/dev/null)
     rm -f "$tmp" "$err"
     die "refusing to write: the resulting ledger would be invalid (${marker:-refusal}): ${detail:-}"

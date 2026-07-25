@@ -36,7 +36,9 @@
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCHEMAS_DIR="${FM_CUE_SCHEMAS_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)/docs/failure-classes/schema}"
+# The committed schemas are bound UNCONDITIONALLY to this repo, resolved by the validator's own
+# directory. No ambient variable may substitute a permissive schema directory for the closed ones.
+SCHEMAS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/docs/failure-classes/schema"
 
 SUBCMD="${1:-}"
 TARGET="${2:-}"

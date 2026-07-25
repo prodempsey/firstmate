@@ -676,18 +676,32 @@ if command -v python3 >/dev/null 2>&1 && python3 -c 'import jsonschema' 2>/dev/n
   }
   inject() { cp "$LEDGER" "$1"; printf '%s\n' "$2" >> "$1"; }   # <dest> <extra-line>
   amline() { printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-amended","id":"FC-001","detection":[%s]}' "$1"; }
-  L="$TMP/rd-dup1.jsonl"; inject "$L" "$(amline '{"engine":"awk-ere","engine":"regex-pcre","pattern":"x","cue_ref":"c"}')"; read_fail_closed "$L" "R5 read: DUP engine top-level (first-valid/last-invalid)"
-  L="$TMP/rd-dup2.jsonl"; inject "$L" "$(amline '{"engine":"regex-pcre","engine":"awk-ere","pattern":"x","cue_ref":"c"}')"; read_fail_closed "$L" "R5 read: DUP engine top-level (first-invalid/last-valid)"
-  L="$TMP/rd-dupp.jsonl"; inject "$L" "$(amline '{"engine":"awk-ere","pattern":"a","pattern":"b","cue_ref":"c"}')"; read_fail_closed "$L" "R5 read: DUP pattern on a detection row"
+  occ() { printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"occurrence","id":"FC-001","provenance":{"type":"q","ref":"r"}}'; }
+  # Duplicate detection members, ALL THREE members in BOTH orderings, on the live read path.
+  L="$TMP/rd-dupe1.jsonl"; inject "$L" "$(amline '{"engine":"awk-ere","engine":"regex-pcre","pattern":"x","cue_ref":"c"}')"; read_fail_closed "$L" "R5 read: DUP engine (first-valid/last-invalid)"
+  L="$TMP/rd-dupe2.jsonl"; inject "$L" "$(amline '{"engine":"regex-pcre","engine":"awk-ere","pattern":"x","cue_ref":"c"}')"; read_fail_closed "$L" "R5 read: DUP engine (first-invalid/last-valid)"
+  L="$TMP/rd-dupp1.jsonl"; inject "$L" "$(amline '{"engine":"awk-ere","pattern":"feature","pattern":"[","cue_ref":"c"}')"; read_fail_closed "$L" "R5 read: DUP pattern (first-valid/last-invalid)"
+  L="$TMP/rd-dupp2.jsonl"; inject "$L" "$(amline '{"engine":"awk-ere","pattern":"[","pattern":"feature","cue_ref":"c"}')"; read_fail_closed "$L" "R5 read: DUP pattern (first-invalid/last-valid)"
+  L="$TMP/rd-dupc1.jsonl"; inject "$L" "$(amline '{"engine":"awk-ere","pattern":"a","cue_ref":"ok","cue_ref":""}')"; read_fail_closed "$L" "R5 read: DUP cue_ref (first-valid/last-invalid)"
+  L="$TMP/rd-dupc2.jsonl"; inject "$L" "$(amline '{"engine":"awk-ere","pattern":"a","cue_ref":"","cue_ref":"ok"}')"; read_fail_closed "$L" "R5 read: DUP cue_ref (first-invalid/last-valid)"
   L="$TMP/rd-envdup.jsonl"; inject "$L" '{"schema":"kraken-failure-class/ledger-event/v1","event":"occurrence","id":"FC-001","id":"FC-002","provenance":{"type":"q","ref":"r"}}'; read_fail_closed "$L" "R5 read: DUP member on the ledger envelope"
   L="$TMP/rd-nestdup.jsonl"; inject "$L" '{"schema":"kraken-failure-class/ledger-event/v1","event":"occurrence","id":"FC-001","provenance":{"type":"q","ref":"r","ref":"r2"}}'; read_fail_closed "$L" "R5 read: DUP member nested in a value object"
   L="$TMP/rd-dupid.jsonl"; cp "$LEDGER" "$L"; grep '"event":"class-defined".*"id":"FC-001"' "$LEDGER" | head -1 >> "$L"; read_fail_closed "$L" "R5 read: duplicate class id"
+  # Lexical / encoding fixtures.
   L="$TMP/rd-bom.jsonl"; printf '\xef\xbb\xbf' > "$L"; cat "$LEDGER" >> "$L"; read_fail_closed "$L" "R5 read: leading UTF-8 BOM"
-  L="$TMP/rd-ctl.jsonl"; cp "$LEDGER" "$L"; printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"occurrence","id":"FC-001","provenance":{"type":"q","ref":"r"}}\x07\n' >> "$L"; read_fail_closed "$L" "R5 read: control byte in a line"
-  L="$TMP/rd-trail.jsonl"; cp "$LEDGER" "$L"; printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"occurrence","id":"FC-001","provenance":{"type":"q","ref":"r"}} garbage\n' >> "$L"; read_fail_closed "$L" "R5 read: trailing garbage after a valid object"
+  L="$TMP/rd-bomline.jsonl"; cp "$LEDGER" "$L"; printf '\xef\xbb\xbf%s\n' "$(occ)" >> "$L"; read_fail_closed "$L" "R5 read: BOM on a non-initial line"
+  L="$TMP/rd-ctl.jsonl"; cp "$LEDGER" "$L"; printf '%s\x07\n' "$(occ)" >> "$L"; read_fail_closed "$L" "R5 read: control byte in a line"
+  L="$TMP/rd-nul.jsonl"; cp "$LEDGER" "$L"; printf '%s\x00\n' "$(occ)" >> "$L"; read_fail_closed "$L" "R5 read: NUL byte in a line"
+  L="$TMP/rd-trail.jsonl"; cp "$LEDGER" "$L"; printf '%s garbage\n' "$(occ)" >> "$L"; read_fail_closed "$L" "R5 read: trailing garbage after a valid object"
+  L="$TMP/rd-emptyline.jsonl"; cp "$LEDGER" "$L"; printf '\n%s\n' "$(occ)" >> "$L"; read_fail_closed "$L" "R5 read: an empty line"
+  L="$TMP/rd-wsline.jsonl"; cp "$LEDGER" "$L"; printf '   \n%s\n' "$(occ)" >> "$L"; read_fail_closed "$L" "R5 read: a whitespace-only line"
   read_fail_closed "$TMP/rd-missing-does-not-exist.jsonl" "R5 read: a MISSING ledger fails closed (distinct from empty)"
   read_fail_closed "$LEDGER" "R5 read: python3 absent fails closed" "FM_CUE_SIMULATE_MISSING=python3"
   read_fail_closed "$LEDGER" "R5 read: jsonschema absent fails closed" "FM_CUE_SIMULATE_MISSING=jsonschema"
+  # REGRESSION (qa-scg1r5-q185 F1): an ambient FM_CUE_VALIDATOR / FM_CUE_SCHEMAS_DIR cannot substitute
+  # the authority on the read path either - a malformed ledger must STILL fail the cue lint closed.
+  L="$TMP/rd-override.jsonl"; printf '{broken-json\n' > "$L"
+  read_fail_closed "$L" "R5 read: ambient FM_CUE_VALIDATOR override cannot authorize a malformed ledger (F1)" "FM_CUE_VALIDATOR=true FM_CUE_SCHEMAS_DIR=/tmp FM_CUE_SIMULATE_MISSING=python3"
   # An EMPTY-but-present ledger is valid-empty on the read path: no cues to lint, gate passes, no hit.
   EMPTYL="$TMP/rd-empty.jsonl"; : > "$EMPTYL"
   FM_HOME="$TMP/nohomeE" FM_FAILURE_LEDGER="$EMPTYL" "$VERIFY" --out "$TMP/rfe.json" --brief "$BRIEF" \
