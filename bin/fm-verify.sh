@@ -784,7 +784,7 @@ cue_status=pass
 LEDGER_OK=no
 FOLDED="$WORK/ledger-folded.json"
 if [ -f "$LEDGER" ] \
-  && FM_FC_LEDGER="$LEDGER" "$FM_ROOT/bin/fm-failure-class.sh" list --json > "$FOLDED" 2>/dev/null \
+  && FM_FC_LEDGER="$LEDGER" "$SCRIPT_DIR/fm-failure-class.sh" list --json > "$FOLDED" 2>/dev/null \
   && jq -e 'type=="array" and length>0' "$FOLDED" >/dev/null 2>&1; then
   LEDGER_OK=yes
 fi
