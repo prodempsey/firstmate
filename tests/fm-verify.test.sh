@@ -72,6 +72,11 @@ printf '{"runs":[]}\n'
 SH
 chmod +x "$FM_SCANNER_DIR/bin/osv-scanner"
 mkdir -p "$FM_SCANNER_DIR/osv-db/osv-scanner"
+printf '%s\n' \
+  '{"schema":"firstmate/scanner-tools-ready/1","status":"ready","versions":{"actionlint":"1.7.12","ajv":"8.17.1","eslint":"9.39.5","eslint-plugin-n":"18.2.2","eslint-plugin-security":"4.0.1","eslint-plugin-sonarjs":"4.2.0","gitleaks":"8.30.1","jq":"1.7.1","osv-scanner":"2.4.0","oxlint":"1.75.0","ruff":"0.16.0","shellcheck":"0.11.0"}}' \
+  > "$FM_SCANNER_DIR/tools-ready.json"
+printf '%s\n' '{"schema":"firstmate/scanner-provisioned/1","status":"ready"}' \
+  > "$FM_SCANNER_DIR/provisioned.json"
 
 BRIEF="$TMP/brief.md"
 cat > "$BRIEF" <<'EOF'
@@ -108,6 +113,33 @@ verify() {
   FM_HOME="$TMP/nohome" "$VERIFY" --out "$out" --brief "$BRIEF" "$@" >/dev/null 2>&1
   printf '%s\n' "$?"
 }
+
+# --- scanner adoption: visible note before provisioning, no silent skip -------
+RUNADOPTED=$(build_repo scanner-not-adopted)
+echo feat >> "$RUNADOPTED/f.txt"; git -C "$RUNADOPTED" commit -qam feature
+UNADOPTED_SHA=$(git -C "$RUNADOPTED" rev-parse HEAD)
+rc=$(FM_SCANNER_DIR="$TMP/not-provisioned" verify "$TMP/scanner-not-adopted.json" \
+  --worktree "$RUNADOPTED" --base main --sha "$UNADOPTED_SHA" --branch fm/g1 --task g1)
+expect_code 0 "$rc" "scanner gate is non-blocking before explicit adoption"
+[ "$(bget "$TMP/scanner-not-adopted.json" '.gates[]|select(.gate=="scanner")|.details.adopted')" = false ] ||
+  fail "unprovisioned scanner gate must record adopted=false"
+[ "$(bget "$TMP/scanner-not-adopted.json" '[.findings[]|select(.gate=="scanner" and .code=="gate-not-adopted" and .severity=="note")]|length')" = 1 ] ||
+  fail "unprovisioned scanner gate must emit exactly one visible gate-not-adopted note"
+pass "scanner adoption: an unprovisioned environment passes with one visible note"
+
+# Explicit adoption retains fail-closed behavior for a missing pinned scanner.
+mkdir -p "$TMP/adopted-config"
+printf 'enabled\n' > "$TMP/adopted-config/scanner-gate"
+mv "$FM_SCANNER_DIR/bin/gitleaks" "$FM_SCANNER_DIR/bin/gitleaks.missing"
+rc=$(FM_CONFIG_OVERRIDE="$TMP/adopted-config" verify "$TMP/scanner-adopted-missing.json" \
+  --worktree "$RUNADOPTED" --base main --sha "$UNADOPTED_SHA" --branch fm/g1 --task g1)
+mv "$FM_SCANNER_DIR/bin/gitleaks.missing" "$FM_SCANNER_DIR/bin/gitleaks"
+expect_code 1 "$rc" "explicitly adopted scanner gate fails closed on a missing scanner"
+[ "$(bget "$TMP/scanner-adopted-missing.json" '.gates[]|select(.gate=="scanner")|.details.adopted')" = true ] ||
+  fail "explicit scanner config must record adopted=true"
+[ "$(bget "$TMP/scanner-adopted-missing.json" '[.findings[]|select(.gate=="scanner" and .code=="gitleaks/scanner-unavailable")]|length')" = 1 ] ||
+  fail "an adopted missing scanner must produce one loud scanner-unavailable finding"
+pass "scanner adoption: a missing scanner fails closed after explicit adoption"
 
 # --- clean candidate passes end to end ----------------------------------------
 R=$(build_repo clean)

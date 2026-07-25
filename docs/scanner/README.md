@@ -6,6 +6,10 @@
 
 Install the pinned tools with `bin/fm-install-scanners.sh <scanner-directory>`.
 Refresh the OSV database explicitly with `bin/fm-install-osv-db.sh <scanner-directory>`.
+The scanner gate is adopted automatically only after both helpers publish their closed readiness manifests.
+An operator may adopt it earlier by making the first non-empty line of `config/scanner-gate` exactly `enabled`.
+Before adoption, `bin/fm-verify.sh` emits a visible `gate-not-adopted` note and leaves the gate non-blocking.
+After adoption, every missing, crashed, or timed-out scanner fails closed as a `scanner-unavailable` finding.
 The verification runtime never downloads packages, updates vulnerability data, submits source, or calls a remote service.
 TruffleHog is deliberately excluded because its license and verification behavior violate this gate's local-first boundary.
 

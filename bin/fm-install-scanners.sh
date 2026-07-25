@@ -30,6 +30,7 @@ for tool in curl sha256sum tar npm; do
 done
 
 mkdir -p "$DESTINATION/bin" "$DESTINATION/node"
+rm -f "$DESTINATION/tools-ready.json" "$DESTINATION/provisioned.json"
 
 fetch() {
   local url=$1 checksum=$2 output=$3 actual
@@ -108,3 +109,9 @@ npm ci --prefix "$DESTINATION/node" --ignore-scripts --no-audit --no-fund
 "$DESTINATION/bin/shellcheck" --version
 FM_SCANNER_NODE_DIR="$DESTINATION/node" node "$ROOT/bin/fm-eslint-scanner.mjs" --version
 FM_SCANNER_NODE_DIR="$DESTINATION/node" node "$ROOT/bin/fm-json-schema-scanner.mjs" --version
+
+TOOLS_READY_TMP="$DESTINATION/tools-ready.json.tmp.$$"
+printf '%s\n' \
+  '{"schema":"firstmate/scanner-tools-ready/1","status":"ready","versions":{"actionlint":"1.7.12","ajv":"8.17.1","eslint":"9.39.5","eslint-plugin-n":"18.2.2","eslint-plugin-security":"4.0.1","eslint-plugin-sonarjs":"4.2.0","gitleaks":"8.30.1","jq":"1.7.1","osv-scanner":"2.4.0","oxlint":"1.75.0","ruff":"0.16.0","shellcheck":"0.11.0"}}' \
+  > "$TOOLS_READY_TMP"
+mv -f "$TOOLS_READY_TMP" "$DESTINATION/tools-ready.json"

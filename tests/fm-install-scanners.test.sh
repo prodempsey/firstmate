@@ -17,6 +17,14 @@ done
 [ "$(grep -Fc 'sha256sum "$output"' "$INSTALLER")" -eq 1 ] ||
   fail "standalone scanner downloads must share one checksum-verifying fetch path"
 assert_grep 'npm ci' "$INSTALLER" "Node scanner bundle must install from the lockfile"
+assert_grep 'firstmate/scanner-tools-ready/1' "$INSTALLER" "tool provisioning must publish a closed readiness manifest"
+assert_grep 'firstmate/scanner-provisioned/1' "$DB_INSTALLER" "OSV provisioning must publish the final adoption manifest"
+# shellcheck disable=SC2016  # assertions intentionally match literal script variables
+assert_grep 'rm -f "$DESTINATION/tools-ready.json" "$DESTINATION/provisioned.json"' "$INSTALLER" \
+  "a reinstall must invalidate prior readiness before provisioning"
+# shellcheck disable=SC2016  # assertion intentionally matches a literal script variable
+assert_grep 'rm -f "$SCANNER_DIR/provisioned.json"' "$DB_INSTALLER" \
+  "an OSV refresh must invalidate prior readiness before provisioning"
 jq -e '
   .lockfileVersion==3
   and .packages[""].dependencies.eslint=="9.39.5"

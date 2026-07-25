@@ -82,6 +82,8 @@
 #   FM_VERIFY_SCANNER_BUDGET     whole scanner battery deadline (default 30).
 #   FM_SCANNER_DIR               pinned scanner installation.
 #   FM_SCANNER_OSV_DB            pre-provisioned offline OSV database root.
+#   config/scanner-gate          first non-empty line "enabled" explicitly adopts
+#                                the scanner gate before automatic provisioning.
 #   FM_FAILURE_LEDGER            override the failure-class ledger path.
 set -u
 
@@ -89,9 +91,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
+CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 LEDGER="${FM_FAILURE_LEDGER:-$FM_ROOT/docs/failure-classes/ledger.jsonl}"
 TEST_TIMEOUT="${FM_VERIFY_TEST_TIMEOUT:-600}"
 SCANNER_BUDGET="${FM_VERIFY_SCANNER_BUDGET:-30}"
+SCANNER_DIR="${FM_SCANNER_DIR:-$FM_HOME/tools/scanners}"
+SCANNER_OSV_DB="${FM_SCANNER_OSV_DB:-$SCANNER_DIR/osv-db}"
 
 usage() { sed -n '/^# Usage:/,/^set -u$/p' "$0" | sed 's/^# \{0,1\}//;$d'; }
 
@@ -612,52 +617,94 @@ awk '
 # ============================================================================
 scanner_status=pass
 SCANNER_REPORT="$WORK/scanner-report.json"
-scanner_outer_budget=$SCANNER_BUDGET
-SCANNER_ARGS=(--repo "$WORKTREE" --candidate "$ACTUAL_SHA")
-[ -n "$DIFF_BASE" ] && SCANNER_ARGS+=(--base "$DIFF_BASE")
-SCANNER_ARGS+=(--out "$SCANNER_REPORT")
-run_bounded "$scanner_outer_budget" "$WORK/scanner-driver.out" \
-  env FM_VERIFY_SCANNER_BUDGET="$SCANNER_BUDGET" \
-    FM_VERIFY_SCANNER_TIMEOUT="${FM_VERIFY_SCANNER_TIMEOUT:-8}" \
-    FM_SCANNER_DIR="${FM_SCANNER_DIR:-$FM_HOME/tools/scanners}" \
-    FM_SCANNER_OSV_DB="${FM_SCANNER_OSV_DB:-${FM_SCANNER_DIR:-$FM_HOME/tools/scanners}/osv-db}" \
-    "$SCRIPT_DIR/fm-scanner.sh" "${SCANNER_ARGS[@]}"
-scanner_rc=$?
-if [ "$BOUNDED_TIMEOUT" = yes ]; then
-  emit_finding scanner scanner-unavailable fail \
-    "SCANNER_UNAVAILABLE [battery]: exceeded the ${scanner_outer_budget}s outer hard deadline (FC-006/FC-004)"
-  scanner_status=fail
-elif [ ! -f "$SCANNER_REPORT" ] || ! jq -e '
-    .schema=="firstmate/scanner-report/1"
-    and (keys == ["base_sha","baseline","budget_s","candidate_sha","duration_ms","findings","schema","timings"])
-  ' "$SCANNER_REPORT" >/dev/null 2>&1; then
-  emit_finding scanner scanner-unavailable fail \
-    "SCANNER_UNAVAILABLE [battery]: scanner crashed or returned output outside firstmate/scanner-report/1 (rc=$scanner_rc; fail closed, FC-001/FC-004)"
-  scanner_status=fail
-else
-  while IFS= read -r finding; do
-    printf '%s\n' "$finding" | jq -c '{
-      gate:"scanner",
-      code:(.scanner+"/"+.rule_id),
-      severity:"fail",
-      message:("["+.attribution+"] "+.message),
-      file:.path,
-      line:.line
-    }' >> "$FINDINGS"
-    FINDING_COUNT=$((FINDING_COUNT + 1))
-    scanner_status=fail
-  done < <(jq -c '.findings[]|select(.blocking)' "$SCANNER_REPORT")
-  [ "$scanner_rc" -eq 0 ] || scanner_status=fail
+SCANNER_ADOPTED=no
+SCANNER_ADOPTION_SOURCE=""
+scanner_config_value=""
+if [ -f "$CONFIG/scanner-gate" ]; then
+  scanner_config_value=$(sed -n '/[^[:space:]]/{s/^[[:space:]]*//;s/[[:space:]]*$//;p;q;}' "$CONFIG/scanner-gate")
 fi
-if [ -f "$SCANNER_REPORT" ] && jq -e '.schema=="firstmate/scanner-report/1"' "$SCANNER_REPORT" >/dev/null 2>&1; then
-  emit_gate scanner "$scanner_status" "$(jq -c '{
-    baseline:.baseline,budget_s:.budget_s,duration_ms:.duration_ms,
-    timings:.timings,findings:.findings
-  }' "$SCANNER_REPORT")"
+if [ "$scanner_config_value" = enabled ]; then
+  SCANNER_ADOPTED=yes
+  SCANNER_ADOPTION_SOURCE=config
+elif jq -e '
+      .schema=="firstmate/scanner-tools-ready/1"
+      and .status=="ready"
+      and (keys == ["schema","status","versions"])
+      and (.versions|keys == ["actionlint","ajv","eslint","eslint-plugin-n","eslint-plugin-security","eslint-plugin-sonarjs","gitleaks","jq","osv-scanner","oxlint","ruff","shellcheck"])
+      and .versions=={
+        "actionlint":"1.7.12","ajv":"8.17.1","eslint":"9.39.5",
+        "eslint-plugin-n":"18.2.2","eslint-plugin-security":"4.0.1",
+        "eslint-plugin-sonarjs":"4.2.0","gitleaks":"8.30.1","jq":"1.7.1",
+        "osv-scanner":"2.4.0","oxlint":"1.75.0","ruff":"0.16.0",
+        "shellcheck":"0.11.0"
+      }
+    ' "$SCANNER_DIR/tools-ready.json" >/dev/null 2>&1 \
+    && jq -e '
+      .schema=="firstmate/scanner-provisioned/1"
+      and .status=="ready"
+      and (keys == ["schema","status"])
+    ' "$SCANNER_DIR/provisioned.json" >/dev/null 2>&1; then
+  SCANNER_ADOPTED=yes
+  SCANNER_ADOPTION_SOURCE=provisioning
+fi
+
+if [ "$SCANNER_ADOPTED" != yes ]; then
+  emit_finding scanner gate-not-adopted note \
+    "scanner gate not adopted; provision the pinned tools and offline OSV database, or set config/scanner-gate to enabled"
+  emit_gate scanner pass "$(jq -nc \
+    '{adopted:false,adoption_source:null,baseline:null,budget_s:null,
+      duration_ms:0,timings:[],findings:[]}')"
 else
-  emit_gate scanner "$scanner_status" "$(jq -nc --arg budget "$SCANNER_BUDGET" \
-    '{baseline:{available:false,warning:"scanner report unavailable"},
-      budget_s:($budget|tonumber),duration_ms:0,timings:[],findings:[]}')"
+  scanner_outer_budget=$SCANNER_BUDGET
+  SCANNER_ARGS=(--repo "$WORKTREE" --candidate "$ACTUAL_SHA")
+  [ -n "$DIFF_BASE" ] && SCANNER_ARGS+=(--base "$DIFF_BASE")
+  SCANNER_ARGS+=(--out "$SCANNER_REPORT")
+  run_bounded "$scanner_outer_budget" "$WORK/scanner-driver.out" \
+    env FM_VERIFY_SCANNER_BUDGET="$SCANNER_BUDGET" \
+      FM_VERIFY_SCANNER_TIMEOUT="${FM_VERIFY_SCANNER_TIMEOUT:-8}" \
+      FM_SCANNER_DIR="$SCANNER_DIR" \
+      FM_SCANNER_OSV_DB="$SCANNER_OSV_DB" \
+      "$SCRIPT_DIR/fm-scanner.sh" "${SCANNER_ARGS[@]}"
+  scanner_rc=$?
+  if [ "$BOUNDED_TIMEOUT" = yes ]; then
+    emit_finding scanner scanner-unavailable fail \
+      "SCANNER_UNAVAILABLE [battery]: exceeded the ${scanner_outer_budget}s outer hard deadline (FC-006/FC-004)"
+    scanner_status=fail
+  elif [ ! -f "$SCANNER_REPORT" ] || ! jq -e '
+      .schema=="firstmate/scanner-report/1"
+      and (keys == ["base_sha","baseline","budget_s","candidate_sha","duration_ms","findings","schema","timings"])
+    ' "$SCANNER_REPORT" >/dev/null 2>&1; then
+    emit_finding scanner scanner-unavailable fail \
+      "SCANNER_UNAVAILABLE [battery]: scanner crashed or returned output outside firstmate/scanner-report/1 (rc=$scanner_rc; fail closed, FC-001/FC-004)"
+    scanner_status=fail
+  else
+    while IFS= read -r finding; do
+      printf '%s\n' "$finding" | jq -c '{
+        gate:"scanner",
+        code:(.scanner+"/"+.rule_id),
+        severity:"fail",
+        message:("["+.attribution+"] "+.message),
+        file:.path,
+        line:.line
+      }' >> "$FINDINGS"
+      FINDING_COUNT=$((FINDING_COUNT + 1))
+      scanner_status=fail
+    done < <(jq -c '.findings[]|select(.blocking)' "$SCANNER_REPORT")
+    [ "$scanner_rc" -eq 0 ] || scanner_status=fail
+  fi
+  if [ -f "$SCANNER_REPORT" ] && jq -e '.schema=="firstmate/scanner-report/1"' "$SCANNER_REPORT" >/dev/null 2>&1; then
+    emit_gate scanner "$scanner_status" "$(jq -c --arg source "$SCANNER_ADOPTION_SOURCE" '{
+      adopted:true,adoption_source:$source,
+      baseline:.baseline,budget_s:.budget_s,duration_ms:.duration_ms,
+      timings:.timings,findings:.findings
+    }' "$SCANNER_REPORT")"
+  else
+    emit_gate scanner "$scanner_status" "$(jq -nc \
+      --arg budget "$SCANNER_BUDGET" --arg source "$SCANNER_ADOPTION_SOURCE" \
+      '{adopted:true,adoption_source:$source,
+        baseline:{available:false,warning:"scanner report unavailable"},
+        budget_s:($budget|tonumber),duration_ms:0,timings:[],findings:[]}')"
+  fi
 fi
 
 # ============================================================================
@@ -804,7 +851,9 @@ SUMMARY="$WORK/summary.md"
     printf 'none\n'
   fi
   printf '\n## Scanner unattributed warning\n'
-  if [ -f "$SCANNER_REPORT" ]; then
+  if [ "$SCANNER_ADOPTED" != yes ]; then
+    printf 'scanner gate not adopted\n'
+  elif [ -f "$SCANNER_REPORT" ]; then
     jq -r '.baseline.warning // "none"' "$SCANNER_REPORT" 2>/dev/null || printf 'scanner report unavailable\n'
   else
     printf 'scanner report unavailable\n'
