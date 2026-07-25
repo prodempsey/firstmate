@@ -757,9 +757,11 @@ fi
 # ============================================================================
 # The single authority for executable cues is docs/failure-classes/ledger.jsonl:
 # each class-defined event MAY carry a machine-readable `detection` array of
-# {engine:"awk-ere", pattern, cue_ref}. The verifier reads it live and lints from
-# it. There is no built-in fallback table - a class the ledger gives no detection
-# for is reported advisory-only, never silently enforced from a duplicate source.
+# {engine:"awk-ere", pattern, cue_ref}, and a later `class-amended` event MAY append
+# more detection onto that id (the ledger's append-only fold-at-read idiom). The
+# verifier reads BOTH event kinds live and lints from their merged detection. There
+# is no built-in fallback table - a class the ledger gives no detection for is
+# reported advisory-only, never silently enforced from a duplicate source.
 cue_status=pass
 LEDGER_OK=no
 if [ -f "$LEDGER" ] && grep -q '"event":"class-defined"' "$LEDGER" 2>/dev/null; then
@@ -784,7 +786,7 @@ if [ "$LEDGER_OK" = yes ]; then
       printf '%s\t%s\t%s\n' "$cid" "$pattern" "$cueref" >> "$EFFECTIVE"
       got=yes
     done < <(jq -r --arg id "$cid" '
-      select(.event=="class-defined" and .id==$id) | (.detection // [])[]
+      select(.id==$id and (.event=="class-defined" or .event=="class-amended")) | (.detection // [])[]
       | [ (.engine // "awk-ere"), (.pattern // ""), (.cue_ref // "") ] | @tsv' "$LEDGER" 2>/dev/null)
     if [ "$got" = yes ]; then printf '%s\n' "$cid" >> "$LINTED_FILE"; else printf '%s\n' "$cid" >> "$ADVISORY_FILE"; fi
   done < <(jq -r 'select(.event=="class-defined")|.id' "$LEDGER" 2>/dev/null)

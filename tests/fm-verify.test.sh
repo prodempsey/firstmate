@@ -16,7 +16,9 @@
 #           invalidates BOTH the JSON bundle and the summary sibling first, so no
 #           stale pass survives in either artifact.
 #   F5      executable cues are read LIVE from the production ledger's `detection`
-#           field with no hardcoded fallback; editing the ledger changes the lint.
+#           field - both the inline class-defined detection and later class-amended
+#           detection, folded at read - with no hardcoded fallback; a class the ledger
+#           gives no detection stays advisory; editing the ledger changes the lint.
 #   FC-006  a wedged suite is killed by a portable hard deadline (timeout AND the
 #           forced PID-watchdog path).
 set -u
@@ -566,27 +568,39 @@ expect_code 1 "$?" "missing declaration exits 1"
 pass "base_currency: stale base fails; trunk-check current passes, missing declaration fails closed"
 
 # --- F5: cues are read LIVE from the production ledger (no hardcoded fallback) --
+# One added line per class the production ledger gives a detection tripwire for:
+# FC-004/006/007 carry their detection inline on the class-defined event; FC-001/002/005
+# carry theirs on an appended `class-amended` event, so this fixture also proves the
+# verifier folds class-amended detection at read. FC-003 has no ledger detection and
+# must therefore stay advisory-only, not linted, no matter what the diff contains.
 RCu=$(build_repo cues)
 cat > "$RCu/script.sh" <<'EOF'
 command -v gtimeout || true
 curl https://example.com/data || true
 rm -f /tmp/attest 2>/dev/null || true
+  "additionalProperties": true,
+  if (count == items.length) { accounted = 1; }
+  mv "$tmp1" "$dst1" && mv "$tmp2" "$dst2"
 EOF
 git -C "$RCu" add -A; git -C "$RCu" commit -qam cues
 USHA=$(git -C "$RCu" rev-parse HEAD)
 rc=$(verify "$TMP/cues.json" --worktree "$RCu" --base main --sha "$USHA" --branch fm/g1 --task g1)
 expect_code 1 "$rc" "cue hits exit 1"
-[ "$(bget "$TMP/cues.json" '[.findings[]|select(.gate=="cue_lint")|.code]|sort|unique|join(",")')" = "FC-004,FC-006,FC-007" ] || fail "the production ledger must drive FC-004/006/007"
+[ "$(bget "$TMP/cues.json" '[.findings[]|select(.gate=="cue_lint")|.code]|sort|unique|join(",")')" = "FC-001,FC-002,FC-004,FC-005,FC-006,FC-007" ] || fail "the production ledger must drive every class it gives a detection - inline (FC-004/006/007) AND class-amended (FC-001/002/005)"
 [ "$(bget "$TMP/cues.json" '[.gates[]|select(.gate=="cue_lint")|.details.detections[].source]|unique|join(",")')" = ledger ] || fail "every detection source must be the live ledger (no builtin)"
 [ "$(bget "$TMP/cues.json" '.gates[]|select(.gate=="cue_lint")|.details.ledger')" = "$LEDGER" ] || fail "cue_lint must record the live ledger path it read"
-pass "F5: FC-004/006/007 detections are read live from the production ledger"
+# FC-003 carries no ledger detection, so it must be reported advisory-only and NEVER linted,
+# even though the diff above contains per-field-equality conditionals it could over-match.
+[ "$(bget "$TMP/cues.json" '.gates[]|select(.gate=="cue_lint")|.details.advisory_only|index("FC-003")|type')" = number ] || fail "FC-003 (no ledger detection) must be advisory-only, not mechanically linted"
+[ "$(bget "$TMP/cues.json" '[.findings[]|select(.gate=="cue_lint")|.code]|index("FC-003")|type')" = null ] || fail "FC-003 must never produce a mechanical cue finding while the ledger gives it no detection"
+pass "F5: inline AND class-amended detections are read live from the production ledger; a detection-less class stays advisory"
 
 # --- F5: editing the ledger authority alone changes the lint ------------------
 STRIPPED="$TMP/ledger-no-fc007.jsonl"
 jq -c 'if .id=="FC-007" then del(.detection) else . end' "$LEDGER" > "$STRIPPED"
 FM_HOME="$TMP/nohome" FM_FAILURE_LEDGER="$STRIPPED" "$VERIFY" --out "$TMP/cues2.json" --brief "$BRIEF" \
   --worktree "$RCu" --base main --sha "$USHA" --branch fm/g1 --task g1 >/dev/null 2>&1
-[ "$(bget "$TMP/cues2.json" '[.findings[]|select(.gate=="cue_lint")|.code]|sort|unique|join(",")')" = "FC-004,FC-006" ] || fail "removing FC-007's detection from the ledger must stop FC-007 linting"
+[ "$(bget "$TMP/cues2.json" '[.findings[]|select(.gate=="cue_lint")|.code]|sort|unique|join(",")')" = "FC-001,FC-002,FC-004,FC-005,FC-006" ] || fail "removing FC-007's detection from the ledger must stop FC-007 linting while the other classes keep theirs"
 [ "$(bget "$TMP/cues2.json" '.gates[]|select(.gate=="cue_lint")|.details.advisory_only|index("FC-007")|type')" = number ] || fail "FC-007 must fall to advisory-only when the ledger drops its detection"
 pass "F5: lint behavior changes from the ledger authority alone (strip FC-007 detection => not linted)"
 

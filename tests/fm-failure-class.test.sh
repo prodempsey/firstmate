@@ -75,6 +75,35 @@ expect_code 1 $? "bump refuses without --provenance"
 FM_FC_LEDGER="$L" "$FC" bump FC-404 --provenance "qa:data/q#1" >/dev/null 2>&1
 expect_code 1 $? "bump refuses an unknown class id"
 
+# --- amend: append detection cues onto an existing class (class-amended, folded) --
+A="$TMP_ROOT/amend.jsonl"
+seed_one "$A"
+firstline_amend_before=$(head -1 "$A")
+det='{"engine":"awk-ere","pattern":"\"additionalProperties\"[[:space:]]*:[[:space:]]*true","cue_ref":"open schema"}'
+FM_FC_LEDGER="$A" "$FC" amend FC-001 --detection "$det" >/dev/null
+if FM_FC_LEDGER="$A" "$FC" show FC-001 --json | jq -e '(.detection|length)==1 and (.detection[0].pattern|length)>0' >/dev/null; then
+  pass "amend folds a detection tripwire onto the class"; else fail "amend did not surface detection on the folded record"; fi
+if [ "$(head -1 "$A")" = "$firstline_amend_before" ]; then
+  pass "amend leaves the class-defined line byte-identical (append-only)"
+else fail "amend rewrote a prior line"; fi
+if FM_FC_LEDGER="$A" "$FC" validate | grep -q 'FAILURE_CLASSES_OK=1'; then
+  pass "an amended ledger still validates"; else fail "amend broke ledger validation"; fi
+# A second amendment accumulates, and natural-language cues append too.
+FM_FC_LEDGER="$A" "$FC" amend FC-001 --detection '{"engine":"awk-ere","pattern":"mv .*&& mv ","cue_ref":"nonatomic pair"}' --cue "an extra cue" >/dev/null
+if FM_FC_LEDGER="$A" "$FC" show FC-001 --json | jq -e '(.detection|length==2) and (.cues|index("an extra cue")|type=="number")' >/dev/null; then
+  pass "amendments accumulate detection and cues at read"; else fail "a second amendment did not accumulate"; fi
+FM_FC_LEDGER="$A" "$FC" amend FC-404 --detection "$det" >/dev/null 2>&1
+expect_code 1 $? "amend refuses an unknown class id"
+FM_FC_LEDGER="$A" "$FC" amend FC-001 >/dev/null 2>&1
+expect_code 1 $? "amend refuses when it would add nothing"
+FM_FC_LEDGER="$A" "$FC" amend FC-001 --detection '{"engine":"awk-ere","pattern":""}' >/dev/null 2>&1
+expect_code 1 $? "amend refuses a detection with an empty pattern (never a silently-inert tripwire)"
+# A class-amended event against an id no class-defined ever declared is corrupt: fail closed.
+Cam="$TMP_ROOT/corrupt-amend.jsonl"
+printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-amended","id":"FC-777","detection":[{"engine":"awk-ere","pattern":"x"}]}\n' > "$Cam"
+FM_FC_LEDGER="$Cam" "$FC" list >/dev/null 2>&1
+expect_code 1 $? "list fails closed on an amendment for an unknown class (corrupt ledger)"
+
 # --- corrupt ledger fails closed --------------------------------------------
 C="$TMP_ROOT/corrupt.jsonl"
 printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"occurrence","id":"FC-999","provenance":{"type":"qa","ref":"r"}}\n' > "$C"
@@ -92,6 +121,15 @@ done
 # Every seed provenance ref is namespaced <type>:... - no unprovenanced rows slipped in.
 if printf '%s' "$committed" | jq -e 'all(.[]; all(.provenance[]; (.type|length)>0 and (.ref|length)>0))' >/dev/null; then
   pass "every seed provenance entry carries a type and ref"; else fail "a seed provenance entry is malformed"; fi
+# Detection coverage: the committed ledger carries a well-formed detection tripwire on every
+# class that HAS one, and every such tripwire is a non-empty-pattern awk-ere object so
+# bin/fm-verify.sh's cue lint can execute it. FC-003 deliberately carries no detection - no
+# sound single-line ERE tripwire exists for "digest not covering the whole document" without
+# false-positiving on legitimate code - so it stays advisory; this guards that decision.
+if printf '%s' "$committed" | jq -e 'all(.[]|select(.detection); all(.detection[]; .engine=="awk-ere" and (.pattern|type=="string" and length>0)))' >/dev/null; then
+  pass "every committed detection is a well-formed non-empty awk-ere tripwire"; else fail "a committed detection tripwire is malformed or empty"; fi
+if printf '%s' "$committed" | jq -e '[.[]|select(.detection|type=="array" and length>0)|.id]|sort == ["FC-001","FC-002","FC-004","FC-005","FC-006","FC-007"]' >/dev/null; then
+  pass "committed detection covers every class with a sound tripwire (FC-003 stays advisory)"; else fail "committed detection coverage drifted from the seeded set"; fi
 
 # --- register dry-run writes nothing to the registry ------------------------
 REG="$TMP_ROOT/reg-dry"

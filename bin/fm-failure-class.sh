@@ -13,12 +13,16 @@
 # The ledger is an APPEND-ONLY jsonl event log (docs/failure-classes/ledger.jsonl),
 # the same fold-at-read idiom as memory-registry.jsonl and the KD comment ledger:
 #   * a `class-defined` event declares a class with its seed provenance;
-#   * an `occurrence` event appends one more provenance citation to an existing id.
+#   * an `occurrence` event appends one more provenance citation to an existing id;
+#   * a `class-amended` event appends DETECTION cues (and/or natural-language cues)
+#     onto an existing id, so a class can graduate its cues into executable checks
+#     without rewriting its durable class-defined line.
 # `list`/`show` fold the log; no verb ever rewrites or deletes a prior line.
 #
-# This script is the SANCTIONED WRITER. It refuses a duplicate id, an occurrence
-# against an unknown id, and any event missing provenance, so the ledger cannot
-# drift into an unprovenanced or self-contradictory state.
+# This script is the SANCTIONED WRITER. It refuses a duplicate id, an occurrence or
+# amendment against an unknown id, an amendment that adds nothing, and any event
+# missing provenance, so the ledger cannot drift into an unprovenanced or
+# self-contradictory state.
 #
 # Retrieval is delegated: `register` distils each class into the LIVE memory
 # registry through the activated propose/activate flow (mem propose | mem activate)
@@ -38,6 +42,8 @@
 #        [--confidence unverified|observed|reproduced|guarded] [--keyword <kw> ...]
 #   fm-failure-class.sh ensure --id <FC-NNN> ...   # idempotent-additive add (skip if present)
 #   fm-failure-class.sh bump <id> --provenance <type>:<ref>[:<note>] [--note <text>]
+#   fm-failure-class.sh amend <id> --detection '<json-object>' [--detection ...] [--cue <text> ...]
+#        # append detection/cue tripwires onto an existing class (class-amended, folded at read)
 #   fm-failure-class.sh refinements [--json]   # classes at/over the refinement threshold, with provenance
 #   fm-failure-class.sh register [--id <FC-NNN> ...] [--live] [--gate <ref>] [--json]
 #
@@ -55,7 +61,7 @@
 # --source-type) on every registered record so curation can filter failure classes
 # by a first-class field, not only a keyword.
 #
-# All ledger mutations (add/ensure/bump) serialize the whole read-check-append
+# All ledger mutations (add/ensure/bump/amend) serialize the whole read-check-append
 # under a portable, abandoned-owner-aware lock co-located with the ledger, so
 # concurrent sanctioned writers cannot corrupt the append-only log.
 #
@@ -123,6 +129,14 @@ fold() {
           if (.defs[$e.id] == null) then error("occurrence for unknown class id: \($e.id)")
           elif ($e.provenance | type) != "object" then error("occurrence missing provenance: \($e.id)")
           else .defs[$e.id].provenance += [$e.provenance] end
+        elif $e.event == "class-amended" then
+          if (.defs[$e.id] == null) then error("amendment for unknown class id: \($e.id)")
+          elif ((($e.detection // []) | length) == 0) and ((($e.cues // []) | length) == 0)
+            then error("amendment adds nothing (no detection, no cues): \($e.id)")
+          else .defs[$e.id] |= (
+              (if (($e.detection // []) | length) > 0 then .detection = ((.detection // []) + $e.detection) else . end)
+            | (if (($e.cues // []) | length) > 0 then .cues = ((.cues // []) + $e.cues) else . end)
+          ) end
         else error("unknown event: \($e.event)") end)
     | [ .order[] as $id | .defs[$id] | .occurrence_count = (.provenance | length) ]
   ' "$LEDGER"
@@ -395,6 +409,56 @@ cmd_bump() {
   fi
 }
 
+# amend: append machine-readable DETECTION cues (and/or natural-language cues) onto an
+# already-defined class, as a `class-amended` event folded at read - the same append-only
+# idiom as `bump`, so a class seeded without a detection tripwire can graduate its cues into
+# executable checks (bin/fm-verify.sh's cue lint) WITHOUT rewriting its durable class-defined
+# line. A class-defined line is never edited; the amendment's detection/cues are merged onto
+# the folded record. Refuses an amendment against an unknown id and an amendment that adds
+# nothing. Each --detection is one JSON object ({engine, pattern, cue_ref, ...}) with a
+# non-empty string `pattern`; each --cue is one natural-language cue string.
+cmd_amend() {
+  local id=${1:-}; shift || true
+  [ -n "$id" ] || die "amend requires a class id"
+  echo "$id" | grep -Eq '^FC-[0-9]{3,}$' || die "id must match FC-NNN, got '$id'"
+  local dets=() cues=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --detection) dets+=("${2:-}"); shift 2 ;;
+      --cue) cues+=("${2:-}"); shift 2 ;;
+      *) die "amend: unknown flag '$1'" ;;
+    esac
+  done
+  [ "${#dets[@]}" -gt 0 ] || [ "${#cues[@]}" -gt 0 ] \
+    || die "amend requires at least one --detection or --cue"
+  local dets_json="[]" cues_json="[]"
+  if [ "${#dets[@]}" -gt 0 ]; then
+    dets_json=$(printf '%s\n' "${dets[@]}" | jq -c . 2>/dev/null | jq -sc .) \
+      || die "each --detection must be one valid JSON object"
+    # Fail closed on a detection that carries no usable pattern: a silently-inert tripwire
+    # would let a class read as mechanically linted while enforcing nothing.
+    printf '%s' "$dets_json" | jq -e 'all(.[]; type=="object" and (.pattern|type=="string" and length>0))' >/dev/null \
+      || die "each --detection must be an object with a non-empty string 'pattern'"
+  fi
+  if [ "${#cues[@]}" -gt 0 ]; then
+    cues_json=$(printf '%s\n' "${cues[@]}" | jq -R . | jq -s .)
+  fi
+  local event
+  event=$(jq -cn --arg schema "$SCHEMA" --arg id "$id" \
+    --argjson dets "$dets_json" --argjson cues "$cues_json" \
+    '{schema:$schema, event:"class-amended", id:$id}
+     + (if ($dets|length) > 0 then {detection:$dets} else {} end)
+     + (if ($cues|length) > 0 then {cues:$cues} else {} end)')
+  lock_ledger
+  # The id must already be defined; fold sees class-defined AND prior amendments, all under
+  # one serialized generation so the check cannot race an interleaved writer.
+  fold_or_die | jq -e --arg id "$id" 'any(.[]; .id==$id)' >/dev/null \
+    || { unlock_ledger; die "cannot amend unknown class id: $id (define it with add first)"; }
+  append_event "$event"
+  unlock_ledger
+  echo "amended $id (+${#dets[@]} detection, +${#cues[@]} cue)"
+}
+
 # refinements: list every class whose derived occurrence count is at/over the
 # refinement threshold, each with its full provenance, so a captain-gated process
 # amendment can be drafted with its citations ready. Read-only: it folds the ledger
@@ -517,6 +581,7 @@ main() {
     add) cmd_add "$@" ;;
     ensure) cmd_ensure "$@" ;;
     bump) cmd_bump "$@" ;;
+    amend) cmd_amend "$@" ;;
     refinements) cmd_refinements "$@" ;;
     register) cmd_register "$@" ;;
     -h|--help|help) usage ;;

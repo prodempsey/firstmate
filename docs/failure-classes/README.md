@@ -14,9 +14,10 @@ Design authority: `data/kl-improve-scout-f5/compounding-fleet.kd.html` (stage C)
 ## Why an append-only event log
 
 `ledger.jsonl` is an append-only JSONL event log folded at read, the same idiom as `memory-registry.jsonl` and the KrakenDesign comment ledger.
-There are two event kinds, one per line.
+There are three event kinds, one per line.
 A `class-defined` event declares a class with its seed provenance.
 An `occurrence` event appends one more provenance citation to an existing class id.
+A `class-amended` event appends `detection` tripwires (and/or natural-language `cues`) onto an existing class id, so a class can graduate its cues into executable checks without rewriting its durable `class-defined` line.
 
 `list` and `show` fold the log; no verb ever rewrites or deletes a prior line.
 The occurrence count is derived: it is the number of provenance citations a class has accumulated.
@@ -35,14 +36,18 @@ The `class-defined` event carries these fields.
 | `fix` | the fix pattern |
 | `provenance` | array of `{type, ref, note?}`: the rulings / QA reports it was distilled from |
 | `registry` | `{memory_type, scope, confidence, keywords}`: how it registers into memory |
+| `detection` | optional array of `{engine:"awk-ere", pattern, cue_ref}`: machine-readable tripwires that graduate a natural-language cue into an executable check `bin/fm-verify.sh`'s cue lint runs live over a candidate diff. May be seeded inline here or appended later via `class-amended`. |
 
 The `occurrence` event is `{id, provenance:{type, ref, note?}}`: one more citation for `id`.
+The `class-amended` event is `{id, detection?, cues?}`: it appends `detection` tripwires and/or natural-language `cues` onto an existing `id`, folded (concatenated) onto the class record at read.
 
-The writer refuses a duplicate id, an occurrence against an unknown id, and any event missing provenance, so the ledger cannot drift into an unprovenanced or self-contradictory state.
-A malformed line, an unknown-schema line, or an occurrence for an undefined id makes `list` and `validate` fail closed rather than fold silently.
+The writer refuses a duplicate id, an occurrence or amendment against an unknown id, an amendment that adds nothing, a detection with no non-empty `pattern`, and any event missing provenance, so the ledger cannot drift into an unprovenanced or self-contradictory state.
+A malformed line, an unknown-schema line, or an occurrence/amendment for an undefined id makes `list` and `validate` fail closed rather than fold silently.
 
-Every mutation (`add`, `ensure`, `bump`) serializes its whole read-check-append under a portable, abandoned-owner-aware lock (the fleet's `fm-wake-lib.sh` discipline) co-located with the ledger, so two concurrent sanctioned writers can never both pass the duplicate check and append the same id.
-There is no destructive path: `add` refuses a duplicate, `ensure` skips an existing id, `bump` only appends, and the seed builder never deletes or rewrites the ledger, so no supported command can drop an appended occurrence.
+Every mutation (`add`, `ensure`, `bump`, `amend`) serializes its whole read-check-append under a portable, abandoned-owner-aware lock (the fleet's `fm-wake-lib.sh` discipline) co-located with the ledger, so two concurrent sanctioned writers can never both pass the duplicate check and append the same id.
+There is no destructive path: `add` refuses a duplicate, `ensure` skips an existing id, `bump` and `amend` only append, and the seed builder never deletes or rewrites the ledger, so no supported command can drop an appended occurrence or amendment.
+
+A class carries a `detection` tripwire only where a **sound** single-line ERE exists - one that matches the failure shape without false-positiving on legitimate code (verify each candidate against the tree before seeding it). `FC-003` (digest/verification not covering the whole document) deliberately carries none: its manifestations - a projection-digest, or a per-field-equality ladder - are indistinguishable by syntax alone from legitimate uses, so it stays advisory rather than enforce an unsound check (which would itself be an `FC-001` move).
 
 ## Retrievability: registering classes into the live memory registry
 

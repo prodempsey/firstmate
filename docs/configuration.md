@@ -173,6 +173,7 @@ The write is backgrounded and detached and the hook always exits 0, so a slow, w
 
 Env-only gating is fragile for the same reason the shadow run's is: a closeout invoked from a non-interactive shell that never sourced a bashrc sees `FM_POSTMORTEM_STOW` unset and silently no-ops.
 `config/postmortem-stow.env` (local, gitignored, never shipped) makes enabling durable.
+To turn the write half on in a runtime home, firstmate places this file in that home's `config/` with `FM_POSTMORTEM_STOW=1` - exactly the operational act that a runtime home already applied for the shadow run via its `config/cp-shadow.env`; shipping this template never creates it.
 When `FM_POSTMORTEM_STOW` is UNSET in the environment, `bin/fm-postmortem-stow.sh` reads this file for `KEY=VALUE` lines and exports them; when `FM_POSTMORTEM_STOW` is set ambiently (even to `0` or empty) the file is not consulted at all.
 Only three keys are honoured, one `KEY=VALUE` per line, with the same deliberately-literal parser as `config/cp-shadow.env` (the whole right-hand side is the value; a comment must be its own line):
 
