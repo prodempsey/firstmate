@@ -17,6 +17,8 @@ An operator may adopt it earlier by making the first non-empty line of `config/s
 Before adoption, `bin/fm-verify.sh` emits a visible `gate-not-adopted` note and leaves the gate non-blocking.
 After adoption, every missing, crashed, or timed-out scanner fails closed as a `scanner-unavailable` finding.
 The deterministic battery never downloads packages, updates vulnerability data, submits source, or calls a remote service.
+Ast-grep runs the committed rules under `docs/scanner/ast-rules/` over changed supported source files.
+Its normalized findings use the same confirmation, occurrence fingerprint, severity policy, and inherited-versus-candidate attribution path as every Phase 1 scanner.
 Candidate-new blocking findings from designated noisy selectors are then sent in one bounded BYOK Claude CLI call.
 OSV findings use the scanner's structured JSON package and advisory fields; that closed subject is fingerprinted and human-readable scanner messages never select a corroboration target.
 The committed policy declares the default and escalation models; operators select the latter with `FM_SCANNER_ADJUDICATOR_MODEL`.
@@ -81,6 +83,7 @@ The direct pins and licenses are:
 - Oxlint 1.75.0 is MIT.
 - OSV-Scanner 2.4.0 is Apache-2.0.
 - Actionlint 1.7.12 is MIT.
+- Ast-grep 0.45.0 is MIT.
 - Ruff 0.16.0 is MIT.
 - jq 1.7.1 is MIT.
 - ShellCheck 0.11.0 is GPL-3.0.
@@ -92,6 +95,9 @@ The direct pins and licenses are:
 
 Standalone release assets are pinned by SHA-256 in `bin/fm-install-scanners.sh`.
 The Node tool graph is transitively pinned by `docs/scanner/package-lock.json`.
+
+Ast-grep is the structural-rule seam.
+Opengrep and markdownlint remain deferred and are not runtime dependencies.
 
 Repositories declare exact document-to-schema mappings in `.fm-scanner-schemas.json`.
 That declaration must conform to `firstmate/scanner-schema-map/1` and contains only exact `path` and `schema_path` pairs.

@@ -12,7 +12,7 @@ LOCK="$ROOT/docs/scanner/package-lock.json"
 POLICY="$ROOT/docs/scanner/blocking-policy.json"
 ADJUDICATOR_POLICY="$ROOT/docs/scanner/adjudicator-policy.json"
 
-for version in 8.30.1 1.75.0 2.4.0 1.7.12 0.16.0 1.7.1; do
+for version in 8.30.1 1.75.0 2.4.0 1.7.12 0.45.0 0.16.0 1.7.1; do
   assert_grep "$version" "$INSTALLER" "scanner installer is missing pin $version"
 done
 # shellcheck disable=SC2016  # the assertion matches a literal installer variable
@@ -40,7 +40,11 @@ pass "scanner installers pin binaries by checksum and Node tools by lockfile"
 jq -e '
   .schema=="firstmate/scanner-blocking-policy/1"
   and ([.scanners[].budget_s]|add)<30
-  and ([.scanners[].scanner]|length)==8
+  and ([.scanners[].scanner]|length)==9
+  and any(.scanners[];
+    .scanner=="ast-grep"
+    and .budget_s>0
+    and (.blocking_severities|index("error"))!=null)
   and any(.scanners[];
     .scanner=="eslint"
     and (.blocking_severities|index("error"))!=null

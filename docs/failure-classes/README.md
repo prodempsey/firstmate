@@ -36,7 +36,7 @@ The `class-defined` event carries these fields.
 | `fix` | the fix pattern |
 | `provenance` | array of `{type, ref, note?}`: the rulings / QA reports it was distilled from |
 | `registry` | `{memory_type, scope, confidence, keywords}`: how it registers into memory |
-| `detection` | optional array of objects whose key set is EXACTLY `{engine, pattern, cue_ref}` (a closed schema, `additionalProperties:false` - any undeclared key is rejected): machine-readable tripwires that graduate a natural-language cue into an executable check `bin/fm-verify.sh`'s cue lint runs live over a candidate diff. `engine` MUST be one of the closed supported set (currently only `awk-ere`), `pattern` a non-empty ERE that actually **compiles** under that engine, and `cue_ref` a non-empty label. May be seeded inline here or appended later via `class-amended`. |
+| `detection` | optional array of closed, engine-specific objects: `awk-ere` rows are exactly `{engine, pattern, cue_ref}` and `ast-grep` rows are exactly `{engine, rule_id, cue_ref}`. `bin/fm-verify.sh` cue lint executes the regex rows live over added lines, while `bin/fm-scanner.sh` executes the referenced structural rules through the baseline-attributed scanner battery. May be seeded inline here or appended later via `class-amended`. |
 
 The `occurrence` event is `{id, provenance:{type, ref, note?}}`: one more citation for `id`.
 The `class-amended` event is `{id, detection?, cues?}`: it appends `detection` tripwires and/or natural-language `cues` onto an existing `id`, folded (concatenated) onto the class record at read.
@@ -44,8 +44,8 @@ The `class-amended` event is `{id, detection?, cues?}`: it appends `detection` t
 ### Validation authority (committed JSON Schema + python3, hard prerequisites)
 
 Per the binding ruling (`data/seasoning-cues-g1/design-ruling.md`; precedents me-s3-profiles and dj-orders-s2), validation is NOT a per-row shell/jq predicate.
-It is a single atomic fail-closed pass over the RAW ledger bytes, owned by ONE authority, `bin/fm-cue-validate.sh` (`python3` + `jsonschema` Draft 2020-12), against two committed closed schemas under `schema/`: `ledger-event.schema.json` (the event envelope, per kind) and `detection-row.schema.json` (the `{engine, pattern, cue_ref}` row).
-Both are `additionalProperties:false` and total, so a field the schema does not positively admit fails closed - `engine` is an `enum`, `pattern`/`cue_ref` non-empty strings.
+It is a single atomic fail-closed pass over the RAW ledger bytes, owned by ONE authority, `bin/fm-cue-validate.sh` (`python3` + `jsonschema` Draft 2020-12), against two committed closed schemas under `schema/`: `ledger-event.schema.json` (the event envelope, per kind) and `detection-row.schema.json` (the engine-specific row).
+Both are `additionalProperties:false` and total, so a field the schema does not positively admit fails closed.
 
 **jq is disqualified as the validation parser**: it collapses a duplicate JSON member name (last-wins) before any filter runs, so it structurally cannot detect a duplicate `engine`/`pattern`/`cue_ref` or a duplicate envelope key.
 Duplicate members are rejected on the RAW bytes at ANY depth by python's `object_pairs_hook`, BEFORE any normalizing parse.

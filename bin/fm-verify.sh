@@ -691,9 +691,10 @@ elif jq -e '
       .schema=="firstmate/scanner-tools-ready/1"
       and .status=="ready"
       and (keys == ["schema","status","versions"])
-      and (.versions|keys == ["actionlint","ajv","eslint","eslint-plugin-n","eslint-plugin-security","eslint-plugin-sonarjs","gitleaks","jq","osv-scanner","oxlint","ruff","shellcheck"])
+      and (.versions|keys == ["actionlint","ajv","ast-grep","eslint","eslint-plugin-n","eslint-plugin-security","eslint-plugin-sonarjs","gitleaks","jq","osv-scanner","oxlint","ruff","shellcheck"])
       and .versions=={
-        "actionlint":"1.7.12","ajv":"8.17.1","eslint":"9.39.5",
+        "actionlint":"1.7.12","ajv":"8.17.1","ast-grep":"0.45.0",
+        "eslint":"9.39.5",
         "eslint-plugin-n":"18.2.2","eslint-plugin-security":"4.0.1",
         "eslint-plugin-sonarjs":"4.2.0","gitleaks":"8.30.1","jq":"1.7.1",
         "osv-scanner":"2.4.0","oxlint":"1.75.0","ruff":"0.16.0",
@@ -784,9 +785,10 @@ fi
 # GATE: cue_lint - detections read LIVE from the ledger; no hardcoded patterns
 # ============================================================================
 # The single authority for executable cues is docs/failure-classes/ledger.jsonl:
-# each class-defined event MAY carry a machine-readable `detection` array of
-# {engine:"awk-ere", pattern, cue_ref}, and a later `class-amended` event MAY append
-# more detection onto that id (the ledger's append-only fold-at-read idiom). The
+# each class-defined event MAY carry a machine-readable `detection` array, and a
+# later `class-amended` event MAY append more detection onto that id (the ledger's
+# append-only fold-at-read idiom). This gate executes only `awk-ere` rows;
+# `ast-grep` rows name structural rules consumed by the scanner gate. The
 # verifier folds BOTH event kinds and lints from their merged detection. There is no
 # built-in fallback table - a class the ledger gives no detection for is reported
 # advisory-only, never silently enforced from a duplicate source.
@@ -831,7 +833,9 @@ if [ "$LEDGER_OK" = yes ]; then
       cueref=$(printf '%s' "$row" | jq -r '.cue_ref')
       printf '%s\t%s\t%s\n' "$cid" "$pattern" "$cueref" >> "$EFFECTIVE"
       got=yes
-    done < <(jq -c --arg id "$cid" '.[] | select(.id==$id) | (.detection // [])[]' "$FOLDED" 2>/dev/null)
+    done < <(jq -c --arg id "$cid" '
+      .[] | select(.id==$id) | (.detection // [])[] | select(.engine=="awk-ere")
+    ' "$FOLDED" 2>/dev/null)
     if [ "$got" = yes ]; then printf '%s\n' "$cid" >> "$LINTED_FILE"; else printf '%s\n' "$cid" >> "$ADVISORY_FILE"; fi
   done < <(jq -r '.[].id' "$FOLDED" 2>/dev/null)
 fi

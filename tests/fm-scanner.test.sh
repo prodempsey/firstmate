@@ -5,8 +5,9 @@
 # scanner. Further loops independently replace each pinned tool with a wrong
 # version and a wedging implementation, proving FC-004 and FC-006 per scanner.
 #
-# Set FM_TEST_REAL_GITLEAKS=1 to run the linked-worktree regression with
-# $FM_SCANNER_DIR/bin/gitleaks, or set it to an explicit pinned executable path.
+# Set FM_TEST_REAL_GITLEAKS=1 or FM_TEST_REAL_AST_GREP=1 to run the corresponding
+# pinned-binary regression from $FM_SCANNER_DIR, or set either variable to an
+# explicit pinned executable path.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -144,6 +145,27 @@ case "$name" in
     done
     printf ']\n'
     ;;
+  ast-grep)
+    if [ "$version" = true ]; then echo 'ast-grep 0.45.0'; exit 0; fi
+    printf '['
+    comma=""
+    for file in "$@"; do
+      case "$file" in -*) continue ;; esac
+      [ -f "$file" ] && grep -q AST_GREP "$file" || continue
+      printf '%s' "$comma"
+      "$REAL_JQ" -nc --arg file "$file" '{
+        text:"const ids = JSON.parse(snapshot);",
+        range:{start:{line:1}},
+        file:$file,
+        ruleId:"fc-005-repeated-json-parse",
+        severity:"error",
+        message:"Parse the artifact once and consume values from that same validated generation."
+      }'
+      comma=","
+    done
+    printf ']\n'
+    [ -z "$comma" ]
+    ;;
   jq)
     if [ "$version" = true ]; then echo 'jq-1.7.1'; exit 0; fi
     file=${@: -1}
@@ -195,7 +217,7 @@ case "$name" in
 esac
 SH
 chmod +x "$TOOLS/bin/fake-scanner"
-for scanner in gitleaks oxlint eslint-scanner osv-scanner actionlint jq json-schema-scanner shellcheck ruff; do
+for scanner in gitleaks oxlint eslint-scanner osv-scanner actionlint ast-grep jq json-schema-scanner shellcheck ruff; do
   ln -s fake-scanner "$TOOLS/bin/$scanner"
 done
 cat > "$TOOLS/bin/claude" <<'SH'
@@ -230,7 +252,9 @@ git init -q "$REPO"
 git -C "$REPO" checkout -q -b main
 mkdir -p "$REPO/.github/workflows"
 printf 'INHERITED_GITLEAKS\n' > "$REPO/inherited-secret.txt"
-printf 'INHERITED_OXLINT ESLINT\n' > "$REPO/inherited.js"
+printf '%s\n' \
+  'const validated = JSON.parse(snapshot); // INHERITED_OXLINT ESLINT AST_GREP' \
+  'const ids = JSON.parse(snapshot);' > "$REPO/inherited.js"
 printf '# ACTIONLINT inherited\nname: inherited\non: push\njobs: {}\n' > "$REPO/.github/workflows/inherited.yml"
 printf '{"marker":"JQ_FINDING"}\n' > "$REPO/inherited.json"
 printf '# SHELLCHECK inherited\ntrue\n' > "$REPO/inherited.sh"
@@ -248,7 +272,9 @@ printf '# candidate edit\n' >> "$REPO/inherited.sh"
 printf '# candidate edit\n' >> "$REPO/inherited.py"
 printf '{"lockfileVersion":3,"marker":"INHERITED_OSV NEW_OSV","packages":{"node_modules/dev-vuln":{"dev":true}}}\n' > "$REPO/package-lock.json"
 printf 'NEW_GITLEAKS\n' > "$REPO/new-secret.txt"
-printf 'const command = "SAFE_COMMAND"; // NEW_OXLINT ESLINT\n' > "$REPO/new.js"
+printf '%s\n' \
+  'const validated = JSON.parse(snapshot); // NEW_OXLINT ESLINT AST_GREP' \
+  'const ids = JSON.parse(snapshot);' > "$REPO/new.js"
 printf '# ACTIONLINT new\nname: new\non: push\njobs: {}\n' > "$REPO/.github/workflows/new.yml"
 printf '{"marker":"JQ_FINDING"}\n' > "$REPO/new.json"
 printf '# SHELLCHECK new\ntrue\n' > "$REPO/new.sh"
@@ -270,18 +296,26 @@ run_scanner() {
 OUT="$TMP/report.json"
 run_scanner "$TOOLS" "$OUT"
 expect_code 1 "$?" "synthetic diff with candidate-new findings fails"
-[ "$(jq '.timings|length' "$OUT")" -eq 8 ] || fail "scanner report did not time all eight battery members"
+[ "$(jq '.timings|length' "$OUT")" -eq 9 ] || fail "scanner report did not time all nine battery members"
 [ "$(jq '[.timings[].budget_s]|add' "$OUT")" -lt 30 ] ||
   fail "committed per-scanner budgets leave no reserve inside the 30s battery budget"
 [ "$(jq '[.timings[].budget_s]|unique|length' "$OUT")" -gt 1 ] ||
   fail "scanner timings do not expose distinct per-scanner budgets"
 [ "$(jq '.duration_ms' "$OUT")" -lt 30000 ] || fail "scanner fixture exceeded the 30s gate budget"
-for scanner in gitleaks oxlint eslint osv-scanner actionlint jq shellcheck ruff; do
+for scanner in gitleaks oxlint eslint osv-scanner actionlint ast-grep jq shellcheck ruff; do
   [ "$(jq --arg scanner "$scanner" '[.findings[]|select(.scanner==$scanner and .attribution=="candidate-new" and .blocking)]|length' "$OUT")" -gt 0 ] ||
     fail "$scanner did not fire on its real candidate fixture"
   [ "$(jq --arg scanner "$scanner" '[.findings[]|select(.scanner==$scanner and .attribution=="inherited" and (.blocking|not))]|length' "$OUT")" -gt 0 ] ||
     fail "$scanner did not exclude its inherited fixture"
 done
+[ "$(jq '[.findings[]|select(
+    .scanner=="ast-grep"
+    and .rule_id=="fc-005-repeated-json-parse"
+    and .attribution=="candidate-new"
+    and .blocking
+  )]|length' "$OUT")" -eq 1 ] ||
+  fail "the ported FC-005 structural rule did not reach the scanner report"
+pass "ported FC-005 structural detection is a blocking candidate-new finding"
 [ "$(jq '[.findings[]|select(
     .scanner=="eslint"
     and (.rule_id|startswith("security/"))
@@ -385,11 +419,29 @@ expect_code 0 "$?" "every valid JSON top-level value passes parse-only validatio
   fail "valid false, null, scalar, collection, or JSONL values were reported malformed"
 pass "jq parse-only validation accepts false, null, scalars, collections, and JSONL records"
 
+REPO="$TMP/ast-clean-repo"
+git init -q "$REPO"
+git -C "$REPO" checkout -q -b main
+printf 'const parsed = JSON.parse(snapshot);\n' > "$REPO/clean.js"
+git -C "$REPO" add -A
+git -C "$REPO" commit -qm base
+BASE=$(git -C "$REPO" rev-parse HEAD)
+git -C "$REPO" checkout -q -b fm/ast-clean
+printf 'consume(parsed);\n' >> "$REPO/clean.js"
+git -C "$REPO" commit -qam clean
+CANDIDATE=$(git -C "$REPO" rev-parse HEAD)
+run_scanner "$TOOLS" "$TMP/ast-clean-report.json"
+expect_code 0 "$?" "clean structural source passes"
+[ "$(jq '[.findings[]|select(.scanner=="ast-grep")]|length' \
+  "$TMP/ast-clean-report.json")" -eq 0 ] ||
+  fail "clean structural source produced an ast-grep finding"
+pass "ast-grep fixture: a clean changed source tree passes"
+
 REPO=$MAIN_REPO
 BASE=$MAIN_BASE
 CANDIDATE=$MAIN_CANDIDATE
 
-for scanner in gitleaks oxlint eslint-scanner osv-scanner actionlint jq shellcheck ruff; do
+for scanner in gitleaks oxlint eslint-scanner osv-scanner actionlint ast-grep jq shellcheck ruff; do
   broken="$TMP/missing-$scanner"
   cp -R "$TOOLS" "$broken"
   target=$scanner
@@ -424,7 +476,7 @@ expect_code 1 "$?" "a genuine gitleaks crash fails closed"
   fail "a genuine gitleaks crash did not yield scanner-unavailable"
 pass "FC-004: a genuine gitleaks crash remains fail-closed"
 
-for scanner in gitleaks oxlint eslint-scanner osv-scanner actionlint jq shellcheck ruff; do
+for scanner in gitleaks oxlint eslint-scanner osv-scanner actionlint ast-grep jq shellcheck ruff; do
   wedged="$TMP/wedged-$scanner"
   cp -R "$TOOLS" "$wedged"
   target=$scanner
@@ -437,6 +489,7 @@ for scanner in gitleaks oxlint eslint-scanner osv-scanner actionlint jq shellche
     eslint-scanner) version='9.39.5' ;;
     osv-scanner) version='osv-scanner version: 2.4.0' ;;
     actionlint) version='1.7.12' ;;
+    ast-grep) version='ast-grep 0.45.0' ;;
     jq) version='jq-1.7.1' ;;
     shellcheck) version='version: 0.11.0' ;;
     ruff) version='ruff 0.16.0' ;;
@@ -526,6 +579,74 @@ if [ -n "$real_gitleaks" ]; then
   pass "FC-001: real pinned gitleaks maps linked-worktree clean/finding exit semantics"
 else
   echo "skip: set FM_TEST_REAL_GITLEAKS to run the pinned linked-worktree regression"
+fi
+
+real_ast_grep=${FM_TEST_REAL_AST_GREP:-}
+if [ "$real_ast_grep" = 1 ]; then
+  [ -n "${FM_SCANNER_DIR:-}" ] ||
+    fail "FM_TEST_REAL_AST_GREP=1 requires FM_SCANNER_DIR"
+  real_ast_grep="$FM_SCANNER_DIR/bin/ast-grep"
+fi
+if [ -n "$real_ast_grep" ]; then
+  [ -x "$real_ast_grep" ] ||
+    fail "FM_TEST_REAL_AST_GREP does not name an executable"
+  "$real_ast_grep" --version | grep -Fq '0.45.0' ||
+    fail "FM_TEST_REAL_AST_GREP is not the pinned ast-grep 0.45.0"
+
+  real_tools="$TMP/real-ast-grep-tools"
+  cp -R "$TOOLS" "$real_tools"
+  rm -f "$real_tools/bin/ast-grep"
+  ln -s "$real_ast_grep" "$real_tools/bin/ast-grep"
+
+  REPO="$TMP/real-ast-grep-repo"
+  git init -q "$REPO"
+  git -C "$REPO" checkout -q -b main
+  printf '%s\n' \
+    'const validated = JSON.parse(snapshot);' \
+    'const ids = JSON.parse(snapshot);' > "$REPO/inherited.js"
+  git -C "$REPO" add -A
+  git -C "$REPO" commit -qm "seed inherited structural violation"
+  BASE=$(git -C "$REPO" rev-parse HEAD)
+  git -C "$REPO" checkout -q -b fm/real-ast
+  printf '// touched without changing the inherited finding\n' >> "$REPO/inherited.js"
+  printf '%s\n' 'const parsed = JSON.parse(other);' 'consume(parsed);' > "$REPO/clean.js"
+  git -C "$REPO" add -A
+  git -C "$REPO" commit -qm "clean structural candidate"
+  CANDIDATE=$(git -C "$REPO" rev-parse HEAD)
+  run_scanner "$real_tools" "$TMP/real-ast-grep-clean.json"
+  expect_code 0 "$?" "real ast-grep excludes an inherited violation from a clean candidate"
+  [ "$(jq '[.findings[]|select(
+      .scanner=="ast-grep"
+      and .rule_id=="fc-005-repeated-json-parse"
+      and .attribution=="inherited"
+      and (.blocking|not)
+    )]|length' "$TMP/real-ast-grep-clean.json")" -eq 1 ] ||
+    fail "real ast-grep did not baseline-attribute the inherited structural violation"
+
+  printf '%s\n' \
+    'const validated = JSON.parse(candidateSnapshot);' \
+    'const ids = JSON.parse(candidateSnapshot);' > "$REPO/new.js"
+  # shellcheck disable=SC2016  # The fixture needs literal shell variable syntax.
+  printf '%s\n' \
+    'jq -e . "$snapshot"' \
+    'jq -r .id "$snapshot"' > "$REPO/new.sh"
+  git -C "$REPO" add -A
+  git -C "$REPO" commit -qm "seed candidate structural violations"
+  CANDIDATE=$(git -C "$REPO" rev-parse HEAD)
+  run_scanner "$real_tools" "$TMP/real-ast-grep-findings.json"
+  expect_code 1 "$?" "real ast-grep candidate-new structural violations block"
+  for rule in fc-005-repeated-json-parse fc-005-repeated-jq-parse; do
+    [ "$(jq --arg rule "$rule" '[.findings[]|select(
+        .scanner=="ast-grep"
+        and .rule_id==$rule
+        and .attribution=="candidate-new"
+        and .blocking
+      )]|length' "$TMP/real-ast-grep-findings.json")" -eq 1 ] ||
+      fail "real ast-grep did not fire the ported structural rule: $rule"
+  done
+  pass "real pinned ast-grep catches ported FC-005 rules and excludes inherited findings"
+else
+  echo "skip: set FM_TEST_REAL_AST_GREP to run the pinned structural-rule regression"
 fi
 
 echo "# all fm-scanner tests passed"

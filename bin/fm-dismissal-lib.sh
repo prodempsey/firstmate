@@ -10,16 +10,21 @@ fm_dismissal_ledger_prove() {
 fm_scanner_stack_fingerprint() {
   local root=${1:?repository root required}
   local relative
-  for relative in \
-    bin/fm-scanner.sh \
-    bin/fm-findings-attribute.sh \
-    bin/fm-findings-adjudicate.sh \
-    bin/fm-dismissal-lib.sh \
-    bin/fm-dismissal-validate.sh \
-    docs/scanner/blocking-policy.json \
-    docs/scanner/adjudicator-policy.json \
-    docs/scanner/schema/dismissal-event.schema.json \
-    docs/scanner/package-lock.json; do
+  {
+    printf '%s\n' \
+      bin/fm-scanner.sh \
+      bin/fm-findings-attribute.sh \
+      bin/fm-findings-adjudicate.sh \
+      bin/fm-dismissal-lib.sh \
+      bin/fm-dismissal-validate.sh \
+      docs/scanner/blocking-policy.json \
+      docs/scanner/adjudicator-policy.json \
+      docs/scanner/schema/dismissal-event.schema.json \
+      docs/scanner/package-lock.json
+    find "$root/docs/scanner/ast-rules" -type f -print |
+      sed "s#^$root/##" |
+      sort
+  } | while IFS= read -r relative; do
     printf '%s\t' "$relative"
     sha256sum "$root/$relative" | awk '{print $1}'
   done | sha256sum | awk '{print $1}'

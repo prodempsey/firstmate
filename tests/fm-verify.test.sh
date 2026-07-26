@@ -141,6 +141,12 @@ if [ "${1:-}" = "--version" ]; then printf '1.7.12\n'; exit 0; fi
 printf '[]\n'
 SH
 chmod +x "$FM_SCANNER_DIR/bin/actionlint"
+cat > "$FM_SCANNER_DIR/bin/ast-grep" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then printf 'ast-grep 0.45.0\n'; exit 0; fi
+printf '[]\n'
+SH
+chmod +x "$FM_SCANNER_DIR/bin/ast-grep"
 ln -s "$(command -v jq)" "$FM_SCANNER_DIR/bin/jq"
 cat > "$FM_SCANNER_DIR/bin/json-schema-scanner" <<'SH'
 #!/usr/bin/env bash
@@ -165,7 +171,7 @@ SH
 chmod +x "$FM_SCANNER_DIR/bin/ruff"
 mkdir -p "$FM_SCANNER_DIR/osv-db/osv-scanner"
 printf '%s\n' \
-  '{"schema":"firstmate/scanner-tools-ready/1","status":"ready","versions":{"actionlint":"1.7.12","ajv":"8.17.1","eslint":"9.39.5","eslint-plugin-n":"18.2.2","eslint-plugin-security":"4.0.1","eslint-plugin-sonarjs":"4.2.0","gitleaks":"8.30.1","jq":"1.7.1","osv-scanner":"2.4.0","oxlint":"1.75.0","ruff":"0.16.0","shellcheck":"0.11.0"}}' \
+  '{"schema":"firstmate/scanner-tools-ready/1","status":"ready","versions":{"actionlint":"1.7.12","ajv":"8.17.1","ast-grep":"0.45.0","eslint":"9.39.5","eslint-plugin-n":"18.2.2","eslint-plugin-security":"4.0.1","eslint-plugin-sonarjs":"4.2.0","gitleaks":"8.30.1","jq":"1.7.1","osv-scanner":"2.4.0","oxlint":"1.75.0","ruff":"0.16.0","shellcheck":"0.11.0"}}' \
   > "$FM_SCANNER_DIR/tools-ready.json"
 printf '%s\n' '{"schema":"firstmate/scanner-provisioned/1","status":"ready"}' \
   > "$FM_SCANNER_DIR/provisioned.json"

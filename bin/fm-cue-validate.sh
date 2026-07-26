@@ -142,7 +142,7 @@ def pattern_compiles(engine, pattern):
         except Exception as e:
             invalid("cannot run the grep -E compile probe: %s" % e)
         return rc < 2
-    return False
+    return engine == "ast-grep"
 
 
 def raw_line_checks(bline, where):
@@ -176,8 +176,9 @@ def check_detection(drow, where):
     derr = schema_first_error(DETECTION_V, drow)
     if derr is not None:
         invalid("%s violates the detection-row schema at %s" % (where, derr))
-    if not pattern_compiles(drow["engine"], drow["pattern"]):
-        invalid("%s pattern does not compile under %s: %s" % (where, drow["engine"], drow["pattern"]))
+    pattern = drow.get("pattern", "")
+    if not pattern_compiles(drow["engine"], pattern):
+        invalid("%s pattern does not compile under %s: %s" % (where, drow["engine"], pattern))
 
 
 # =========================== check-row: a single raw detection row ===========================

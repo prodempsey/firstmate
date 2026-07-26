@@ -127,9 +127,13 @@ pass "no injection-seam string exists in the cue authority's production code or 
 # --- check-row: the raw single-row entrypoint (write path uses this pre-jq) --
 check_row() { printf '%s' "$1" > "$TMP/row.json"; "$V" check-row "$TMP/row.json" >/dev/null 2>&1; }
 if check_row '{"engine":"awk-ere","pattern":"feature","cue_ref":"ok"}'; then pass "check-row: a valid detection row passes"; else fail "check-row valid must pass"; fi
+if check_row '{"engine":"ast-grep","rule_id":"fc-005-repeated-json-parse","cue_ref":"two structural parses"}'; then pass "check-row: a valid ast-grep rule reference passes"; else fail "check-row valid ast-grep row must pass"; fi
 if check_row '{"engine":"awk-ere","engine":"awk-ere","pattern":"x","cue_ref":"c"}'; then fail "check-row must reject a duplicate member"; else pass "check-row: a duplicate member is rejected on raw bytes (jq cannot)"; fi
 if check_row '{"engine":"regex-pcre","pattern":"x","cue_ref":"c"}'; then fail "check-row must reject an unsupported engine"; else pass "check-row: unsupported engine rejected"; fi
 if check_row '{"engine":"awk-ere","pattern":"[","cue_ref":"c"}'; then fail "check-row must reject an uncompilable ERE"; else pass "check-row: uncompilable ERE rejected"; fi
 if check_row '{"engine":"awk-ere","pattern":"x","cue_ref":"c","extra":1}'; then fail "check-row must reject an undeclared property"; else pass "check-row: undeclared property rejected"; fi
+# shellcheck disable=SC2016  # The invalid fixture carries literal ast-grep syntax.
+if check_row '{"engine":"ast-grep","pattern":"JSON.parse($A)","cue_ref":"wrong shape"}'; then fail "check-row must reject pattern in an ast-grep reference"; else pass "check-row: ast-grep rows reject undeclared pattern data"; fi
+if check_row '{"engine":"ast-grep","rule_id":"FC 005","cue_ref":"bad id"}'; then fail "check-row must reject an invalid structural rule id"; else pass "check-row: invalid ast-grep rule id rejected"; fi
 
 echo "# all fm-cue-validate tests passed"

@@ -12,6 +12,12 @@
       "report_only_rule_prefixes": []
     },
     {
+      "scanner": "ast-grep",
+      "budget_s": 3,
+      "blocking_severities": ["error"],
+      "report_only_rule_prefixes": []
+    },
+    {
       "scanner": "eslint",
       "budget_s": 4,
       "blocking_severities": ["error"],

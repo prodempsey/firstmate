@@ -92,6 +92,15 @@ if FM_FC_LEDGER="$A" "$FC" validate | grep -q 'FAILURE_CLASSES_OK=1'; then
 FM_FC_LEDGER="$A" "$FC" amend FC-001 --detection '{"engine":"awk-ere","pattern":"mv .*&& mv ","cue_ref":"nonatomic pair"}' --cue "an extra cue" >/dev/null
 if FM_FC_LEDGER="$A" "$FC" show FC-001 --json | jq -e '(.detection|length==2) and (.cues|index("an extra cue")|type=="number")' >/dev/null; then
   pass "amendments accumulate detection and cues at read"; else fail "a second amendment did not accumulate"; fi
+FM_FC_LEDGER="$A" "$FC" amend FC-001 \
+  --detection '{"engine":"ast-grep","rule_id":"fc-005-repeated-json-parse","cue_ref":"two structural parses"}' >/dev/null
+if FM_FC_LEDGER="$A" "$FC" show FC-001 --json | jq -e '
+  any(.detection[]; .engine=="ast-grep" and .rule_id=="fc-005-repeated-json-parse")
+' >/dev/null; then
+  pass "amend accepts an ast-grep rule reference without replacing regex cues"
+else
+  fail "ast-grep detection amendment did not survive the closed fold"
+fi
 FM_FC_LEDGER="$A" "$FC" amend FC-404 --detection "$det" >/dev/null 2>&1
 expect_code 1 $? "amend refuses an unknown class id"
 FM_FC_LEDGER="$A" "$FC" amend FC-001 >/dev/null 2>&1
@@ -196,12 +205,28 @@ done
 if printf '%s' "$committed" | jq -e 'all(.[]; all(.provenance[]; (.type|length)>0 and (.ref|length)>0))' >/dev/null; then
   pass "every seed provenance entry carries a type and ref"; else fail "a seed provenance entry is malformed"; fi
 # Detection coverage: the committed ledger carries a well-formed detection tripwire on every
-# class that HAS one, and every such tripwire is a non-empty-pattern awk-ere object so
-# bin/fm-verify.sh's cue lint can execute it. FC-003 deliberately carries no detection - no
+# class that HAS one. Regex rows carry a compilable pattern for cue lint and structural rows
+# carry a committed ast-grep rule id. FC-003 deliberately carries no detection - no
 # sound single-line ERE tripwire exists for "digest not covering the whole document" without
 # false-positiving on legitimate code - so it stays advisory; this guards that decision.
-if printf '%s' "$committed" | jq -e 'all(.[]|select(.detection); all(.detection[]; .engine=="awk-ere" and (.pattern|type=="string" and length>0)))' >/dev/null; then
-  pass "every committed detection is a well-formed non-empty awk-ere tripwire"; else fail "a committed detection tripwire is malformed or empty"; fi
+if printf '%s' "$committed" | jq -e '
+  all(.[].detection[]?;
+    if .engine=="awk-ere" then (.pattern|type=="string" and length>0)
+    elif .engine=="ast-grep" then (.rule_id|type=="string" and length>0)
+    else false end)
+' >/dev/null; then
+  pass "every committed detection has the closed shape for its engine"
+else
+  fail "a committed detection tripwire is malformed or uses an unsupported engine"
+fi
+if printf '%s' "$committed" | jq -e '
+  any(.[]|select(.id=="FC-005").detection[];
+    .engine=="ast-grep" and .rule_id=="fc-005-repeated-json-parse")
+' >/dev/null; then
+  pass "FC-005 carries an additive ast-grep structural rule reference"
+else
+  fail "FC-005 structural detection reference is missing"
+fi
 if printf '%s' "$committed" | jq -e '[.[]|select(.detection|type=="array" and length>0)|.id]|sort == ["FC-001","FC-002","FC-004","FC-005","FC-006","FC-007"]' >/dev/null; then
   pass "committed detection covers every class with a sound tripwire (FC-003 stays advisory)"; else fail "committed detection coverage drifted from the seeded set"; fi
 

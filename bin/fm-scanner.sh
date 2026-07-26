@@ -36,6 +36,7 @@ OSV_DB="${FM_SCANNER_OSV_DB:-$SCANNER_DIR/osv-db}"
 CALL_TIMEOUT="${FM_VERIFY_SCANNER_TIMEOUT:-8}"
 TOTAL_BUDGET="${FM_VERIFY_SCANNER_BUDGET:-30}"
 POLICY="$(cd "$SCRIPT_DIR/.." && pwd)/docs/scanner/blocking-policy.json"
+AST_CONFIG="$(cd "$SCRIPT_DIR/.." && pwd)/docs/scanner/ast-rules/sgconfig.yml"
 
 usage() { sed -n '/^# Usage:/,/^set -u$/p' "$0" | sed 's/^# \{0,1\}//;$d'; }
 refuse() { printf 'fm-scanner: %s\n' "$1" >&2; exit 2; }
@@ -131,6 +132,7 @@ for tb in timeout gtimeout; do
 done
 BOUNDED_TIMEOUT=no
 RUN_RC=0
+RUN_STDERR_FILE=""
 run_bounded() {
   local budget=$1 cwd=$2 outfile=$3
   shift 3
@@ -146,14 +148,23 @@ run_bounded() {
   fi
   [ "$budget" -gt "$scanner_remaining" ] && budget=$scanner_remaining
   if [ -n "$TIMEOUT_BIN" ] && [ "${FM_VERIFY_FORCE_PID_WATCHDOG:-}" != 1 ]; then
-    (cd "$cwd" && exec "$TIMEOUT_BIN" -k 2 "$budget" "$@") > "$outfile" 2>&1
+    if [ -n "$RUN_STDERR_FILE" ]; then
+      (cd "$cwd" && exec "$TIMEOUT_BIN" -k 2 "$budget" "$@") \
+        > "$outfile" 2> "$RUN_STDERR_FILE"
+    else
+      (cd "$cwd" && exec "$TIMEOUT_BIN" -k 2 "$budget" "$@") > "$outfile" 2>&1
+    fi
     RUN_RC=$?
     [ "$RUN_RC" -eq 124 ] && BOUNDED_TIMEOUT=yes
     return
   fi
   local flag="$TMP/scanner-timeout.$RANDOM"
   rm -f "$flag"
-  (cd "$cwd" && exec "$@") > "$outfile" 2>&1 &
+  if [ -n "$RUN_STDERR_FILE" ]; then
+    (cd "$cwd" && exec "$@") > "$outfile" 2> "$RUN_STDERR_FILE" &
+  else
+    (cd "$cwd" && exec "$@") > "$outfile" 2>&1 &
+  fi
   local child=$!
   (sleep "$budget"; touch "$flag"; kill -TERM "$child" 2>/dev/null; sleep 2; kill -KILL "$child" 2>/dev/null) &
   local watcher=$!
@@ -412,6 +423,38 @@ raw_from_actionlint() {
   ' "$report" >> "$destination"
 }
 
+raw_from_ast_grep() {
+  local report=$1 root=$2 destination=$3
+  jq -e '
+    type=="array"
+    and all(.[];
+      (type=="object")
+      and (.file|type)=="string" and (.file|length)>0
+      and (.ruleId|type)=="string" and (.ruleId|length)>0
+      and (.severity=="error" or .severity=="warning"
+        or .severity=="info" or .severity=="hint")
+      and (.message|type)=="string" and (.message|length)>0
+      and (.range|type)=="object"
+      and (.range.start|type)=="object"
+      and (.range.start.line|type)=="number" and .range.start.line>=0)
+  ' "$report" >/dev/null 2>&1 || return 1
+  jq -c --arg root "$root/" '
+    .[] | {
+      schema:"firstmate/scanner-raw-finding/1",
+      scanner:"ast-grep",
+      rule_id:.ruleId,
+      severity:(if .severity=="error" then "error"
+                elif .severity=="warning" then "warning"
+                else "note" end),
+      path:(.file|sub("^file://";"")
+        | if startswith($root) then .[($root|length):] else . end),
+      line:(.range.start.line+1),
+      message:.message,
+      content:null
+    }
+  ' "$report" >> "$destination"
+}
+
 raw_from_shellcheck() {
   local report=$1 root=$2 destination=$3
   jq -e 'type=="array"' "$report" >/dev/null 2>&1 || return 1
@@ -529,6 +572,34 @@ run_osv_scan() {
   fi
   if ! jq -e '(.results|type)=="array"' "$output" >/dev/null 2>&1; then
     SCAN_ERROR="osv-scanner returned malformed JSON"
+    return 1
+  fi
+  return 0
+}
+
+run_ast_scan() {
+  local root=$1 output=$2 log=$3
+  shift 3
+  RUN_STDERR_FILE=$log
+  run_bounded "$(remaining_budget)" "$root" "$output" \
+    "$AST_GREP" --config "$AST_CONFIG" scan --json=compact --color never "$@"
+  RUN_STDERR_FILE=""
+  if [ "$BOUNDED_TIMEOUT" = yes ]; then
+    SCAN_ERROR="ast-grep exceeded its hard deadline (FC-006)"
+    return 1
+  fi
+  case "$RUN_RC" in
+    0|1) ;;
+    *)
+      SCAN_ERROR="ast-grep crashed with exit $RUN_RC"
+      return 1
+      ;;
+  esac
+  if ! jq -e --argjson rc "$RUN_RC" '
+      type=="array"
+      and (($rc==0 and length==0) or ($rc==1 and length>0))
+    ' "$output" >/dev/null 2>&1; then
+    SCAN_ERROR="ast-grep exit code and JSON output violated the pinned contract (FC-001)"
     return 1
   fi
   return 0
@@ -698,6 +769,59 @@ if changed_matches '\.(js|mjs|cjs)$'; then
   fi
 else
   not_applicable eslint "candidate diff has no JavaScript"
+fi
+
+# ast-grep: committed structural rules over candidate-diff source files.
+AST_SOURCE_RE='\.(js|mjs|cjs|ts|tsx|sh)$'
+if changed_matches "$AST_SOURCE_RE"; then
+  scanner_begin ast-grep
+  AST_GREP=$(resolve_tool ast-grep)
+  if tool_ready ast-grep "$AST_GREP" 0.45.0; then
+    AST_GREP_OK=true
+    if [ ! -f "$AST_CONFIG" ]; then
+      emit_unavailable ast-grep "committed structural-rule config is missing: $AST_CONFIG"
+      AST_GREP_OK=false
+    fi
+    mapfile -t AST_FILES < <(list_changed "$AST_SOURCE_RE")
+    BASE_AST=()
+    CANDIDATE_AST=()
+    for file in "${AST_FILES[@]}"; do
+      [ "$BASELINE_AVAILABLE" = true ] && [ -f "$BASE_DIR/$file" ] && BASE_AST+=("$file")
+      [ -f "$CANDIDATE_DIR/$file" ] && CANDIDATE_AST+=("$file")
+    done
+    if [ "$AST_GREP_OK" = true ] && [ "${#BASE_AST[@]}" -gt 0 ]; then
+      if run_ast_scan "$BASE_DIR" "$TMP/ast-grep-base.json" "$TMP/ast-grep-base.log" \
+        "${BASE_AST[@]}" &&
+        raw_from_ast_grep "$TMP/ast-grep-base.json" "$BASE_DIR" "$RAW_BASE"; then :;
+      else AST_GREP_OK=false; fi
+    fi
+    if [ "$AST_GREP_OK" = true ] && [ "${#CANDIDATE_AST[@]}" -gt 0 ]; then
+      if run_ast_scan "$CANDIDATE_DIR" "$TMP/ast-grep-candidate.json" \
+        "$TMP/ast-grep-candidate.log" "${CANDIDATE_AST[@]}" &&
+        raw_from_ast_grep "$TMP/ast-grep-candidate.json" "$CANDIDATE_DIR" \
+          "$RAW_CANDIDATE"; then :;
+      else AST_GREP_OK=false; fi
+    fi
+    if [ "$AST_GREP_OK" = true ] && [ "${#CANDIDATE_AST[@]}" -gt 0 ]; then
+      if run_ast_scan "$CANDIDATE_DIR" "$TMP/ast-grep-confirm.json" \
+        "$TMP/ast-grep-confirm.log" "${CANDIDATE_AST[@]}" &&
+        raw_from_ast_grep "$TMP/ast-grep-confirm.json" "$CANDIDATE_DIR" \
+          "$RAW_CONFIRMATION"; then :;
+      else AST_GREP_OK=false; fi
+    fi
+    if [ "$AST_GREP_OK" = true ]; then scanner_end ast-grep ok
+    else
+      if ! grep -q '"scanner":"ast-grep".*"rule_id":"scanner-unavailable"' \
+        "$RAW_CANDIDATE"; then
+        emit_unavailable ast-grep "${SCAN_ERROR:-structural rule scan failed}"
+      fi
+      scanner_end ast-grep unavailable
+    fi
+  else
+    scanner_end ast-grep unavailable
+  fi
+else
+  not_applicable ast-grep "candidate diff has no structurally supported source"
 fi
 
 # osv-scanner: lockfile-touching diffs only, with the fully-offline flag.

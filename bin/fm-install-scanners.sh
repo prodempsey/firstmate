@@ -22,7 +22,7 @@ trap 'rm -rf "$TMP"' EXIT
   printf 'fm-install-scanners.sh: only Linux x86_64 is currently pinned\n' >&2
   exit 1
 }
-for tool in curl sha256sum tar npm; do
+for tool in curl sha256sum tar unzip npm; do
   command -v "$tool" >/dev/null 2>&1 || {
     printf 'fm-install-scanners.sh: required installer tool missing: %s\n' "$tool" >&2
     exit 1
@@ -77,6 +77,15 @@ fetch \
 tar -xzf "$TMP/$ACTIONLINT_ARCHIVE" -C "$TMP" actionlint
 install -m 0755 "$TMP/actionlint" "$DESTINATION/bin/actionlint"
 
+AST_GREP_VERSION=0.45.0
+AST_GREP_ARCHIVE=app-x86_64-unknown-linux-gnu.zip
+fetch \
+  "https://github.com/ast-grep/ast-grep/releases/download/${AST_GREP_VERSION}/${AST_GREP_ARCHIVE}" \
+  78931ae35ebac33d9a72b3aecea3e3d62d6e5b0b718ac8bbedfbe69d68421e41 \
+  "$TMP/$AST_GREP_ARCHIVE"
+unzip -q "$TMP/$AST_GREP_ARCHIVE" -d "$TMP/ast-grep"
+install -m 0755 "$TMP/ast-grep/ast-grep" "$DESTINATION/bin/ast-grep"
+
 RUFF_VERSION=0.16.0
 RUFF_ARCHIVE=ruff-x86_64-unknown-linux-gnu.tar.gz
 fetch \
@@ -104,6 +113,7 @@ npm ci --prefix "$DESTINATION/node" --ignore-scripts --no-audit --no-fund
 "$DESTINATION/bin/oxlint" --version
 "$DESTINATION/bin/osv-scanner" --version
 "$DESTINATION/bin/actionlint" --version
+"$DESTINATION/bin/ast-grep" --version
 "$DESTINATION/bin/ruff" --version
 "$DESTINATION/bin/jq" --version
 "$DESTINATION/bin/shellcheck" --version
@@ -112,6 +122,6 @@ FM_SCANNER_NODE_DIR="$DESTINATION/node" node "$ROOT/bin/fm-json-schema-scanner.m
 
 TOOLS_READY_TMP="$DESTINATION/tools-ready.json.tmp.$$"
 printf '%s\n' \
-  '{"schema":"firstmate/scanner-tools-ready/1","status":"ready","versions":{"actionlint":"1.7.12","ajv":"8.17.1","eslint":"9.39.5","eslint-plugin-n":"18.2.2","eslint-plugin-security":"4.0.1","eslint-plugin-sonarjs":"4.2.0","gitleaks":"8.30.1","jq":"1.7.1","osv-scanner":"2.4.0","oxlint":"1.75.0","ruff":"0.16.0","shellcheck":"0.11.0"}}' \
+  '{"schema":"firstmate/scanner-tools-ready/1","status":"ready","versions":{"actionlint":"1.7.12","ajv":"8.17.1","ast-grep":"0.45.0","eslint":"9.39.5","eslint-plugin-n":"18.2.2","eslint-plugin-security":"4.0.1","eslint-plugin-sonarjs":"4.2.0","gitleaks":"8.30.1","jq":"1.7.1","osv-scanner":"2.4.0","oxlint":"1.75.0","ruff":"0.16.0","shellcheck":"0.11.0"}}' \
   > "$TOOLS_READY_TMP"
 mv -f "$TOOLS_READY_TMP" "$DESTINATION/tools-ready.json"

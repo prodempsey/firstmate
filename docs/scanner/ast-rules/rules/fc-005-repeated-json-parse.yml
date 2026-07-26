@@ -1,0 +1,16 @@
+id: fc-005-repeated-json-parse
+language: JavaScript
+severity: error
+message: Parse the artifact once and consume values from that same validated generation.
+rule:
+  all:
+    - any:
+        - pattern: const $CURRENT = JSON.parse($SOURCE)
+        - pattern: let $CURRENT = JSON.parse($SOURCE)
+        - pattern: var $CURRENT = JSON.parse($SOURCE)
+    - follows:
+        any:
+          - pattern: const $PREVIOUS = JSON.parse($SOURCE)
+          - pattern: let $PREVIOUS = JSON.parse($SOURCE)
+          - pattern: var $PREVIOUS = JSON.parse($SOURCE)
+        stopBy: end

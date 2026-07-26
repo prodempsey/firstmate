@@ -1,0 +1,9 @@
+id: fc-005-repeated-jq-parse
+language: Bash
+severity: error
+message: Parse the artifact once and consume values from that same validated generation.
+rule:
+  pattern: jq $OPTION $FILTER $FILE
+  follows:
+    pattern: jq $PREVIOUS_OPTION $PREVIOUS_FILTER $FILE
+    stopBy: end

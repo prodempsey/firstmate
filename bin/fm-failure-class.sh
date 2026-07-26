@@ -501,7 +501,7 @@ cmd_cue_lint() {
         [ -n "$file" ] || continue
         printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$file" "$line" "$name" "$cue_ref" >> "$hits_file"
       done < "$matches_file"
-    done < <(printf '%s' "$class" | jq -c '(.detection // [])[]')
+    done < <(printf '%s' "$class" | jq -c '(.detection // [])[]|select(.engine=="awk-ere")')
   done < <(printf '%s' "$snapshot" | jq -c '.[]')
 
   local hits=0
@@ -524,8 +524,8 @@ cmd_cue_lint() {
 # executable checks (bin/fm-verify.sh's cue lint) WITHOUT rewriting its durable class-defined
 # line. A class-defined line is never edited; the amendment's detection/cues are merged onto
 # the folded record. Refuses an amendment against an unknown id and an amendment that adds
-# nothing. Each --detection is one JSON object ({engine, pattern, cue_ref, ...}) with a
-# non-empty string `pattern`; each --cue is one natural-language cue string.
+# nothing. Each --detection is one closed engine-specific JSON object; each
+# --cue is one natural-language cue string.
 cmd_amend() {
   local id=${1:-}; shift || true
   [ -n "$id" ] || die "amend requires a class id"
