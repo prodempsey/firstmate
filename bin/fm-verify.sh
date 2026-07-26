@@ -82,7 +82,8 @@
 #                                no-timeout path required by FC-006.
 #   FM_VERIFY_SCANNER_TIMEOUT    per scanner-call deadline (default 8).
 #   FM_VERIFY_SCANNER_BUDGET     whole scanner battery deadline (default 30).
-#   FM_SCANNER_ADJUDICATOR_TIMEOUT adjudicator deadline (committed policy default).
+#   FM_SCANNER_ADJUDICATOR_TIMEOUT positive integer adjudicator deadline override;
+#                                unset reads the committed policy default.
 #   FM_SCANNER_ADJUDICATOR_MODEL committed default or escalation model.
 #   FM_SCANNER_ADJUDICATOR_CLI   Claude CLI executable (default claude).
 #   FM_SCANNER_DIR               pinned scanner installation.
@@ -100,7 +101,8 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 LEDGER="${FM_FAILURE_LEDGER:-$FM_ROOT/docs/failure-classes/ledger.jsonl}"
 TEST_TIMEOUT="${FM_VERIFY_TEST_TIMEOUT:-600}"
 SCANNER_BUDGET="${FM_VERIFY_SCANNER_BUDGET:-30}"
-SCANNER_ADJUDICATOR_TIMEOUT="${FM_SCANNER_ADJUDICATOR_TIMEOUT:-}"
+SCANNER_ADJUDICATOR_TIMEOUT="${FM_SCANNER_ADJUDICATOR_TIMEOUT-}"
+SCANNER_ADJUDICATOR_TIMEOUT_SET="${FM_SCANNER_ADJUDICATOR_TIMEOUT+yes}"
 SCANNER_DIR="${FM_SCANNER_DIR:-$FM_HOME/tools/scanners}"
 SCANNER_OSV_DB="${FM_SCANNER_OSV_DB:-$SCANNER_DIR/osv-db}"
 SCANNER_ADJUDICATOR_POLICY="$(cd "$SCRIPT_DIR/.." && pwd)/docs/scanner/adjudicator-policy.json"
@@ -190,9 +192,12 @@ case "$FORMAT" in json|text) ;; *) refuse "--format must be json or text" ;; esa
 for tool in git jq awk grep sed env; do
   command -v "$tool" >/dev/null 2>&1 || refuse "missing prerequisite tool: $tool (fail closed, FC-004)"
 done
-if [ -z "$SCANNER_ADJUDICATOR_TIMEOUT" ]; then
-  SCANNER_ADJUDICATOR_TIMEOUT=$(jq -r '.limits.timeout_s // empty' \
-    "$SCANNER_ADJUDICATOR_POLICY" 2>/dev/null || true)
+if [ "$SCANNER_ADJUDICATOR_TIMEOUT_SET" != yes ]; then
+  SCANNER_ADJUDICATOR_TIMEOUT=$(jq -er '
+    .limits.timeout_s
+    | select(type == "number" and . >= 1 and . == floor)
+  ' "$SCANNER_ADJUDICATOR_POLICY" 2>/dev/null) ||
+    refuse "committed adjudicator timeout default is missing or invalid: $SCANNER_ADJUDICATOR_POLICY"
 fi
 
 # --- mandatory bindings (identity is proven, never merely observed) -----------

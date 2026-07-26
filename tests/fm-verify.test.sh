@@ -522,6 +522,26 @@ FM_HOME="$TMP/nohome" "$VERIFY" --out "$TMP/no-brief.json" --brief "$TMP/does-no
 expect_code 2 "$?" "unreadable brief refuses"
 pass "mandatory bindings: missing sha/task/brief each refuse"
 
+# --- adjudicator timeout: committed default, strict operator override ----------
+jq -e '
+  .limits.timeout_s
+  | type == "number" and . >= 1 and . == floor
+' "$ROOT/docs/scanner/adjudicator-policy.json" >/dev/null ||
+  fail "committed adjudicator timeout default must be a positive integer"
+env -u FM_SCANNER_ADJUDICATOR_TIMEOUT \
+  FM_HOME="$TMP/nohome" FM_SCANNER_DIR="$TMP/not-provisioned" "$VERIFY" \
+  --out "$TMP/adjudicator-timeout-default.json" --brief "$BRIEF" \
+  --worktree "$R" --base main --sha "$SHA" --branch fm/g1 --task g1 >/dev/null 2>&1
+expect_code 0 "$?" "unset adjudicator timeout reaches and passes the verifier gates"
+[ "$(bget "$TMP/adjudicator-timeout-default.json" .verdict)" = pass ] ||
+  fail "unset adjudicator timeout did not reach an authoritative verifier verdict"
+FM_SCANNER_ADJUDICATOR_TIMEOUT=invalid \
+  FM_HOME="$TMP/nohome" FM_SCANNER_DIR="$TMP/not-provisioned" "$VERIFY" \
+  --out "$TMP/adjudicator-timeout-invalid.json" --brief "$BRIEF" \
+  --worktree "$R" --base main --sha "$SHA" --branch fm/g1 --task g1 >/dev/null 2>&1
+expect_code 2 "$?" "invalid adjudicator timeout override refuses"
+pass "adjudicator timeout: unset uses a positive committed default; invalid override refuses"
+
 # --- identity: SHA mismatch, branch mismatch, detached HEAD -------------------
 rc=$(verify "$TMP/mm.json" --worktree "$R" --base main --sha deadbeefdeadbeef --branch fm/g1 --task g1)
 expect_code 1 "$rc" "SHA mismatch exits 1"
