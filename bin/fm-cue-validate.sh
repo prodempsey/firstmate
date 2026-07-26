@@ -30,14 +30,11 @@
 #
 # An empty-but-present ledger (zero events) is valid-empty: `prove` prints "[]" and exits 0.
 #
-# Test seam (fixture-gated, NOT an ambient variable): a missing-prerequisite simulation engages ONLY
-# when BOTH hold - a sandbox marker file `.fm-cue-test-sandbox` exists in the fixture's own directory
-# AND the target being validated lives in that same directory (the marker is looked up in the
-# target's own directory, so the target is inside the fixture dir by construction). The marker's
-# content lists the engine(s) to simulate absent (`python3` and/or `jsonschema`). No environment
-# variable can engage it, and no stray marker in a production home can either, because a production
-# ledger's directory (the committed docs/failure-classes/) carries no such marker. It can ONLY force
-# a refusal, never a false pass.
+# There is NO test-injection seam of any kind: no environment variable and no marker file can force
+# or redirect the outcome. python3 and jsonschema are GENUINE hard prerequisites - their real absence
+# is what refuses. Fixtures exercise the missing-prerequisite refusal by running this unmodified
+# script in a constrained environment (a PATH without python3, or a python that cannot import
+# jsonschema), never through a production hook.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,34 +50,17 @@ case "$SUBCMD" in
 esac
 [ -n "$TARGET" ] || { echo "fm-cue-validate: a target path is required" >&2; exit 2; }
 
-# Read the fixture-gated simulation marker from the TARGET's own directory (both conditions: the
-# marker exists in that directory, and the target is inside it). Absent marker => no simulation.
-SIMULATE_MISSING=""
-_target_dir=$(dirname "$TARGET")
-if [ -d "$_target_dir" ]; then
-  _marker="$(cd "$_target_dir" && pwd)/.fm-cue-test-sandbox"
-  [ -f "$_marker" ] && SIMULATE_MISSING=$(tr '\n' ',' < "$_marker" 2>/dev/null)
-fi
-
-# python3 is a HARD prerequisite. Absence is non-authoritative and fails closed.
-case ",$SIMULATE_MISSING," in
-  *,python3,*)
-    echo "CUE_VALIDATOR_UNAVAILABLE" >&2
-    echo "fm-cue-validate: python3 unavailable (test sandbox); refusing rather than degrading" >&2
-    exit 1 ;;
-esac
+# python3 is a HARD prerequisite. Its real absence is non-authoritative and fails closed.
 if ! command -v python3 >/dev/null 2>&1; then
   echo "CUE_VALIDATOR_UNAVAILABLE" >&2
   echo "fm-cue-validate: python3 is a hard prerequisite; refusing rather than degrading to a weaker check" >&2
   exit 1
 fi
 
-python3 - "$SUBCMD" "$TARGET" "$SCHEMAS_DIR" "$SIMULATE_MISSING" <<'PYEOF'
+python3 - "$SUBCMD" "$TARGET" "$SCHEMAS_DIR" <<'PYEOF'
 import json, os, subprocess, sys
 
-MODE, TARGET, SCHEMAS_DIR, SIMULATE_MISSING = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-
-_SIMULATE_MISSING = set(m for m in SIMULATE_MISSING.split(",") if m)
+MODE, TARGET, SCHEMAS_DIR = sys.argv[1], sys.argv[2], sys.argv[3]
 
 
 def unavailable(msg):
@@ -89,10 +69,9 @@ def unavailable(msg):
     sys.exit(1)
 
 
-# jsonschema joins python3 as a hard prerequisite: without a real schema engine we cannot POSITIVELY
-# prove additionalProperties:false / enum / type conformance, so we refuse rather than degrade.
-if "jsonschema" in _SIMULATE_MISSING:
-    unavailable("jsonschema unavailable (simulated); refusing")
+# jsonschema joins python3 as a GENUINE hard prerequisite: without a real schema engine we cannot
+# POSITIVELY prove additionalProperties:false / enum / type conformance, so we refuse rather than
+# degrade. Its real import failure is what refuses - there is no simulation hook.
 try:
     from jsonschema import Draft202012Validator
 except Exception:

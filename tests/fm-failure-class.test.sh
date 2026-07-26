@@ -402,32 +402,28 @@ if command -v python3 >/dev/null 2>&1 && python3 -c 'import jsonschema' 2>/dev/n
     else fail "amend refused but mutated the ledger: $row"; fi
   done
 
-  # Both engines are HARD prerequisites on the write path: absent -> CUE_VALIDATOR_UNAVAILABLE, refuse.
-  # The missing-engine simulation engages ONLY through the fixture-gated sandbox marker in the ledger's
-  # own directory (a dedicated dir so it cannot leak); the write's temp file lives in that same dir, so
-  # the temp proof sees the marker too.
+  # Both engines are HARD prerequisites on the write path: their GENUINE absence must refuse
+  # byte-identically. python3 absence is exercised under a constrained PATH; jsonschema absence under a
+  # python that cannot import it. There is no injection hook - the real prerequisite check fires.
   EA_DIR="$TMP_ROOT/engabsent"; mkdir -p "$EA_DIR"; EL="$EA_DIR/l.jsonl"
   FM_FC_LEDGER="$EL" "$FC" add --id FC-001 --name n --invariant i --fix f --cue c --provenance qa:d#1 >/dev/null
   el_base=$(md5sum "$EL"|cut -d' ' -f1)
-  for miss in python3 jsonschema; do
-    printf '%s\n' "$miss" > "$EA_DIR/.fm-cue-test-sandbox"
-    if FM_FC_LEDGER="$EL" "$FC" bump FC-001 --provenance qa:d#2 >/dev/null 2>"$TMP_ROOT/ea.err"; then
-      fail "$miss-absent write must refuse"
-    elif [ "$el_base" = "$(md5sum "$EL"|cut -d' ' -f1)" ] && grep -q CUE_VALIDATOR_UNAVAILABLE "$TMP_ROOT/ea.err"; then
-      pass "$miss absent (sandbox marker) on the write path -> CUE_VALIDATOR_UNAVAILABLE, ledger byte-identical"
-    else fail "$miss-absent write must refuse byte-identically with CUE_VALIDATOR_UNAVAILABLE"; fi
-  done
-  rm -f "$EA_DIR/.fm-cue-test-sandbox"
+  WNOPY=$(fm_test_path_without_python3 "$TMP_ROOT/w-nopy")
+  if PATH="$WNOPY" FM_FC_LEDGER="$EL" "$FC" bump FC-001 --provenance qa:d#2 >/dev/null 2>"$TMP_ROOT/ea.err"; then
+    fail "python3-absent write must refuse"
+  elif [ "$el_base" = "$(md5sum "$EL"|cut -d' ' -f1)" ] && grep -q CUE_VALIDATOR_UNAVAILABLE "$TMP_ROOT/ea.err"; then
+    pass "python3 genuinely absent (constrained PATH) on the write path -> CUE_VALIDATOR_UNAVAILABLE, byte-identical"
+  else fail "python3-absent write must refuse byte-identically with CUE_VALIDATOR_UNAVAILABLE"; fi
+  WNOJS=$(fm_test_pythonpath_no_jsonschema "$TMP_ROOT/w-nojs")
+  if PYTHONPATH="$WNOJS" FM_FC_LEDGER="$EL" "$FC" bump FC-001 --provenance qa:d#2 >/dev/null 2>"$TMP_ROOT/ea.err"; then
+    fail "jsonschema-absent write must refuse"
+  elif [ "$el_base" = "$(md5sum "$EL"|cut -d' ' -f1)" ] && grep -q CUE_VALIDATOR_UNAVAILABLE "$TMP_ROOT/ea.err"; then
+    pass "jsonschema genuinely unimportable on the write path -> CUE_VALIDATOR_UNAVAILABLE, byte-identical"
+  else fail "jsonschema-absent write must refuse byte-identically with CUE_VALIDATOR_UNAVAILABLE"; fi
 
-  # PLAIN-SHELL BYPASS (qa-scg1r6-q187 F1): a bare ambient FM_CUE_SIMULATE_MISSING must NOT engage the
-  # seam - with no marker present, the write proceeds normally.
-  if FM_CUE_SIMULATE_MISSING=python3 FM_FC_LEDGER="$EL" "$FC" bump FC-001 --provenance qa:d#3 >/dev/null 2>&1; then
-    pass "a bare ambient FM_CUE_SIMULATE_MISSING cannot engage the write-path seam (plain-shell bypass)"
-  else fail "a bare FM_CUE_SIMULATE_MISSING must not engage the seam on the write path"; fi
-
-  # REGRESSION (qa-scg1r5-q185 F1): ambient FM_CUE_VALIDATOR / FM_CUE_SCHEMAS_DIR (and the now-dead
-  # FM_CUE_SIMULATE_MISSING) cannot substitute the authority. A success-always validator + permissive
-  # schema dir must STILL refuse to append to a malformed ledger, byte-identical - all are ignored.
+  # REGRESSION (qa-scg1r5-q185 F1): ambient FM_CUE_VALIDATOR / FM_CUE_SCHEMAS_DIR cannot substitute the
+  # authority. A success-always validator + permissive schema dir must STILL refuse to append to a
+  # malformed ledger, byte-identical - all are ignored.
   OV="$TMP_ROOT/override-mal.jsonl"; printf '{broken-json\n' > "$OV"; ov_base=$(md5sum "$OV"|cut -d' ' -f1)
   if FM_CUE_VALIDATOR=true FM_CUE_SCHEMAS_DIR=/tmp FM_CUE_SIMULATE_MISSING=python3 FM_FC_LEDGER="$OV" \
        "$FC" add --id FC-901 --name n --invariant i --fix f --cue c --provenance qa:r#1 >/dev/null 2>&1; then

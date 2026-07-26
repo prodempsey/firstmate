@@ -697,25 +697,18 @@ if command -v python3 >/dev/null 2>&1 && python3 -c 'import jsonschema' 2>/dev/n
   L="$TMP/rd-trail.jsonl"; cp "$LEDGER" "$L"; printf '%s garbage\n' "$(occ)" >> "$L"; read_fail_closed "$L" "R5 read: trailing garbage after a valid object"
   L="$TMP/rd-emptyline.jsonl"; cp "$LEDGER" "$L"; printf '\n%s\n' "$(occ)" >> "$L"; read_fail_closed "$L" "R5 read: an empty line"
   L="$TMP/rd-wsline.jsonl"; cp "$LEDGER" "$L"; printf '   \n%s\n' "$(occ)" >> "$L"; read_fail_closed "$L" "R5 read: a whitespace-only line"
+  L="$TMP/rd-malafter.jsonl"; cp "$LEDGER" "$L"; printf '{broken-json\n' >> "$L"; read_fail_closed "$L" "R5 read: malformed JSON AFTER a valid line (isolated)"
   read_fail_closed "$TMP/rd-missing-does-not-exist.jsonl" "R5 read: a MISSING ledger fails closed (distinct from empty)"
-  # Both engines absent via the FIXTURE-GATED sandbox marker (a copy of the ledger in a dedicated dir
-  # so the marker cannot touch the committed production ledger). No ambient variable is used.
-  SB="$TMP/read-sim"; mkdir -p "$SB"; cp "$LEDGER" "$SB/l.jsonl"
-  printf 'python3\n' > "$SB/.fm-cue-test-sandbox"; read_fail_closed "$SB/l.jsonl" "R5 read: python3 absent (sandbox marker) fails closed"
-  printf 'jsonschema\n' > "$SB/.fm-cue-test-sandbox"; read_fail_closed "$SB/l.jsonl" "R5 read: jsonschema absent (sandbox marker) fails closed"
-  rm -f "$SB/.fm-cue-test-sandbox"
-  # PLAIN-SHELL BYPASS (qa-scg1r6-q187 F1): a bare ambient FM_CUE_SIMULATE_MISSING must NOT engage the
-  # read-path seam - a valid ledger with no marker must NOT produce a ledger-unreadable finding.
-  FM_CUE_SIMULATE_MISSING=python3 FM_HOME="$TMP/nhbypass" FM_FAILURE_LEDGER="$SB/l.jsonl" "$VERIFY" --out "$TMP/rbypass.json" --brief "$BRIEF" \
-    --worktree "$RCu" --base main --sha "$USHA" --branch fm/g1 --task g1 >/dev/null 2>&1
-  if [ "$(bget "$TMP/rbypass.json" '[.findings[]|select(.gate=="cue_lint" and .code=="ledger-unreadable")]|length')" = 0 ]; then
-    pass "R5 read: a bare ambient FM_CUE_SIMULATE_MISSING cannot engage the seam (plain-shell bypass)"
-  else fail "a bare FM_CUE_SIMULATE_MISSING must not engage the read-path seam"; fi
-  # REGRESSION (qa-scg1r5-q185 F1): an ambient FM_CUE_VALIDATOR / FM_CUE_SCHEMAS_DIR (and the now-dead
-  # FM_CUE_SIMULATE_MISSING) cannot substitute the authority on the read path - a malformed ledger must
-  # STILL fail the cue lint closed.
+  # Both engines' GENUINE absence fails the read path closed - no injection hook. python3 absence runs
+  # the verifier under a constrained PATH; jsonschema absence under a python that cannot import it.
+  RNOPY=$(fm_test_path_without_python3 "$TMP/r-nopy")
+  read_fail_closed "$LEDGER" "R5 read: python3 genuinely absent (constrained PATH) fails closed" "PATH=$RNOPY"
+  RNOJS=$(fm_test_pythonpath_no_jsonschema "$TMP/r-nojs")
+  read_fail_closed "$LEDGER" "R5 read: jsonschema genuinely unimportable fails closed" "PYTHONPATH=$RNOJS"
+  # REGRESSION (qa-scg1r5-q185 F1): ambient FM_CUE_VALIDATOR / FM_CUE_SCHEMAS_DIR cannot substitute the
+  # authority on the read path - a malformed ledger must STILL fail the cue lint closed.
   L="$TMP/rd-override.jsonl"; printf '{broken-json\n' > "$L"
-  read_fail_closed "$L" "R5 read: ambient FM_CUE_VALIDATOR override cannot authorize a malformed ledger (F1)" "FM_CUE_VALIDATOR=true FM_CUE_SCHEMAS_DIR=/tmp FM_CUE_SIMULATE_MISSING=python3"
+  read_fail_closed "$L" "R5 read: ambient FM_CUE_VALIDATOR override cannot authorize a malformed ledger (F1)" "FM_CUE_VALIDATOR=true FM_CUE_SCHEMAS_DIR=/tmp"
   # An EMPTY-but-present ledger is valid-empty on the read path: no cues to lint, gate passes, no hit.
   EMPTYL="$TMP/rd-empty.jsonl"; : > "$EMPTYL"
   FM_HOME="$TMP/nohomeE" FM_FAILURE_LEDGER="$EMPTYL" "$VERIFY" --out "$TMP/rfe.json" --brief "$BRIEF" \

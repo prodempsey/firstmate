@@ -313,3 +313,34 @@ assert_absent() {
 assert_present() {
   [ -e "$1" ] || fail "$2"
 }
+
+# fm_test_path_without_python3 <dir>: populate <dir> with symlinks to every executable currently on
+# PATH EXCEPT python3*, and echo <dir>. Running a command with PATH set to the result exercises the
+# GENUINE "python3 is a hard prerequisite" refusal (command -v python3 fails) with no production hook
+# - every other tool the script needs (jq, git, coreutils, ...) is still resolvable.
+fm_test_path_without_python3() {
+  local dir=$1 d f b oldifs
+  mkdir -p "$dir"
+  oldifs=$IFS; IFS=:
+  for d in $PATH; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*; do
+      [ -e "$f" ] || continue
+      b=${f##*/}
+      case "$b" in python3*) continue ;; esac
+      [ -e "$dir/$b" ] || ln -s "$f" "$dir/$b" 2>/dev/null || true
+    done
+  done
+  IFS=$oldifs
+  printf '%s\n' "$dir"
+}
+
+# fm_test_pythonpath_no_jsonschema <dir>: create a jsonschema.py in <dir> that raises on import, and
+# echo <dir>. Running a command with PYTHONPATH set to the result exercises the GENUINE "jsonschema
+# is a hard prerequisite" refusal (`from jsonschema import ...` fails) with no production hook.
+fm_test_pythonpath_no_jsonschema() {
+  local dir=$1
+  mkdir -p "$dir"
+  printf 'raise ImportError("fm-test: jsonschema unavailable in this constrained environment")\n' > "$dir/jsonschema.py"
+  printf '%s\n' "$dir"
+}

@@ -98,33 +98,28 @@ else
   fail "empty-present ledger must be valid-empty"
 fi
 
-# --- engine fail-closed via the FIXTURE-GATED sandbox marker (never an ambient variable) ----
-# The simulation engages only when the marker file sits in the validated ledger's OWN directory, so
-# the fixture owns it entirely. It is placed in a dedicated sub-directory so it cannot leak into any
-# other fixture's proof.
-SIMDIR="$TMP/sim"; mkdir -p "$SIMDIR"; printf '%s\n' "$CD" > "$SIMDIR/l.jsonl"
-printf 'python3\n' > "$SIMDIR/.fm-cue-test-sandbox"
-"$V" prove "$SIMDIR/l.jsonl" >/dev/null 2>"$TMP/e"
-if [ "$(sed -n 1p "$TMP/e")" = CUE_VALIDATOR_UNAVAILABLE ]; then pass "python3 absent (sandbox marker) -> CUE_VALIDATOR_UNAVAILABLE (fail closed)"; else fail "python3 absent must refuse"; fi
-printf 'jsonschema\n' > "$SIMDIR/.fm-cue-test-sandbox"
-"$V" prove "$SIMDIR/l.jsonl" >/dev/null 2>"$TMP/e"
-if [ "$(sed -n 1p "$TMP/e")" = CUE_VALIDATOR_UNAVAILABLE ]; then pass "jsonschema absent (sandbox marker) -> CUE_VALIDATOR_UNAVAILABLE (fail closed)"; else fail "jsonschema absent must refuse"; fi
-rm -f "$SIMDIR/.fm-cue-test-sandbox"
+# --- engine fail-closed via a GENUINE constrained environment (no production hook) ---------------
+# There is no injection seam. The missing-prerequisite refusal is exercised by running the unmodified
+# validator where the prerequisite truly cannot be resolved: a PATH without python3, and a python that
+# cannot import jsonschema.
+led="$TMP/ok.jsonl"; printf '%s\n' "$CD" > "$led"
+NOPY=$(fm_test_path_without_python3 "$TMP/nopy")
+env -i PATH="$NOPY" HOME="$TMP" "$V" prove "$led" >/dev/null 2>"$TMP/e"
+if [ "$(sed -n 1p "$TMP/e")" = CUE_VALIDATOR_UNAVAILABLE ]; then pass "python3 genuinely absent (constrained PATH) -> CUE_VALIDATOR_UNAVAILABLE (fail closed)"; else fail "python3 absent must refuse"; fi
+NOJS=$(fm_test_pythonpath_no_jsonschema "$TMP/nojs")
+PYTHONPATH="$NOJS" "$V" prove "$led" >/dev/null 2>"$TMP/e"
+if [ "$(sed -n 1p "$TMP/e")" = CUE_VALIDATOR_UNAVAILABLE ]; then pass "jsonschema genuinely unimportable -> CUE_VALIDATOR_UNAVAILABLE (fail closed)"; else fail "jsonschema absent must refuse"; fi
 
-# --- PLAIN-SHELL BYPASS (qa-scg1r6-q187 F1): the seam is un-engageable outside its fixture --------
-# A bare ambient variable must NOT engage the seam, and a marker in a DIFFERENT directory must NOT
-# engage it: only a marker co-located with the validated ledger does.
-if FM_CUE_SIMULATE_MISSING=python3 "$V" prove "$SIMDIR/l.jsonl" >/dev/null 2>&1; then
-  pass "a bare ambient FM_CUE_SIMULATE_MISSING cannot engage the seam (plain-shell bypass)"
-else
-  fail "the injection seam must NOT be engageable from a bare env var"
-fi
-mkdir -p "$TMP/stray"; printf 'python3\n' > "$TMP/stray/.fm-cue-test-sandbox"
-if "$V" prove "$SIMDIR/l.jsonl" >/dev/null 2>&1; then
-  pass "a sandbox marker in a different directory cannot engage the seam"
-else
-  fail "a stray marker outside the validated ledger's directory must NOT engage the seam"
-fi
+# --- NO-SEAM regression (qa-scg1r7-q189 F1): the injection seam is DELETED, not merely guarded ----
+# The only correct guard is the absence of any seam. Assert the seam strings do not appear anywhere in
+# the cue authority's production code, so no ordinary shell (marker file, symlink, env var, or
+# otherwise) can engage a replacement of the prerequisite check.
+for f in "$ROOT/bin/fm-cue-validate.sh" "$ROOT/bin/fm-cue-lib.sh" "$ROOT/bin/fm-failure-class.sh" "$ROOT/bin/fm-verify.sh"; do
+  if grep -qE 'FM_CUE_SIMULATE_MISSING|fm-cue-test-sandbox|SIMULATE_MISSING' "$f"; then
+    fail "a test-injection seam string is still present in production code: $f"
+  fi
+done
+pass "no injection-seam string exists in the cue authority's production code (grep-based)"
 
 # --- check-row: the raw single-row entrypoint (write path uses this pre-jq) --
 check_row() { printf '%s' "$1" > "$TMP/row.json"; "$V" check-row "$TMP/row.json" >/dev/null 2>&1; }
