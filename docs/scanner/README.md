@@ -1,8 +1,10 @@
 # Shakedown scanner battery
 
-`bin/fm-scanner.sh` owns scanner execution, normalization, timing, offline enforcement, and the `firstmate/scanner-report/2` contract.
+`bin/fm-scanner.sh` owns scanner execution, normalization, timing, offline enforcement, and the `firstmate/scanner-report/3` contract.
 `bin/fm-findings-attribute.sh` is the reusable owner of inherited, candidate-new, and unattributed baseline semantics.
 `bin/fm-findings-adjudicate.sh` owns the bounded, demote-only Phase 2 classification pass and its closed report schema.
+`bin/fm-dismissal-validate.sh` is the single raw-byte validation authority for the committed dismissal ledger.
+`bin/fm-scanner-learning.sh` is the sanctioned dismissal writer and Seasoning proposal surface.
 `bin/fm-verify.sh` consumes that closed report as its `scanner` gate.
 `docs/scanner/blocking-policy.json` is the single committed authority for blocking severities, report-only rule prefixes, and per-scanner time slices.
 `docs/scanner/adjudicator-policy.json` is the single committed authority for models, bounds, noisy-finding selectors, and the demotion reason taxonomy.
@@ -24,6 +26,54 @@ Every invalid, unavailable, or timed-out classification preserves all pre-adjudi
 Every demotion requires an independent machine-owned corroboration proof tied to the exact finding and reason code; model-selected source text never authorizes a downgrade.
 The scanner bundle records that proof with the reason code, exact cited span, prompt fingerprint, model, cost estimate, and random audit-sample marker.
 TruffleHog is deliberately excluded because its license and verification behavior violate this gate's local-first boundary.
+
+## Dismissals and captain learning
+
+`docs/scanner/dismissals.jsonl` is an append-only committed ledger of `firstmate/scanner-dismissal-event/1` records.
+Its closed schema is `docs/scanner/schema/dismissal-event.schema.json`.
+The validator reads the raw JSONL bytes once with python3 and jsonschema Draft 2020-12, rejects duplicate members before materialization, and refuses if either engine is unavailable.
+The writer proves the existing ledger, stages one event, proves the complete result, and atomically renames it under the portable ledger lock.
+
+Every event binds the application-computed scanner-qualified occurrence fingerprint, repository identity, scanner and rule, severity, occurrence, scanner-stack fingerprint, narrow scope, closed reason code, actor, evidence reference, creation time, and mandatory `review_after`.
+There is no global scope.
+Path scope is exact.
+Rule scope requires a non-global repository-relative path prefix.
+Secrets-class findings may use only exact path scope.
+AST scope is schema-ready but remains non-matching until a later scanner phase supplies a machine-owned AST anchor in the finding contract.
+Any fingerprint, severity, rule, path scope, repository, or scanner-stack change prevents a match.
+
+The adjudicator loads the target repository's ledger from the immutable base commit when it exists.
+For repositories without a local ledger it uses this committed control-plane ledger.
+`FM_SCANNER_DISMISSAL_LEDGER` selects an explicit control-plane ledger for isolated operation and tests.
+A candidate ledger change cannot suppress a finding in the same review once the base carries the ledger.
+Only a live event whose `created_at` is not in the future and whose `review_after` is later than the current UTC instant can pre-filter a finding.
+The validator refuses a review interval longer than 180 days.
+An expired event re-surfaces the finding for normal adjudication.
+A corrupt, unreadable, or unprovable ledger disables all pre-filtering, preserves the ordinary model path, and adds one blocking `dismissal-ledger-unavailable` finding.
+Every pre-filtered finding remains in the bundle with `adjudication.status="pre-filtered"`, its dismissal id, reason, and review deadline.
+
+Record a surfaced captain decision with the following shape.
+
+```sh
+bin/fm-scanner-learning.sh dismiss \
+  --bundle scanner-report.json \
+  --fingerprint <application-computed-sha256> \
+  --scope path \
+  --reason accepted-risk \
+  --by captain \
+  --evidence captain-order:<id> \
+  --review-after 2026-10-01T00:00:00Z \
+  --repo .
+```
+
+Record a corroborated adjudicator demotion with the same verb and `--by adjudicator`.
+The writer then derives the closed reason, model identity, and proof reference from that exact demoted finding rather than accepting human-readable scanner text as authority.
+
+Repeated model confirmations are labels, not executable policy.
+Three unique confirmations of one scanner and rule may be graduated into a captain-gated Seasoning proposal with `fm-scanner-learning.sh propose`.
+The proposal is a valid `class-defined` event with one provenance citation per confirmed fingerprint, but the command never mutates the failure-class ledger.
+The captain still approves and lands the real rule through `bin/fm-failure-class.sh`.
+Dismissal frequency never changes scanner severity or creates a global suppression automatically.
 
 The direct pins and licenses are:
 

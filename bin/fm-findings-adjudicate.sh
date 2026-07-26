@@ -31,6 +31,7 @@
 #   FM_SCANNER_ADJUDICATOR_MODEL  Committed default or escalation model.
 #   FM_SCANNER_ADJUDICATOR_TIMEOUT positive integer override.
 #   FM_SCANNER_ADJUDICATOR_AUDIT_SEED bounded deterministic test seed.
+#   FM_SCANNER_DISMISSAL_LEDGER explicit control-plane dismissal ledger.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,6 +39,9 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 POLICY="$ROOT/docs/scanner/adjudicator-policy.json"
 PROMPT_FILE="$ROOT/docs/scanner/adjudicator-system-prompt.txt"
 CLI="${FM_SCANNER_ADJUDICATOR_CLI:-claude}"
+
+# shellcheck source=bin/fm-dismissal-lib.sh
+. "$SCRIPT_DIR/fm-dismissal-lib.sh"
 
 usage() { sed -n '/^# Usage:/,/^set -u$/p' "$0" | sed 's/^# \{0,1\}//;$d'; }
 refuse() { printf 'fm-findings-adjudicate: %s\n' "$1" >&2; exit 2; }
@@ -181,11 +185,137 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/quarantine"
 printf '{"mcpServers":{}}\n' > "$TMP/empty-mcp.json"
 
+DISMISSAL_LEDGER="$TMP/dismissals.jsonl"
+DISMISSAL_PROVEN="$TMP/dismissals-proven.json"
+DISMISSAL_MATCHES="$TMP/dismissal-matches.json"
+DISMISSAL_ATTRIBUTION="$TMP/dismissal-attribution.json"
+DISMISSAL_SOURCE=control-plane
+DISMISSAL_STATUS=ok
+DISMISSAL_LEDGER_FINGERPRINT=""
+DISMISSAL_NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+REPOSITORY_ID=$(fm_scanner_repository_id "$REPO" "$CANDIDATE") ||
+  refuse "repository identity could not be computed"
+STACK_FINGERPRINT=$(fm_scanner_stack_fingerprint "$ROOT") ||
+  refuse "scanner-stack identity could not be computed"
+
+if [ -n "${FM_SCANNER_DISMISSAL_LEDGER:-}" ]; then
+  DISMISSAL_LEDGER=$FM_SCANNER_DISMISSAL_LEDGER
+  DISMISSAL_SOURCE=explicit-control-plane
+elif git -C "$REPO" cat-file -e "$BASE:docs/scanner/dismissals.jsonl" 2>/dev/null; then
+  git -C "$REPO" show "$BASE:docs/scanner/dismissals.jsonl" > "$DISMISSAL_LEDGER" ||
+    DISMISSAL_STATUS=unavailable
+  DISMISSAL_SOURCE=base
+else
+  DISMISSAL_LEDGER="$ROOT/docs/scanner/dismissals.jsonl"
+fi
+
+if [ "$DISMISSAL_STATUS" = ok ]; then
+  if ! fm_dismissal_ledger_prove "$DISMISSAL_LEDGER" \
+    > "$DISMISSAL_PROVEN" 2>"$TMP/dismissal-prove.err"; then
+    DISMISSAL_STATUS=unavailable
+  fi
+fi
+if [ "$DISMISSAL_STATUS" = ok ]; then
+  DISMISSAL_LEDGER_FINGERPRINT=$(sha256sum "$DISMISSAL_LEDGER" | awk '{print $1}')
+  jq --arg repository_id "$REPOSITORY_ID" --arg stack "$STACK_FINGERPRINT" \
+    --arg now "$DISMISSAL_NOW" --slurpfile dismissals "$DISMISSAL_PROVEN" '
+    [
+      .findings[]
+      | select(.attribution=="candidate-new" and .stability=="confirmed" and .blocking)
+      | . as $finding
+      | [
+          $dismissals[0][] as $dismissal
+          | $dismissal
+          | select(
+              .repository_id==$repository_id
+              and .finding_fingerprint==$finding.fingerprint
+              and .fingerprint_algorithm=="firstmate/scanner-fingerprint/2"
+              and .stack_fingerprint==$stack
+              and .scanner==$finding.scanner
+              and .rule_id==$finding.rule_id
+              and .severity==$finding.severity
+              and .occurrence==$finding.occurrence
+              and .created_at<=$now
+              and .review_after>$now
+              and (
+                (.scope.kind=="path" and .scope.path==$finding.path)
+                or
+                (.scope.kind=="rule"
+                  and ($finding.path|type)=="string"
+                  and ($finding.path|startswith($dismissal.scope.path_prefix)))
+              )
+          )
+        ]
+      | sort_by(.created_at,.review_after,.id)
+      | last
+      | select(.!=null)
+      | {
+          fingerprint:$finding.fingerprint,
+          dismissal_id:.id,
+          reason_code:.reason_code,
+          review_after:.review_after,
+          scope:.scope
+        }
+    ]
+  ' "$ATTRIBUTION" > "$DISMISSAL_MATCHES" ||
+    DISMISSAL_STATUS=unavailable
+fi
+
+if [ "$DISMISSAL_STATUS" != ok ]; then
+  printf '[]\n' > "$DISMISSAL_MATCHES"
+  dismissal_unavailable_fp=$(
+    printf '%s\t%s\t%s\n' dismissal-ledger-unavailable "$CANDIDATE_SHA" "$STACK_FINGERPRINT" |
+      sha256sum | awk '{print $1}'
+  )
+  jq --arg fingerprint "$dismissal_unavailable_fp" '
+    .findings += [{
+      schema:"firstmate/scanner-raw-finding/1",
+      scanner:"dismissal-filter",
+      rule_id:"dismissal-ledger-unavailable",
+      severity:"error",
+      path:null,
+      line:null,
+      message:"DISMISSAL_LEDGER_UNAVAILABLE: no findings were pre-filtered; normal adjudication retained (fail closed, FC-001/FC-002/FC-004)",
+      subject:null,
+      occurrence:1,
+      fingerprint:$fingerprint,
+      attribution:"candidate-new",
+      blocking:true,
+      policy_decision:"block",
+      policy_reason:"dismissal authority unavailable; pre-filter disabled",
+      stability:"confirmed"
+    }]
+  ' "$ATTRIBUTION" > "$DISMISSAL_ATTRIBUTION"
+else
+  cp "$ATTRIBUTION" "$DISMISSAL_ATTRIBUTION"
+fi
+PREFILTERED_COUNT=$(jq 'length' "$DISMISSAL_MATCHES")
+EXPIRED_DISMISSAL_COUNT=0
+if [ "$DISMISSAL_STATUS" = ok ]; then
+  EXPIRED_DISMISSAL_COUNT=$(
+    jq --arg repository_id "$REPOSITORY_ID" --arg stack "$STACK_FINGERPRINT" \
+      --arg now "$DISMISSAL_NOW" --slurpfile attribution "$ATTRIBUTION" '
+      [
+        .[] as $dismissal
+        | $dismissal
+        | select(
+            .repository_id==$repository_id
+            and .stack_fingerprint==$stack
+            and .review_after<=$now
+            and any($attribution[0].findings[];
+              .fingerprint==$dismissal.finding_fingerprint)
+        )
+      ] | length
+    ' "$DISMISSAL_PROVEN"
+  )
+fi
+
 ELIGIBLE="$TMP/eligible.jsonl"
-jq -c --slurpfile policy "$POLICY" '
+jq -c --slurpfile policy "$POLICY" --slurpfile dismissals "$DISMISSAL_MATCHES" '
   .findings[]
   | select(.attribution=="candidate-new" and .stability=="confirmed" and .blocking)
   | . as $finding
+  | select(any($dismissals[0][]; .fingerprint==$finding.fingerprint)|not)
   | select(any($policy[0].never_adjudicate_scanners[]; .==$finding.scanner)|not)
   | first($policy[0].selectors[] as $selector
       | select($selector.scanner==$finding.scanner
@@ -193,12 +323,12 @@ jq -c --slurpfile policy "$POLICY" '
       | $selector) as $selector
   | select($selector != null)
   | . + {finding_class:$selector.finding_class,corroboration:null}
-' "$ATTRIBUTION" > "$ELIGIBLE"
+' "$DISMISSAL_ATTRIBUTION" > "$ELIGIBLE"
 
 SUBMITTED_COUNT=$(wc -l < "$ELIGIBLE" | tr -d ' ')
 EXCLUDED_SECRETS=$(jq '[.findings[]|
   select(.attribution=="candidate-new" and .blocking and .scanner=="gitleaks")]|length' \
-  "$ATTRIBUTION")
+  "$DISMISSAL_ATTRIBUTION")
 jq -s 'map(. + {cluster_id:null})' "$ELIGIBLE" > "$TMP/eligible-array.json"
 
 OUTPUT_SCHEMA=$(
@@ -265,7 +395,8 @@ build_findings() {
   local status=$1 results=$2 audit_fingerprints=$3 destination=$4
   jq --arg adjudication_status "$status" \
     --slurpfile results "$results" --rawfile audits "$audit_fingerprints" \
-    --slurpfile eligible "$TMP/eligible-array.json" '
+    --slurpfile eligible "$TMP/eligible-array.json" \
+    --slurpfile dismissals "$DISMISSAL_MATCHES" '
     ($results[0].results // []) as $results
     | ($audits|split("\n")|map(select(length>0))) as $audits
     | ($eligible[0] // []) as $eligible
@@ -273,10 +404,29 @@ build_findings() {
     | map(
         . as $finding
         | ($eligible|map(select(.fingerprint==$finding.fingerprint))|.[0] // null) as $selected
-        | if $selected==null then
+        | ($dismissals[0]|map(select(.fingerprint==$finding.fingerprint))|.[0] // null) as $dismissal
+        | if $dismissal!=null then
+            . + {
+              blocking:false,
+              policy_decision:"report-only",
+              policy_reason:(
+                "live dismissal "+$dismissal.dismissal_id+
+                " ["+$dismissal.reason_code+"] until "+$dismissal.review_after
+              ),
+              adjudication:{
+                status:"pre-filtered",verdict:"demote-to-report",
+                reason_code:$dismissal.reason_code,
+                reason:"live, in-scope dismissal matched the computed fingerprint",
+                evidence:null,corroboration:null,audit_sampled:false,cluster_id:null,
+                dismissal_id:$dismissal.dismissal_id,
+                pre_blocking:.blocking,pre_policy_decision:.policy_decision
+              }
+            }
+          elif $selected==null then
             . + {adjudication:{
               status:"not-eligible",verdict:null,reason_code:null,reason:null,
               evidence:null,corroboration:null,audit_sampled:false,cluster_id:null,
+              dismissal_id:null,
               pre_blocking:.blocking,pre_policy_decision:.policy_decision
             }}
           elif $adjudication_status=="unavailable" then
@@ -284,6 +434,7 @@ build_findings() {
               status:"unavailable",verdict:null,reason_code:null,reason:null,
               evidence:null,corroboration:$selected.corroboration,
               audit_sampled:false,cluster_id:$selected.cluster_id,
+              dismissal_id:null,
               pre_blocking:.blocking,pre_policy_decision:.policy_decision
             }}
           else
@@ -301,11 +452,12 @@ build_findings() {
                   evidence:$result.evidence,corroboration:$selected.corroboration,
                   audit_sampled:(.fingerprint as $fp|any($audits[]; .==$fp)),
                   cluster_id:$selected.cluster_id,
+                  dismissal_id:null,
                   pre_blocking:.blocking,pre_policy_decision:.policy_decision
                 }
               }
           end)
-  ' "$ATTRIBUTION" > "$destination"
+  ' "$DISMISSAL_ATTRIBUTION" > "$destination"
 }
 
 publish_report() {
@@ -314,7 +466,10 @@ publish_report() {
   local findings=$TMP/final-findings.json
   build_findings "$status" "$results" "$audit_fingerprints" "$findings"
   local demotions=$TMP/demotions.json
-  jq '[.[]|select(.adjudication.verdict=="demote-to-report")|{
+  jq '[.[]|select(
+    .adjudication.status=="adjudicated"
+    and .adjudication.verdict=="demote-to-report"
+  )|{
     fingerprint,reason_code:.adjudication.reason_code,reason:.adjudication.reason,
     evidence:.adjudication.evidence,corroboration:.adjudication.corroboration,
     audit_sampled:.adjudication.audit_sampled
@@ -325,9 +480,14 @@ publish_report() {
     --arg duration "$duration" --arg submitted "$SUBMITTED_COUNT" \
     --arg excluded "$EXCLUDED_SECRETS" --arg cost "$cost" --arg basis "$basis" \
     --arg reason "$reason" --arg sample_k "$AUDIT_K" --arg seed_hash "$seed_hash" \
+    --arg dismissal_status "$DISMISSAL_STATUS" --arg dismissal_source "$DISMISSAL_SOURCE" \
+    --arg dismissal_ledger_fingerprint "$DISMISSAL_LEDGER_FINGERPRINT" \
+    --arg stack_fingerprint "$STACK_FINGERPRINT" --arg repository_id "$REPOSITORY_ID" \
+    --arg evaluated_at "$DISMISSAL_NOW" --arg prefiltered "$PREFILTERED_COUNT" \
+    --arg expired "$EXPIRED_DISMISSAL_COUNT" \
     --slurpfile findings "$findings" --slurpfile demotions "$demotions" '
       {
-        schema:"firstmate/scanner-adjudication/1",
+        schema:"firstmate/scanner-adjudication/2",
         status:$status,
         model:$model,
         prompt_version:$version,
@@ -353,17 +513,30 @@ publish_report() {
         cost_estimate_usd:($cost|tonumber),
         cost_estimate_basis:$basis,
         unavailable_reason:(if $reason=="" then null else $reason end),
+        dismissal_filter:{
+          status:$dismissal_status,
+          source:$dismissal_source,
+          ledger_fingerprint:(
+            if $dismissal_ledger_fingerprint=="" then null
+            else $dismissal_ledger_fingerprint end
+          ),
+          repository_id:$repository_id,
+          stack_fingerprint:$stack_fingerprint,
+          evaluated_at:$evaluated_at,
+          prefiltered_count:($prefiltered|tonumber),
+          expired_count:($expired|tonumber)
+        },
         findings:$findings[0]
       }
     ' > "$TMP/report.json" || refuse "failed to assemble adjudication report"
 
   jq -e '
     keys==["adjudicated_count","audit","cluster_count","cluster_reduction_count",
-           "cost_estimate_basis","cost_estimate_usd","demoted_count","demotions","duration_ms",
-           "excluded_secrets_count","findings","model","model_prompt_fingerprint",
+           "cost_estimate_basis","cost_estimate_usd","demoted_count","demotions",
+           "dismissal_filter","duration_ms","excluded_secrets_count","findings","model","model_prompt_fingerprint",
            "prompt_fingerprint","prompt_version","schema","status",
            "submitted_count","unavailable_reason"]
-    and .schema=="firstmate/scanner-adjudication/1"
+    and .schema=="firstmate/scanner-adjudication/2"
     and (.status=="ok" or .status=="not-applicable" or .status=="unavailable")
     and (.model|type)=="string" and (.model|length)>0
     and (.prompt_version|type)=="string" and (.prompt_version|length)>0
@@ -377,6 +550,22 @@ publish_report() {
     and (.cost_estimate_basis|type)=="string" and (.cost_estimate_basis|length)>0
     and (.unavailable_reason==null or
       ((.unavailable_reason|type)=="string" and (.unavailable_reason|length)>0))
+    and (.dismissal_filter|keys)==
+      ["evaluated_at","expired_count","ledger_fingerprint","prefiltered_count",
+       "repository_id","source","stack_fingerprint","status"]
+    and (.dismissal_filter.status=="ok" or .dismissal_filter.status=="unavailable")
+    and (.dismissal_filter.source|type)=="string"
+    and (.dismissal_filter.source|length)>0
+    and (.dismissal_filter.ledger_fingerprint==null
+      or (.dismissal_filter.ledger_fingerprint|test("^[0-9a-f]{64}$")))
+    and (.dismissal_filter.repository_id|test("^[0-9a-f]{64}$"))
+    and (.dismissal_filter.stack_fingerprint|test("^[0-9a-f]{64}$"))
+    and (.dismissal_filter.evaluated_at
+      | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+    and (.dismissal_filter.prefiltered_count|type)=="number"
+    and .dismissal_filter.prefiltered_count>=0
+    and (.dismissal_filter.expired_count|type)=="number"
+    and .dismissal_filter.expired_count>=0
     and (.audit|keys)==["sample_k","sampled_count","seed_hash"]
     and (.audit.sample_k|type)=="number" and .audit.sample_k>=1
     and (.audit.sampled_count|type)=="number" and .audit.sampled_count>=0
@@ -410,12 +599,15 @@ publish_report() {
       keys==["adjudication","attribution","blocking","fingerprint","line","message",
              "occurrence","path","policy_decision","policy_reason","rule_id",
              "scanner","schema","severity","stability","subject"]
-      and (.adjudication|keys)==["audit_sampled","cluster_id","corroboration","evidence",
+      and (.adjudication|keys)==["audit_sampled","cluster_id","corroboration","dismissal_id","evidence",
                                  "pre_blocking","pre_policy_decision","reason",
                                  "reason_code","status","verdict"]
       and (.adjudication.status=="not-eligible"
         or .adjudication.status=="unavailable"
-        or .adjudication.status=="adjudicated")
+        or .adjudication.status=="adjudicated"
+        or .adjudication.status=="pre-filtered")
+      and (.adjudication.dismissal_id==null
+        or (.adjudication.dismissal_id|test("^DS-[0-9a-f]{32}$")))
       and (.adjudication.pre_blocking|type)=="boolean"
       and (.adjudication.pre_policy_decision|type)=="string"
       and (.adjudication.audit_sampled|type)=="boolean"
@@ -475,6 +667,7 @@ append_unavailable_finding() {
       adjudication:{
         status:"not-eligible",verdict:null,reason_code:null,reason:null,
         evidence:null,corroboration:null,audit_sampled:false,cluster_id:null,
+        dismissal_id:null,
         pre_blocking:true,pre_policy_decision:"block"
       }
     }]
@@ -491,7 +684,7 @@ publish_unavailable() {
     '.findings=$findings[0]' "$TMP/report.json" > "$TMP/report-with-unavailable.json"
   mv "$TMP/report-with-unavailable.json" "$TMP/report.json"
   jq -e '
-    .schema=="firstmate/scanner-adjudication/1"
+    .schema=="firstmate/scanner-adjudication/2"
     and .status=="unavailable"
     and .demoted_count==0
     and ([.findings[]|select(

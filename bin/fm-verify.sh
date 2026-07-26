@@ -729,13 +729,13 @@ else
     scanner_status=fail
   elif [ ! -f "$SCANNER_REPORT" ] || ! jq -e \
     --arg expected "$DIFF_BASE" --arg candidate "$ACTUAL_SHA" '
-      .schema=="firstmate/scanner-report/2"
+      .schema=="firstmate/scanner-report/3"
       and (keys == ["adjudication","base_sha","baseline","budget_s","candidate_sha","duration_ms","findings","schema","timings"])
       and .base_sha==(if $expected=="" then null else $expected end)
       and .candidate_sha==$candidate
     ' "$SCANNER_REPORT" >/dev/null 2>&1; then
     emit_finding scanner scanner-unavailable fail \
-      "SCANNER_UNAVAILABLE [battery]: scanner crashed or returned output outside firstmate/scanner-report/2 (rc=$scanner_rc; fail closed, FC-001/FC-004)"
+      "SCANNER_UNAVAILABLE [battery]: scanner crashed or returned output outside firstmate/scanner-report/3 (rc=$scanner_rc; fail closed, FC-001/FC-004)"
     scanner_status=fail
   else
     while IFS= read -r finding; do
@@ -755,7 +755,7 @@ else
     done < <(jq -c '.findings[]|select(.blocking)' "$SCANNER_REPORT")
     [ "$scanner_rc" -eq 0 ] || scanner_status=fail
   fi
-  if [ -f "$SCANNER_REPORT" ] && jq -e '.schema=="firstmate/scanner-report/2"' "$SCANNER_REPORT" >/dev/null 2>&1; then
+  if [ -f "$SCANNER_REPORT" ] && jq -e '.schema=="firstmate/scanner-report/3"' "$SCANNER_REPORT" >/dev/null 2>&1; then
     emit_gate scanner "$scanner_status" "$(jq -c \
       --arg source "$SCANNER_ADOPTION_SOURCE" --arg expected "$DIFF_BASE" '{
       adopted:true,adoption_source:$source,
@@ -975,7 +975,7 @@ SUMMARY="$WORK/summary.md"
     printf 'none\n'
   fi
   printf '\n## Scanner adjudication\n'
-  if jq -e '.adjudication.schema=="firstmate/scanner-adjudication/1"' "$SCANNER_REPORT" >/dev/null 2>&1; then
+  if jq -e '.adjudication.schema=="firstmate/scanner-adjudication/2"' "$SCANNER_REPORT" >/dev/null 2>&1; then
     jq -r '.adjudication|
       "status: "+.status+
       "; submitted="+(.submitted_count|tostring)+

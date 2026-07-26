@@ -11,6 +11,7 @@ set -u
 
 ADJUDICATOR="$ROOT/bin/fm-findings-adjudicate.sh"
 ATTRIBUTOR="$ROOT/bin/fm-findings-attribute.sh"
+LEARNING="$ROOT/bin/fm-scanner-learning.sh"
 GOLDEN="$ROOT/tests/fixtures/scanner-golden.json"
 TMP=$(fm_test_tmproot fm-findings-adjudicate)
 REPO="$TMP/repo"
@@ -168,13 +169,143 @@ jq -e '
 DEFAULT_COST=$(jq -r '.cost_estimate_usd' "$TMP/adjudicated.json")
 pass "confirm, demote, needs-human, secrets exclusion, one-call bound, and random audit sampling"
 
+# Record one independently corroborated model demotion through the sanctioned
+# writer, then prove the live exact-path dismissal runs before the model.
+DISMISSED_FP=$(jq -r 'first(.findings[]|select(
+  .scanner=="osv-scanner" and .rule_id=="dev-dependency/GHSA-ONE"
+)).fingerprint' "$TMP/adjudicated.json")
+REVIEW_AFTER=$(python3 -c '
+import datetime
+print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=90))
+      .strftime("%Y-%m-%dT%H:%M:%SZ"))
+')
+: > "$TMP/dismissals.jsonl"
+"$LEARNING" dismiss --bundle "$TMP/adjudicated.json" \
+  --fingerprint "$DISMISSED_FP" --scope path --by adjudicator \
+  --review-after "$REVIEW_AFTER" --repo "$REPO" \
+  --ledger "$TMP/dismissals.jsonl" > "$TMP/dismissal-event.json"
+"$ROOT/bin/fm-dismissal-validate.sh" prove "$TMP/dismissals.jsonl" >/dev/null ||
+  fail "sanctioned dismiss writer did not publish a valid ledger"
+jq --arg fingerprint "$DISMISSED_FP" '
+  .findings=[.findings[]|select(.fingerprint==$fingerprint)]
+' "$TMP/attribution.json" > "$TMP/dismissal-attribution.json"
+CALLS_BEFORE=$(sed -n '1p' "$FM_TEST_CALL_COUNT")
+FM_SCANNER_DISMISSAL_LEDGER="$TMP/dismissals.jsonl" \
+  FM_SCANNER_ADJUDICATOR_CLI="$FAKE" \
+  "$ADJUDICATOR" --attribution "$TMP/dismissal-attribution.json" --repo "$REPO" \
+    --base "$BASE" --candidate "$CANDIDATE" --out "$TMP/prefiltered.json"
+expect_code 0 "$?" "live dismissal demotes the only finding before adjudication"
+[ "$(sed -n '1p' "$FM_TEST_CALL_COUNT")" -eq "$CALLS_BEFORE" ] ||
+  fail "a pre-filtered finding still consumed a model call"
+jq -e --arg fingerprint "$DISMISSED_FP" '
+  .status=="not-applicable"
+  and .submitted_count==0
+  and .dismissal_filter.status=="ok"
+  and .dismissal_filter.prefiltered_count==1
+  and .dismissal_filter.expired_count==0
+  and (.findings|length)==1
+  and .findings[0].fingerprint==$fingerprint
+  and (.findings[0].blocking|not)
+  and .findings[0].adjudication.status=="pre-filtered"
+  and (.findings[0].adjudication.dismissal_id|test("^DS-[0-9a-f]{32}$"))
+' "$TMP/prefiltered.json" >/dev/null ||
+  fail "bundle did not audit the deterministic dismissal demotion"
+pass "live in-scope dismissal is auditable and saves the LLM call"
+
+# Exact fingerprint equality is necessary but not sufficient: scope must also
+# match. A path mismatch runs the normal adjudication path.
+jq -c '.scope.path="other/package-lock.json"' "$TMP/dismissal-event.json" \
+  > "$TMP/out-of-scope-dismissals.jsonl"
+CALLS_BEFORE=$(sed -n '1p' "$FM_TEST_CALL_COUNT")
+FM_SCANNER_DISMISSAL_LEDGER="$TMP/out-of-scope-dismissals.jsonl" \
+  FM_SCANNER_ADJUDICATOR_CLI="$FAKE" \
+  "$ADJUDICATOR" --attribution "$TMP/dismissal-attribution.json" --repo "$REPO" \
+    --base "$BASE" --candidate "$CANDIDATE" --out "$TMP/out-of-scope.json"
+expect_code 0 "$?" "out-of-scope finding takes normal adjudication"
+[ "$(sed -n '1p' "$FM_TEST_CALL_COUNT")" -eq "$((CALLS_BEFORE + 1))" ] ||
+  fail "out-of-scope dismissal skipped the model"
+jq -e '
+  .dismissal_filter.prefiltered_count==0
+  and .submitted_count==1
+  and .findings[0].adjudication.status=="adjudicated"
+' "$TMP/out-of-scope.json" >/dev/null ||
+  fail "out-of-scope dismissal altered the finding"
+pass "dismissal does not fire outside its narrow scope"
+
+# FC-002 regression: once REVIEW_AFTER lapses, the same exact finding must
+# re-surface and consume the normal adjudication call.
+jq -c '
+  .created_at="1999-01-01T00:00:00Z"
+  | .review_after="1999-03-01T00:00:00Z"
+' "$TMP/dismissal-event.json" > "$TMP/expired-dismissals.jsonl"
+CALLS_BEFORE=$(sed -n '1p' "$FM_TEST_CALL_COUNT")
+FM_SCANNER_DISMISSAL_LEDGER="$TMP/expired-dismissals.jsonl" \
+  FM_SCANNER_ADJUDICATOR_CLI="$FAKE" \
+  "$ADJUDICATOR" --attribution "$TMP/dismissal-attribution.json" --repo "$REPO" \
+    --base "$BASE" --candidate "$CANDIDATE" --out "$TMP/expired.json"
+expect_code 0 "$?" "expired dismissal takes normal adjudication"
+[ "$(sed -n '1p' "$FM_TEST_CALL_COUNT")" -eq "$((CALLS_BEFORE + 1))" ] ||
+  fail "expired dismissal silently skipped the model"
+jq -e '
+  .dismissal_filter.prefiltered_count==0
+  and .dismissal_filter.expired_count==1
+  and .submitted_count==1
+  and .findings[0].adjudication.status=="adjudicated"
+' "$TMP/expired.json" >/dev/null ||
+  fail "expired dismissal did not re-surface for re-confirmation"
+pass "FC-002: REVIEW_AFTER expiry re-surfaces the finding"
+
+# A forged or attacker-selected fingerprint cannot borrow a real dismissal,
+# even when every human-readable field and scope remain unchanged.
+jq -c '.finding_fingerprint=("0"*64)' "$TMP/dismissal-event.json" \
+  > "$TMP/mismatched-dismissals.jsonl"
+CALLS_BEFORE=$(sed -n '1p' "$FM_TEST_CALL_COUNT")
+FM_SCANNER_DISMISSAL_LEDGER="$TMP/mismatched-dismissals.jsonl" \
+  FM_SCANNER_ADJUDICATOR_CLI="$FAKE" \
+  "$ADJUDICATOR" --attribution "$TMP/dismissal-attribution.json" --repo "$REPO" \
+    --base "$BASE" --candidate "$CANDIDATE" --out "$TMP/mismatched-dismissal.json"
+expect_code 0 "$?" "fingerprint mismatch takes normal adjudication"
+[ "$(sed -n '1p' "$FM_TEST_CALL_COUNT")" -eq "$((CALLS_BEFORE + 1))" ] ||
+  fail "attacker-fingerprint mismatch skipped the model"
+jq -e '
+  .dismissal_filter.prefiltered_count==0
+  and .submitted_count==1
+' "$TMP/mismatched-dismissal.json" >/dev/null ||
+  fail "attacker-influenced text substituted for the computed fingerprint"
+pass "attacker fingerprint mismatch cannot select a dismissal"
+
+# Corrupt authority disables only pre-filtering. The ordinary adjudicator still
+# runs, and one loud blocking finding records the failure.
+printf '{not-json\n' > "$TMP/corrupt-dismissals.jsonl"
+CALLS_BEFORE=$(sed -n '1p' "$FM_TEST_CALL_COUNT")
+FM_SCANNER_DISMISSAL_LEDGER="$TMP/corrupt-dismissals.jsonl" \
+  FM_SCANNER_ADJUDICATOR_CLI="$FAKE" \
+  "$ADJUDICATOR" --attribution "$TMP/dismissal-attribution.json" --repo "$REPO" \
+    --base "$BASE" --candidate "$CANDIDATE" --out "$TMP/corrupt-dismissal.json"
+expect_code 1 "$?" "corrupt ledger fails loudly after normal adjudication"
+[ "$(sed -n '1p' "$FM_TEST_CALL_COUNT")" -eq "$((CALLS_BEFORE + 1))" ] ||
+  fail "corrupt ledger prevented the normal model path"
+jq -e '
+  .dismissal_filter.status=="unavailable"
+  and .dismissal_filter.prefiltered_count==0
+  and .submitted_count==1
+  and ([.findings[]|select(
+    .scanner=="dismissal-filter"
+    and .rule_id=="dismissal-ledger-unavailable"
+    and .blocking
+  )]|length)==1
+' "$TMP/corrupt-dismissal.json" >/dev/null ||
+  fail "corrupt ledger did not disable suppression and emit one loud finding"
+pass "corrupt dismissal ledger fails closed without skipping adjudication"
+
 "$ATTRIBUTOR" --candidate "$TMP/candidate.jsonl" \
   --confirmation "$TMP/confirmation.jsonl" --out "$TMP/unattributed.json"
+CALLS_BEFORE=$(sed -n '1p' "$FM_TEST_CALL_COUNT")
 FM_SCANNER_ADJUDICATOR_CLI="$FAKE" \
   "$ADJUDICATOR" --attribution "$TMP/unattributed.json" --repo "$REPO" \
     --base "$BASE" --candidate "$CANDIDATE" --out "$TMP/unattributed-adjudication.json"
 expect_code 1 "$?" "unattributed findings retain their pre-adjudication blocks"
-[ "$(sed -n '1p' "$FM_TEST_CALL_COUNT")" -eq 1 ] ||
+[ "$(sed -n '1p' "$FM_TEST_CALL_COUNT")" -eq "$CALLS_BEFORE" ] ||
   fail "unattributed findings triggered a model call"
 jq -e '
   .status=="not-applicable"

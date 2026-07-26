@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "firstmate/scanner-dismissal-event/1",
+  "title": "A scanner dismissal ledger event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "id",
+    "repository_id",
+    "finding_fingerprint",
+    "fingerprint_algorithm",
+    "stack_fingerprint",
+    "scanner",
+    "rule_id",
+    "severity",
+    "occurrence",
+    "scope",
+    "reason_code",
+    "dismissed_by",
+    "evidence_ref",
+    "created_at",
+    "review_after"
+  ],
+  "properties": {
+    "schema": {
+      "const": "firstmate/scanner-dismissal-event/1"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^DS-[0-9a-f]{32}$"
+    },
+    "repository_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "finding_fingerprint": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "fingerprint_algorithm": {
+      "const": "firstmate/scanner-fingerprint/2"
+    },
+    "stack_fingerprint": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "scanner": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "rule_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "severity": {
+      "enum": [
+        "error",
+        "warning",
+        "note"
+      ]
+    },
+    "occurrence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "scope": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path"
+          ],
+          "properties": {
+            "kind": {
+              "const": "path"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path_prefix"
+          ],
+          "properties": {
+            "kind": {
+              "const": "rule"
+            },
+            "path_prefix": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path",
+            "anchor_sha256"
+          ],
+          "properties": {
+            "kind": {
+              "const": "ast"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "anchor_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        }
+      ]
+    },
+    "reason_code": {
+      "enum": [
+        "accepted-risk",
+        "constant-safe-value",
+        "dev-only-package",
+        "duplicate-signal",
+        "guarded-by-allowlist",
+        "not-actionable",
+        "test-fixture",
+        "tool-defect"
+      ]
+    },
+    "dismissed_by": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "actor"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "captain",
+            "firstmate",
+            "adjudicator"
+          ]
+        },
+        "actor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "evidence_ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "created_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "review_after": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "dismissed_by": {
+            "properties": {
+              "kind": {
+                "const": "adjudicator"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "reason_code": {
+            "enum": [
+              "constant-safe-value",
+              "dev-only-package",
+              "guarded-by-allowlist",
+              "test-fixture"
+            ]
+          },
+          "evidence_ref": {
+            "pattern": "^adjudication:[0-9a-f]{64}$"
+          }
+        }
+      }
+    }
+  ]
+}

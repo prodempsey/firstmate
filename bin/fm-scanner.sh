@@ -1066,7 +1066,7 @@ ADJUDICATION_BASE=$CANDIDATE
   --base "$ADJUDICATION_BASE" --candidate "$CANDIDATE" --out "$ADJUDICATION"
 ADJUDICATION_RC=$?
 if [ "$ADJUDICATION_RC" -gt 1 ] || [ ! -f "$ADJUDICATION" ] ||
-  ! jq -e '.schema=="firstmate/scanner-adjudication/1"' "$ADJUDICATION" >/dev/null 2>&1; then
+  ! jq -e '.schema=="firstmate/scanner-adjudication/2"' "$ADJUDICATION" >/dev/null 2>&1; then
   refuse "adjudicator failed without a closed fail-closed report"
 fi
 
@@ -1075,7 +1075,7 @@ jq -n --arg base "$BASE" --arg candidate "$CANDIDATE" \
   --arg budget "$TOTAL_BUDGET" --slurpfile attribution "$ATTRIBUTION" \
   --slurpfile adjudication "$ADJUDICATION" --slurpfile timings "$TIMINGS" '
   {
-    schema:"firstmate/scanner-report/2",
+    schema:"firstmate/scanner-report/3",
     base_sha:(if $base=="" then null else $base end),
     candidate_sha:$candidate,
     baseline:$attribution[0].baseline,
@@ -1089,17 +1089,18 @@ jq -n --arg base "$BASE" --arg candidate "$CANDIDATE" \
 
 jq -e '
   keys == ["adjudication","base_sha","baseline","budget_s","candidate_sha","duration_ms","findings","schema","timings"]
-  and .schema == "firstmate/scanner-report/2"
+  and .schema == "firstmate/scanner-report/3"
   and (.base_sha == null or (.base_sha|type) == "string")
   and (.candidate_sha|type) == "string"
   and (.baseline|keys) == ["available","warning"]
   and (.budget_s|type) == "number"
   and (.duration_ms|type) == "number"
   and (.adjudication|keys)==["adjudicated_count","audit","cluster_count",
-      "cluster_reduction_count","cost_estimate_basis","cost_estimate_usd","demoted_count","demotions",
-      "duration_ms","excluded_secrets_count","model","model_prompt_fingerprint","prompt_fingerprint",
-      "prompt_version","schema","status","submitted_count","unavailable_reason"]
-  and .adjudication.schema=="firstmate/scanner-adjudication/1"
+      "cluster_reduction_count","cost_estimate_basis","cost_estimate_usd","demoted_count",
+      "demotions","dismissal_filter","duration_ms","excluded_secrets_count","model",
+      "model_prompt_fingerprint","prompt_fingerprint","prompt_version","schema","status",
+      "submitted_count","unavailable_reason"]
+  and .adjudication.schema=="firstmate/scanner-adjudication/2"
   and (.timings|type) == "array"
   and all(.timings[];
     ((keys - ["reason"]) == ["budget_s","duration_ms","scanner","status"])

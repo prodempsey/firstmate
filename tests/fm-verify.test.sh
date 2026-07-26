@@ -285,7 +285,7 @@ rc=$(verify "$TMP/adjudication-integration.json" --worktree "$RADJ" --base main 
 expect_code 0 "$rc" "independently proven noisy finding is demoted without hiding its bundle record"
 jq -e '
   .gates[]|select(.gate=="scanner")|.details
-  | .adjudication.schema=="firstmate/scanner-adjudication/1"
+  | .adjudication.schema=="firstmate/scanner-adjudication/2"
   and .adjudication.submitted_count==1
   and .adjudication.adjudicated_count==1
   and .adjudication.demoted_count==1
