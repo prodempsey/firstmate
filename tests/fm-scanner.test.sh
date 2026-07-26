@@ -116,6 +116,8 @@ case "$name" in
     if [ -f package-lock.json ] && grep -q NEW_OSV package-lock.json; then
       results=$("$REAL_JQ" -nc --argjson old "$results" '$old + [
         {"ruleId":"CVE-NEW","message":{"text":"new dependency vulnerability"},
+         "locations":[{"physicalLocation":{"artifactLocation":{"uri":"package-lock.json"}}}]},
+        {"ruleId":"GHSA-DEV","message":{"text":"Package '\''dev-vuln@1.0.0'\'' is vulnerable to '\''GHSA-DEV'\''."},
          "locations":[{"physicalLocation":{"artifactLocation":{"uri":"package-lock.json"}}}]}
       ]')
     fi
@@ -189,6 +191,34 @@ chmod +x "$TOOLS/bin/fake-scanner"
 for scanner in gitleaks oxlint eslint-scanner osv-scanner actionlint jq json-schema-scanner shellcheck ruff; do
   ln -s fake-scanner "$TOOLS/bin/$scanner"
 done
+cat > "$TOOLS/bin/claude" <<'SH'
+#!/usr/bin/env bash
+set -u
+prompt=$(mktemp)
+sed -n '2,$p' | sed '$d' > "$prompt"
+"$REAL_JQ" '{
+  structured_output:{
+    results:[
+      .untrusted_clusters[].findings[] |
+      if .scanner=="osv-scanner" then
+        {
+          fingerprint,verdict:"demote-to-report",reason_code:"dev-only-package",
+          reason:"The cited package is positively marked dev-only.",
+          evidence:{source:"hunk",quote:"\"dev\":true"}
+        }
+      else
+        {
+          fingerprint,verdict:"demote-to-report",reason_code:"constant-safe-value",
+          reason:"The cited command is a fixed safe test literal.",
+          evidence:{source:"hunk",quote:"\"SAFE_COMMAND\""}
+        }
+      end
+    ]
+  }
+}' "$prompt"
+rm -f "$prompt"
+SH
+chmod +x "$TOOLS/bin/claude"
 
 REPO="$TMP/repo"
 git init -q "$REPO"
@@ -211,9 +241,9 @@ printf '# candidate edit\n' >> "$REPO/.github/workflows/inherited.yml"
 printf ' ' >> "$REPO/inherited.json"
 printf '# candidate edit\n' >> "$REPO/inherited.sh"
 printf '# candidate edit\n' >> "$REPO/inherited.py"
-printf '{"lockfileVersion":3,"marker":"INHERITED_OSV NEW_OSV"}\n' > "$REPO/package-lock.json"
+printf '{"lockfileVersion":3,"marker":"INHERITED_OSV NEW_OSV","packages":{"node_modules/dev-vuln":{"dev":true}}}\n' > "$REPO/package-lock.json"
 printf 'NEW_GITLEAKS\n' > "$REPO/new-secret.txt"
-printf 'NEW_OXLINT ESLINT\n' > "$REPO/new.js"
+printf 'const command = "SAFE_COMMAND"; // NEW_OXLINT ESLINT\n' > "$REPO/new.js"
 printf '# ACTIONLINT new\nname: new\non: push\njobs: {}\n' > "$REPO/.github/workflows/new.yml"
 printf '{"marker":"JQ_FINDING"}\n' > "$REPO/new.json"
 printf '# SHELLCHECK new\ntrue\n' > "$REPO/new.sh"
@@ -227,6 +257,8 @@ run_scanner() {
   shift 2
   FM_SCANNER_DIR="$tool_dir" FM_VERIFY_SCANNER_TIMEOUT="${FM_VERIFY_SCANNER_TIMEOUT:-2}" \
     FM_VERIFY_SCANNER_BUDGET="${FM_VERIFY_SCANNER_BUDGET:-30}" \
+    FM_SCANNER_ADJUDICATOR_CLI="$tool_dir/bin/claude" \
+    FM_SCANNER_ADJUDICATOR_AUDIT_SEED=scanner-fixture \
     "$SCANNER" --repo "$REPO" --base "$BASE" --candidate "$CANDIDATE" --out "$out" "$@" >/dev/null 2>&1
 }
 
@@ -248,11 +280,21 @@ done
 [ "$(jq '[.findings[]|select(
     .scanner=="eslint"
     and (.rule_id|startswith("security/"))
+    and .adjudication.verdict=="demote-to-report"
     and .policy_decision=="report-only"
     and (.blocking|not)
   )]|length' "$OUT")" -gt 0 ] ||
-  fail "eslint-plugin-security findings did not remain visible and report-only"
-pass "severity policy: blocking errors gate while eslint-plugin-security remains report-only"
+  fail "eslint-plugin-security finding was not visibly demoted with a cited reason"
+pass "severity policy: deterministic errors gate while cited security noise is demoted"
+[ "$(jq '[.findings[]|select(
+    .scanner=="osv-scanner"
+    and (.rule_id|startswith("dev-dependency/"))
+    and .adjudication.verdict=="demote-to-report"
+    and .policy_decision=="report-only"
+    and (.blocking|not)
+  )]|length' "$OUT")" -eq 1 ] ||
+  fail "positively proven OSV dev dependency was not routed through adjudication"
+pass "OSV dev-dependency scope is proven from package-lock before demotion"
 pass "every Phase 1 scanner fires on a real fixture and excludes its inherited baseline finding"
 
 run_scanner "$TOOLS" "$TMP/full-report.json" --scope full

@@ -1,5 +1,5 @@
 {
-  "schema": "firstmate/scanner-golden/1",
+  "schema": "firstmate/scanner-golden/2",
   "cases": [
     {"id":"inh-gitleaks","scanner":"gitleaks","rule_id":"secret","severity":"error","path":"inherited/secret.txt","line":1,"content":"secret-a","base_content":"secret-a","confirm":true,"expected_attribution":"inherited","expected_decision":"inherited","expected_blocking":false},
     {"id":"inh-oxlint","scanner":"oxlint","rule_id":"no-debugger","severity":"error","path":"inherited/a.js","line":2,"content":"debugger;","base_content":"debugger;","confirm":true,"expected_attribution":"inherited","expected_decision":"inherited","expected_blocking":false},
@@ -23,13 +23,24 @@
     {"id":"report-shell-note","scanner":"shellcheck","rule_id":"SC2148","severity":"note","path":"noise/b.sh","line":2,"content":"echo style","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"report-only","expected_blocking":false},
     {"id":"report-oxlint-warning","scanner":"oxlint","rule_id":"style/prefer-const","severity":"warning","path":"noise/a.js","line":3,"content":"let value = 1;","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"report-only","expected_blocking":false},
     {"id":"report-eslint-warning","scanner":"eslint","rule_id":"sonarjs/cognitive-complexity","severity":"warning","path":"noise/b.js","line":4,"content":"function complex() {}","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"report-only","expected_blocking":false},
-    {"id":"report-security-error","scanner":"eslint","rule_id":"security/detect-object-injection","severity":"error","path":"noise/security.js","line":5,"content":"object[key]","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"report-only","expected_blocking":false},
+    {"id":"report-security-error","scanner":"eslint","rule_id":"security/detect-object-injection","severity":"error","path":"noise/security.js","line":5,"content":"object[key]","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"block","expected_blocking":true},
     {"id":"report-security-warning","scanner":"eslint","rule_id":"security/detect-child-process","severity":"warning","path":"noise/security.js","line":6,"content":"exec(command)","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"report-only","expected_blocking":false},
     {"id":"report-ruff-warning","scanner":"ruff","rule_id":"E501","severity":"warning","path":"noise/a.py","line":7,"content":"long line","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"report-only","expected_blocking":false},
     {"id":"report-actionlint-warning","scanner":"actionlint","rule_id":"expression","severity":"warning","path":"noise/workflow.yml","line":8,"content":"advisory expression","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"report-only","expected_blocking":false},
     {"id":"report-jq-note","scanner":"jq","rule_id":"declared-schema","severity":"note","path":"noise/data.json","line":9,"content":"schema note","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"report-only","expected_blocking":false},
     {"id":"report-osv-warning","scanner":"osv-scanner","rule_id":"GHSA-LOW","severity":"warning","path":"noise/package-lock.json","line":10,"content":"low advisory","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"report-only","expected_blocking":false},
     {"id":"report-nondeterministic","scanner":"gitleaks","rule_id":"unstable-secret","severity":"error","path":"noise/flaky.txt","line":11,"content":"one run only","base_content":null,"confirm":false,"expected_attribution":"candidate-new","expected_decision":"report-only","expected_blocking":false},
-    {"id":"block-case-change","scanner":"eslint","rule_id":"sonarjs/case-sensitive","severity":"error","path":"positive/case.js","line":12,"content":"const token = \"abc\";","base_content":"const token = \"ABC\";","confirm":true,"expected_attribution":"candidate-new","expected_decision":"block","expected_blocking":true}
-  ]
+    {"id":"block-case-change","scanner":"eslint","rule_id":"sonarjs/case-sensitive","severity":"error","path":"positive/case.js","line":12,"content":"const token = \"abc\";","base_content":"const token = \"ABC\";","confirm":true,"expected_attribution":"candidate-new","expected_decision":"block","expected_blocking":true},
+    {"id":"adjudicate-security-confirm","scanner":"eslint","rule_id":"security/detect-child-process","severity":"error","path":"positive/security-confirm.js","line":1,"content":"exec(userInput)","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"block","expected_blocking":true},
+    {"id":"adjudicate-osv-human","scanner":"osv-scanner","rule_id":"dev-dependency/GHSA-HUMAN","severity":"error","path":"positive/package-lock.json","line":1,"content":"dev-only vulnerable package","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"block","expected_blocking":true}
+  ],
+  "adjudication_expectations": [
+    {"id":"report-security-error","gold_label":"noise","verdict":"demote-to-report","reason_code":"guarded-by-allowlist","expected_final_decision":"report-only","expected_final_blocking":false},
+    {"id":"adjudicate-security-confirm","gold_label":"real","verdict":"confirm","reason_code":null,"expected_final_decision":"block","expected_final_blocking":true},
+    {"id":"adjudicate-osv-human","gold_label":"real","verdict":"needs-human","reason_code":null,"expected_final_decision":"block","expected_final_blocking":true}
+  ],
+  "expected_metrics": {
+    "precision": 1,
+    "recall": 1
+  }
 }

@@ -1,0 +1,62 @@
+{
+  "schema": "firstmate/scanner-adjudicator-policy/1",
+  "prompt_version": "scanner-adjudicator-v1",
+  "models": {
+    "default": "claude-haiku-4-5-20251001",
+    "escalation": "claude-sonnet-4-5-20250929"
+  },
+  "limits": {
+    "timeout_s": 20,
+    "max_findings": 32,
+    "max_hunk_chars": 4000,
+    "max_message_chars": 1000,
+    "max_reason_chars": 240,
+    "max_evidence_chars": 240,
+    "max_cost_usd": 0.05,
+    "audit_sample_k": 2
+  },
+  "cost_estimate": {
+    "chars_per_token": 4,
+    "default": {
+      "input_usd_per_million_tokens": 1,
+      "output_usd_per_million_tokens": 5
+    },
+    "escalation": {
+      "input_usd_per_million_tokens": 3,
+      "output_usd_per_million_tokens": 15
+    }
+  },
+  "never_adjudicate_scanners": [
+    "gitleaks"
+  ],
+  "selectors": [
+    {
+      "scanner": "eslint",
+      "rule_prefix": "security/",
+      "finding_class": "security-heuristic"
+    },
+    {
+      "scanner": "osv-scanner",
+      "rule_prefix": "dev-dependency/",
+      "finding_class": "dev-dependency-advisory"
+    }
+  ],
+  "reason_taxonomy": [
+    {
+      "code": "test-fixture",
+      "description": "The cited span and path positively identify synthetic test or fixture data that is not shipped."
+    },
+    {
+      "code": "constant-safe-value",
+      "description": "The cited span positively shows that the flagged value is a fixed safe literal rather than attacker-controlled input."
+    },
+    {
+      "code": "guarded-by-allowlist",
+      "description": "The cited span positively shows a closed allowlist check before the flagged operation."
+    },
+    {
+      "code": "dev-only-package",
+      "description": "The deterministic scanner wrapper positively classified the affected package as dev-only and the cited span identifies that package."
+    }
+  ]
+}

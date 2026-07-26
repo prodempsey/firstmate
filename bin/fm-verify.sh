@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fm-verify.sh - the Shakedown: a deterministic, LLM-free pre-QA verifier.
+# fm-verify.sh - the Shakedown: deterministic gates plus bounded adjudication.
 #
 # WHY THIS EXISTS
 # ---------------
@@ -44,8 +44,8 @@
 #                   parsed; SKIP, timeout, no-tests, and any declared!=executed
 #                   mismatch are findings, never passes
 #   scanner         pinned, offline deterministic scanners over the exact base
-#                   and candidate trees; only candidate-new findings block while
-#                   inherited findings are retained in a separately labeled set
+#                   and candidate trees; candidate-new noisy findings receive
+#                   one bounded, demote-only BYOK adjudication pass
 #   cue_lint        failure-class detection cues read LIVE from the ledger's
 #                   machine-readable `detection` field (docs/failure-classes/
 #                   ledger.jsonl) - no hardcoded patterns - grepped against the diff
@@ -82,6 +82,9 @@
 #                                no-timeout path required by FC-006.
 #   FM_VERIFY_SCANNER_TIMEOUT    per scanner-call deadline (default 8).
 #   FM_VERIFY_SCANNER_BUDGET     whole scanner battery deadline (default 30).
+#   FM_SCANNER_ADJUDICATOR_TIMEOUT adjudicator deadline (committed policy default).
+#   FM_SCANNER_ADJUDICATOR_MODEL committed default or escalation model.
+#   FM_SCANNER_ADJUDICATOR_CLI   Claude CLI executable (default claude).
 #   FM_SCANNER_DIR               pinned scanner installation.
 #   FM_SCANNER_OSV_DB            pre-provisioned offline OSV database root.
 #   config/scanner-gate          first non-empty line "enabled" explicitly adopts
@@ -97,8 +100,10 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 LEDGER="${FM_FAILURE_LEDGER:-$FM_ROOT/docs/failure-classes/ledger.jsonl}"
 TEST_TIMEOUT="${FM_VERIFY_TEST_TIMEOUT:-600}"
 SCANNER_BUDGET="${FM_VERIFY_SCANNER_BUDGET:-30}"
+SCANNER_ADJUDICATOR_TIMEOUT="${FM_SCANNER_ADJUDICATOR_TIMEOUT:-}"
 SCANNER_DIR="${FM_SCANNER_DIR:-$FM_HOME/tools/scanners}"
 SCANNER_OSV_DB="${FM_SCANNER_OSV_DB:-$SCANNER_DIR/osv-db}"
+SCANNER_ADJUDICATOR_POLICY="$(cd "$SCRIPT_DIR/.." && pwd)/docs/scanner/adjudicator-policy.json"
 
 # The ONE authority on detection-row validity, shared with the sanctioned writer so the cue
 # lint proves the SAME thing before it executes a row (JSON + closed schema + pattern compiles).
@@ -185,6 +190,10 @@ case "$FORMAT" in json|text) ;; *) refuse "--format must be json or text" ;; esa
 for tool in git jq awk grep sed env; do
   command -v "$tool" >/dev/null 2>&1 || refuse "missing prerequisite tool: $tool (fail closed, FC-004)"
 done
+if [ -z "$SCANNER_ADJUDICATOR_TIMEOUT" ]; then
+  SCANNER_ADJUDICATOR_TIMEOUT=$(jq -r '.limits.timeout_s // empty' \
+    "$SCANNER_ADJUDICATOR_POLICY" 2>/dev/null || true)
+fi
 
 # --- mandatory bindings (identity is proven, never merely observed) -----------
 [ -n "$WORKTREE" ] || refuse "--worktree is required"
@@ -199,6 +208,11 @@ case "$TEST_TIMEOUT" in ''|*[!0-9]*) refuse "FM_VERIFY_TEST_TIMEOUT must be a po
 [ "$TEST_TIMEOUT" -gt 0 ] || refuse "FM_VERIFY_TEST_TIMEOUT must be a positive integer: $TEST_TIMEOUT"
 case "$SCANNER_BUDGET" in ''|*[!0-9]*) refuse "FM_VERIFY_SCANNER_BUDGET must be a positive integer: $SCANNER_BUDGET" ;; esac
 [ "$SCANNER_BUDGET" -gt 0 ] || refuse "FM_VERIFY_SCANNER_BUDGET must be a positive integer: $SCANNER_BUDGET"
+case "$SCANNER_ADJUDICATOR_TIMEOUT" in
+  ''|*[!0-9]*) refuse "FM_SCANNER_ADJUDICATOR_TIMEOUT must be a positive integer: $SCANNER_ADJUDICATOR_TIMEOUT" ;;
+esac
+[ "$SCANNER_ADJUDICATOR_TIMEOUT" -gt 0 ] ||
+  refuse "FM_SCANNER_ADJUDICATOR_TIMEOUT must be a positive integer: $SCANNER_ADJUDICATOR_TIMEOUT"
 
 # --- scratch + guaranteed teardown of the disposable checkout -----------------
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/fm-verify.XXXXXX") || refuse "cannot create scratch dir"
@@ -697,13 +711,14 @@ if [ "$SCANNER_ADOPTED" != yes ]; then
     '{adopted:false,adoption_source:null,baseline:null,budget_s:null,
       duration_ms:0,timings:[],findings:[]}')"
 else
-  scanner_outer_budget=$SCANNER_BUDGET
+  scanner_outer_budget=$((SCANNER_BUDGET + SCANNER_ADJUDICATOR_TIMEOUT + 2))
   SCANNER_ARGS=(--repo "$WORKTREE" --candidate "$ACTUAL_SHA")
   [ -n "$DIFF_BASE" ] && SCANNER_ARGS+=(--base "$DIFF_BASE")
   SCANNER_ARGS+=(--out "$SCANNER_REPORT")
   run_bounded "$scanner_outer_budget" "$WORK/scanner-driver.out" \
     env FM_VERIFY_SCANNER_BUDGET="$SCANNER_BUDGET" \
       FM_VERIFY_SCANNER_TIMEOUT="${FM_VERIFY_SCANNER_TIMEOUT:-8}" \
+      FM_SCANNER_ADJUDICATOR_TIMEOUT="$SCANNER_ADJUDICATOR_TIMEOUT" \
       FM_SCANNER_DIR="$SCANNER_DIR" \
       FM_SCANNER_OSV_DB="$SCANNER_OSV_DB" \
       "$SCRIPT_DIR/fm-scanner.sh" "${SCANNER_ARGS[@]}"
@@ -714,13 +729,13 @@ else
     scanner_status=fail
   elif [ ! -f "$SCANNER_REPORT" ] || ! jq -e \
     --arg expected "$DIFF_BASE" --arg candidate "$ACTUAL_SHA" '
-      .schema=="firstmate/scanner-report/1"
-      and (keys == ["base_sha","baseline","budget_s","candidate_sha","duration_ms","findings","schema","timings"])
+      .schema=="firstmate/scanner-report/2"
+      and (keys == ["adjudication","base_sha","baseline","budget_s","candidate_sha","duration_ms","findings","schema","timings"])
       and .base_sha==(if $expected=="" then null else $expected end)
       and .candidate_sha==$candidate
     ' "$SCANNER_REPORT" >/dev/null 2>&1; then
     emit_finding scanner scanner-unavailable fail \
-      "SCANNER_UNAVAILABLE [battery]: scanner crashed or returned output outside firstmate/scanner-report/1 (rc=$scanner_rc; fail closed, FC-001/FC-004)"
+      "SCANNER_UNAVAILABLE [battery]: scanner crashed or returned output outside firstmate/scanner-report/2 (rc=$scanner_rc; fail closed, FC-001/FC-004)"
     scanner_status=fail
   else
     while IFS= read -r finding; do
@@ -728,7 +743,10 @@ else
         gate:"scanner",
         code:(.scanner+"/"+.rule_id),
         severity:"fail",
-        message:("["+.attribution+"] "+.message),
+        message:("["+.attribution+"] "+.message+
+          (if .adjudication.verdict then
+            " [adjudication="+.adjudication.verdict+"]"
+           else "" end)),
         file:.path,
         line:.line
       }' >> "$FINDINGS"
@@ -737,7 +755,7 @@ else
     done < <(jq -c '.findings[]|select(.blocking)' "$SCANNER_REPORT")
     [ "$scanner_rc" -eq 0 ] || scanner_status=fail
   fi
-  if [ -f "$SCANNER_REPORT" ] && jq -e '.schema=="firstmate/scanner-report/1"' "$SCANNER_REPORT" >/dev/null 2>&1; then
+  if [ -f "$SCANNER_REPORT" ] && jq -e '.schema=="firstmate/scanner-report/2"' "$SCANNER_REPORT" >/dev/null 2>&1; then
     emit_gate scanner "$scanner_status" "$(jq -c \
       --arg source "$SCANNER_ADOPTION_SOURCE" --arg expected "$DIFF_BASE" '{
       adopted:true,adoption_source:$source,
@@ -745,7 +763,7 @@ else
       baseline_sha:.base_sha,
       baseline_matches_base_currency:(.base_sha==(if $expected=="" then null else $expected end)),
       baseline:.baseline,budget_s:.budget_s,duration_ms:.duration_ms,
-      timings:.timings,findings:.findings
+      timings:.timings,adjudication:.adjudication,findings:.findings
     }' "$SCANNER_REPORT")"
   else
     emit_gate scanner "$scanner_status" "$(jq -nc \
@@ -955,6 +973,25 @@ SUMMARY="$WORK/summary.md"
       "$SCANNER_REPORT"
   else
     printf 'none\n'
+  fi
+  printf '\n## Scanner adjudication\n'
+  if jq -e '.adjudication.schema=="firstmate/scanner-adjudication/1"' "$SCANNER_REPORT" >/dev/null 2>&1; then
+    jq -r '.adjudication|
+      "status: "+.status+
+      "; submitted="+(.submitted_count|tostring)+
+      "; adjudicated="+(.adjudicated_count|tostring)+
+      "; demoted="+(.demoted_count|tostring)+
+      "; model="+.model+
+      "; prompt="+.prompt_version+
+      "; fingerprint="+.model_prompt_fingerprint+
+      "; estimated-cost-usd="+(.cost_estimate_usd|tostring)' "$SCANNER_REPORT"
+    if jq -e '.adjudication.demotions[]?' "$SCANNER_REPORT" >/dev/null 2>&1; then
+      jq -r '.adjudication.demotions[]|
+        "- "+.fingerprint+" ["+.reason_code+"] "+.reason+
+        (if .audit_sampled then " [AUDIT SAMPLE]" else "" end)' "$SCANNER_REPORT"
+    fi
+  else
+    printf 'unavailable\n'
   fi
   printf '\n## Scanner unattributed warning\n'
   if [ "$SCANNER_ADOPTED" != yes ]; then

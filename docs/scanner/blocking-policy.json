@@ -15,7 +15,7 @@
       "scanner": "eslint",
       "budget_s": 4,
       "blocking_severities": ["error"],
-      "report_only_rule_prefixes": ["security/"]
+      "report_only_rule_prefixes": []
     },
     {
       "scanner": "gitleaks",

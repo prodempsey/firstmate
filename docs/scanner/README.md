@@ -1,9 +1,12 @@
 # Shakedown scanner battery
 
-`bin/fm-scanner.sh` owns scanner execution, normalization, timing, offline enforcement, and the `firstmate/scanner-report/1` contract.
+`bin/fm-scanner.sh` owns scanner execution, normalization, timing, offline enforcement, and the `firstmate/scanner-report/2` contract.
 `bin/fm-findings-attribute.sh` is the reusable owner of inherited, candidate-new, and unattributed baseline semantics.
+`bin/fm-findings-adjudicate.sh` owns the bounded, demote-only Phase 2 classification pass and its closed report schema.
 `bin/fm-verify.sh` consumes that closed report as its `scanner` gate.
 `docs/scanner/blocking-policy.json` is the single committed authority for blocking severities, report-only rule prefixes, and per-scanner time slices.
+`docs/scanner/adjudicator-policy.json` is the single committed authority for models, bounds, noisy-finding selectors, and the demotion reason taxonomy.
+`docs/scanner/adjudicator-system-prompt.txt` is the versioned trusted instruction channel.
 
 Install the pinned tools with `bin/fm-install-scanners.sh <scanner-directory>`.
 Refresh the OSV database explicitly with `bin/fm-install-osv-db.sh <scanner-directory>`.
@@ -11,7 +14,13 @@ The scanner gate is adopted automatically only after both helpers publish their 
 An operator may adopt it earlier by making the first non-empty line of `config/scanner-gate` exactly `enabled`.
 Before adoption, `bin/fm-verify.sh` emits a visible `gate-not-adopted` note and leaves the gate non-blocking.
 After adoption, every missing, crashed, or timed-out scanner fails closed as a `scanner-unavailable` finding.
-The verification runtime never downloads packages, updates vulnerability data, submits source, or calls a remote service.
+The deterministic battery never downloads packages, updates vulnerability data, submits source, or calls a remote service.
+Candidate-new blocking findings from designated noisy selectors are then sent in one bounded BYOK Claude CLI call.
+The committed policy declares the default and escalation models; operators select the latter with `FM_SCANNER_ADJUDICATOR_MODEL`.
+The classifier runs in safe mode with no tools, no MCP servers, no session persistence, and a closed structured-output schema.
+Gitleaks findings are secrets-class and are never submitted to or demoted by the classifier.
+Every invalid, unavailable, or timed-out classification preserves all pre-adjudication dispositions and adds one blocking `adjudicator-unavailable` finding.
+Every demotion records its reason code, exact cited span, prompt fingerprint, model, cost estimate, and random audit-sample marker in the scanner bundle.
 TruffleHog is deliberately excluded because its license and verification behavior violate this gate's local-first boundary.
 
 The direct pins and licenses are:

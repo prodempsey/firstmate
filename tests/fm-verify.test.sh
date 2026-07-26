@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # tests/fm-verify.test.sh - behavior tests for bin/fm-verify.sh, the Shakedown
 # pre-QA verifier. Every fixture is a deliberately-shaped candidate repo; the
-# verifier is LLM-free and execution-backed, so the tests assert on the machine
-# bundle it produces and on its exit code.
+# verifier uses bounded fake adjudication and execution-backed gates, so the
+# tests assert on the machine bundle it produces and on its exit code.
 #
 # The adversarial fixtures exercise the failure classes the verifier must itself
 # obey, including the round-2 (qa-gauntlet-g1r2-q148) escapes:
@@ -73,9 +73,46 @@ chmod +x "$FM_SCANNER_DIR/bin/oxlint"
 cat > "$FM_SCANNER_DIR/bin/eslint-scanner" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = "--version" ]; then printf '9.39.5\n'; exit 0; fi
-printf '[]\n'
+printf '['
+comma=""
+for file in "$@"; do
+  [ -f "$file" ] && grep -q FM_TEST_SECURITY_NOISE "$file" || continue
+  printf '%s' "$comma"
+  jq -nc --arg path "$PWD/$file" '{
+    filePath:$path,
+    messages:[{
+      ruleId:"security/detect-object-injection",severity:2,line:1,
+      message:"high-noise security heuristic"
+    }]
+  }'
+  comma=","
+done
+printf ']\n'
 SH
 chmod +x "$FM_SCANNER_DIR/bin/eslint-scanner"
+cat > "$FM_SCANNER_DIR/bin/claude" <<'SH'
+#!/usr/bin/env bash
+set -u
+prompt=$(mktemp)
+sed -n '2,$p' | sed '$d' > "$prompt"
+jq '{
+  structured_output:{
+    results:[
+      .untrusted_clusters[].findings[] |
+      {
+        fingerprint,verdict:"demote-to-report",reason_code:"constant-safe-value",
+        reason:"The cited test value is a fixed safe literal.",
+        evidence:{source:"hunk",quote:"\"SAFE_TEST_VALUE\""}
+      }
+    ]
+  }
+}' "$prompt"
+rm -f "$prompt"
+SH
+chmod +x "$FM_SCANNER_DIR/bin/claude"
+FM_SCANNER_ADJUDICATOR_CLI="$FM_SCANNER_DIR/bin/claude"
+FM_SCANNER_ADJUDICATOR_AUDIT_SEED=verify-fixture
+export FM_SCANNER_ADJUDICATOR_CLI FM_SCANNER_ADJUDICATOR_AUDIT_SEED
 cat > "$FM_SCANNER_DIR/bin/osv-scanner" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = "--version" ]; then printf 'osv-scanner version: 2.4.0\n'; exit 0; fi
@@ -220,6 +257,34 @@ expect_code 1 "$rc" "scanner finding fails integrated verifier"
 [ "$(bget "$TMP/scanner-integration.json" '.findings[]|select(.gate=="scanner" and .code=="gitleaks/generic-api-key")|.code')" = gitleaks/generic-api-key ] ||
   fail "normalized scanner finding did not reach the top-level verifier findings"
 pass "scanner gate integration: a synthetic candidate diff blocks fm-verify"
+
+# --- adjudication integration: cited noise is demoted and bundled -------------
+RADJ=$(build_repo adjudication-integration)
+printf 'const value = "SAFE_TEST_VALUE"; // FM_TEST_SECURITY_NOISE\n' > "$RADJ/security.js"
+git -C "$RADJ" add security.js
+git -C "$RADJ" commit -qm "add synthetic security heuristic"
+ADJSHA=$(git -C "$RADJ" rev-parse HEAD)
+rc=$(verify "$TMP/adjudication-integration.json" --worktree "$RADJ" --base main \
+  --sha "$ADJSHA" --branch fm/g1 --task g1)
+expect_code 0 "$rc" "cited noisy finding is demoted without hiding its bundle record"
+jq -e '
+  .gates[]|select(.gate=="scanner")|.details
+  | .adjudication.schema=="firstmate/scanner-adjudication/1"
+  and .adjudication.submitted_count==1
+  and .adjudication.adjudicated_count==1
+  and .adjudication.demoted_count==1
+  and (.adjudication.model_prompt_fingerprint|test("^[0-9a-f]{64}$"))
+  and .adjudication.cost_estimate_usd>0
+  and (.adjudication.demotions[0].reason_code=="constant-safe-value")
+  and (.adjudication.demotions[0].audit_sampled)
+  and ([.findings[]|select(
+    .rule_id=="security/detect-object-injection"
+    and .policy_decision=="report-only"
+    and (.blocking|not)
+  )]|length)==1
+' "$TMP/adjudication-integration.json" >/dev/null ||
+  fail "verifier bundle omitted adjudication counts, reasons, fingerprint, cost, or audit marker"
+pass "scanner adjudication bundle records counts, cited reasons, model/prompt fingerprint, cost, and audit sample"
 
 # --- baseline freshness: scanner stays pinned and final publication rechecks ---
 RBASE=$(build_repo base-advances-during-scan)

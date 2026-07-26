@@ -3,10 +3,12 @@
 #
 # The runner scans immutable checkouts of one candidate SHA and, when available,
 # one base SHA. Every scheduled tool call has a portable hard deadline. Tool
-# output is normalized to firstmate/scanner-raw-finding/1, then classified by
-# bin/fm-findings-attribute.sh. A missing, wrong-version, timed-out, crashed, or
-# malformed-output scanner produces exactly one blocking scanner-unavailable
-# finding (FC-004); it is never a skip.
+# output is normalized to firstmate/scanner-raw-finding/1, classified by
+# bin/fm-findings-attribute.sh, then passed through one bounded demote-only
+# adjudication call for committed noisy-finding selectors.
+# A missing, wrong-version, timed-out, crashed, or malformed-output scanner
+# produces exactly one blocking scanner-unavailable finding (FC-004); it is
+# never a skip.
 #
 # No scanner invocation may use a network. OSV-Scanner is always passed --offline
 # and must find a pre-provisioned database under FM_SCANNER_OSV_DB.
@@ -20,6 +22,9 @@
 #   FM_SCANNER_OSV_DB           offline OSV DB cache root (default: $FM_SCANNER_DIR/osv-db)
 #   FM_VERIFY_SCANNER_TIMEOUT   per external scanner call, seconds (default 8)
 #   FM_VERIFY_SCANNER_BUDGET    whole battery budget, seconds (default 30)
+#   FM_SCANNER_ADJUDICATOR_CLI  Claude CLI executable (default: claude)
+#   FM_SCANNER_ADJUDICATOR_MODEL committed default or escalation model
+#   FM_SCANNER_ADJUDICATOR_TIMEOUT bounded adjudicator deadline
 #   FM_VERIFY_FORCE_PID_WATCHDOG=1 forces the portable watchdog path in tests
 set -u
 
@@ -268,6 +273,33 @@ raw_from_sarif() {
       content:null
     }
   ' "$sarif" >> "$destination"
+}
+
+raw_from_osv_sarif() {
+  local sarif=$1 root=$2 destination=$3 temporary path package lockfile record
+  temporary="$TMP/osv-raw.$RANDOM.jsonl"
+  : > "$temporary"
+  raw_from_sarif osv-scanner "$sarif" "$root" "$temporary" || return 1
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    path=$(printf '%s\n' "$record" | jq -r '.path // ""')
+    package=$(printf '%s\n' "$record" | jq -r '
+      try (.message|capture("^Package '\''(?<spec>.+)'\'' is vulnerable").spec
+        | sub("@[^@]+$";"")) catch ""
+    ')
+    lockfile="$root/$path"
+    if [ -n "$package" ] &&
+      printf '%s\n' "$path" | grep -Eq '(^|/)package-lock\.json$' &&
+      ! printf '%s\n' "$path" | grep -Eq '(^|/)\.\.(/|$)|^/' &&
+      [ -f "$lockfile" ] &&
+      jq -e --arg key "node_modules/$package" '.packages[$key].dev == true' \
+        "$lockfile" >/dev/null 2>&1; then
+      printf '%s\n' "$record" | jq -c '.rule_id="dev-dependency/"+.rule_id'
+    else
+      printf '%s\n' "$record"
+    fi
+  done < "$temporary" >> "$destination"
+  rm -f "$temporary"
 }
 
 raw_from_eslint() {
@@ -591,7 +623,7 @@ if changed_matches "$LOCK_RE"; then
       for file in "${BASE_LOCKS[@]}"; do OSV_ARGS+=(-L "$file"); done
       if run_sarif_scan osv-scanner env "$BASE_DIR" "$TMP/osv-base.sarif" \
         OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY="$OSV_DB" "$OSV" "${OSV_ARGS[@]}" &&
-        raw_from_sarif osv-scanner "$TMP/osv-base.sarif" "$BASE_DIR" "$RAW_BASE"; then :;
+        raw_from_osv_sarif "$TMP/osv-base.sarif" "$BASE_DIR" "$RAW_BASE"; then :;
       else OSV_OK=false; fi
     fi
     if [ "$OSV_OK" = true ] && [ "${#CANDIDATE_LOCKS[@]}" -gt 0 ]; then
@@ -599,7 +631,7 @@ if changed_matches "$LOCK_RE"; then
       for file in "${CANDIDATE_LOCKS[@]}"; do OSV_ARGS+=(-L "$file"); done
       if run_sarif_scan osv-scanner env "$CANDIDATE_DIR" "$TMP/osv-candidate.sarif" \
         OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY="$OSV_DB" "$OSV" "${OSV_ARGS[@]}" &&
-        raw_from_sarif osv-scanner "$TMP/osv-candidate.sarif" "$CANDIDATE_DIR" "$RAW_CANDIDATE"; then :;
+        raw_from_osv_sarif "$TMP/osv-candidate.sarif" "$CANDIDATE_DIR" "$RAW_CANDIDATE"; then :;
       else OSV_OK=false; fi
     fi
     if [ "$OSV_OK" = true ] && [ "${#CANDIDATE_LOCKS[@]}" -gt 0 ]; then
@@ -607,7 +639,7 @@ if changed_matches "$LOCK_RE"; then
       for file in "${CANDIDATE_LOCKS[@]}"; do OSV_ARGS+=(-L "$file"); done
       if run_sarif_scan osv-scanner env "$CANDIDATE_DIR" "$TMP/osv-confirm.sarif" \
         OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY="$OSV_DB" "$OSV" "${OSV_ARGS[@]}" &&
-        raw_from_sarif osv-scanner "$TMP/osv-confirm.sarif" "$CANDIDATE_DIR" "$RAW_CONFIRMATION"; then :;
+        raw_from_osv_sarif "$TMP/osv-confirm.sarif" "$CANDIDATE_DIR" "$RAW_CONFIRMATION"; then :;
       else OSV_OK=false; fi
     fi
     if [ "$OSV_OK" = true ]; then scanner_end osv-scanner ok
@@ -927,30 +959,47 @@ else
     refuse "baseline attributor failed"
 fi
 
+ADJUDICATION="$TMP/adjudication.json"
+ADJUDICATION_BASE=$CANDIDATE
+[ "$BASELINE_AVAILABLE" = true ] && ADJUDICATION_BASE=$BASE
+"$SCRIPT_DIR/fm-findings-adjudicate.sh" --attribution "$ATTRIBUTION" --repo "$REPO" \
+  --base "$ADJUDICATION_BASE" --candidate "$CANDIDATE" --out "$ADJUDICATION"
+ADJUDICATION_RC=$?
+if [ "$ADJUDICATION_RC" -gt 1 ] || [ ! -f "$ADJUDICATION" ] ||
+  ! jq -e '.schema=="firstmate/scanner-adjudication/1"' "$ADJUDICATION" >/dev/null 2>&1; then
+  refuse "adjudicator failed without a closed fail-closed report"
+fi
+
 REPORT="$TMP/report.json"
 jq -n --arg base "$BASE" --arg candidate "$CANDIDATE" \
   --arg budget "$TOTAL_BUDGET" --slurpfile attribution "$ATTRIBUTION" \
-  --slurpfile timings "$TIMINGS" '
+  --slurpfile adjudication "$ADJUDICATION" --slurpfile timings "$TIMINGS" '
   {
-    schema:"firstmate/scanner-report/1",
+    schema:"firstmate/scanner-report/2",
     base_sha:(if $base=="" then null else $base end),
     candidate_sha:$candidate,
     baseline:$attribution[0].baseline,
     budget_s:($budget|tonumber),
-    duration_ms:([$timings[].duration_ms]|add // 0),
+    duration_ms:(([$timings[].duration_ms]|add // 0)+$adjudication[0].duration_ms),
     timings:$timings,
-    findings:$attribution[0].findings
+    adjudication:($adjudication[0]|del(.findings)),
+    findings:$adjudication[0].findings
   }
 ' > "$REPORT" || refuse "failed to assemble scanner report"
 
 jq -e '
-  keys == ["base_sha","baseline","budget_s","candidate_sha","duration_ms","findings","schema","timings"]
-  and .schema == "firstmate/scanner-report/1"
+  keys == ["adjudication","base_sha","baseline","budget_s","candidate_sha","duration_ms","findings","schema","timings"]
+  and .schema == "firstmate/scanner-report/2"
   and (.base_sha == null or (.base_sha|type) == "string")
   and (.candidate_sha|type) == "string"
   and (.baseline|keys) == ["available","warning"]
   and (.budget_s|type) == "number"
   and (.duration_ms|type) == "number"
+  and (.adjudication|keys)==["adjudicated_count","audit","cluster_count",
+      "cluster_reduction_count","cost_estimate_basis","cost_estimate_usd","demoted_count","demotions",
+      "duration_ms","excluded_secrets_count","model","model_prompt_fingerprint","prompt_fingerprint",
+      "prompt_version","schema","status","submitted_count","unavailable_reason"]
+  and .adjudication.schema=="firstmate/scanner-adjudication/1"
   and (.timings|type) == "array"
   and all(.timings[];
     ((keys - ["reason"]) == ["budget_s","duration_ms","scanner","status"])

@@ -10,6 +10,7 @@ DB_INSTALLER="$ROOT/bin/fm-install-osv-db.sh"
 RUNNER="$ROOT/bin/fm-scanner.sh"
 LOCK="$ROOT/docs/scanner/package-lock.json"
 POLICY="$ROOT/docs/scanner/blocking-policy.json"
+ADJUDICATOR_POLICY="$ROOT/docs/scanner/adjudicator-policy.json"
 
 for version in 8.30.1 1.75.0 2.4.0 1.7.12 0.16.0 1.7.1; do
   assert_grep "$version" "$INSTALLER" "scanner installer is missing pin $version"
@@ -43,9 +44,24 @@ jq -e '
   and any(.scanners[];
     .scanner=="eslint"
     and (.blocking_severities|index("error"))!=null
-    and (.report_only_rule_prefixes|index("security/"))!=null)
+    and (.report_only_rule_prefixes|length)==0)
 ' "$POLICY" >/dev/null ||
-  fail "committed scanner policy must reserve time and keep eslint-plugin-security report-only"
+  fail "committed scanner policy must reserve time and make security errors pre-adjudication blockers"
+jq -e '
+  .schema=="firstmate/scanner-adjudicator-policy/1"
+  and .models.default=="claude-haiku-4-5-20251001"
+  and .models.escalation=="claude-sonnet-4-5-20250929"
+  and .limits.timeout_s>0
+  and .limits.max_findings>0
+  and any(.selectors[];
+    .scanner=="eslint" and .rule_prefix=="security/")
+  and any(.selectors[];
+    .scanner=="osv-scanner" and .rule_prefix=="dev-dependency/")
+  and (.never_adjudicate_scanners|index("gitleaks"))!=null
+  and all(.selectors[]; .scanner!="gitleaks")
+  and (([.reason_taxonomy[].code]|length)==([.reason_taxonomy[].code]|unique|length))
+' "$ADJUDICATOR_POLICY" >/dev/null ||
+  fail "committed adjudicator policy lost its bounds, selectors, taxonomy, or secrets boundary"
 pass "scanner policy closes blocking thresholds and fair per-scanner budgets"
 
 assert_no_grep 'trufflehog' "$RUNNER" "trufflehog must never enter the runtime battery"

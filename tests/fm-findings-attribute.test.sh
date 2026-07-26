@@ -87,11 +87,22 @@ pass "G6: occurrence identity preserves distinct identical-content findings"
 
 GOLDEN="$ROOT/tests/fixtures/scanner-golden.json"
 jq -e '
-  keys==["cases","schema"]
-  and .schema=="firstmate/scanner-golden/1"
-  and (.cases|length)==30
+  [.cases[].id] as $ids
+  |
+  keys==["adjudication_expectations","cases","expected_metrics","schema"]
+  and .schema=="firstmate/scanner-golden/2"
+  and (.cases|length)==32
   and (([.cases[].id]|length)==([.cases[].id]|unique|length))
-' "$GOLDEN" >/dev/null || fail "minimal scanner golden set is not closed, unique, and exactly 30 cases"
+  and (.adjudication_expectations|length)==3
+  and all(.adjudication_expectations[];
+    . as $expectation
+    |
+    keys==["expected_final_blocking","expected_final_decision","gold_label","id",
+           "reason_code","verdict"]
+    and any($ids[]; .==$expectation.id))
+  and (.expected_metrics|keys)==["precision","recall"]
+' "$GOLDEN" >/dev/null ||
+  fail "scanner golden set is not closed, unique, and complete"
 jq -c '.cases[]|{
   schema:"firstmate/scanner-raw-finding/1",
   scanner,rule_id,severity,path,line,message:.id,content
@@ -110,7 +121,7 @@ jq -c '.cases[]|select(.confirm)|{
 jq -e --slurpfile golden "$GOLDEN" '
   . as $report
   |
-  (.findings|length)==30
+  (.findings|length)==32
   and all($golden[0].cases[];
     . as $case
     | any($report.findings[];
@@ -119,8 +130,8 @@ jq -e --slurpfile golden "$GOLDEN" '
       and .policy_decision==$case.expected_decision
       and .blocking==$case.expected_blocking))
 ' "$TMP/golden-report.json" >/dev/null ||
-  fail "minimal golden set disposition diverged from its 30 human labels"
-pass "Phase 1 golden set: all 30 labeled findings retain blocking/report/inherited disposition"
+  fail "golden set disposition diverged from its 32 human labels"
+pass "Phase 1 golden set: all 32 labeled findings retain blocking/report/inherited disposition"
 
 "$ATTRIBUTOR" --candidate "$CANDIDATE" --confirmation "$TMP/confirmation.jsonl" \
   --out "$TMP/unattributed.json"
