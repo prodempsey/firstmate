@@ -71,6 +71,10 @@ case "$name" in
     else
       mv "$full_report" "$report"
     fi
+    if "$REAL_JQ" -e 'length > 0' "$report" >/dev/null; then
+      exit 1
+    fi
+    exit 0
     ;;
   oxlint)
     if [ "$version" = true ]; then echo 'oxlint 1.75.0'; exit 0; fi
@@ -346,6 +350,25 @@ for scanner in gitleaks oxlint eslint-scanner osv-scanner actionlint jq shellche
 done
 pass "FC-004: every scanner independently fails closed with one unavailable finding"
 
+crashed="$TMP/crashed-gitleaks"
+cp -R "$TOOLS" "$crashed"
+rm -f "$crashed/bin/gitleaks"
+cat > "$crashed/bin/gitleaks" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+  printf 'gitleaks version 8.30.1\n'
+  exit 0
+fi
+exit 2
+SH
+chmod +x "$crashed/bin/gitleaks"
+run_scanner "$crashed" "$TMP/crashed-gitleaks.json"
+expect_code 1 "$?" "a genuine gitleaks crash fails closed"
+[ "$(jq '[.findings[]|select(.scanner=="gitleaks" and .rule_id=="scanner-unavailable")]|length' \
+  "$TMP/crashed-gitleaks.json")" -eq 1 ] ||
+  fail "a genuine gitleaks crash did not yield scanner-unavailable"
+pass "FC-004: a genuine gitleaks crash remains fail-closed"
+
 for scanner in gitleaks oxlint eslint-scanner osv-scanner actionlint jq shellcheck ruff; do
   wedged="$TMP/wedged-$scanner"
   cp -R "$TOOLS" "$wedged"
@@ -381,5 +404,56 @@ for scanner in gitleaks oxlint eslint-scanner osv-scanner actionlint jq shellche
     fail "$report_name exhausted another scanner's reserved time slice"
 done
 pass "FC-006/G9: each scanner has a reserved budget and exhaustion stays local and loud"
+
+if [ -n "${FM_TEST_REAL_GITLEAKS:-}" ]; then
+  [ -x "$FM_TEST_REAL_GITLEAKS" ] ||
+    fail "FM_TEST_REAL_GITLEAKS does not name an executable"
+  "$FM_TEST_REAL_GITLEAKS" --version | grep -Fq '8.30.1' ||
+    fail "FM_TEST_REAL_GITLEAKS is not the pinned gitleaks 8.30.1"
+
+  real_tools="$TMP/real-gitleaks-tools"
+  cp -R "$TOOLS" "$real_tools"
+  rm -f "$real_tools/bin/gitleaks"
+  ln -s "$FM_TEST_REAL_GITLEAKS" "$real_tools/bin/gitleaks"
+
+  real_origin="$TMP/real-gitleaks-origin"
+  real_worktree="$TMP/real-gitleaks-worktree"
+  git clone -q "$ROOT" "$real_origin"
+  git -C "$real_origin" worktree add --detach --quiet "$real_worktree" HEAD
+  [ -f "$real_worktree/.git" ] ||
+    fail "real gitleaks sandbox is not a linked worktree with a gitdir pointer"
+  fm_git_identity "$real_worktree"
+
+  REPO=$real_worktree
+  BASE=$(git -C "$REPO" rev-parse HEAD^)
+  CANDIDATE=$(git -C "$REPO" rev-parse HEAD)
+  FM_VERIFY_SCANNER_TIMEOUT=8 run_scanner "$real_tools" "$TMP/real-gitleaks-clean.json"
+  expect_code 0 "$?" "real pinned gitleaks accepts the clean linked-worktree candidate"
+  [ "$(jq '[.findings[]|select(.scanner=="gitleaks" and .rule_id=="scanner-unavailable")]|length' \
+    "$TMP/real-gitleaks-clean.json")" -eq 0 ] ||
+    fail "real pinned gitleaks was unavailable in the clean linked-worktree fixture"
+
+  printf 'api_key = "aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY"\n' > "$REPO/seeded-secret.txt"
+  git -C "$REPO" add seeded-secret.txt
+  git -C "$REPO" commit -qm "seed gitleaks fixture"
+  BASE=$CANDIDATE
+  CANDIDATE=$(git -C "$REPO" rev-parse HEAD)
+  FM_VERIFY_SCANNER_TIMEOUT=8 run_scanner "$real_tools" "$TMP/real-gitleaks-secret.json"
+  expect_code 1 "$?" "real pinned gitleaks finding blocks the linked-worktree candidate"
+  [ "$(jq '[.findings[]|select(
+      .scanner=="gitleaks"
+      and .rule_id!="scanner-unavailable"
+      and .path=="seeded-secret.txt"
+      and .attribution=="candidate-new"
+      and .blocking
+    )]|length' "$TMP/real-gitleaks-secret.json")" -eq 1 ] ||
+    fail "real pinned gitleaks did not normalize the seeded linked-worktree secret"
+  [ "$(jq '[.findings[]|select(.scanner=="gitleaks" and .rule_id=="scanner-unavailable")]|length' \
+    "$TMP/real-gitleaks-secret.json")" -eq 0 ] ||
+    fail "real pinned gitleaks finding was inverted into scanner-unavailable"
+  pass "FC-001: real pinned gitleaks maps linked-worktree clean/finding exit semantics"
+else
+  echo "skip: set FM_TEST_REAL_GITLEAKS to run the pinned linked-worktree regression"
+fi
 
 echo "# all fm-scanner tests passed"

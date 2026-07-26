@@ -55,9 +55,11 @@ done
 [ -n "$report" ] || exit 2
 if grep -Rqs 'FM_TEST_NEW_SECRET' . --exclude-dir=.git; then
   printf '[{"RuleID":"generic-api-key","File":"secret.txt","StartLine":1,"Description":"potential secret","Line":"FM_TEST_NEW_SECRET"}]\n' > "$report"
+  exit 1
 else
   printf '[]\n' > "$report"
 fi
+exit 0
 SH
 chmod +x "$FM_SCANNER_DIR/bin/gitleaks"
 cat > "$FM_SCANNER_DIR/bin/oxlint" <<'SH'

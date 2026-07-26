@@ -402,58 +402,69 @@ run_sarif_scan() {
   return 0
 }
 
-# Gitleaks runs raw against both snapshots.
+run_gitleaks_scan() {
+  local root=$1 report=$2 log=$3
+  shift 3
+  run_bounded "$(remaining_budget)" "$root" "$log" \
+    "$GITLEAKS" "$@" --report-path "$report"
+  if [ "$BOUNDED_TIMEOUT" = yes ]; then
+    GITLEAKS_ERROR="scan exceeded its hard deadline (FC-006)"
+    return 1
+  fi
+  case "$RUN_RC" in
+    0|1) ;;
+    *)
+      GITLEAKS_ERROR="scanner crashed with exit $RUN_RC"
+      return 1
+      ;;
+  esac
+  if ! jq -e --argjson rc "$RUN_RC" '
+      type=="array"
+      and (($rc==0 and length==0) or ($rc==1 and length>0))
+    ' "$report" >/dev/null 2>&1; then
+    GITLEAKS_ERROR="exit code and JSON report did not match the pinned gitleaks contract (FC-001)"
+    return 1
+  fi
+  return 0
+}
+
+# Gitleaks scans committed history from each immutable checkout.
+# A separate directory scan would rescan the same committed content and exhaust
+# the scanner slice without adding coverage.
 # The generic attributor is the only mechanism allowed to separate inherited
 # and candidate-new findings, so native baseline filtering is deliberately absent.
 scanner_begin gitleaks
 GITLEAKS=$(resolve_tool gitleaks)
 if tool_ready gitleaks "$GITLEAKS" 8.30.1; then
   GITLEAKS_OK=true
+  GITLEAKS_ERROR="scan failed"
   BASELINE_REPORT="$TMP/gitleaks-baseline.json"
   printf '[]\n' > "$BASELINE_REPORT"
   if [ "$BASELINE_AVAILABLE" = true ]; then
-    run_bounded "$(remaining_budget)" "$BASE_DIR" "$TMP/gitleaks-base-history.log" \
-      "$GITLEAKS" git --no-banner --redact --exit-code 0 --report-format json \
-      --report-path "$TMP/gitleaks-base-history.json" --log-opts="$BASE"
-    if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -ne 0 ]; then GITLEAKS_OK=false; fi
-    run_bounded "$(remaining_budget)" "$BASE_DIR" "$TMP/gitleaks-base-dir.log" \
-      "$GITLEAKS" dir --no-banner --redact --exit-code 0 --report-format json \
-      --report-path "$TMP/gitleaks-base-dir.json" .
-    if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -ne 0 ]; then GITLEAKS_OK=false; fi
+    run_gitleaks_scan "$BASE_DIR" "$BASELINE_REPORT" \
+      "$TMP/gitleaks-base-history.log" git --no-banner --redact --report-format json \
+      --log-opts="$BASE" || GITLEAKS_OK=false
     if [ "$GITLEAKS_OK" = true ] &&
-      jq -s 'add' "$TMP/gitleaks-base-history.json" "$TMP/gitleaks-base-dir.json" > "$BASELINE_REPORT" &&
       raw_from_gitleaks "$BASELINE_REPORT" "$BASE_DIR" "$RAW_BASE"; then :; else GITLEAKS_OK=false; fi
   fi
   if [ "$GITLEAKS_OK" = true ]; then
     log_opts=$CANDIDATE
     [ "$BASELINE_AVAILABLE" = true ] && log_opts="$BASE..$CANDIDATE"
-    run_bounded "$(remaining_budget)" "$CANDIDATE_DIR" "$TMP/gitleaks-candidate-history.log" \
-      "$GITLEAKS" git --no-banner --redact --exit-code 0 --report-format json \
-      --report-path "$TMP/gitleaks-candidate-history.json" --log-opts="$log_opts"
-    if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -ne 0 ]; then GITLEAKS_OK=false; fi
-    run_bounded "$(remaining_budget)" "$CANDIDATE_DIR" "$TMP/gitleaks-candidate-dir.log" \
-      "$GITLEAKS" dir --no-banner --redact --exit-code 0 --report-format json \
-      --report-path "$TMP/gitleaks-candidate-dir.json" .
-    if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -ne 0 ]; then GITLEAKS_OK=false; fi
+    run_gitleaks_scan "$CANDIDATE_DIR" "$TMP/gitleaks-candidate.json" \
+      "$TMP/gitleaks-candidate-history.log" git --no-banner --redact --report-format json \
+      --log-opts="$log_opts" || GITLEAKS_OK=false
   fi
   if [ "$GITLEAKS_OK" = true ]; then
-    run_bounded "$(remaining_budget)" "$CANDIDATE_DIR" "$TMP/gitleaks-confirm-history.log" \
-      "$GITLEAKS" git --no-banner --redact --exit-code 0 --report-format json \
-      --report-path "$TMP/gitleaks-confirm-history.json" --log-opts="$log_opts"
-    if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -ne 0 ]; then GITLEAKS_OK=false; fi
-    run_bounded "$(remaining_budget)" "$CANDIDATE_DIR" "$TMP/gitleaks-confirm-dir.log" \
-      "$GITLEAKS" dir --no-banner --redact --exit-code 0 --report-format json \
-      --report-path "$TMP/gitleaks-confirm-dir.json" .
-    if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -ne 0 ]; then GITLEAKS_OK=false; fi
+    run_gitleaks_scan "$CANDIDATE_DIR" "$TMP/gitleaks-confirm.json" \
+      "$TMP/gitleaks-confirm-history.log" git --no-banner --redact --report-format json \
+      --log-opts="$log_opts" || GITLEAKS_OK=false
   fi
   if [ "$GITLEAKS_OK" = true ] &&
-    jq -s 'add' "$TMP/gitleaks-candidate-history.json" "$TMP/gitleaks-candidate-dir.json" > "$TMP/gitleaks-candidate.json" &&
     raw_from_gitleaks "$TMP/gitleaks-candidate.json" "$CANDIDATE_DIR" "$RAW_CANDIDATE" &&
-    jq -s 'add' "$TMP/gitleaks-confirm-history.json" "$TMP/gitleaks-confirm-dir.json" > "$TMP/gitleaks-confirm.json" &&
     raw_from_gitleaks "$TMP/gitleaks-confirm.json" "$CANDIDATE_DIR" "$RAW_CONFIRMATION"; then
     scanner_end gitleaks ok
   else
-    emit_unavailable gitleaks "scan timed out, crashed, or returned malformed JSON"
+    emit_unavailable gitleaks "$GITLEAKS_ERROR"
     scanner_end gitleaks unavailable
   fi
 else
