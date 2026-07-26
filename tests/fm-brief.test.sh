@@ -139,7 +139,9 @@ test_herdr_lab_contract_quotes_foreign_firstmate_path() {
   id="brief-herdr-lab-foreign-d2"
   helper=$(printf '%s' "$foreign_root/bin/fm-herdr-lab.sh" | sed "s/'/'\\\\''/g")
   helper="'$helper'"
-  FM_HOME="$home" FM_ROOT_OVERRIDE="$foreign_root" "$ROOT/bin/fm-brief.sh" "$id" foreign --scout --herdr-lab >/dev/null 2>&1
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$foreign_root" \
+    FM_FC_LEDGER="$ROOT/docs/failure-classes/ledger.jsonl" \
+    "$ROOT/bin/fm-brief.sh" "$id" foreign --scout --herdr-lab >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
   assert_grep "HERDR_LAB_HELPER=$helper" "$brief" \
     "Herdr lab brief must shell-quote an absolute Firstmate helper path"
@@ -224,12 +226,11 @@ test_herdr_lab_contract_applies_to_scouts_but_not_secondmates() {
   pass "fm-brief.sh: Herdr lab contract covers scouts and rejects secondmate misuse"
 }
 
-# Ship briefs must carry the standing failure-class invariants (FC-001 and
-# FC-002) verbatim from the ledger, across every delivery mode, plus a pointer
-# to the full ledger. The invariant strings are quoted here so the test also
-# guards against silent paraphrase drift away from the ledger's wording.
-test_ship_standing_invariants_block() {
-  local home id brief
+# Ship and scout briefs must carry every current standing failure-class
+# invariant from the ledger's proven folded snapshot. FC-001 and FC-002 remain
+# pinned verbatim as an additional regression guard.
+test_builder_standing_invariants_block() {
+  local home id brief snapshot cid invariant
   home="$TMP_ROOT/standing-invariants-home"
   write_registry "$home"
 
@@ -237,12 +238,10 @@ test_ship_standing_invariants_block() {
   fc001='A conclusion may be drawn only from ONE atomic pass that positively proves conformance to a single declared, closed schema; authority defaults to none and is NEVER inferred from the absence of a failing check.'
   fc002='An obligation is cleared ONLY by positive proof from a fresh, structurally-complete, authoritative snapshot that provably enumerates that obligation'\''s status; absent/stale/corrupt/partial coverage RETAINS the prior fact unchanged (fail-open when CREATING a block, fail-closed when DISCHARGING one).'
 
-  # Guard the ledger source too: the on-disk invariants must equal what the
-  # brief embeds, so this test fails if either the ledger or the brief drifts.
-  local led="$ROOT/docs/failure-classes/ledger.jsonl"
-  assert_present "$led" "failure-class ledger missing"
-  assert_grep "$fc001" "$led" "ledger FC-001 invariant text drifted from the test's expected string"
-  assert_grep "$fc002" "$led" "ledger FC-002 invariant text drifted from the test's expected string"
+  snapshot=$("$ROOT/bin/fm-failure-class.sh" list --json) \
+    || fail "failure-class authority refused the committed ledger"
+  assert_contains "$snapshot" "$fc001" "ledger FC-001 invariant text drifted from the expected string"
+  assert_contains "$snapshot" "$fc002" "ledger FC-002 invariant text drifted from the expected string"
 
   for id_proj in "brief-inv-nomistakes:no-registry-proj" "brief-inv-directpr:direct-proj" "brief-inv-localonly:local-proj"; do
     id=${id_proj%%:*}
@@ -250,18 +249,50 @@ test_ship_standing_invariants_block() {
     brief="$home/data/$id/brief.md"
     assert_present "$brief" "$id: brief was not scaffolded"
     assert_grep "# Standing invariants" "$brief" "$id: ship brief missing the Standing invariants block"
-    assert_grep "FC-001 (closed-schema positive proof)" "$brief" "$id: ship brief missing the FC-001 label"
-    assert_grep "$fc001" "$brief" "$id: ship brief missing the FC-001 invariant verbatim"
-    assert_grep "FC-002 (absence is never discharge)" "$brief" "$id: ship brief missing the FC-002 label"
-    assert_grep "$fc002" "$brief" "$id: ship brief missing the FC-002 invariant verbatim"
+    while IFS=$'\t' read -r cid invariant; do
+      assert_grep "- $cid: $invariant" "$brief" \
+        "$id: ship brief missing current invariant $cid verbatim"
+    done < <(printf '%s' "$snapshot" | jq -r '.[] | [.id, .invariant] | @tsv')
     assert_grep "docs/failure-classes/ledger.jsonl" "$brief" "$id: ship brief missing the full-ledger pointer"
   done
 
-  # Scout briefs are not gated on implementation invariants; keep the block out.
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-inv-scout no-registry-proj --scout >/dev/null 2>&1
-  assert_no_grep "# Standing invariants" "$home/data/brief-inv-scout/brief.md" \
-    "scout brief must not carry the ship-only Standing invariants block"
-  pass "fm-brief.sh: ship briefs embed FC-001/FC-002 invariants verbatim with a ledger pointer"
+  brief="$home/data/brief-inv-scout/brief.md"
+  assert_grep "# Standing invariants" "$brief" "scout brief missing the Standing invariants block"
+  while IFS=$'\t' read -r cid invariant; do
+    assert_grep "- $cid: $invariant" "$brief" \
+      "scout brief missing current invariant $cid verbatim"
+  done < <(printf '%s' "$snapshot" | jq -r '.[] | [.id, .invariant] | @tsv')
+  assert_grep "docs/failure-classes/ledger.jsonl" "$brief" \
+    "scout brief missing the full-ledger pointer"
+  pass "fm-brief.sh: ship and scout briefs embed every current invariant from the proven ledger snapshot"
+}
+
+test_builder_brief_refuses_unreadable_ledger() {
+  local home ledger out status=0
+  home="$TMP_ROOT/unreadable-ledger-home"
+  ledger="$TMP_ROOT/unreadable-ledger.jsonl"
+  mkdir -p "$home/data"
+  cp "$ROOT/docs/failure-classes/ledger.jsonl" "$ledger"
+  chmod 000 "$ledger"
+
+  out=$(FM_HOME="$home" FM_FC_LEDGER="$ledger" \
+    "$ROOT/bin/fm-brief.sh" brief-unreadable someproj 2>&1) || status=$?
+  expect_code 1 "$status" "ship scaffold must refuse an unreadable failure-class ledger"
+  assert_contains "$out" "refusing to scaffold ship brief" \
+    "ship scaffold's unreadable-ledger refusal was not loud"
+  assert_absent "$home/data/brief-unreadable/brief.md" \
+    "ship scaffold emitted a brief after the ledger authority refused"
+
+  status=0
+  FM_HOME="$home" FM_FC_LEDGER="$ledger" FM_SECONDMATE_CHARTER=ops \
+    "$ROOT/bin/fm-brief.sh" secondmate-unreadable --secondmate --no-projects \
+    >/dev/null 2>&1 || status=$?
+  expect_code 0 "$status" "secondmate charter must not depend on the failure-class ledger"
+  assert_present "$home/data/secondmate-unreadable/brief.md" \
+    "secondmate charter was not scaffolded independently of the ledger"
+  chmod 600 "$ledger"
+  pass "fm-brief.sh: builder scaffolds fail closed on an unreadable ledger without changing secondmate charters"
 }
 
 # Scout/QA briefs must carry the Review practice block: neutral software-QA
@@ -336,6 +367,7 @@ test_herdr_lab_contract_quotes_foreign_firstmate_path
 test_herdr_lab_omission_is_loud_for_ship_and_scout
 test_herdr_lab_contract_applies_to_scouts_but_not_secondmates
 test_secondmate_no_projects_charter
-test_ship_standing_invariants_block
+test_builder_standing_invariants_block
+test_builder_brief_refuses_unreadable_ledger
 test_scout_review_practice_block
 test_pause_verb_override_renders_all_brief_scaffolds
