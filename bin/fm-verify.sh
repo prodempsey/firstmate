@@ -13,6 +13,8 @@
 #
 # A verifier must itself obey the failure-class ledger it lints with. The
 # invariants that shape this script (each proven by an adversarial fixture):
+# FC-001 (closed-schema positive proof): A conclusion may be drawn only from ONE atomic pass that positively proves conformance to a single declared, closed schema; authority defaults to none and is NEVER inferred from the absence of a failing check.
+# FC-002 (absence is never discharge): An obligation is cleared ONLY by positive proof from a fresh, structurally-complete, authoritative snapshot that provably enumerates that obligation's status; absent/stale/corrupt/partial coverage RETAINS the prior fact unchanged (fail-open when CREATING a block, fail-closed when DISCHARGING one).
 #   FC-002  completeness is positive per-item proof; absence from a partial
 #           discovery is NOT discharge. Suites are enumerated INDEPENDENTLY of
 #           execution from authoritative structures (a filesystem glob, Make's
@@ -440,13 +442,45 @@ if [ -n "$EXEC_DIR" ] && [ "$DEPS_PROVISIONED" = yes ]; then
 fi
 DECLARED_N=$(grep -c . "$DECLARED_FILE" 2>/dev/null || true); DECLARED_N=${DECLARED_N:-0}
 
+# parse_fleet_suite_summary <transcript>: recognize exactly one fleet-bridge
+# suite authority line and print <passed><TAB><failed><TAB><skipped>. This is a
+# closed grammar, not a generic PASS grep: unknown, duplicate, malformed, or
+# status/count-contradictory summaries remain unrecognized so no-assertions
+# still fails closed.
+parse_fleet_suite_summary() {
+  awk '
+    {
+      sub(/\r$/, "")
+      if (NF == 9 &&
+          $1 == "SUITE" &&
+          ($2 == "PASS" || $2 == "FAIL") &&
+          ($3 == "—" || $3 == "-") &&
+          $4 ~ /^[0-9]+$/ && $5 == "passed," &&
+          $6 ~ /^[0-9]+$/ && $7 == "skipped," &&
+          $8 ~ /^[0-9]+$/ && $9 == "failed") {
+        matches++
+        status=$2
+        passed=$4
+        skipped=$6
+        failed=$8
+      }
+    }
+    END {
+      if (matches != 1) exit 1
+      if (status == "PASS" && failed != 0) exit 1
+      if (status == "FAIL" && failed == 0) exit 1
+      printf "%d\t%d\t%d\n", passed, failed, skipped
+    }
+  ' "$1"
+}
+
 # run_one <label> <interp> <cmd...>: execute one declared suite and record it.
 run_one() {
   local label=$1 interp=$2; shift 2
   if [ -n "$interp" ] && ! command -v "$interp" >/dev/null 2>&1; then
     refuse "test runner '$interp' for suite '$label' is not installed (fail closed, FC-004)"
   fi
-  local tout="$WORK/transcript.$RANDOM.txt" rc ok notok skip timedout=no
+  local tout="$WORK/transcript.$RANDOM.txt" rc ok notok skip timedout=no suite_summary
   run_bounded "$TEST_TIMEOUT" "$tout" \
     env -u FM_ROOT_OVERRIDE -u FM_HOME -u FM_STATE_OVERRIDE "$@"
   rc=$?
@@ -455,6 +489,10 @@ run_one() {
   notok=$(grep -cE '^not ok([[:space:]]|$)' "$tout" 2>/dev/null || true)
   skip=$(grep -cE '(^[[:space:]]*skip:)|(^[[:space:]]*SKIP([[:space:]]|$))|(#[[:space:]]*(skip|SKIP))' "$tout" 2>/dev/null || true)
   ok=${ok:-0}; notok=${notok:-0}; skip=${skip:-0}
+  if [ "$ok" -eq 0 ] && [ "$notok" -eq 0 ] &&
+    suite_summary=$(parse_fleet_suite_summary "$tout"); then
+    IFS=$'\t' read -r ok notok skip <<< "$suite_summary"
+  fi
   TOTAL_OK=$((TOTAL_OK + ok)); TOTAL_NOTOK=$((TOTAL_NOTOK + notok)); TOTAL_SKIP=$((TOTAL_SKIP + skip))
   printf '%s\n' "$label" >> "$EXECUTED_FILE"
   jq -nc --arg suite_label "$label" --arg rc "$rc" --arg ok "$ok" --arg notok "$notok" \

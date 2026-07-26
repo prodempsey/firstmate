@@ -148,9 +148,18 @@ jq -r '.fingerprint' "$TMP/confirmation-fingerprinted.jsonl" |
 while IFS= read -r record; do
   [ -n "$record" ] || continue
   fingerprint=$(printf '%s\n' "$record" | jq -r '.fingerprint')
+  rule_id=$(printf '%s\n' "$record" | jq -r '.rule_id')
+  availability_finding=false
+  case "$rule_id" in
+    scanner-unavailable|adjudicator-unavailable) availability_finding=true ;;
+  esac
   attribution=unattributed
   if [ "$BASELINE_AVAILABLE" = true ]; then
-    if grep -Fqx "$fingerprint" "$BASE_FINGERPRINTS"; then
+    if [ "$availability_finding" = true ]; then
+      # Availability describes this execution, not source ancestry. A matching
+      # base record can never discharge a missing current-run prerequisite.
+      attribution=candidate-new
+    elif grep -Fqx "$fingerprint" "$BASE_FINGERPRINTS"; then
       attribution=inherited
     else
       attribution=candidate-new
@@ -160,8 +169,8 @@ while IFS= read -r record; do
     printf '%s\n' "$record" | jq -r --slurpfile policy "$POLICY" '
       . as $finding
       | (($policy[0].scanners[]?|select(.scanner==$finding.scanner)) // $policy[0].default) as $rule
-      | if $finding.rule_id=="scanner-unavailable" then
-          ["eligible","scanner-unavailable always fails closed"]
+      | if ($finding.rule_id=="scanner-unavailable" or $finding.rule_id=="adjudicator-unavailable") then
+          ["eligible",($finding.rule_id+" always fails closed")]
         elif any($rule.report_only_rule_prefixes[]?;
           . as $prefix | $finding.rule_id|startswith($prefix)) then
           ["report-only","rule prefix is report-only by committed policy"]
@@ -181,7 +190,7 @@ while IFS= read -r record; do
   if [ "$attribution" = inherited ]; then
     policy_decision=inherited
     policy_reason="finding is present in the authoritative baseline"
-  elif [ "$eligibility" = eligible ] && [ "$(printf '%s\n' "$record" | jq -r '.rule_id')" = scanner-unavailable ]; then
+  elif [ "$eligibility" = eligible ] && [ "$availability_finding" = true ]; then
     blocking=true
     policy_decision=block
   elif [ "$eligibility" = eligible ] && grep -Fqx "$fingerprint" "$CONFIRMATION_FINGERPRINTS"; then

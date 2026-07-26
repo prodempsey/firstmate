@@ -16,13 +16,16 @@
 # script may enter disposition. Failure is total and mutation-free; a completed
 # zero-count proof is the only source of the empty-fleet message.
 #
+# FC-001 (closed-schema positive proof): A conclusion may be drawn only from ONE atomic pass that positively proves conformance to a single declared, closed schema; authority defaults to none and is NEVER inferred from the absence of a failing check.
+# FC-002 (absence is never discharge): An obligation is cleared ONLY by positive proof from a fresh, structurally-complete, authoritative snapshot that provably enumerates that obligation's status; absent/stale/corrupt/partial coverage RETAINS the prior fact unchanged (fail-open when CREATING a block, fail-closed when DISCHARGING one).
+#
 # Confirm-twice safeguard (bug-20260710152159-d3f294fa): a live,
 # actively-working crew can transiently read as a dead endpoint - e.g. a tmux
 # window briefly failing to resolve while a grouped session is being rebuilt -
 # and a single missed liveness probe must never be enough evidence to reap a
 # crew mid-flight (engine-room-p0, 2026-07-10; only the separate unlanded-work
 # refusal below saved it that time). A meta is only treated as a true ghost
-# once fm_backend_target_exists reports it dead on TWO independent reads, with
+# once fm_backend_target_probe proves it absent on TWO independent reads, with
 # a short settle delay (FM_GHOST_SETTLE_SECS, default 2s) between them. This
 # is a second, independent layer stacked on top of - never a replacement for -
 # fm-teardown.sh's own unlanded-work refusal.
@@ -62,47 +65,131 @@ enumeration_failed() {  # <reason> [canonical-or-input-path]
 
 TASK_SNAPSHOT=$(mktemp "${TMPDIR:-/tmp}/fm-ghost-records.XXXXXX" 2>/dev/null) \
   || enumeration_failed "could not create a complete enumeration snapshot"
-trap 'rm -f "$TASK_SNAPSHOT"' EXIT
+LIVENESS_SNAPSHOT=$(mktemp "${TMPDIR:-/tmp}/fm-ghost-liveness.XXXXXX" 2>/dev/null) \
+  || {
+    rm -f "$TASK_SNAPSHOT"
+    enumeration_failed "could not create a complete endpoint snapshot"
+  }
+trap 'rm -f "$TASK_SNAPSHOT" "$LIVENESS_SNAPSHOT"' EXIT
 if ! fm_enumerate_task_records "$STATE" "$TASK_SNAPSHOT"; then
   enumeration_failed "$FM_TASK_ENUM_REASON" "$FM_TASK_ENUM_CANONICAL_STATE"
 fi
 
-DEAD_FOUND=0
-CLEARED=0
-CORRUPT_PRESERVED=0
-PRESERVED=0
-
+# Endpoint presence is a second complete enumeration surface. Attest every
+# target before entering disposition so one unavailable probe cannot arrive
+# after an earlier record has already been reaped.
 record_index=0
 exec 8< "$TASK_SNAPSHOT" \
   || enumeration_failed "completed enumeration snapshot could not be opened" "$FM_TASK_ENUM_CANONICAL_STATE"
+: > "$LIVENESS_SNAPSHOT" \
+  || enumeration_failed "endpoint snapshot could not be initialized" "$FM_TASK_ENUM_CANONICAL_STATE"
 while [ "$record_index" -lt "$FM_TASK_ENUM_COUNT" ]; do
   fm_task_record_snapshot_read 8 \
     || enumeration_failed "completed enumeration snapshot could not be read" "$FM_TASK_ENUM_CANONICAL_STATE"
   id=$FM_TASK_RECORD_ID
-  meta=$FM_TASK_RECORD_META
   backend=$FM_TASK_RECORD_BACKEND
   target=$FM_TASK_RECORD_TARGET
-  worktree=$FM_TASK_RECORD_WORKTREE
   record_index=$((record_index + 1))
 
   if [ -z "$target" ]; then
-    PRESERVED=$((PRESERVED + 1))
-    printf 'GHOST_RECONCILE: ATTENTION: %s has no backend target in %s; preserved for manual recovery.\n' "$id" "$meta"
+    printf 'untargeted\0' >> "$LIVENESS_SNAPSHOT" \
+      || enumeration_failed "endpoint snapshot could not be written" "$FM_TASK_ENUM_CANONICAL_STATE"
     continue
   fi
 
-  if fm_backend_target_exists "$backend" "$target" "fm-$id"; then
+  if fm_backend_target_probe "$backend" "$target" "fm-$id"; then
+    printf 'alive\0' >> "$LIVENESS_SNAPSHOT" \
+      || enumeration_failed "endpoint snapshot could not be written" "$FM_TASK_ENUM_CANONICAL_STATE"
     continue
+  else
+    probe_rc=$?
+  fi
+  if [ "$probe_rc" -eq 2 ]; then
+    enumeration_failed "backend endpoint enumeration unavailable for $id: $FM_BACKEND_TARGET_PROBE_REASON" \
+      "$FM_TASK_ENUM_CANONICAL_STATE"
   fi
 
   # First read says dead. Do not act on a single miss: re-check after a short
   # settle delay and require BOTH reads to agree before this counts as a true
   # ghost (see the confirm-twice safeguard note above).
   sleep "$GHOST_SETTLE_SECS"
-  if fm_backend_target_exists "$backend" "$target" "fm-$id"; then
-    printf 'GHOST_RECONCILE: %s read dead once but resolved alive on recheck after %ss - treating as a transient miss, not reaping.\n' "$id" "$GHOST_SETTLE_SECS"
+  if fm_backend_target_probe "$backend" "$target" "fm-$id"; then
+    printf 'transient\0' >> "$LIVENESS_SNAPSHOT" \
+      || enumeration_failed "endpoint snapshot could not be written" "$FM_TASK_ENUM_CANONICAL_STATE"
     continue
+  else
+    probe_rc=$?
   fi
+  if [ "$probe_rc" -eq 2 ]; then
+    enumeration_failed "backend endpoint enumeration unavailable for $id: $FM_BACKEND_TARGET_PROBE_REASON" \
+      "$FM_TASK_ENUM_CANONICAL_STATE"
+  fi
+  printf 'dead\0' >> "$LIVENESS_SNAPSHOT" \
+    || enumeration_failed "endpoint snapshot could not be written" "$FM_TASK_ENUM_CANONICAL_STATE"
+done
+exec 8<&-
+printf 'count\0%s\0' "$record_index" >> "$LIVENESS_SNAPSHOT" \
+  || enumeration_failed "endpoint count could not be attested" "$FM_TASK_ENUM_CANONICAL_STATE"
+
+# Validate the closed liveness schema and its exact cardinality before any
+# mutation. Unknown/truncated/extra states retain every task record.
+liveness_index=0
+exec 9< "$LIVENESS_SNAPSHOT" \
+  || enumeration_failed "endpoint snapshot could not be opened" "$FM_TASK_ENUM_CANONICAL_STATE"
+while [ "$liveness_index" -lt "$FM_TASK_ENUM_COUNT" ]; do
+  IFS= read -r -d '' liveness <&9 \
+    || enumeration_failed "endpoint snapshot is incomplete" "$FM_TASK_ENUM_CANONICAL_STATE"
+  case "$liveness" in
+    alive|dead|transient|untargeted) ;;
+    *) enumeration_failed "endpoint snapshot violates its closed schema" "$FM_TASK_ENUM_CANONICAL_STATE" ;;
+  esac
+  liveness_index=$((liveness_index + 1))
+done
+IFS= read -r -d '' liveness_marker <&9 \
+  || enumeration_failed "endpoint snapshot lacks an attested count" "$FM_TASK_ENUM_CANONICAL_STATE"
+IFS= read -r -d '' liveness_count <&9 \
+  || enumeration_failed "endpoint snapshot lacks an attested count" "$FM_TASK_ENUM_CANONICAL_STATE"
+if [ "$liveness_marker" != count ] || [ "$liveness_count" != "$FM_TASK_ENUM_COUNT" ]; then
+  enumeration_failed "endpoint snapshot count is invalid" "$FM_TASK_ENUM_CANONICAL_STATE"
+fi
+if IFS= read -r -d '' _ <&9; then
+  enumeration_failed "endpoint snapshot contains trailing data" "$FM_TASK_ENUM_CANONICAL_STATE"
+fi
+exec 9<&-
+
+DEAD_FOUND=0
+CLEARED=0
+CORRUPT_PRESERVED=0
+PRESERVED=0
+record_index=0
+exec 8< "$TASK_SNAPSHOT" \
+  || enumeration_failed "completed enumeration snapshot could not be opened" "$FM_TASK_ENUM_CANONICAL_STATE"
+exec 9< "$LIVENESS_SNAPSHOT" \
+  || enumeration_failed "endpoint snapshot could not be opened" "$FM_TASK_ENUM_CANONICAL_STATE"
+while [ "$record_index" -lt "$FM_TASK_ENUM_COUNT" ]; do
+  fm_task_record_snapshot_read 8 \
+    || enumeration_failed "completed enumeration snapshot could not be read" "$FM_TASK_ENUM_CANONICAL_STATE"
+  IFS= read -r -d '' liveness <&9 \
+    || enumeration_failed "endpoint snapshot could not be read" "$FM_TASK_ENUM_CANONICAL_STATE"
+  id=$FM_TASK_RECORD_ID
+  meta=$FM_TASK_RECORD_META
+  worktree=$FM_TASK_RECORD_WORKTREE
+  record_index=$((record_index + 1))
+
+  case "$liveness" in
+    alive) continue ;;
+    transient)
+      printf 'GHOST_RECONCILE: %s read dead once but resolved alive on recheck after %ss - treating as a transient miss, not reaping.\n' "$id" "$GHOST_SETTLE_SECS"
+      continue
+      ;;
+    untargeted)
+      PRESERVED=$((PRESERVED + 1))
+      printf 'GHOST_RECONCILE: ATTENTION: %s has no backend target in %s; preserved for manual recovery.\n' "$id" "$meta"
+      continue
+      ;;
+    dead) ;;
+    *) enumeration_failed "endpoint snapshot changed after validation" "$FM_TASK_ENUM_CANONICAL_STATE" ;;
+  esac
 
   DEAD_FOUND=1
   if worktree_is_active_home "$worktree"; then
@@ -123,6 +210,7 @@ while [ "$record_index" -lt "$FM_TASK_ENUM_COUNT" ]; do
   fi
 done
 exec 8<&-
+exec 9<&-
 
 if [ "$FM_TASK_ENUM_COUNT" -eq 0 ]; then
   printf 'GHOST_RECONCILE: no in-flight metadata found.\n'

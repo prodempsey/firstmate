@@ -3,6 +3,9 @@
 # and - the confirm-twice safeguard (bug-20260710152159-d3f294fa) - never
 # reaps a meta on a single transient dead read.
 #
+# FC-001 (closed-schema positive proof): A conclusion may be drawn only from ONE atomic pass that positively proves conformance to a single declared, closed schema; authority defaults to none and is NEVER inferred from the absence of a failing check.
+# FC-002 (absence is never discharge): An obligation is cleared ONLY by positive proof from a fresh, structurally-complete, authoritative snapshot that provably enumerates that obligation's status; absent/stale/corrupt/partial coverage RETAINS the prior fact unchanged (fail-open when CREATING a block, fail-closed when DISCHARGING one).
+#
 # The real cleanup path remains fm-teardown.sh; these tests fake only the
 # runtime endpoint and treehouse return so the teardown safety logic still runs
 # against real synthetic git worktrees.
@@ -146,24 +149,31 @@ setup_project_with_worktree() {  # <project> <worktree> <branch>
 # runs, it just does not sleep for real between the two probes.
 run_reconcile() {
   local fakebin=$1 home=$2 fake_root=$3 windows=$4 tmux_log=$5 treehouse_log=$6 dm_calls=$7 force_dead=${8:-0}
-  local run_home=$home
+  local run_home=$home run_path="$fakebin:$BASE_PATH"
   if [ "${FM_TEST_HOME_OVERRIDE+x}" = x ]; then
     run_home=$FM_TEST_HOME_OVERRIDE
   fi
-  env PATH="$fakebin:$BASE_PATH" \
-    FM_HOME="$run_home" \
-    FM_ROOT_OVERRIDE="$fake_root" \
-    FM_STATE_OVERRIDE="${FM_TEST_STATE_OVERRIDE:-}" \
-    FM_VISIBILITY_CLI="$fake_root/visibility.mjs" \
-    FM_TASK_ENUM_TEST_AFTER_LIST_HOOK="${FM_TEST_ENUM_AFTER_LIST_HOOK:-}" \
-    FM_GHOST_SETTLE_SECS=0 \
-    FM_FAKE_TMUX_WINDOWS="$windows" \
-    FM_FAKE_TMUX_LOG="$tmux_log" \
-    FM_FAKE_TREEHOUSE_LOG="$treehouse_log" \
-    FM_FAKE_TREEHOUSE_STATUS="${FM_FAKE_TREEHOUSE_STATUS:-}" \
-    FM_FAKE_TMUX_DM_CALLS="$dm_calls" \
-    FM_FAKE_TMUX_FORCE_DEAD_CALLS="$force_dead" \
-    "$RECONCILE"
+  if [ -n "${FM_TEST_RUN_PATH:-}" ]; then
+    run_path=$FM_TEST_RUN_PATH
+  fi
+  (
+    cd "$home" || exit 1
+    env -u FM_PRIMARY_HOME -u FM_CREWMATE -u FM_TASK_ID \
+      PATH="$run_path" \
+      FM_HOME="$run_home" \
+      FM_ROOT_OVERRIDE="$fake_root" \
+      FM_STATE_OVERRIDE="${FM_TEST_STATE_OVERRIDE:-}" \
+      FM_VISIBILITY_CLI="$fake_root/visibility.mjs" \
+      FM_TASK_ENUM_TEST_AFTER_LIST_HOOK="${FM_TEST_ENUM_AFTER_LIST_HOOK:-}" \
+      FM_GHOST_SETTLE_SECS=0 \
+      FM_FAKE_TMUX_WINDOWS="$windows" \
+      FM_FAKE_TMUX_LOG="$tmux_log" \
+      FM_FAKE_TREEHOUSE_LOG="$treehouse_log" \
+      FM_FAKE_TREEHOUSE_STATUS="${FM_FAKE_TREEHOUSE_STATUS:-}" \
+      FM_FAKE_TMUX_DM_CALLS="$dm_calls" \
+      FM_FAKE_TMUX_FORCE_DEAD_CALLS="$force_dead" \
+      "$RECONCILE"
+  )
 }
 
 assert_enumeration_failure() {  # <output> <rc> <label>
@@ -895,6 +905,64 @@ test_transient_dead_read_is_not_reaped() {
   pass "ghost reconciliation never reaps a crew on a single transient dead read - it must resolve alive twice-checked, not once"
 }
 
+test_missing_tmux_probe_fails_once_without_reaping_any_live_record() {
+  local dir fakebin fake_root home windows tmux_log treehouse_log dm_calls
+  local tool tool_path out rc before after
+  dir="$TMP_ROOT/missing-tmux-probe"
+  mkdir -p "$dir"
+  fakebin=$(make_fake_tooling "$dir")
+  rm -f "$fakebin/tmux"
+  for tool in bash cat dirname find grep mktemp mv rm sed sleep stat uname; do
+    tool_path=$(command -v "$tool") || fail "test prerequisite unavailable: $tool"
+    ln -s "$tool_path" "$fakebin/$tool"
+  done
+  [ ! -e "$fakebin/tmux" ] || fail "missing-tmux fixture accidentally retained tmux"
+
+  fake_root=$(make_fake_root "$dir/fake-root")
+  home=$(setup_home "$dir/home")
+  windows="$dir/windows"
+  tmux_log="$dir/tmux.log"
+  treehouse_log="$dir/treehouse.log"
+  dm_calls="$dir/dm-calls"
+  : > "$windows"
+  : > "$tmux_log"
+  : > "$treehouse_log"
+  fm_write_meta "$home/state/alpha.meta" \
+    "window=fleet:fm-alpha" \
+    "worktree=$dir/alpha-worktree" \
+    "project=$dir/alpha-project" \
+    "harness=echo" \
+    "kind=ship" \
+    "mode=local-only"
+  fm_write_meta "$home/state/bravo.meta" \
+    "window=fleet:fm-bravo" \
+    "worktree=$dir/bravo-worktree" \
+    "project=$dir/bravo-project" \
+    "harness=echo" \
+    "kind=ship" \
+    "mode=local-only"
+  printf 'working: alpha is live\n' > "$home/state/alpha.status"
+  printf 'working: bravo is live\n' > "$home/state/bravo.status"
+  before=$(cksum "$home/state/alpha.meta" "$home/state/alpha.status" \
+    "$home/state/bravo.meta" "$home/state/bravo.status")
+
+  out=$(FM_TEST_RUN_PATH="$fakebin" run_reconcile \
+    "$fakebin" "$home" "$fake_root" "$windows" "$tmux_log" \
+    "$treehouse_log" "$dm_calls" 2>&1)
+  rc=$?
+  after=$(cksum "$home/state/alpha.meta" "$home/state/alpha.status" \
+    "$home/state/bravo.meta" "$home/state/bravo.status")
+
+  assert_enumeration_failure "$out" "$rc" "missing tmux probe"
+  assert_contains "$out" "required tmux probe is unavailable" \
+    "missing tmux probe must identify the unavailable authority"
+  [ "$after" = "$before" ] ||
+    fail "missing tmux probe changed live task records instead of retaining them byte-identically"
+  [ ! -s "$treehouse_log" ] ||
+    fail "missing tmux probe entered teardown instead of stopping before every mutation"
+  pass "FC-002/FC-004: a missing tmux probe emits one failure and reaps zero live tasks"
+}
+
 test_landed_dead_meta_is_cleared
 test_corrupt_home_worktree_preserves_every_record_without_proof
 test_unreadable_state_directory_fails_loud_without_touching_records
@@ -912,3 +980,4 @@ test_landed_meta_in_recycled_slot_is_cleared_without_touching_new_holder
 test_valid_terminal_proof_clears_when_task_branch_is_already_gone
 test_complete_mixed_snapshot_dispositions_every_record
 test_transient_dead_read_is_not_reaped
+test_missing_tmux_probe_fails_once_without_reaping_any_live_record

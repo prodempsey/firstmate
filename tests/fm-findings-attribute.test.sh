@@ -35,6 +35,29 @@ cp "$CANDIDATE" "$TMP/confirmation.jsonl"
   fail "candidate-new finding did not remain blocking"
 pass "generic attribution separates inherited from candidate-new findings"
 
+# Availability is a property of this execution and is never inherited from a
+# source baseline. Phase 2's adjudicator finding is pinned here before its
+# producer lands so it cannot repeat the same FC-004 escape.
+raw oxlint scanner-unavailable null null > "$TMP/availability-base.jsonl"
+raw policy adjudicator-unavailable null null >> "$TMP/availability-base.jsonl"
+cp "$TMP/availability-base.jsonl" "$TMP/availability-candidate.jsonl"
+: > "$TMP/availability-confirmation.jsonl"
+"$ATTRIBUTOR" --base "$TMP/availability-base.jsonl" \
+  --candidate "$TMP/availability-candidate.jsonl" \
+  --confirmation "$TMP/availability-confirmation.jsonl" \
+  --out "$TMP/availability-report.json"
+jq -e '
+  (.findings|length)==2
+  and all(.findings[];
+    (.rule_id=="scanner-unavailable" or .rule_id=="adjudicator-unavailable")
+    and .attribution=="candidate-new"
+    and .blocking==true
+    and .policy_decision=="block"
+    and .stability=="not-required")
+' "$TMP/availability-report.json" >/dev/null ||
+  fail "a baseline-matching current-run availability finding was inherited or suppressed"
+pass "FC-004: scanner and adjudicator availability findings always block fresh"
+
 # A fingerprint is closed over scanner identity as well as rule, path, and
 # normalized content.
 raw base-scanner same-rule same.txt 'same source' > "$TMP/cross-scanner-base.jsonl"

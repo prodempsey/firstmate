@@ -979,22 +979,32 @@ fm_backend_composer_state() {  # <backend> <target> -> empty|pending|unknown
   esac
 }
 
-# fm_backend_target_exists: cheap, READ-ONLY existence check - does the
-# recorded TARGET endpoint still exist on BACKEND? Never starts a server or
-# session: for herdr this deliberately queries the pane directly instead of
-# going through fm_backend_herdr_target_ready (which auto-starts the herdr
-# server as a side effect via fm_backend_herdr_server_ensure - fine for an
-# operation that is about to use the pane, wrong for a passive liveness
-# probe). A gone tmux window or an unqueryable herdr pane (server down, pane
-# closed), missing zellij pane, or unreadable Orca terminal simply fails, which
-# IS "does not exist" for this purpose.
-# Mirrors fm-crew-state.sh's pane_readable check; exists here as one shared
-# primitive so callers that only need a fast alive/dead read (recovery
-# digests, the session-start fleet digest) do not re-derive it inline.
-fm_backend_target_exists() {  # <backend> <target> [expected-label]
-  local backend=$1 target=$2 expected_label=${3:-} session pane window label
+# fm_backend_target_probe: tri-state, READ-ONLY endpoint enumeration for
+# callers whose decision distinguishes positively absent from unqueryable.
+# Returns 0 for present, 1 for absent, and 2 when the backend inventory could
+# not be queried authoritatively. FM_BACKEND_TARGET_PROBE_REASON describes
+# status 2. It never starts a server or session.
+#
+# tmux is the first backend with the full distinction because its structural
+# inventory has an authoritative exit status: a completed inventory without
+# the target proves absence, while a missing binary or failed inventory proves
+# only that the question could not be answered. Other backend adapters retain
+# their existing present/absent contracts until their CLIs expose an equivalent
+# closed inventory primitive.
+FM_BACKEND_TARGET_PROBE_REASON=""
+: "$FM_BACKEND_TARGET_PROBE_REASON"
+
+fm_backend_target_probe() {  # <backend> <target> [expected-label]
+  local backend=$1 target=$2 expected_label=${3:-}
+  local session pane window label names indexes
+  # shellcheck disable=SC2034 # result global is consumed by sourcing callers.
+  FM_BACKEND_TARGET_PROBE_REASON=""
   case "$backend" in
     tmux)
+      if ! command -v tmux >/dev/null 2>&1; then
+        FM_BACKEND_TARGET_PROBE_REASON="required tmux probe is unavailable"
+        return 2
+      fi
       [ -n "$target" ] || return 1
       case "$target" in
         %[0-9]*)
@@ -1003,7 +1013,10 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
           # cannot silently resolve a pane id to a DIFFERENT pane the way it does
           # for a missing window name, but require the reported id to equal the
           # requested one anyway, so this stays exact rather than trusting exit 0.
-          pane=$(tmux display-message -p -t "$target" '#{pane_id}' 2>/dev/null) || return 1
+          pane=$(tmux display-message -p -t "$target" '#{pane_id}' 2>/dev/null) || {
+            FM_BACKEND_TARGET_PROBE_REASON="tmux pane inventory query failed"
+            return 2
+          }
           [ "$pane" = "$target" ]
           ;;
         *:*)
@@ -1019,21 +1032,35 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
           # (firstmate:0, the away-mode daemon's default supervisor target) - so
           # confirming a target always means it literally appears in tmux's own
           # inventory, never that tmux fell back to the active window.
+          names=$(tmux list-windows -a -F '#{session_name}:#{window_name}' 2>/dev/null) || {
+            FM_BACKEND_TARGET_PROBE_REASON="tmux window-name inventory query failed"
+            return 2
+          }
+          indexes=$(tmux list-windows -a -F '#{session_name}:#{window_index}' 2>/dev/null) || {
+            FM_BACKEND_TARGET_PROBE_REASON="tmux window-index inventory query failed"
+            return 2
+          }
           {
-            tmux list-windows -a -F '#{session_name}:#{window_name}' 2>/dev/null
-            tmux list-windows -a -F '#{session_name}:#{window_index}' 2>/dev/null
+            printf '%s\n' "$names"
+            printf '%s\n' "$indexes"
           } | grep -Fx -- "$target" >/dev/null
           ;;
         *)
           label=$target
           [ -z "$expected_label" ] || [ "$label" = "$expected_label" ] || return 1
-          tmux list-windows -a -F '#{window_name}' 2>/dev/null \
-            | grep -Fx -- "$label" >/dev/null
+          names=$(tmux list-windows -a -F '#{window_name}' 2>/dev/null) || {
+            FM_BACKEND_TARGET_PROBE_REASON="tmux window inventory query failed"
+            return 2
+          }
+          printf '%s\n' "$names" | grep -Fx -- "$label" >/dev/null
           ;;
       esac
       ;;
     herdr)
-      fm_backend_source herdr || return 1
+      fm_backend_source herdr || {
+        FM_BACKEND_TARGET_PROBE_REASON="herdr backend adapter is unavailable"
+        return 2
+      }
       session=${target%%:*}
       pane=${target#*:}
       [ -n "$session" ] && [ -n "$pane" ] && [ "$pane" != "$target" ] || return 1
@@ -1048,21 +1075,42 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label]
       fm_backend_herdr_cli "$session" pane get "$pane" >/dev/null 2>&1
       ;;
     zellij)
-      fm_backend_source zellij || return 1
+      fm_backend_source zellij || {
+        FM_BACKEND_TARGET_PROBE_REASON="zellij backend adapter is unavailable"
+        return 2
+      }
       fm_backend_zellij_target_ready "$target" "$expected_label"
       ;;
     orca)
-      fm_backend_source orca || return 1
+      fm_backend_source orca || {
+        FM_BACKEND_TARGET_PROBE_REASON="Orca backend adapter is unavailable"
+        return 2
+      }
       fm_backend_orca_capture "$target" 1 >/dev/null 2>&1
       ;;
     cmux)
-      fm_backend_source cmux || return 1
+      fm_backend_source cmux || {
+        FM_BACKEND_TARGET_PROBE_REASON="cmux backend adapter is unavailable"
+        return 2
+      }
       fm_backend_cmux_target_ready "$target" "$expected_label"
       ;;
     *)
-      return 1
+      FM_BACKEND_TARGET_PROBE_REASON="unknown backend '$backend'"
+      return 2
       ;;
   esac
+}
+
+# fm_backend_target_exists: compatibility boolean for passive callers that only
+# render or route on present/not-present. Probe unavailability remains false
+# here; destructive reconcilers must call fm_backend_target_probe directly and
+# retain status 2 as a blocking enumeration failure.
+fm_backend_target_exists() {  # <backend> <target> [expected-label]
+  if fm_backend_target_probe "$@"; then
+    return 0
+  fi
+  return 1
 }
 
 # fm_backend_agent_alive: CONFIDENT liveness of a live harness-agent PROCESS

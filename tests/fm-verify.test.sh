@@ -498,6 +498,37 @@ expect_code 1 "$rc" "no tests exits 1"
 [ "$(bget "$TMP/notests.json" '.findings[]|select(.code=="no-tests")|.code')" = no-tests ] || fail "expected no-tests finding"
 pass "tests: failing suite, SKIP, and no-tests each fail"
 
+# --- F8: fleet-bridge suite summaries are a closed assertion grammar ---------
+RFS=$(build_repo fleet-suite-summary)
+echo feat >> "$RFS/f.txt"
+git -C "$RFS" commit -qam "fleet suite summary fixture"
+FSSHA=$(git -C "$RFS" rev-parse HEAD)
+rc=$(verify "$TMP/fleet-suite-pass.json" \
+  --worktree "$RFS" --base main --sha "$FSSHA" --branch fm/g1 --task g1 \
+  --tests-cmd "printf '%s\\n' 'SUITE PASS — 114 passed, 0 skipped, 0 failed'")
+expect_code 0 "$rc" "fleet-bridge SUITE PASS exits 0"
+[ "$(bget "$TMP/fleet-suite-pass.json" '.gates[]|select(.gate=="tests")|.details.totals.ok')" = 114 ] ||
+  fail "fleet-bridge SUITE PASS count was not parsed as passing assertions"
+[ "$(bget "$TMP/fleet-suite-pass.json" '[.findings[]|select(.code=="no-assertions")]|length')" = 0 ] ||
+  fail "recognized fleet-bridge SUITE PASS retained the false no-assertions finding"
+
+rc=$(verify "$TMP/fleet-suite-fail.json" \
+  --worktree "$RFS" --base main --sha "$FSSHA" --branch fm/g1 --task g1 \
+  --tests-cmd "printf '%s\\n' 'SUITE FAIL - 113 passed, 0 skipped, 1 failed'")
+expect_code 1 "$rc" "fleet-bridge SUITE FAIL exits 1 even when the command exits 0"
+[ "$(bget "$TMP/fleet-suite-fail.json" '.gates[]|select(.gate=="tests")|.details.totals.not_ok')" = 1 ] ||
+  fail "fleet-bridge SUITE FAIL count was not parsed as a failing assertion"
+[ "$(bget "$TMP/fleet-suite-fail.json" '[.findings[]|select(.code=="assertions-failed")]|length')" = 1 ] ||
+  fail "fleet-bridge SUITE FAIL did not produce the assertions-failed finding"
+
+rc=$(verify "$TMP/fleet-suite-unknown.json" \
+  --worktree "$RFS" --base main --sha "$FSSHA" --branch fm/g1 --task g1 \
+  --tests-cmd "printf '%s\\n' 'PASS some-file.mjs' 'SUITE PASS — many passed, 0 skipped, 0 failed'")
+expect_code 1 "$rc" "unknown suite-summary format remains unproved"
+[ "$(bget "$TMP/fleet-suite-unknown.json" '[.findings[]|select(.code=="no-assertions")]|length')" = 1 ] ||
+  fail "unknown suite-summary format bypassed the no-assertions finding"
+pass "F8: fleet-bridge SUITE PASS/FAIL counts are closed-recognized and unknown formats fail closed"
+
 # --- base_currency: stale base fails; trunk-check current/missing -------------
 RSt=$(build_repo stale)
 git -C "$RSt" checkout -q main
