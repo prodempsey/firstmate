@@ -295,6 +295,38 @@ test_builder_brief_refuses_unreadable_ledger() {
   pass "fm-brief.sh: builder scaffolds fail closed on an unreadable ledger without changing secondmate charters"
 }
 
+test_cue_lint_done_contract_and_qa_rerun() {
+  local home id brief invocation
+  home="$TMP_ROOT/cue-lint-contract-home"
+  invocation="$ROOT/bin/fm-failure-class.sh cue-lint"
+  write_registry "$home"
+
+  for id_proj in "brief-cue-nomistakes:no-registry-proj" "brief-cue-directpr:direct-proj" "brief-cue-localonly:local-proj"; do
+    id=${id_proj%%:*}
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" "${id_proj##*:}" >/dev/null 2>&1
+    brief="$home/data/$id/brief.md"
+    assert_grep "Before appending any \`done:\` status, run \`$invocation\`" "$brief" \
+      "$id: ship Definition of done missing the exact cue-lint invocation"
+    assert_grep "explicitly list each remaining hit with a one-line justification in the \`done:\` line" "$brief" \
+      "$id: ship Definition of done missing the justified-hit requirement"
+    assert_grep "An unexplained cue hit is a contract violation." "$brief" \
+      "$id: ship Definition of done does not make unexplained hits a contract violation"
+  done
+
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-cue-qa-bundle someproj --scout \
+    --gauntlet-bundle "$home/data/candidate/verify-bundle.json" >/dev/null 2>&1
+  assert_grep "re-run \`$invocation\` from the candidate worktree" \
+    "$home/data/brief-cue-qa-bundle/brief.md" \
+    "bundle-backed QA brief missing the exact cue-lint rerun"
+
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-cue-qa-waived someproj --scout \
+    --gauntlet-waived "fixture waiver" >/dev/null 2>&1
+  assert_grep "Run \`$invocation\` from the candidate worktree" \
+    "$home/data/brief-cue-qa-waived/brief.md" \
+    "waived QA brief missing the exact cue-lint rerun"
+  pass "fm-brief.sh: all ship modes self-check cue hits and QA briefs rerun the same entrypoint"
+}
+
 # Scout/QA briefs must carry the Review practice block: neutral software-QA
 # framing (no adversarial/attack vocabulary that trips provider filters) and the
 # fleet-bridge headless-Chrome rig guidance in place of chrome-devtools-axi.
@@ -369,5 +401,6 @@ test_herdr_lab_contract_applies_to_scouts_but_not_secondmates
 test_secondmate_no_projects_charter
 test_builder_standing_invariants_block
 test_builder_brief_refuses_unreadable_ledger
+test_cue_lint_done_contract_and_qa_rerun
 test_scout_review_practice_block
 test_pause_verb_override_renders_all_brief_scaffolds

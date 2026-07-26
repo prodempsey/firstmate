@@ -47,6 +47,7 @@
 #   fm-failure-class.sh bump <id> --provenance <type>:<ref>[:<note>] [--note <text>]
 #   fm-failure-class.sh amend <id> --detection '<json-object>' [--detection ...] [--cue <text> ...]
 #        # append detection/cue tripwires onto an existing class (class-amended, folded at read)
+#   fm-failure-class.sh cue-lint [<base-ref>]   # lint the current HEAD branch diff
 #   fm-failure-class.sh refinements [--json]   # classes at/over the refinement threshold, with provenance
 #   fm-failure-class.sh register [--id <FC-NNN> ...] [--live] [--gate <ref>] [--json]
 #
@@ -424,6 +425,99 @@ cmd_bump() {
   fi
 }
 
+# cue-lint: run every executable detection from the single proven ledger snapshot
+# against lines added by the current HEAD branch. An explicit base ref may be
+# supplied; otherwise prefer the remote default branch, then local main/master.
+# This is the builder/reviewer entrypoint embedded by fm-brief.sh.
+cmd_cue_lint() {
+  [ "$#" -le 1 ] || die "cue-lint accepts at most one base ref"
+  command -v git >/dev/null 2>&1 || die "cue-lint requires git"
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "cue-lint must run from inside the candidate worktree"
+
+  local base_ref=${1:-} candidate base_sha head_sha diff_base
+  if [ -z "$base_ref" ]; then
+    for candidate in refs/remotes/origin/HEAD refs/remotes/fork/HEAD refs/heads/main refs/heads/master; do
+      if git rev-parse --verify "$candidate^{commit}" >/dev/null 2>&1; then
+        base_ref=$candidate
+        break
+      fi
+    done
+  fi
+  [ -n "$base_ref" ] || die "cue-lint cannot resolve a default branch; pass an explicit base ref"
+  base_sha=$(git rev-parse --verify "$base_ref^{commit}" 2>/dev/null) \
+    || die "cue-lint cannot resolve base ref: $base_ref"
+  head_sha=$(git rev-parse --verify "HEAD^{commit}" 2>/dev/null) \
+    || die "cue-lint cannot resolve HEAD"
+  diff_base=$(git merge-base "$base_sha" "$head_sha" 2>/dev/null) \
+    || die "cue-lint cannot find a merge base between $base_ref and HEAD"
+
+  local snapshot tmp diff_file added_file matches_file hits_file
+  snapshot=$(fold_or_die)
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-cue-lint.XXXXXX") \
+    || die "cue-lint cannot create a temporary directory"
+  diff_file="$tmp/branch.diff"
+  added_file="$tmp/added.tsv"
+  matches_file="$tmp/matches.tsv"
+  hits_file="$tmp/hits.tsv"
+  : > "$hits_file"
+
+  if ! git diff --no-ext-diff "$diff_base...$head_sha" > "$diff_file" 2>/dev/null; then
+    rm -rf "$tmp"
+    die "cue-lint cannot read the branch diff"
+  fi
+  awk '
+    /^\+\+\+ / { file=$2; sub(/^b\//, "", file); next }
+    /^--- / { next }
+    /^@@ / {
+      if (match($0, /\+[0-9]+/)) line=substr($0, RSTART+1, RLENGTH-1)+0
+      next
+    }
+    /^\+/ { print file "\t" line "\t" substr($0, 2); line++; next }
+    /^-/ { next }
+    /^ / { line++; next }
+  ' "$diff_file" > "$added_file"
+
+  local class row id name pattern cue_ref file line
+  while IFS= read -r class; do
+    [ -n "$class" ] || continue
+    id=$(printf '%s' "$class" | jq -r '.id')
+    name=$(printf '%s' "$class" | jq -r '.name')
+    while IFS= read -r row; do
+      [ -n "$row" ] || continue
+      pattern=$(printf '%s' "$row" | jq -r '.pattern')
+      cue_ref=$(printf '%s' "$row" | jq -r '.cue_ref')
+      if ! awk -F'\t' -v ere="$pattern" '
+        {
+          text=$0
+          sub(/^[^\t]*\t[^\t]*\t/, "", text)
+          if (text ~ ere) print
+        }
+      ' "$added_file" > "$matches_file" 2>/dev/null; then
+        rm -rf "$tmp"
+        die "cue-lint detection execution failed for $id"
+      fi
+      while IFS=$'\t' read -r file line _; do
+        [ -n "$file" ] || continue
+        printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$file" "$line" "$name" "$cue_ref" >> "$hits_file"
+      done < "$matches_file"
+    done < <(printf '%s' "$class" | jq -c '(.detection // [])[]')
+  done < <(printf '%s' "$snapshot" | jq -c '.[]')
+
+  local hits=0
+  hits=$(wc -l < "$hits_file" | tr -d ' ')
+  if [ "$hits" -gt 0 ]; then
+    while IFS=$'\t' read -r id file line name cue_ref; do
+      printf '%s %s:%s - %s: %s\n' "$id" "$file" "$line" "$name" "$cue_ref"
+    done < "$hits_file"
+    rm -rf "$tmp"
+    echo "CUE_LINT_HITS=$hits base=$diff_base head=$head_sha" >&2
+    return 1
+  fi
+  rm -rf "$tmp"
+  echo "CUE_LINT_OK=1 base=$diff_base head=$head_sha"
+}
+
 # amend: append machine-readable DETECTION cues (and/or natural-language cues) onto an
 # already-defined class, as a `class-amended` event folded at read - the same append-only
 # idiom as `bump`, so a class seeded without a detection tripwire can graduate its cues into
@@ -602,6 +696,7 @@ main() {
     ensure) cmd_ensure "$@" ;;
     bump) cmd_bump "$@" ;;
     amend) cmd_amend "$@" ;;
+    cue-lint) cmd_cue_lint "$@" ;;
     refinements) cmd_refinements "$@" ;;
     register) cmd_register "$@" ;;
     -h|--help|help) usage ;;

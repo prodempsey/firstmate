@@ -152,6 +152,38 @@ printf '{"schema":"kraken-failure-class/ledger-event/v1","event":"occurrence","i
 FM_FC_LEDGER="$C" "$FC" list >/dev/null 2>&1
 expect_code 1 $? "list fails closed on an occurrence for an unknown class (corrupt ledger)"
 
+# --- cue-lint: current branch diff, proven ledger, fail-closed hits ----------
+CL="$TMP_ROOT/cue-lint.jsonl"
+seed_one "$CL"
+FM_FC_LEDGER="$CL" "$FC" amend FC-001 \
+  --detection '{"engine":"awk-ere","pattern":"danger-cue","cue_ref":"fixture danger"}' >/dev/null
+CLR="$TMP_ROOT/cue-lint-repo"
+fm_git_init_commit "$CLR"
+git -C "$CLR" branch -M main
+git -C "$CLR" checkout -qb fm/cue-lint
+printf '%s\n' 'safe change' > "$CLR/feature.txt"
+git -C "$CLR" add feature.txt
+git -C "$CLR" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm safe
+out=$(cd "$CLR" && FM_FC_LEDGER="$CL" "$FC" cue-lint 2>&1)
+expect_code 0 $? "cue-lint passes a branch diff with no detection hit"
+assert_contains "$out" "CUE_LINT_OK=1" "cue-lint clean result omitted its positive proof"
+
+printf '%s\n' 'danger-cue' >> "$CLR/feature.txt"
+git -C "$CLR" add feature.txt
+git -C "$CLR" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm hit
+out=$(cd "$CLR" && FM_FC_LEDGER="$CL" "$FC" cue-lint 2>&1)
+expect_code 1 $? "cue-lint fails when the branch diff hits a ledger detection"
+assert_contains "$out" "FC-001 feature.txt:2" "cue-lint hit omitted its class and branch-diff location"
+assert_contains "$out" "fixture danger" "cue-lint hit omitted its ledger cue reference"
+assert_contains "$out" "CUE_LINT_HITS=1" "cue-lint hit result omitted its count"
+
+CL_BAD="$TMP_ROOT/cue-lint-bad.jsonl"
+printf '{broken\n' > "$CL_BAD"
+out=$(cd "$CLR" && FM_FC_LEDGER="$CL_BAD" "$FC" cue-lint 2>&1)
+expect_code 1 $? "cue-lint fails closed when the ledger authority refuses"
+assert_contains "$out" "ledger refused" "cue-lint ledger refusal was not loud"
+pass "cue-lint checks the current branch diff through the proven ledger and fails closed"
+
 # --- the COMMITTED seed ledger is well-formed and complete ------------------
 if "$FC" validate | grep -q 'FAILURE_CLASSES_OK=7'; then
   pass "committed ledger validates with 7 seed classes"; else fail "committed ledger is not 7 valid classes"; fi

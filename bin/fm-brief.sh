@@ -140,6 +140,7 @@ KD_NOTE=""
 [ "$KD_REVIEW" = 1 ] && KD_NOTE=" +kd-review"
 [ -n "$GAUNTLET_BUNDLE" ] && KD_NOTE="$KD_NOTE +shakedown"
 [ -n "$GAUNTLET_WAIVED" ] && KD_NOTE="$KD_NOTE +shakedown-waived"
+CUE_LINT_INVOCATION="$FM_ROOT/bin/fm-failure-class.sh cue-lint"
 
 # --kd-review/--visual-review appends this visual-review contract to a ship or
 # scout brief. It routes a rendered UI/design/mockup into one self-contained
@@ -160,6 +161,7 @@ This QA review starts from a machine-checked evidence bundle produced by the pre
 Read the human summary first: \`$summary\`
 The full bundle is \`$bundle\` (schema \`firstmate/verify-bundle/1\`). It binds the exact HEAD SHA and branch under review and records, per gate: a clean-tree attestation, base currency, the executed-test transcript (SKIP, TIMEOUT, and no-tests are findings, never passes), failure-class cue-lint results, and the dispatch-contract checklist.
 Those mechanical checks are already proven, so do not re-litigate them: spend your whole budget on the semantics a script cannot verify - whether the change does the right thing, whether the tests are meaningful, whether the edge cases are real.
+As the required reviewer freshness check, re-run \`$CUE_LINT_INVOCATION\` from the candidate worktree against its current branch diff before reporting the verdict.
 If the bundle's \`candidate.head_sha\` does not match the commit you are actually reviewing, stop and report it: the evidence is stale and the review is unsafe.
 EOF
 }
@@ -175,6 +177,7 @@ emit_gauntlet_waived_section() {
 The pre-QA verifier (\`fm-verify.sh\`) was explicitly waived for this scout.
 Reason: $reason
 No executed evidence bundle backs this review, so nothing mechanical has been proven up front. Treat test execution, SHA/branch identity, tree cleanliness, and base currency as unverified and check them yourself if they bear on your findings.
+Run \`$CUE_LINT_INVOCATION\` from the candidate worktree against its current branch diff before reporting the verdict.
 EOF
 }
 
@@ -385,6 +388,13 @@ read -r MODE _ <<EOF
 $("$FM_ROOT/bin/fm-project-mode.sh" "$REPO")
 EOF
 
+BUILDER_SELF_CHECK=$(cat <<EOF
+Before appending any \`done:\` status, run \`$CUE_LINT_INVOCATION\` from this worktree against the current branch diff.
+Fix every reported cue hit, or explicitly list each remaining hit with a one-line justification in the \`done:\` line.
+An unexplained cue hit is a contract violation.
+EOF
+)
+
 case "$MODE" in
   direct-PR)
     SETUP2=""
@@ -393,6 +403,7 @@ case "$MODE" in
 # Definition of done
 This project ships **direct-PR**: you raise the PR yourself, without the no-mistakes pipeline.
 The task is complete only when committed on your branch.
+$BUILDER_SELF_CHECK
 When it is implemented and committed, push your branch and open a PR with \`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
 Do NOT run /no-mistakes. The captain reviews and merges the PR; firstmate relays it.
 EOF
@@ -406,6 +417,7 @@ EOF
 This project ships **local-only**: no remote, no PR, no pipeline.
 The task is complete only when committed on your branch \`fm/$ID\`. Do NOT push, do NOT open a PR, do NOT merge.
 Keep your branch a clean fast-forward onto the current default branch - if \`main\` has advanced, rebase onto it so the eventual merge stays a fast-forward.
+$BUILDER_SELF_CHECK
 When it is implemented and committed, append \`done: ready in branch fm/$ID\` to the status file and stop.
 Firstmate then reviews your branch diff, the captain approves, and firstmate merges it into local \`main\`.
 EOF
@@ -418,6 +430,7 @@ EOF
     DOD=$(cat <<EOF
 # Definition of done
 The task is complete only when committed on your branch.
+$BUILDER_SELF_CHECK
 When you believe it is complete, append \`done: {summary}\` to the status file and stop.
 Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
 
