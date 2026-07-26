@@ -280,6 +280,15 @@ if ! FAILURE_CLASSES_JSON=$("$SCRIPT_DIR/fm-failure-class.sh" list --json); then
   echo "error: refusing to scaffold $KIND brief: current failure-class invariants are unavailable" >&2
   exit 1
 fi
+FAILURE_CLASS_COUNT=""
+if ! FAILURE_CLASS_COUNT=$(printf '%s' "$FAILURE_CLASSES_JSON" | jq -r 'length'); then
+  echo "error: refusing to scaffold $KIND brief: proven failure-class snapshot could not be counted" >&2
+  exit 1
+fi
+if [ "$FAILURE_CLASS_COUNT" -eq 0 ]; then
+  echo "error: refusing to scaffold $KIND brief: proven failure-class snapshot contains zero invariants" >&2
+  exit 1
+fi
 STANDING_INVARIANTS=""
 if ! STANDING_INVARIANTS=$(printf '%s' "$FAILURE_CLASSES_JSON" \
   | jq -r '.[] | "- \(.id): \(.invariant)"'); then

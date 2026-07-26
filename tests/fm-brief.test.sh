@@ -268,8 +268,8 @@ test_builder_standing_invariants_block() {
   pass "fm-brief.sh: ship and scout briefs embed every current invariant from the proven ledger snapshot"
 }
 
-test_builder_brief_refuses_unreadable_ledger() {
-  local home ledger out status=0
+test_builder_brief_refuses_unavailable_or_empty_ledger() {
+  local home ledger empty kind id out status=0
   home="$TMP_ROOT/unreadable-ledger-home"
   ledger="$TMP_ROOT/unreadable-ledger.jsonl"
   mkdir -p "$home/data"
@@ -292,7 +292,26 @@ test_builder_brief_refuses_unreadable_ledger() {
   assert_present "$home/data/secondmate-unreadable/brief.md" \
     "secondmate charter was not scaffolded independently of the ledger"
   chmod 600 "$ledger"
-  pass "fm-brief.sh: builder scaffolds fail closed on an unreadable ledger without changing secondmate charters"
+
+  empty="$TMP_ROOT/empty-ledger.jsonl"
+  : > "$empty"
+  for kind in ship scout; do
+    id="brief-empty-$kind"
+    status=0
+    if [ "$kind" = scout ]; then
+      out=$(FM_HOME="$home" FM_FC_LEDGER="$empty" \
+        "$ROOT/bin/fm-brief.sh" "$id" someproj --scout 2>&1) || status=$?
+    else
+      out=$(FM_HOME="$home" FM_FC_LEDGER="$empty" \
+        "$ROOT/bin/fm-brief.sh" "$id" someproj 2>&1) || status=$?
+    fi
+    expect_code 1 "$status" "$kind scaffold must refuse a zero-byte failure-class ledger"
+    assert_contains "$out" "proven failure-class snapshot contains zero invariants" \
+      "$kind scaffold's zero-invariant refusal was not loud"
+    assert_absent "$home/data/$id/brief.md" \
+      "$kind scaffold emitted a brief from a zero-byte ledger"
+  done
+  pass "fm-brief.sh: builder scaffolds fail closed on unavailable or empty ledgers without changing secondmate charters"
 }
 
 test_cue_lint_done_contract_and_qa_rerun() {
@@ -400,7 +419,7 @@ test_herdr_lab_omission_is_loud_for_ship_and_scout
 test_herdr_lab_contract_applies_to_scouts_but_not_secondmates
 test_secondmate_no_projects_charter
 test_builder_standing_invariants_block
-test_builder_brief_refuses_unreadable_ledger
+test_builder_brief_refuses_unavailable_or_empty_ledger
 test_cue_lint_done_contract_and_qa_rerun
 test_scout_review_practice_block
 test_pause_verb_override_renders_all_brief_scaffolds
