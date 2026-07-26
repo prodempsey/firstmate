@@ -687,6 +687,8 @@ if command -v python3 >/dev/null 2>&1 && python3 -c 'import jsonschema' 2>/dev/n
   L="$TMP/rd-envdup.jsonl"; inject "$L" '{"schema":"kraken-failure-class/ledger-event/v1","event":"occurrence","id":"FC-001","id":"FC-002","provenance":{"type":"q","ref":"r"}}'; read_fail_closed "$L" "R5 read: DUP member on the ledger envelope"
   L="$TMP/rd-nestdup.jsonl"; inject "$L" '{"schema":"kraken-failure-class/ledger-event/v1","event":"occurrence","id":"FC-001","provenance":{"type":"q","ref":"r","ref":"r2"}}'; read_fail_closed "$L" "R5 read: DUP member nested in a value object"
   L="$TMP/rd-dupid.jsonl"; cp "$LEDGER" "$L"; grep '"event":"class-defined".*"id":"FC-001"' "$LEDGER" | head -1 >> "$L"; read_fail_closed "$L" "R5 read: duplicate class id"
+  # Undeclared property nested in a value object (a new class-defined whose registry carries a rogue key).
+  L="$TMP/rd-nestundecl.jsonl"; inject "$L" '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-defined","id":"FC-099","name":"n","invariant":"i","cues":["c"],"fix":"f","provenance":[{"type":"qa","ref":"r"}],"registry":{"memory_type":"procedural","scope":"fleet","confidence":"guarded","keywords":["k"],"rogue":1}}'; read_fail_closed "$L" "R5 read: undeclared property nested in a value object"
   # Lexical / encoding fixtures.
   L="$TMP/rd-bom.jsonl"; printf '\xef\xbb\xbf' > "$L"; cat "$LEDGER" >> "$L"; read_fail_closed "$L" "R5 read: leading UTF-8 BOM"
   L="$TMP/rd-bomline.jsonl"; cp "$LEDGER" "$L"; printf '\xef\xbb\xbf%s\n' "$(occ)" >> "$L"; read_fail_closed "$L" "R5 read: BOM on a non-initial line"
@@ -696,10 +698,22 @@ if command -v python3 >/dev/null 2>&1 && python3 -c 'import jsonschema' 2>/dev/n
   L="$TMP/rd-emptyline.jsonl"; cp "$LEDGER" "$L"; printf '\n%s\n' "$(occ)" >> "$L"; read_fail_closed "$L" "R5 read: an empty line"
   L="$TMP/rd-wsline.jsonl"; cp "$LEDGER" "$L"; printf '   \n%s\n' "$(occ)" >> "$L"; read_fail_closed "$L" "R5 read: a whitespace-only line"
   read_fail_closed "$TMP/rd-missing-does-not-exist.jsonl" "R5 read: a MISSING ledger fails closed (distinct from empty)"
-  read_fail_closed "$LEDGER" "R5 read: python3 absent fails closed" "FM_CUE_SIMULATE_MISSING=python3"
-  read_fail_closed "$LEDGER" "R5 read: jsonschema absent fails closed" "FM_CUE_SIMULATE_MISSING=jsonschema"
-  # REGRESSION (qa-scg1r5-q185 F1): an ambient FM_CUE_VALIDATOR / FM_CUE_SCHEMAS_DIR cannot substitute
-  # the authority on the read path either - a malformed ledger must STILL fail the cue lint closed.
+  # Both engines absent via the FIXTURE-GATED sandbox marker (a copy of the ledger in a dedicated dir
+  # so the marker cannot touch the committed production ledger). No ambient variable is used.
+  SB="$TMP/read-sim"; mkdir -p "$SB"; cp "$LEDGER" "$SB/l.jsonl"
+  printf 'python3\n' > "$SB/.fm-cue-test-sandbox"; read_fail_closed "$SB/l.jsonl" "R5 read: python3 absent (sandbox marker) fails closed"
+  printf 'jsonschema\n' > "$SB/.fm-cue-test-sandbox"; read_fail_closed "$SB/l.jsonl" "R5 read: jsonschema absent (sandbox marker) fails closed"
+  rm -f "$SB/.fm-cue-test-sandbox"
+  # PLAIN-SHELL BYPASS (qa-scg1r6-q187 F1): a bare ambient FM_CUE_SIMULATE_MISSING must NOT engage the
+  # read-path seam - a valid ledger with no marker must NOT produce a ledger-unreadable finding.
+  FM_CUE_SIMULATE_MISSING=python3 FM_HOME="$TMP/nhbypass" FM_FAILURE_LEDGER="$SB/l.jsonl" "$VERIFY" --out "$TMP/rbypass.json" --brief "$BRIEF" \
+    --worktree "$RCu" --base main --sha "$USHA" --branch fm/g1 --task g1 >/dev/null 2>&1
+  if [ "$(bget "$TMP/rbypass.json" '[.findings[]|select(.gate=="cue_lint" and .code=="ledger-unreadable")]|length')" = 0 ]; then
+    pass "R5 read: a bare ambient FM_CUE_SIMULATE_MISSING cannot engage the seam (plain-shell bypass)"
+  else fail "a bare FM_CUE_SIMULATE_MISSING must not engage the read-path seam"; fi
+  # REGRESSION (qa-scg1r5-q185 F1): an ambient FM_CUE_VALIDATOR / FM_CUE_SCHEMAS_DIR (and the now-dead
+  # FM_CUE_SIMULATE_MISSING) cannot substitute the authority on the read path - a malformed ledger must
+  # STILL fail the cue lint closed.
   L="$TMP/rd-override.jsonl"; printf '{broken-json\n' > "$L"
   read_fail_closed "$L" "R5 read: ambient FM_CUE_VALIDATOR override cannot authorize a malformed ledger (F1)" "FM_CUE_VALIDATOR=true FM_CUE_SCHEMAS_DIR=/tmp FM_CUE_SIMULATE_MISSING=python3"
   # An EMPTY-but-present ledger is valid-empty on the read path: no cues to lint, gate passes, no hit.

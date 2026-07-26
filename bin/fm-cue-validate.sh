@@ -30,9 +30,14 @@
 #
 # An empty-but-present ledger (zero events) is valid-empty: `prove` prints "[]" and exits 0.
 #
-# Test seam: FM_CUE_SIMULATE_MISSING may list "python3" and/or "jsonschema" (comma-separated) to
-# force the corresponding CUE_VALIDATOR_UNAVAILABLE refusal WITHOUT uninstalling a real dependency.
-# It can ONLY force a refusal, never a false pass.
+# Test seam (fixture-gated, NOT an ambient variable): a missing-prerequisite simulation engages ONLY
+# when BOTH hold - a sandbox marker file `.fm-cue-test-sandbox` exists in the fixture's own directory
+# AND the target being validated lives in that same directory (the marker is looked up in the
+# target's own directory, so the target is inside the fixture dir by construction). The marker's
+# content lists the engine(s) to simulate absent (`python3` and/or `jsonschema`). No environment
+# variable can engage it, and no stray marker in a production home can either, because a production
+# ledger's directory (the committed docs/failure-classes/) carries no such marker. It can ONLY force
+# a refusal, never a false pass.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,11 +53,20 @@ case "$SUBCMD" in
 esac
 [ -n "$TARGET" ] || { echo "fm-cue-validate: a target path is required" >&2; exit 2; }
 
+# Read the fixture-gated simulation marker from the TARGET's own directory (both conditions: the
+# marker exists in that directory, and the target is inside it). Absent marker => no simulation.
+SIMULATE_MISSING=""
+_target_dir=$(dirname "$TARGET")
+if [ -d "$_target_dir" ]; then
+  _marker="$(cd "$_target_dir" && pwd)/.fm-cue-test-sandbox"
+  [ -f "$_marker" ] && SIMULATE_MISSING=$(tr '\n' ',' < "$_marker" 2>/dev/null)
+fi
+
 # python3 is a HARD prerequisite. Absence is non-authoritative and fails closed.
-case ",${FM_CUE_SIMULATE_MISSING:-}," in
+case ",$SIMULATE_MISSING," in
   *,python3,*)
     echo "CUE_VALIDATOR_UNAVAILABLE" >&2
-    echo "fm-cue-validate: python3 unavailable (simulated); refusing rather than degrading" >&2
+    echo "fm-cue-validate: python3 unavailable (test sandbox); refusing rather than degrading" >&2
     exit 1 ;;
 esac
 if ! command -v python3 >/dev/null 2>&1; then
@@ -61,14 +75,12 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-python3 - "$SUBCMD" "$TARGET" "$SCHEMAS_DIR" <<'PYEOF'
+python3 - "$SUBCMD" "$TARGET" "$SCHEMAS_DIR" "$SIMULATE_MISSING" <<'PYEOF'
 import json, os, subprocess, sys
 
-MODE, TARGET, SCHEMAS_DIR = sys.argv[1], sys.argv[2], sys.argv[3]
+MODE, TARGET, SCHEMAS_DIR, SIMULATE_MISSING = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
-_SIMULATE_MISSING = set(
-    m for m in os.environ.get("FM_CUE_SIMULATE_MISSING", "").split(",") if m
-)
+_SIMULATE_MISSING = set(m for m in SIMULATE_MISSING.split(",") if m)
 
 
 def unavailable(msg):

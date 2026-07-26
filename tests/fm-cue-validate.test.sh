@@ -98,12 +98,33 @@ else
   fail "empty-present ledger must be valid-empty"
 fi
 
-# --- engine fail-closed (hard prerequisites) --------------------------------
-led="$TMP/ok.jsonl"; printf '%s\n' "$CD" > "$led"
-FM_CUE_SIMULATE_MISSING=python3 "$V" prove "$led" >/dev/null 2>"$TMP/e"
-if [ "$(sed -n 1p "$TMP/e")" = CUE_VALIDATOR_UNAVAILABLE ]; then pass "python3 absent -> CUE_VALIDATOR_UNAVAILABLE (fail closed)"; else fail "python3 absent must refuse"; fi
-FM_CUE_SIMULATE_MISSING=jsonschema "$V" prove "$led" >/dev/null 2>"$TMP/e"
-if [ "$(sed -n 1p "$TMP/e")" = CUE_VALIDATOR_UNAVAILABLE ]; then pass "jsonschema absent -> CUE_VALIDATOR_UNAVAILABLE (fail closed)"; else fail "jsonschema absent must refuse"; fi
+# --- engine fail-closed via the FIXTURE-GATED sandbox marker (never an ambient variable) ----
+# The simulation engages only when the marker file sits in the validated ledger's OWN directory, so
+# the fixture owns it entirely. It is placed in a dedicated sub-directory so it cannot leak into any
+# other fixture's proof.
+SIMDIR="$TMP/sim"; mkdir -p "$SIMDIR"; printf '%s\n' "$CD" > "$SIMDIR/l.jsonl"
+printf 'python3\n' > "$SIMDIR/.fm-cue-test-sandbox"
+"$V" prove "$SIMDIR/l.jsonl" >/dev/null 2>"$TMP/e"
+if [ "$(sed -n 1p "$TMP/e")" = CUE_VALIDATOR_UNAVAILABLE ]; then pass "python3 absent (sandbox marker) -> CUE_VALIDATOR_UNAVAILABLE (fail closed)"; else fail "python3 absent must refuse"; fi
+printf 'jsonschema\n' > "$SIMDIR/.fm-cue-test-sandbox"
+"$V" prove "$SIMDIR/l.jsonl" >/dev/null 2>"$TMP/e"
+if [ "$(sed -n 1p "$TMP/e")" = CUE_VALIDATOR_UNAVAILABLE ]; then pass "jsonschema absent (sandbox marker) -> CUE_VALIDATOR_UNAVAILABLE (fail closed)"; else fail "jsonschema absent must refuse"; fi
+rm -f "$SIMDIR/.fm-cue-test-sandbox"
+
+# --- PLAIN-SHELL BYPASS (qa-scg1r6-q187 F1): the seam is un-engageable outside its fixture --------
+# A bare ambient variable must NOT engage the seam, and a marker in a DIFFERENT directory must NOT
+# engage it: only a marker co-located with the validated ledger does.
+if FM_CUE_SIMULATE_MISSING=python3 "$V" prove "$SIMDIR/l.jsonl" >/dev/null 2>&1; then
+  pass "a bare ambient FM_CUE_SIMULATE_MISSING cannot engage the seam (plain-shell bypass)"
+else
+  fail "the injection seam must NOT be engageable from a bare env var"
+fi
+mkdir -p "$TMP/stray"; printf 'python3\n' > "$TMP/stray/.fm-cue-test-sandbox"
+if "$V" prove "$SIMDIR/l.jsonl" >/dev/null 2>&1; then
+  pass "a sandbox marker in a different directory cannot engage the seam"
+else
+  fail "a stray marker outside the validated ledger's directory must NOT engage the seam"
+fi
 
 # --- check-row: the raw single-row entrypoint (write path uses this pre-jq) --
 check_row() { printf '%s' "$1" > "$TMP/row.json"; "$V" check-row "$TMP/row.json" >/dev/null 2>&1; }

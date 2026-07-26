@@ -369,6 +369,13 @@ if command -v python3 >/dev/null 2>&1 && python3 -c 'import jsonschema' 2>/dev/n
   L="$TMP_ROOT/mal-ws.jsonl"; printf '   \n%s\n' "$VALID_LINE" > "$L"; refuses_byte_identical "$L" "append to a ledger with a whitespace-only line"
   L="$TMP_ROOT/mal-nonl.jsonl"; printf '%s' "$VALID_LINE" > "$L"; refuses_byte_identical "$L" "append to a ledger with no final newline"
   L="$TMP_ROOT/mal-dupid.jsonl"; printf '%s\n%s\n' "$VALID_LINE" "$VALID_LINE" > "$L"; refuses_byte_identical "$L" "append to a duplicate-class-id ledger"
+  L="$TMP_ROOT/mal-after.jsonl"; printf '%s\n{broken-json\n' "$VALID_LINE" > "$L"; refuses_byte_identical "$L" "append to a ledger with malformed JSON AFTER a valid line"
+  # A nested undeclared property (registry.rogue) makes the existing ledger invalid -> every verb refuses.
+  L="$TMP_ROOT/mal-nestundecl.jsonl"; printf '%s\n' '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-defined","id":"FC-001","name":"n","invariant":"i","cues":["c"],"fix":"f","provenance":[{"type":"qa","ref":"r"}],"registry":{"memory_type":"procedural","scope":"fleet","confidence":"guarded","keywords":["k"],"rogue":1}}' > "$L"; refuses_byte_identical "$L" "append to a ledger with a nested undeclared property"
+  # A nested duplicate member (provenance.ref twice) - jq would collapse it, python's parser cannot.
+  L="$TMP_ROOT/mal-nestdup.jsonl"; printf '%s\n' '{"schema":"kraken-failure-class/ledger-event/v1","event":"class-defined","id":"FC-001","name":"n","invariant":"i","cues":["c"],"fix":"f","provenance":[{"type":"qa","ref":"r","ref":"r2"}],"registry":{"memory_type":"procedural","scope":"fleet","confidence":"guarded","keywords":["k"]}}' > "$L"; refuses_byte_identical "$L" "append to a ledger with a nested duplicate member"
+  # A duplicate member on the event envelope itself (id twice).
+  L="$TMP_ROOT/mal-envdup.jsonl"; { printf '%s\n' "$VALID_LINE"; printf '%s\n' '{"schema":"kraken-failure-class/ledger-event/v1","event":"occurrence","id":"FC-001","id":"FC-002","provenance":{"type":"q","ref":"r"}}'; } > "$L"; refuses_byte_identical "$L" "append to a ledger with a duplicate envelope member"
 
   # Duplicate detection members via the writer, ALL THREE members in BOTH orderings, via add (the
   # ledger must not be created) AND via amend (byte-identical against an existing valid class). A
@@ -396,19 +403,31 @@ if command -v python3 >/dev/null 2>&1 && python3 -c 'import jsonschema' 2>/dev/n
   done
 
   # Both engines are HARD prerequisites on the write path: absent -> CUE_VALIDATOR_UNAVAILABLE, refuse.
-  EL="$TMP_ROOT/engine-absent.jsonl"; FM_FC_LEDGER="$EL" "$FC" add --id FC-001 --name n --invariant i --fix f --cue c --provenance qa:d#1 >/dev/null
+  # The missing-engine simulation engages ONLY through the fixture-gated sandbox marker in the ledger's
+  # own directory (a dedicated dir so it cannot leak); the write's temp file lives in that same dir, so
+  # the temp proof sees the marker too.
+  EA_DIR="$TMP_ROOT/engabsent"; mkdir -p "$EA_DIR"; EL="$EA_DIR/l.jsonl"
+  FM_FC_LEDGER="$EL" "$FC" add --id FC-001 --name n --invariant i --fix f --cue c --provenance qa:d#1 >/dev/null
   el_base=$(md5sum "$EL"|cut -d' ' -f1)
   for miss in python3 jsonschema; do
-    if FM_CUE_SIMULATE_MISSING="$miss" FM_FC_LEDGER="$EL" "$FC" bump FC-001 --provenance qa:d#2 >/dev/null 2>"$TMP_ROOT/ea.err"; then
+    printf '%s\n' "$miss" > "$EA_DIR/.fm-cue-test-sandbox"
+    if FM_FC_LEDGER="$EL" "$FC" bump FC-001 --provenance qa:d#2 >/dev/null 2>"$TMP_ROOT/ea.err"; then
       fail "$miss-absent write must refuse"
     elif [ "$el_base" = "$(md5sum "$EL"|cut -d' ' -f1)" ] && grep -q CUE_VALIDATOR_UNAVAILABLE "$TMP_ROOT/ea.err"; then
-      pass "$miss absent on the write path -> CUE_VALIDATOR_UNAVAILABLE, ledger byte-identical"
+      pass "$miss absent (sandbox marker) on the write path -> CUE_VALIDATOR_UNAVAILABLE, ledger byte-identical"
     else fail "$miss-absent write must refuse byte-identically with CUE_VALIDATOR_UNAVAILABLE"; fi
   done
+  rm -f "$EA_DIR/.fm-cue-test-sandbox"
 
-  # REGRESSION (qa-scg1r5-q185 F1): an ambient FM_CUE_VALIDATOR / FM_CUE_SCHEMAS_DIR must NOT be able
-  # to substitute the authority. A success-always validator + permissive schema dir + a missing-python
-  # seam must STILL refuse to append to a malformed ledger, byte-identical - the override is ignored.
+  # PLAIN-SHELL BYPASS (qa-scg1r6-q187 F1): a bare ambient FM_CUE_SIMULATE_MISSING must NOT engage the
+  # seam - with no marker present, the write proceeds normally.
+  if FM_CUE_SIMULATE_MISSING=python3 FM_FC_LEDGER="$EL" "$FC" bump FC-001 --provenance qa:d#3 >/dev/null 2>&1; then
+    pass "a bare ambient FM_CUE_SIMULATE_MISSING cannot engage the write-path seam (plain-shell bypass)"
+  else fail "a bare FM_CUE_SIMULATE_MISSING must not engage the seam on the write path"; fi
+
+  # REGRESSION (qa-scg1r5-q185 F1): ambient FM_CUE_VALIDATOR / FM_CUE_SCHEMAS_DIR (and the now-dead
+  # FM_CUE_SIMULATE_MISSING) cannot substitute the authority. A success-always validator + permissive
+  # schema dir must STILL refuse to append to a malformed ledger, byte-identical - all are ignored.
   OV="$TMP_ROOT/override-mal.jsonl"; printf '{broken-json\n' > "$OV"; ov_base=$(md5sum "$OV"|cut -d' ' -f1)
   if FM_CUE_VALIDATOR=true FM_CUE_SCHEMAS_DIR=/tmp FM_CUE_SIMULATE_MISSING=python3 FM_FC_LEDGER="$OV" \
        "$FC" add --id FC-901 --name n --invariant i --fix f --cue c --provenance qa:r#1 >/dev/null 2>&1; then
