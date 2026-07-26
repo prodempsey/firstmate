@@ -20,7 +20,8 @@ The committed policy declares the default and escalation models; operators selec
 The classifier runs in safe mode with no tools, no MCP servers, no session persistence, and a closed structured-output schema.
 Gitleaks findings are secrets-class and are never submitted to or demoted by the classifier.
 Every invalid, unavailable, or timed-out classification preserves all pre-adjudication dispositions and adds one blocking `adjudicator-unavailable` finding.
-Every demotion records its reason code, exact cited span, prompt fingerprint, model, cost estimate, and random audit-sample marker in the scanner bundle.
+Every demotion requires an independent machine-owned corroboration proof tied to the exact finding and reason code; model-selected source text never authorizes a downgrade.
+The scanner bundle records that proof with the reason code, exact cited span, prompt fingerprint, model, cost estimate, and random audit-sample marker.
 TruffleHog is deliberately excluded because its license and verification behavior violate this gate's local-first boundary.
 
 The direct pins and licenses are:

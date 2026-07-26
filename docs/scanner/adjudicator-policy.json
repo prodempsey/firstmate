@@ -1,6 +1,6 @@
 {
   "schema": "firstmate/scanner-adjudicator-policy/1",
-  "prompt_version": "scanner-adjudicator-v1",
+  "prompt_version": "scanner-adjudicator-v2",
   "models": {
     "default": "claude-haiku-4-5-20251001",
     "escalation": "claude-sonnet-4-5-20250929"
@@ -44,19 +44,23 @@
   "reason_taxonomy": [
     {
       "code": "test-fixture",
-      "description": "The cited span and path positively identify synthetic test or fixture data that is not shipped."
+      "corroborator": "trusted-test-fixture-manifest",
+      "description": "A machine-owned fixture manifest independently proves that the exact finding is synthetic and is not shipped."
     },
     {
       "code": "constant-safe-value",
-      "description": "The cited span positively shows that the flagged value is a fixed safe literal rather than attacker-controlled input."
+      "corroborator": "trusted-static-dataflow-literal",
+      "description": "A machine-owned static dataflow proof independently proves that the exact flagged value is a fixed safe literal."
     },
     {
       "code": "guarded-by-allowlist",
-      "description": "The cited span positively shows a closed allowlist check before the flagged operation."
+      "corroborator": "trusted-ast-dominating-allowlist",
+      "description": "A machine-owned AST proof independently proves that a closed allowlist check dominates the exact flagged operation."
     },
     {
       "code": "dev-only-package",
-      "description": "The deterministic scanner wrapper positively classified the affected package as dev-only and the cited span identifies that package."
+      "corroborator": "candidate-package-lock-dev-scope",
+      "description": "The application independently re-read the candidate package-lock and proved that the exact affected package is marked dev-only."
     }
   ]
 }

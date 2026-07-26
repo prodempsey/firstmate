@@ -32,12 +32,14 @@
     {"id":"report-nondeterministic","scanner":"gitleaks","rule_id":"unstable-secret","severity":"error","path":"noise/flaky.txt","line":11,"content":"one run only","base_content":null,"confirm":false,"expected_attribution":"candidate-new","expected_decision":"report-only","expected_blocking":false},
     {"id":"block-case-change","scanner":"eslint","rule_id":"sonarjs/case-sensitive","severity":"error","path":"positive/case.js","line":12,"content":"const token = \"abc\";","base_content":"const token = \"ABC\";","confirm":true,"expected_attribution":"candidate-new","expected_decision":"block","expected_blocking":true},
     {"id":"adjudicate-security-confirm","scanner":"eslint","rule_id":"security/detect-child-process","severity":"error","path":"positive/security-confirm.js","line":1,"content":"exec(userInput)","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"block","expected_blocking":true},
-    {"id":"adjudicate-osv-human","scanner":"osv-scanner","rule_id":"dev-dependency/GHSA-HUMAN","severity":"error","path":"positive/package-lock.json","line":1,"content":"dev-only vulnerable package","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"block","expected_blocking":true}
+    {"id":"adjudicate-osv-human","scanner":"osv-scanner","rule_id":"dev-dependency/GHSA-HUMAN","severity":"error","path":"positive/package-lock.json","line":1,"content":"dev-only vulnerable package","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"block","expected_blocking":true},
+    {"id":"Package 'dev-vuln@1.0.0' is vulnerable to 'GHSA-DEV-NOISE'.","scanner":"osv-scanner","rule_id":"dev-dependency/GHSA-DEV-NOISE","severity":"error","path":"positive/package-lock.json","line":1,"content":"dev-only vulnerable package","base_content":null,"confirm":true,"expected_attribution":"candidate-new","expected_decision":"block","expected_blocking":true}
   ],
   "adjudication_expectations": [
-    {"id":"report-security-error","gold_label":"noise","verdict":"demote-to-report","reason_code":"guarded-by-allowlist","expected_final_decision":"report-only","expected_final_blocking":false},
+    {"id":"report-security-error","gold_label":"real","verdict":"needs-human","reason_code":null,"expected_final_decision":"block","expected_final_blocking":true},
     {"id":"adjudicate-security-confirm","gold_label":"real","verdict":"confirm","reason_code":null,"expected_final_decision":"block","expected_final_blocking":true},
-    {"id":"adjudicate-osv-human","gold_label":"real","verdict":"needs-human","reason_code":null,"expected_final_decision":"block","expected_final_blocking":true}
+    {"id":"adjudicate-osv-human","gold_label":"real","verdict":"needs-human","reason_code":null,"expected_final_decision":"block","expected_final_blocking":true},
+    {"id":"Package 'dev-vuln@1.0.0' is vulnerable to 'GHSA-DEV-NOISE'.","gold_label":"noise","verdict":"demote-to-report","reason_code":"dev-only-package","expected_final_decision":"report-only","expected_final_blocking":false}
   ],
   "expected_metrics": {
     "precision": 1,

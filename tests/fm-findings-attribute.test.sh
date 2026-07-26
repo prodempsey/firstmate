@@ -91,9 +91,9 @@ jq -e '
   |
   keys==["adjudication_expectations","cases","expected_metrics","schema"]
   and .schema=="firstmate/scanner-golden/2"
-  and (.cases|length)==32
+  and (.cases|length)==33
   and (([.cases[].id]|length)==([.cases[].id]|unique|length))
-  and (.adjudication_expectations|length)==3
+  and (.adjudication_expectations|length)==4
   and all(.adjudication_expectations[];
     . as $expectation
     |
@@ -121,7 +121,7 @@ jq -c '.cases[]|select(.confirm)|{
 jq -e --slurpfile golden "$GOLDEN" '
   . as $report
   |
-  (.findings|length)==32
+  (.findings|length)==33
   and all($golden[0].cases[];
     . as $case
     | any($report.findings[];
@@ -130,8 +130,8 @@ jq -e --slurpfile golden "$GOLDEN" '
       and .policy_decision==$case.expected_decision
       and .blocking==$case.expected_blocking))
 ' "$TMP/golden-report.json" >/dev/null ||
-  fail "golden set disposition diverged from its 32 human labels"
-pass "Phase 1 golden set: all 32 labeled findings retain blocking/report/inherited disposition"
+  fail "golden set disposition diverged from its 33 human labels"
+pass "Phase 1 golden set: all 33 labeled findings retain blocking/report/inherited disposition"
 
 "$ATTRIBUTOR" --candidate "$CANDIDATE" --confirmation "$TMP/confirmation.jsonl" \
   --out "$TMP/unattributed.json"

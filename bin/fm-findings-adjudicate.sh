@@ -13,7 +13,8 @@
 #
 # One closed structured response must enumerate every submitted fingerprint
 # exactly once.
-# A demotion additionally needs a committed reason code and an exact cited span.
+# A demotion additionally needs a committed reason code, an exact cited span,
+# and an independent machine-owned corroboration proof tied to the finding.
 # Any missing CLI, timeout, over-limit batch, malformed output, unknown id,
 # missing id, uncited demotion, or other validation failure preserves every
 # prior disposition and adds one loud blocking adjudicator-unavailable finding.
@@ -104,10 +105,14 @@ jq -e '
     and all(.scanner,.rule_prefix,.finding_class; (type=="string") and length>0))
   and (.reason_taxonomy|type)=="array" and (.reason_taxonomy|length)>0
   and all(.reason_taxonomy[];
-    keys==["code","description"]
+    keys==["code","corroborator","description"]
     and (.code|type)=="string" and (.code|test("^[a-z][a-z0-9-]+$"))
+    and (.corroborator|type)=="string"
+    and (.corroborator|test("^[a-z][a-z0-9-]+$"))
     and (.description|type)=="string" and (.description|length)>0)
   and (([.reason_taxonomy[].code]|length)==([.reason_taxonomy[].code]|unique|length))
+  and (([.reason_taxonomy[].corroborator]|length)
+    ==([.reason_taxonomy[].corroborator]|unique|length))
 ' "$POLICY" >/dev/null 2>&1 ||
   refuse "adjudicator policy failed its closed-schema proof (FC-001)"
 
@@ -176,7 +181,7 @@ jq -c --slurpfile policy "$POLICY" '
         and ($finding.rule_id|startswith($selector.rule_prefix)))
       | $selector) as $selector
   | select($selector != null)
-  | . + {finding_class:$selector.finding_class}
+  | . + {finding_class:$selector.finding_class,corroboration:null}
 ' "$ATTRIBUTION" > "$ELIGIBLE"
 
 SUBMITTED_COUNT=$(wc -l < "$ELIGIBLE" | tr -d ' ')
@@ -260,13 +265,14 @@ build_findings() {
         | if $selected==null then
             . + {adjudication:{
               status:"not-eligible",verdict:null,reason_code:null,reason:null,
-              evidence:null,audit_sampled:false,cluster_id:null,
+              evidence:null,corroboration:null,audit_sampled:false,cluster_id:null,
               pre_blocking:.blocking,pre_policy_decision:.policy_decision
             }}
           elif $adjudication_status=="unavailable" then
             . + {adjudication:{
               status:"unavailable",verdict:null,reason_code:null,reason:null,
-              evidence:null,audit_sampled:false,cluster_id:$selected.cluster_id,
+              evidence:null,corroboration:$selected.corroboration,
+              audit_sampled:false,cluster_id:$selected.cluster_id,
               pre_blocking:.blocking,pre_policy_decision:.policy_decision
             }}
           else
@@ -281,7 +287,7 @@ build_findings() {
                 adjudication:{
                   status:"adjudicated",verdict:$result.verdict,
                   reason_code:$result.reason_code,reason:$result.reason,
-                  evidence:$result.evidence,
+                  evidence:$result.evidence,corroboration:$selected.corroboration,
                   audit_sampled:(.fingerprint as $fp|any($audits[]; .==$fp)),
                   cluster_id:$selected.cluster_id,
                   pre_blocking:.blocking,pre_policy_decision:.policy_decision
@@ -299,7 +305,8 @@ publish_report() {
   local demotions=$TMP/demotions.json
   jq '[.[]|select(.adjudication.verdict=="demote-to-report")|{
     fingerprint,reason_code:.adjudication.reason_code,reason:.adjudication.reason,
-    evidence:.adjudication.evidence,audit_sampled:.adjudication.audit_sampled
+    evidence:.adjudication.evidence,corroboration:.adjudication.corroboration,
+    audit_sampled:.adjudication.audit_sampled
   }]' "$findings" > "$demotions"
   jq -n --arg status "$status" --arg model "$MODEL" \
     --arg version "$PROMPT_VERSION" --arg fingerprint "$PROMPT_FINGERPRINT" \
@@ -365,17 +372,23 @@ publish_report() {
     and (.audit.sampled_count<=.audit.sample_k)
     and (.audit.seed_hash==null or (.audit.seed_hash|test("^[0-9a-f]{64}$")))
     and all(.demotions[];
-      keys==["audit_sampled","evidence","fingerprint","reason","reason_code"]
+      keys==["audit_sampled","corroboration","evidence","fingerprint","reason","reason_code"]
       and (.audit_sampled|type)=="boolean"
       and (.fingerprint|test("^[0-9a-f]{64}$"))
       and (.reason_code|type)=="string" and (.reason_code|length)>0
       and (.reason|type)=="string" and (.reason|length)>0
-      and (.evidence|keys)==["quote","source"])
+      and (.evidence|keys)==["quote","source"]
+      and (.corroboration|keys)==["kind","proof_id","reason_code","subject"]
+      and (.corroboration.kind|test("^[a-z][a-z0-9-]+$"))
+      and (.corroboration.proof_id|test("^[0-9a-f]{64}$"))
+      and .corroboration.reason_code==.reason_code
+      and (.corroboration.subject|type)=="string"
+      and (.corroboration.subject|length)>0)
     and all(.findings[];
       keys==["adjudication","attribution","blocking","fingerprint","line","message",
              "occurrence","path","policy_decision","policy_reason","rule_id",
              "scanner","schema","severity","stability"]
-      and (.adjudication|keys)==["audit_sampled","cluster_id","evidence",
+      and (.adjudication|keys)==["audit_sampled","cluster_id","corroboration","evidence",
                                  "pre_blocking","pre_policy_decision","reason",
                                  "reason_code","status","verdict"]
       and (.adjudication.status=="not-eligible"
@@ -383,7 +396,15 @@ publish_report() {
         or .adjudication.status=="adjudicated")
       and (.adjudication.pre_blocking|type)=="boolean"
       and (.adjudication.pre_policy_decision|type)=="string"
-      and (.adjudication.audit_sampled|type)=="boolean")
+      and (.adjudication.audit_sampled|type)=="boolean"
+      and (.adjudication.corroboration==null
+        or ((.adjudication.corroboration|keys)==
+              ["kind","proof_id","reason_code","subject"]
+          and (.adjudication.corroboration.kind|test("^[a-z][a-z0-9-]+$"))
+          and (.adjudication.corroboration.proof_id|test("^[0-9a-f]{64}$"))
+          and (.adjudication.corroboration.reason_code|type)=="string"
+          and (.adjudication.corroboration.subject|type)=="string"
+          and (.adjudication.corroboration.subject|length)>0)))
   ' "$TMP/report.json" >/dev/null ||
     refuse "adjudication report failed its closed-schema proof (FC-001)"
 
@@ -419,7 +440,7 @@ append_unavailable_finding() {
       stability:"confirmed",
       adjudication:{
         status:"not-eligible",verdict:null,reason_code:null,reason:null,
-        evidence:null,audit_sampled:false,cluster_id:null,
+        evidence:null,corroboration:null,audit_sampled:false,cluster_id:null,
         pre_blocking:true,pre_policy_decision:"block"
       }
     }]
@@ -475,7 +496,9 @@ jq -r '.findings[]|select(.scanner=="gitleaks" and .path!=null)|.path' "$ATTRIBU
   sort -u > "$SECRET_PATHS"
 
 PROMPT_RECORDS="$TMP/prompt-records.jsonl"
+CORROBORATIONS="$TMP/corroborations.jsonl"
 : > "$PROMPT_RECORDS"
+: > "$CORROBORATIONS"
 while IFS= read -r finding; do
   [ -n "$finding" ] || continue
   fingerprint=$(printf '%s\n' "$finding" | jq -r '.fingerprint')
@@ -501,6 +524,37 @@ while IFS= read -r finding; do
     tr -d '\000' < "$TMP/hunk-full" | head -c "$MAX_HUNK" > "$TMP/hunk"
     hunk=$(cat "$TMP/hunk")
   fi
+  corroboration=null
+  if [ "$finding_class" = dev-dependency-advisory ] &&
+    printf '%s\n' "$path" | grep -Eq '(^|/)package-lock\.json$'; then
+    package=$(printf '%s\n' "$message" | jq -Rr '
+      try (capture("^Package '\''(?<spec>.+)'\'' is vulnerable").spec
+        | sub("@[^@]+$";"")) catch ""
+    ')
+    candidate_lock="$TMP/candidate-lock-$fingerprint.json"
+    if [ -n "$package" ] &&
+      git -C "$REPO" show "$CANDIDATE:$path" > "$candidate_lock" 2>/dev/null &&
+      jq -e --arg key "node_modules/$package" '.packages[$key].dev == true' \
+        "$candidate_lock" >/dev/null 2>&1; then
+      proof_id=$(
+        printf '%s\t%s\t%s\t%s\t%s\n' "$CANDIDATE" "$fingerprint" \
+          candidate-package-lock-dev-scope "$path" "$package" |
+          sha256sum | awk '{print $1}'
+      )
+      corroboration=$(
+        jq -nc --arg proof_id "$proof_id" --arg subject "node_modules/$package" '{
+          kind:"candidate-package-lock-dev-scope",
+          proof_id:$proof_id,
+          reason_code:"dev-only-package",
+          subject:$subject
+        }'
+      )
+    fi
+  fi
+  jq -nc --arg fingerprint "$fingerprint" --argjson corroboration "$corroboration" \
+    '{fingerprint:$fingerprint,corroboration:$corroboration}' \
+    >> "$CORROBORATIONS" ||
+    publish_unavailable "could not construct machine-owned corroboration record"
   cluster_id=$(
     printf '%s\t%s\t%s\n' "$finding_class" "$path" "$line" |
       sha256sum | awk '{print $1}'
@@ -532,10 +586,13 @@ jq -s '
     })
 ' "$PROMPT_RECORDS" > "$TMP/clusters.json"
 jq -s '.' "$ELIGIBLE" > "$TMP/eligible-array-unmapped.json"
-jq --slurpfile clusters "$TMP/clusters.json" '
+jq --slurpfile clusters "$TMP/clusters.json" --slurpfile corroborations "$CORROBORATIONS" '
   map(. as $finding
     | first($clusters[0][]|select(any(.findings[]; .fingerprint==$finding.fingerprint))) as $cluster
-    | . + {cluster_id:$cluster.cluster_id})
+    | ([ $corroborations[] |
+          select(.fingerprint==$finding.fingerprint) |
+          .corroboration ][0] // null) as $corroboration
+    | . + {cluster_id:$cluster.cluster_id,corroboration:$corroboration})
 ' "$TMP/eligible-array-unmapped.json" > "$TMP/eligible-array.json"
 
 jq -n --slurpfile clusters "$TMP/clusters.json" '
@@ -653,30 +710,20 @@ while IFS= read -r result; do
   fi
   printf '%s\n' "$cited" | grep -Fq -- "$quote" ||
     publish_unavailable "demotion did not cite an exact submitted span" "$DURATION"
-  finding_class=$(printf '%s\n' "$cluster" | jq -r '.finding_class')
-  path=$(printf '%s\n' "$cluster" | jq -r '.path')
-  case "$reason_code" in
-    test-fixture)
-      if ! printf '%s\n' "$path" |
-          grep -Eqi '(^|/)(test|tests|fixture|fixtures)(/|$)' ||
-        ! printf '%s\n' "$quote" |
-          grep -Eqi '(test|fixture|mock|sample|example)'; then
-        publish_unavailable "test-fixture demotion lacked path-and-span proof" "$DURATION"
-      fi
-      ;;
-    constant-safe-value)
-      printf '%s\n' "$quote" | grep -Eq "['\"][^'\"]+['\"]" ||
-        publish_unavailable "constant-safe-value demotion lacked literal-span proof" "$DURATION"
-      ;;
-    guarded-by-allowlist)
-      printf '%s\n' "$quote" | grep -Eqi '(allow(list)?|includes|contains|case[[:space:]]|switch[[:space:]]*\()' ||
-        publish_unavailable "guarded-by-allowlist demotion lacked allowlist-span proof" "$DURATION"
-      ;;
-    dev-only-package)
-      [ "$finding_class" = dev-dependency-advisory ] ||
-        publish_unavailable "dev-only-package demotion lacked deterministic dev-scope proof" "$DURATION"
-      ;;
-  esac
+  corroboration=$(jq -c --arg fingerprint "$fingerprint" '
+    [ .[] | select(.fingerprint==$fingerprint) | .corroboration ][0] // null
+  ' "$TMP/eligible-array.json")
+  [ "$corroboration" != null ] ||
+    publish_unavailable "demotion lacked independent machine-owned corroboration" "$DURATION"
+  corroboration_reason=$(printf '%s\n' "$corroboration" | jq -r '.reason_code')
+  corroboration_kind=$(printf '%s\n' "$corroboration" | jq -r '.kind')
+  [ "$corroboration_reason" = "$reason_code" ] ||
+    publish_unavailable "demotion reason did not match its machine-owned corroboration" "$DURATION"
+  jq -e --arg code "$reason_code" --arg kind "$corroboration_kind" '
+    any(.reason_taxonomy[];
+      .code==$code and .corroborator==$kind)
+  ' "$POLICY" >/dev/null ||
+    publish_unavailable "demotion corroborator did not match the committed taxonomy" "$DURATION"
 done < <(jq -c '.results[]' "$TMP/results.json")
 
 DEMOTION_FPS="$TMP/demotion-fingerprints.txt"

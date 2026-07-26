@@ -99,11 +99,15 @@ jq '{
   structured_output:{
     results:[
       .untrusted_clusters[].findings[] |
-      {
-        fingerprint,verdict:"demote-to-report",reason_code:"constant-safe-value",
-        reason:"The cited test value is a fixed safe literal.",
-        evidence:{source:"hunk",quote:"\"SAFE_TEST_VALUE\""}
-      }
+      if .scanner=="osv-scanner" then
+        {
+          fingerprint,verdict:"demote-to-report",reason_code:"dev-only-package",
+          reason:"The candidate lockfile independently proves this package is dev-only.",
+          evidence:{source:"hunk",quote:"\"dev\":true"}
+        }
+      else
+        {fingerprint,verdict:"confirm",reason_code:null,reason:null,evidence:null}
+      end
     ]
   }
 }' "$prompt"
@@ -116,7 +120,17 @@ export FM_SCANNER_ADJUDICATOR_CLI FM_SCANNER_ADJUDICATOR_AUDIT_SEED
 cat > "$FM_SCANNER_DIR/bin/osv-scanner" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = "--version" ]; then printf 'osv-scanner version: 2.4.0\n'; exit 0; fi
-printf '{"runs":[]}\n'
+if [ -f package-lock.json ] && grep -q FM_TEST_DEV_OSV package-lock.json; then
+  jq -nc '{
+    runs:[{results:[{
+      ruleId:"GHSA-DEV-TEST",
+      message:{text:"Package '\''dev-vuln@1.0.0'\'' is vulnerable to '\''GHSA-DEV-TEST'\''."},
+      locations:[{physicalLocation:{artifactLocation:{uri:"package-lock.json"}}}]
+    }]}]
+  }'
+else
+  printf '{"runs":[]}\n'
+fi
 SH
 chmod +x "$FM_SCANNER_DIR/bin/osv-scanner"
 cat > "$FM_SCANNER_DIR/bin/actionlint" <<'SH'
@@ -258,15 +272,15 @@ expect_code 1 "$rc" "scanner finding fails integrated verifier"
   fail "normalized scanner finding did not reach the top-level verifier findings"
 pass "scanner gate integration: a synthetic candidate diff blocks fm-verify"
 
-# --- adjudication integration: cited noise is demoted and bundled -------------
+# --- adjudication integration: independently proven noise is demoted ----------
 RADJ=$(build_repo adjudication-integration)
-printf 'const value = "SAFE_TEST_VALUE"; // FM_TEST_SECURITY_NOISE\n' > "$RADJ/security.js"
-git -C "$RADJ" add security.js
-git -C "$RADJ" commit -qm "add synthetic security heuristic"
+printf '{"marker":"FM_TEST_DEV_OSV","packages":{"node_modules/dev-vuln":{"dev":true}}}\n' > "$RADJ/package-lock.json"
+git -C "$RADJ" add package-lock.json
+git -C "$RADJ" commit -qm "add synthetic dev advisory"
 ADJSHA=$(git -C "$RADJ" rev-parse HEAD)
 rc=$(verify "$TMP/adjudication-integration.json" --worktree "$RADJ" --base main \
   --sha "$ADJSHA" --branch fm/g1 --task g1)
-expect_code 0 "$rc" "cited noisy finding is demoted without hiding its bundle record"
+expect_code 0 "$rc" "independently proven noisy finding is demoted without hiding its bundle record"
 jq -e '
   .gates[]|select(.gate=="scanner")|.details
   | .adjudication.schema=="firstmate/scanner-adjudication/1"
@@ -275,16 +289,18 @@ jq -e '
   and .adjudication.demoted_count==1
   and (.adjudication.model_prompt_fingerprint|test("^[0-9a-f]{64}$"))
   and .adjudication.cost_estimate_usd>0
-  and (.adjudication.demotions[0].reason_code=="constant-safe-value")
+  and (.adjudication.demotions[0].reason_code=="dev-only-package")
+  and (.adjudication.demotions[0].corroboration.kind=="candidate-package-lock-dev-scope")
+  and (.adjudication.demotions[0].corroboration.proof_id|test("^[0-9a-f]{64}$"))
   and (.adjudication.demotions[0].audit_sampled)
   and ([.findings[]|select(
-    .rule_id=="security/detect-object-injection"
+    .rule_id=="dev-dependency/GHSA-DEV-TEST"
     and .policy_decision=="report-only"
     and (.blocking|not)
   )]|length)==1
 ' "$TMP/adjudication-integration.json" >/dev/null ||
   fail "verifier bundle omitted adjudication counts, reasons, fingerprint, cost, or audit marker"
-pass "scanner adjudication bundle records counts, cited reasons, model/prompt fingerprint, cost, and audit sample"
+pass "scanner adjudication bundle records independent proofs, reasons, fingerprint, cost, and audit sample"
 
 # --- baseline freshness: scanner stays pinned and final publication rechecks ---
 RBASE=$(build_repo base-advances-during-scan)

@@ -208,9 +208,7 @@ sed -n '2,$p' | sed '$d' > "$prompt"
         }
       else
         {
-          fingerprint,verdict:"demote-to-report",reason_code:"constant-safe-value",
-          reason:"The cited command is a fixed safe test literal.",
-          evidence:{source:"hunk",quote:"\"SAFE_COMMAND\""}
+          fingerprint,verdict:"confirm",reason_code:null,reason:null,evidence:null
         }
       end
     ]
@@ -280,20 +278,21 @@ done
 [ "$(jq '[.findings[]|select(
     .scanner=="eslint"
     and (.rule_id|startswith("security/"))
-    and .adjudication.verdict=="demote-to-report"
-    and .policy_decision=="report-only"
-    and (.blocking|not)
+    and .adjudication.verdict=="confirm"
+    and .policy_decision=="block"
+    and .blocking
   )]|length' "$OUT")" -gt 0 ] ||
-  fail "eslint-plugin-security finding was not visibly demoted with a cited reason"
-pass "severity policy: deterministic errors gate while cited security noise is demoted"
+  fail "uncorroborated eslint-plugin-security finding did not retain its block"
+pass "severity policy: uncorroborated security findings remain blocking"
 [ "$(jq '[.findings[]|select(
     .scanner=="osv-scanner"
     and (.rule_id|startswith("dev-dependency/"))
     and .adjudication.verdict=="demote-to-report"
     and .policy_decision=="report-only"
     and (.blocking|not)
+    and .adjudication.corroboration.kind=="candidate-package-lock-dev-scope"
   )]|length' "$OUT")" -eq 1 ] ||
-  fail "positively proven OSV dev dependency was not routed through adjudication"
+  fail "positively proven OSV dev dependency lacked machine-owned corroboration"
 pass "OSV dev-dependency scope is proven from package-lock before demotion"
 pass "every Phase 1 scanner fires on a real fixture and excludes its inherited baseline finding"
 
