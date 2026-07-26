@@ -4,6 +4,9 @@
 # One synthetic diff carries an inherited and candidate-new finding for every
 # scanner. Further loops independently replace each pinned tool with a wrong
 # version and a wedging implementation, proving FC-004 and FC-006 per scanner.
+#
+# Set FM_TEST_REAL_GITLEAKS=1 to run the linked-worktree regression with
+# $FM_SCANNER_DIR/bin/gitleaks, or set it to an explicit pinned executable path.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -405,35 +408,52 @@ for scanner in gitleaks oxlint eslint-scanner osv-scanner actionlint jq shellche
 done
 pass "FC-006/G9: each scanner has a reserved budget and exhaustion stays local and loud"
 
-if [ -n "${FM_TEST_REAL_GITLEAKS:-}" ]; then
-  [ -x "$FM_TEST_REAL_GITLEAKS" ] ||
+real_gitleaks=${FM_TEST_REAL_GITLEAKS:-}
+if [ "$real_gitleaks" = 1 ]; then
+  [ -n "${FM_SCANNER_DIR:-}" ] ||
+    fail "FM_TEST_REAL_GITLEAKS=1 requires FM_SCANNER_DIR"
+  real_gitleaks="$FM_SCANNER_DIR/bin/gitleaks"
+fi
+if [ -n "$real_gitleaks" ]; then
+  [ -x "$real_gitleaks" ] ||
     fail "FM_TEST_REAL_GITLEAKS does not name an executable"
-  "$FM_TEST_REAL_GITLEAKS" --version | grep -Fq '8.30.1' ||
+  "$real_gitleaks" --version | grep -Fq '8.30.1' ||
     fail "FM_TEST_REAL_GITLEAKS is not the pinned gitleaks 8.30.1"
 
   real_tools="$TMP/real-gitleaks-tools"
   cp -R "$TOOLS" "$real_tools"
   rm -f "$real_tools/bin/gitleaks"
-  ln -s "$FM_TEST_REAL_GITLEAKS" "$real_tools/bin/gitleaks"
+  ln -s "$real_gitleaks" "$real_tools/bin/gitleaks"
 
   real_origin="$TMP/real-gitleaks-origin"
   real_worktree="$TMP/real-gitleaks-worktree"
-  git clone -q "$ROOT" "$real_origin"
+  git init -q "$real_origin"
+  git -C "$real_origin" checkout -q -b main
+  fm_git_identity
+  printf 'clean baseline\n' > "$real_origin/fixture.txt"
+  git -C "$real_origin" add fixture.txt
+  git -C "$real_origin" commit -qm "clean baseline"
   git -C "$real_origin" worktree add --detach --quiet "$real_worktree" HEAD
   [ -f "$real_worktree/.git" ] ||
     fail "real gitleaks sandbox is not a linked worktree with a gitdir pointer"
-  fm_git_identity "$real_worktree"
 
   REPO=$real_worktree
-  BASE=$(git -C "$REPO" rev-parse HEAD^)
+  BASE=$(git -C "$REPO" rev-parse HEAD)
+  printf 'clean candidate\n' >> "$REPO/fixture.txt"
+  git -C "$REPO" commit -qam "clean candidate"
   CANDIDATE=$(git -C "$REPO" rev-parse HEAD)
   FM_VERIFY_SCANNER_TIMEOUT=8 run_scanner "$real_tools" "$TMP/real-gitleaks-clean.json"
   expect_code 0 "$?" "real pinned gitleaks accepts the clean linked-worktree candidate"
+  [ "$(jq '[.findings[]|select(.scanner=="gitleaks")]|length' \
+    "$TMP/real-gitleaks-clean.json")" -eq 0 ] ||
+    fail "real pinned gitleaks clean linked-worktree fixture produced a finding"
   [ "$(jq '[.findings[]|select(.scanner=="gitleaks" and .rule_id=="scanner-unavailable")]|length' \
     "$TMP/real-gitleaks-clean.json")" -eq 0 ] ||
     fail "real pinned gitleaks was unavailable in the clean linked-worktree fixture"
 
-  printf 'api_key = "aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY"\n' > "$REPO/seeded-secret.txt"
+  fixture_left='aB3dE5fG7hI9jK1mN3pQ5rS7'
+  fixture_right='tU9vW1xY'
+  printf 'api_key = "%s%s"\n' "$fixture_left" "$fixture_right" > "$REPO/seeded-secret.txt"
   git -C "$REPO" add seeded-secret.txt
   git -C "$REPO" commit -qm "seed gitleaks fixture"
   BASE=$CANDIDATE
