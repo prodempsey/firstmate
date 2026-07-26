@@ -16,6 +16,7 @@ Before adoption, `bin/fm-verify.sh` emits a visible `gate-not-adopted` note and 
 After adoption, every missing, crashed, or timed-out scanner fails closed as a `scanner-unavailable` finding.
 The deterministic battery never downloads packages, updates vulnerability data, submits source, or calls a remote service.
 Candidate-new blocking findings from designated noisy selectors are then sent in one bounded BYOK Claude CLI call.
+OSV findings use the scanner's structured JSON package and advisory fields; that closed subject is fingerprinted and human-readable scanner messages never select a corroboration target.
 The committed policy declares the default and escalation models; operators select the latter with `FM_SCANNER_ADJUDICATOR_MODEL`.
 The classifier runs in safe mode with no tools, no MCP servers, no session persistence, and a closed structured-output schema.
 Gitleaks findings are secrets-class and are never submitted to or demoted by the classifier.

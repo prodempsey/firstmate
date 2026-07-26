@@ -71,6 +71,8 @@ git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || refuse "--repo must name a
 git -C "$REPO" cat-file -e "$BASE^{commit}" 2>/dev/null || refuse "--base must resolve to a commit"
 git -C "$REPO" cat-file -e "$CANDIDATE^{commit}" 2>/dev/null ||
   refuse "--candidate must resolve to a commit"
+CANDIDATE_SHA=$(git -C "$REPO" rev-parse "$CANDIDATE^{commit}") ||
+  refuse "--candidate SHA could not be resolved"
 
 jq -e '
   keys == ["cost_estimate","limits","models","never_adjudicate_scanners",
@@ -133,10 +135,19 @@ jq -e '
   and all(.findings[];
     keys==["attribution","blocking","fingerprint","line","message","occurrence",
            "path","policy_decision","policy_reason","rule_id","scanner","schema",
-           "severity","stability"]
+           "severity","stability","subject"]
     and .schema=="firstmate/scanner-raw-finding/1"
     and (.fingerprint|test("^[0-9a-f]{64}$"))
-    and (.blocking|type)=="boolean")
+    and (.blocking|type)=="boolean"
+    and (.subject==null or (
+      (.subject|keys)==["advisory_id","ecosystem","kind","name","version"]
+      and .subject.kind=="osv-package-advisory"
+      and all(.subject.advisory_id,.subject.ecosystem,.subject.name,.subject.version;
+        (type=="string") and length>0)
+      and (.subject.advisory_id|length)<=256
+      and (.subject.ecosystem|length)<=64
+      and (.subject.name|length)<=512
+      and (.subject.version|length)<=256)))
 ' "$ATTRIBUTION" >/dev/null 2>&1 ||
   refuse "attribution input failed its closed-schema positive proof (FC-001/FC-002)"
 
@@ -378,16 +389,27 @@ publish_report() {
       and (.reason_code|type)=="string" and (.reason_code|length)>0
       and (.reason|type)=="string" and (.reason|length)>0
       and (.evidence|keys)==["quote","source"]
-      and (.corroboration|keys)==["kind","proof_id","reason_code","subject"]
+      and (.corroboration|keys)==["candidate_sha","finding_fingerprint","kind",
+                                   "path","proof_id","reason_code","subject"]
+      and (.corroboration.candidate_sha|test("^[0-9a-f]{40}$"))
+      and .corroboration.finding_fingerprint==.fingerprint
       and (.corroboration.kind|test("^[a-z][a-z0-9-]+$"))
+      and (.corroboration.path|type)=="string"
+      and (.corroboration.path|length)>0
       and (.corroboration.proof_id|test("^[0-9a-f]{64}$"))
       and .corroboration.reason_code==.reason_code
-      and (.corroboration.subject|type)=="string"
-      and (.corroboration.subject|length)>0)
+      and (.corroboration.subject|keys)==
+        ["advisory_id","ecosystem","kind","name","version"]
+      and .corroboration.subject.kind=="osv-package-advisory"
+      and all(.corroboration.subject.advisory_id,
+              .corroboration.subject.ecosystem,
+              .corroboration.subject.name,
+              .corroboration.subject.version;
+        (type=="string") and length>0))
     and all(.findings[];
       keys==["adjudication","attribution","blocking","fingerprint","line","message",
              "occurrence","path","policy_decision","policy_reason","rule_id",
-             "scanner","schema","severity","stability"]
+             "scanner","schema","severity","stability","subject"]
       and (.adjudication|keys)==["audit_sampled","cluster_id","corroboration","evidence",
                                  "pre_blocking","pre_policy_decision","reason",
                                  "reason_code","status","verdict"]
@@ -399,12 +421,23 @@ publish_report() {
       and (.adjudication.audit_sampled|type)=="boolean"
       and (.adjudication.corroboration==null
         or ((.adjudication.corroboration|keys)==
-              ["kind","proof_id","reason_code","subject"]
+              ["candidate_sha","finding_fingerprint","kind","path","proof_id",
+               "reason_code","subject"]
+          and (.adjudication.corroboration.candidate_sha|test("^[0-9a-f]{40}$"))
+          and (.adjudication.corroboration.finding_fingerprint|test("^[0-9a-f]{64}$"))
           and (.adjudication.corroboration.kind|test("^[a-z][a-z0-9-]+$"))
+          and (.adjudication.corroboration.path|type)=="string"
+          and (.adjudication.corroboration.path|length)>0
           and (.adjudication.corroboration.proof_id|test("^[0-9a-f]{64}$"))
           and (.adjudication.corroboration.reason_code|type)=="string"
-          and (.adjudication.corroboration.subject|type)=="string"
-          and (.adjudication.corroboration.subject|length)>0)))
+          and (.adjudication.corroboration.subject|keys)==
+            ["advisory_id","ecosystem","kind","name","version"]
+          and .adjudication.corroboration.subject.kind=="osv-package-advisory"
+          and all(.adjudication.corroboration.subject.advisory_id,
+                  .adjudication.corroboration.subject.ecosystem,
+                  .adjudication.corroboration.subject.name,
+                  .adjudication.corroboration.subject.version;
+            (type=="string") and length>0))))
   ' "$TMP/report.json" >/dev/null ||
     refuse "adjudication report failed its closed-schema proof (FC-001)"
 
@@ -431,6 +464,7 @@ append_unavailable_finding() {
       path:null,
       line:null,
       message:("ADJUDICATOR_UNAVAILABLE: "+$reason+" (all prior dispositions retained; fail closed, FC-001/FC-004/FC-006)"),
+      subject:null,
       occurrence:1,
       fingerprint:$fingerprint,
       attribution:"candidate-new",
@@ -469,7 +503,7 @@ publish_unavailable() {
     and all(.findings[];
       keys==["adjudication","attribution","blocking","fingerprint","line","message",
              "occurrence","path","policy_decision","policy_reason","rule_id",
-             "scanner","schema","severity","stability"])
+             "scanner","schema","severity","stability","subject"])
   ' "$TMP/report.json" >/dev/null ||
     refuse "unavailable adjudication report failed its final closed-schema proof (FC-001)"
   mkdir -p "$(dirname "$OUT")" || refuse "cannot create output directory"
@@ -508,6 +542,7 @@ while IFS= read -r finding; do
   scanner=$(printf '%s\n' "$finding" | jq -r '.scanner')
   rule_id=$(printf '%s\n' "$finding" | jq -r '.rule_id')
   severity=$(printf '%s\n' "$finding" | jq -r '.severity')
+  subject=$(printf '%s\n' "$finding" | jq -c '.subject')
   message=$(printf '%s\n' "$finding" | jq -r '.message' | head -c "$MAX_MESSAGE")
   if [ -z "$path" ] || printf '%s\n' "$path" | grep -Eq '(^|/)\.\.(/|$)|^/'; then
     publish_unavailable "eligible finding has an unsafe or absent path"
@@ -526,24 +561,34 @@ while IFS= read -r finding; do
   fi
   corroboration=null
   if [ "$finding_class" = dev-dependency-advisory ] &&
-    printf '%s\n' "$path" | grep -Eq '(^|/)package-lock\.json$'; then
-    package=$(printf '%s\n' "$message" | jq -Rr '
-      try (capture("^Package '\''(?<spec>.+)'\'' is vulnerable").spec
-        | sub("@[^@]+$";"")) catch ""
-    ')
+    printf '%s\n' "$path" | grep -Eq '(^|/)package-lock\.json$' &&
+    printf '%s\n' "$subject" | jq -e '
+      .kind=="osv-package-advisory" and .ecosystem=="npm"
+    ' >/dev/null 2>&1; then
+    package=$(printf '%s\n' "$subject" | jq -r '.name')
+    advisory=$(printf '%s\n' "$subject" | jq -r '.advisory_id')
+    rule_advisory=${rule_id#dev-dependency/}
     candidate_lock="$TMP/candidate-lock-$fingerprint.json"
-    if [ -n "$package" ] &&
-      git -C "$REPO" show "$CANDIDATE:$path" > "$candidate_lock" 2>/dev/null &&
+    if [ "$rule_advisory" = "$advisory" ] &&
+      git -C "$REPO" show "$CANDIDATE_SHA:$path" > "$candidate_lock" 2>/dev/null &&
       jq -e --arg key "node_modules/$package" '.packages[$key].dev == true' \
         "$candidate_lock" >/dev/null 2>&1; then
       proof_id=$(
-        printf '%s\t%s\t%s\t%s\t%s\n' "$CANDIDATE" "$fingerprint" \
-          candidate-package-lock-dev-scope "$path" "$package" |
+        {
+          printf '%s\t%s\t%s\t%s\t' "$CANDIDATE_SHA" "$fingerprint" \
+            candidate-package-lock-dev-scope "$path"
+          printf '%s\n' "$subject" | jq -cS .
+        } |
           sha256sum | awk '{print $1}'
       )
       corroboration=$(
-        jq -nc --arg proof_id "$proof_id" --arg subject "node_modules/$package" '{
+        jq -nc --arg candidate_sha "$CANDIDATE_SHA" \
+          --arg finding_fingerprint "$fingerprint" --arg path "$path" \
+          --arg proof_id "$proof_id" --argjson subject "$subject" '{
+          candidate_sha:$candidate_sha,
+          finding_fingerprint:$finding_fingerprint,
           kind:"candidate-package-lock-dev-scope",
+          path:$path,
           proof_id:$proof_id,
           reason_code:"dev-only-package",
           subject:$subject

@@ -40,22 +40,38 @@ raw() {
     {
       schema:"firstmate/scanner-raw-finding/1",
       scanner:$scanner,rule_id:$rule,severity:"error",path:$path,
-      line:($line|tonumber),message:$message,content:$content
+      line:($line|tonumber),message:$message,content:$content,subject:null
     }
   '
 }
 
+raw_osv() {
+  jq -nc --arg rule "$1" --arg path "$2" --arg line "$3" \
+    --arg message "$4" --arg content "$5" --arg package "$6" '{
+      schema:"firstmate/scanner-raw-finding/1",
+      scanner:"osv-scanner",rule_id:$rule,severity:"error",path:$path,
+      line:($line|tonumber),message:$message,content:$content,
+      subject:{
+        advisory_id:($rule|sub("^dev-dependency/";"")),
+        ecosystem:"npm",
+        kind:"osv-package-advisory",
+        name:$package,
+        version:"1.0.0"
+      }
+    }'
+}
+
 : > "$TMP/base.jsonl"
 {
-  raw osv-scanner dev-dependency/GHSA-ONE positive/package-lock.json 1 \
+  raw_osv dev-dependency/GHSA-ONE positive/package-lock.json 1 \
     "Package 'dev-one@1.0.0' is vulnerable to 'GHSA-ONE'." \
-    '"node_modules/dev-one":{"dev":true}'
-  raw osv-scanner dev-dependency/GHSA-TWO positive/package-lock.json 1 \
+    '"node_modules/dev-one":{"dev":true}' dev-one
+  raw_osv dev-dependency/GHSA-TWO positive/package-lock.json 1 \
     "Package 'dev-two@1.0.0' is vulnerable to 'GHSA-TWO'." \
-    '"node_modules/dev-two":{"dev":true}'
-  raw osv-scanner dev-dependency/GHSA-THREE positive/package-lock.json 1 \
+    '"node_modules/dev-two":{"dev":true}' dev-two
+  raw_osv dev-dependency/GHSA-THREE positive/package-lock.json 1 \
     "Package 'dev-three@1.0.0' is vulnerable to 'GHSA-THREE'." \
-    '"node_modules/dev-three":{"dev":true}'
+    '"node_modules/dev-three":{"dev":true}' dev-three
   raw eslint security/confirm src/confirm.js 1 "real command injection" \
     'exec(userInput);'
   raw eslint security/human src/human.js 1 "ambiguous command flow" \
@@ -184,6 +200,94 @@ jq -e --arg default_cost "$DEFAULT_COST" '
 ' "$TMP/escalated.json" >/dev/null ||
   fail "Sonnet escalation reused the lower Haiku cost estimate"
 pass "committed model default has an explicit Sonnet escalation option"
+
+# The authoritative package/advisory subject is structured and fingerprinted.
+# Changing only the human message cannot change demotion authority or its proof.
+run_message_case() {
+  local label=$1 message=$2
+  raw_osv dev-dependency/GHSA-MESSAGE positive/package-lock.json 1 \
+    "$message" '"node_modules/dev-one":{"dev":true}' dev-one \
+    > "$TMP/message-$label-candidate.jsonl"
+  cp "$TMP/message-$label-candidate.jsonl" "$TMP/message-$label-confirmation.jsonl"
+  "$ATTRIBUTOR" --base "$TMP/base.jsonl" \
+    --candidate "$TMP/message-$label-candidate.jsonl" \
+    --confirmation "$TMP/message-$label-confirmation.jsonl" \
+    --out "$TMP/message-$label-attribution.json"
+  FM_SCANNER_ADJUDICATOR_CLI="$FAKE" \
+    FM_SCANNER_ADJUDICATOR_AUDIT_SEED="message-$label" \
+    "$ADJUDICATOR" --attribution "$TMP/message-$label-attribution.json" --repo "$REPO" \
+      --base "$BASE" --candidate "$CANDIDATE" --out "$TMP/message-$label-final.json"
+}
+
+run_message_case dev-text \
+  "Package 'dev-one@1.0.0' is vulnerable to 'GHSA-MESSAGE'."
+expect_code 0 "$?" "structured dev subject is independently corroborated"
+run_message_case prod-text \
+  "Package 'unrelated-prod@9.9.9' is vulnerable to 'GHSA-MESSAGE'."
+expect_code 0 "$?" "message-only package change cannot remove corroboration"
+jq -e --slurpfile other "$TMP/message-prod-text-final.json" '
+  .findings[0].fingerprint==$other[0].findings[0].fingerprint
+  and .findings[0].blocking==$other[0].findings[0].blocking
+  and .findings[0].policy_decision==$other[0].findings[0].policy_decision
+  and .findings[0].adjudication.corroboration.proof_id
+    ==$other[0].findings[0].adjudication.corroboration.proof_id
+  and (.findings[0].blocking|not)
+  and .findings[0].adjudication.corroboration.subject.name=="dev-one"
+' "$TMP/message-dev-text-final.json" >/dev/null ||
+  fail "message-only text selected or changed the corroboration subject"
+
+raw_osv dev-dependency/GHSA-MESSAGE positive/package-lock.json 1 \
+  "Package 'dev-one@1.0.0' is vulnerable to 'GHSA-MESSAGE'." \
+  '"node_modules/dev-two":{"dev":true}' dev-two > "$TMP/subject-two-candidate.jsonl"
+cp "$TMP/subject-two-candidate.jsonl" "$TMP/subject-two-confirmation.jsonl"
+"$ATTRIBUTOR" --base "$TMP/base.jsonl" --candidate "$TMP/subject-two-candidate.jsonl" \
+  --confirmation "$TMP/subject-two-confirmation.jsonl" \
+  --out "$TMP/subject-two-attribution.json"
+FM_SCANNER_ADJUDICATOR_CLI="$FAKE" \
+  "$ADJUDICATOR" --attribution "$TMP/subject-two-attribution.json" --repo "$REPO" \
+    --base "$BASE" --candidate "$CANDIDATE" --out "$TMP/subject-two-final.json"
+expect_code 0 "$?" "changed structured package subject remains independently provable"
+jq -e --slurpfile first "$TMP/message-dev-text-final.json" '
+  .findings[0].fingerprint!=$first[0].findings[0].fingerprint
+  and .findings[0].adjudication.corroboration.proof_id
+    !=$first[0].findings[0].adjudication.corroboration.proof_id
+  and .findings[0].adjudication.corroboration.subject.name=="dev-two"
+' "$TMP/subject-two-final.json" >/dev/null ||
+  fail "changed structured package subject did not change finding and proof identity"
+
+raw osv-scanner dev-dependency/GHSA-MESSAGE positive/package-lock.json 1 \
+  "Package 'dev-one@1.0.0' is vulnerable to 'GHSA-MESSAGE'." \
+  '"node_modules/dev-one":{"dev":true}' > "$TMP/missing-subject-candidate.jsonl"
+cp "$TMP/missing-subject-candidate.jsonl" "$TMP/missing-subject-confirmation.jsonl"
+"$ATTRIBUTOR" --base "$TMP/base.jsonl" --candidate "$TMP/missing-subject-candidate.jsonl" \
+  --confirmation "$TMP/missing-subject-confirmation.jsonl" \
+  --out "$TMP/missing-subject-attribution.json"
+FM_SCANNER_ADJUDICATOR_CLI="$FAKE" \
+  "$ADJUDICATOR" --attribution "$TMP/missing-subject-attribution.json" --repo "$REPO" \
+    --base "$BASE" --candidate "$CANDIDATE" --out "$TMP/missing-subject-final.json" >/dev/null
+expect_code 1 "$?" "missing structured subject fails closed"
+jq -e '.status=="unavailable" and .demoted_count==0 and .findings[0].blocking' \
+  "$TMP/missing-subject-final.json" >/dev/null ||
+  fail "message text recreated a missing structured subject"
+
+raw_osv dev-dependency/GHSA-MESSAGE positive/package-lock.json 1 \
+  "Package 'dev-one@1.0.0' is vulnerable to 'GHSA-MESSAGE'." \
+  '"node_modules/dev-one":{"dev":true}' dev-one |
+  jq -c '.subject.advisory_id="GHSA-OTHER"' > "$TMP/mismatched-subject-candidate.jsonl"
+cp "$TMP/mismatched-subject-candidate.jsonl" "$TMP/mismatched-subject-confirmation.jsonl"
+"$ATTRIBUTOR" --base "$TMP/base.jsonl" \
+  --candidate "$TMP/mismatched-subject-candidate.jsonl" \
+  --confirmation "$TMP/mismatched-subject-confirmation.jsonl" \
+  --out "$TMP/mismatched-subject-attribution.json"
+FM_SCANNER_ADJUDICATOR_CLI="$FAKE" \
+  "$ADJUDICATOR" --attribution "$TMP/mismatched-subject-attribution.json" --repo "$REPO" \
+    --base "$BASE" --candidate "$CANDIDATE" \
+    --out "$TMP/mismatched-subject-final.json" >/dev/null
+expect_code 1 "$?" "advisory/subject mismatch fails closed"
+jq -e '.status=="unavailable" and .demoted_count==0 and .findings[0].blocking' \
+  "$TMP/mismatched-subject-final.json" >/dev/null ||
+  fail "mismatched advisory and structured subject authorized a demotion"
+pass "G2: message text cannot select corroboration; missing or mismatched subjects fail closed"
 
 UNAVAILABLE="$TMP/unavailable-claude"
 cat > "$UNAVAILABLE" <<'SH'
@@ -328,15 +432,16 @@ pass "G2: attacker-cited allowlist text cannot authorize an uncorroborated demot
 # dispositions and independently labeled precision/recall.
 jq -c '.cases[]|{
   schema:"firstmate/scanner-raw-finding/1",
-  scanner,rule_id,severity,path,line,message:.id,content
+  scanner,rule_id,severity,path,line,message:.id,content,subject:(.subject // null)
 }' "$GOLDEN" > "$TMP/golden-candidate.jsonl"
 jq -c '.cases[]|select(.base_content!=null)|{
   schema:"firstmate/scanner-raw-finding/1",
-  scanner,rule_id,severity,path,line,message:.id,content:.base_content
+  scanner,rule_id,severity,path,line,message:.id,content:.base_content,
+  subject:(.subject // null)
 }' "$GOLDEN" > "$TMP/golden-base.jsonl"
 jq -c '.cases[]|select(.confirm)|{
   schema:"firstmate/scanner-raw-finding/1",
-  scanner,rule_id,severity,path,line,message:.id,content
+  scanner,rule_id,severity,path,line,message:.id,content,subject:(.subject // null)
 }' "$GOLDEN" > "$TMP/golden-confirmation.jsonl"
 "$ATTRIBUTOR" --base "$TMP/golden-base.jsonl" \
   --candidate "$TMP/golden-candidate.jsonl" \

@@ -122,14 +122,16 @@ cat > "$FM_SCANNER_DIR/bin/osv-scanner" <<'SH'
 if [ "${1:-}" = "--version" ]; then printf 'osv-scanner version: 2.4.0\n'; exit 0; fi
 if [ -f package-lock.json ] && grep -q FM_TEST_DEV_OSV package-lock.json; then
   jq -nc '{
-    runs:[{results:[{
-      ruleId:"GHSA-DEV-TEST",
-      message:{text:"Package '\''dev-vuln@1.0.0'\'' is vulnerable to '\''GHSA-DEV-TEST'\''."},
-      locations:[{physicalLocation:{artifactLocation:{uri:"package-lock.json"}}}]
-    }]}]
+    results:[{
+      source:{path:"package-lock.json",type:"lockfile"},
+      packages:[{
+        package:{name:"dev-vuln",version:"1.0.0",ecosystem:"npm"},
+        vulnerabilities:[{id:"GHSA-DEV-TEST"}]
+      }]
+    }]
   }'
 else
-  printf '{"runs":[]}\n'
+  printf '{"results":[]}\n'
 fi
 SH
 chmod +x "$FM_SCANNER_DIR/bin/osv-scanner"
@@ -292,6 +294,8 @@ jq -e '
   and (.adjudication.demotions[0].reason_code=="dev-only-package")
   and (.adjudication.demotions[0].corroboration.kind=="candidate-package-lock-dev-scope")
   and (.adjudication.demotions[0].corroboration.proof_id|test("^[0-9a-f]{64}$"))
+  and (.adjudication.demotions[0].corroboration.subject.name=="dev-vuln")
+  and (.adjudication.demotions[0].corroboration.subject.advisory_id=="GHSA-DEV-TEST")
   and (.adjudication.demotions[0].audit_sampled)
   and ([.findings[]|select(
     .rule_id=="dev-dependency/GHSA-DEV-TEST"

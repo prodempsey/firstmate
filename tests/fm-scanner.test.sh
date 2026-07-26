@@ -108,20 +108,27 @@ case "$name" in
     ;;
   osv-scanner)
     if [ "$version" = true ]; then echo 'osv-scanner version: 2.4.0'; exit 0; fi
-    results='[]'
-    [ -f package-lock.json ] && results='[
-      {"ruleId":"CVE-INHERITED","message":{"text":"inherited dependency vulnerability"},
-       "locations":[{"physicalLocation":{"artifactLocation":{"uri":"package-lock.json"}}}]}
+    packages='[]'
+    [ -f package-lock.json ] && packages='[
+      {
+        "package":{"name":"inherited-dep","version":"1.0.0","ecosystem":"npm"},
+        "vulnerabilities":[{"id":"CVE-INHERITED"}]
+      }
     ]'
     if [ -f package-lock.json ] && grep -q NEW_OSV package-lock.json; then
-      results=$("$REAL_JQ" -nc --argjson old "$results" '$old + [
-        {"ruleId":"CVE-NEW","message":{"text":"new dependency vulnerability"},
-         "locations":[{"physicalLocation":{"artifactLocation":{"uri":"package-lock.json"}}}]},
-        {"ruleId":"GHSA-DEV","message":{"text":"Package '\''dev-vuln@1.0.0'\'' is vulnerable to '\''GHSA-DEV'\''."},
-         "locations":[{"physicalLocation":{"artifactLocation":{"uri":"package-lock.json"}}}]}
+      packages=$("$REAL_JQ" -nc --argjson old "$packages" '$old + [
+        {
+          package:{name:"new-prod",version:"1.0.0",ecosystem:"npm"},
+          vulnerabilities:[{id:"CVE-NEW"}]
+        },
+        {
+          package:{name:"dev-vuln",version:"1.0.0",ecosystem:"npm"},
+          vulnerabilities:[{id:"GHSA-DEV"}]
+        }
       ]')
     fi
-    "$REAL_JQ" -nc --argjson results "$results" '{runs:[{results:$results}]}'
+    "$REAL_JQ" -nc --arg path "$PWD/package-lock.json" --argjson packages "$packages" \
+      '{results:[{source:{path:$path,type:"lockfile"},packages:$packages}]}'
     ;;
   actionlint)
     if [ "$version" = true ]; then echo '1.7.12'; exit 0; fi
@@ -291,6 +298,10 @@ pass "severity policy: uncorroborated security findings remain blocking"
     and .policy_decision=="report-only"
     and (.blocking|not)
     and .adjudication.corroboration.kind=="candidate-package-lock-dev-scope"
+    and .subject.name=="dev-vuln"
+    and .subject.advisory_id=="GHSA-DEV"
+    and .adjudication.corroboration.subject==.subject
+    and .adjudication.corroboration.finding_fingerprint==.fingerprint
   )]|length' "$OUT")" -eq 1 ] ||
   fail "positively proven OSV dev dependency lacked machine-owned corroboration"
 pass "OSV dev-dependency scope is proven from package-lock before demotion"

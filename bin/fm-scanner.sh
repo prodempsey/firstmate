@@ -275,20 +275,95 @@ raw_from_sarif() {
   ' "$sarif" >> "$destination"
 }
 
-raw_from_osv_sarif() {
-  local sarif=$1 root=$2 destination=$3 temporary path package lockfile record
+raw_from_osv_json() {
+  local report=$1 root=$2 destination=$3 canonical temporary path package lockfile record
+  canonical="$TMP/osv-canonical.$RANDOM.json"
   temporary="$TMP/osv-raw.$RANDOM.jsonl"
-  : > "$temporary"
-  raw_from_sarif osv-scanner "$sarif" "$root" "$temporary" || return 1
+  jq -e '
+    if ((.results|type)=="array"
+      and all(.results[];
+        (.source|type)=="object"
+        and (.source.path|type)=="string" and (.source.path|length)>0
+        and (.source.type|type)=="string" and (.source.type|length)>0
+        and (.packages|type)=="array"
+        and all(.packages[];
+          (.package|type)=="object"
+          and (.package.ecosystem|type)=="string" and (.package.ecosystem|length)>0
+          and (.package.name|type)=="string" and (.package.name|length)>0
+          and (.package.version|type)=="string" and (.package.version|length)>0
+          and (.package.ecosystem|length)<=64
+          and (.package.name|length)<=512
+          and (.package.version|length)<=256
+          and (.vulnerabilities|type)=="array"
+          and all(.vulnerabilities[];
+            (.id|type)=="string" and (.id|length)>0 and (.id|length)<=256))))
+    then {
+      results:[.results[]|{
+        source:{path:.source.path,type:.source.type},
+        packages:[.packages[]|{
+          package:{
+            ecosystem:.package.ecosystem,
+            name:.package.name,
+            version:.package.version
+          },
+          vulnerabilities:[.vulnerabilities[]|{id:.id}]
+        }]
+      }]
+    }
+    else error("OSV JSON result is structurally incomplete")
+    end
+  ' "$report" > "$canonical" 2>/dev/null || return 1
+  jq -e '
+    keys==["results"]
+    and (.results|type)=="array"
+    and all(.results[];
+      keys==["packages","source"]
+      and (.source|keys)==["path","type"]
+      and (.source.path|type)=="string" and (.source.path|length)>0
+      and (.source.type|type)=="string" and (.source.type|length)>0
+      and (.packages|type)=="array"
+      and all(.packages[];
+        keys==["package","vulnerabilities"]
+        and (.package|keys)==["ecosystem","name","version"]
+        and all(.package.ecosystem,.package.name,.package.version;
+          (type=="string") and length>0)
+        and (.vulnerabilities|type)=="array"
+        and all(.vulnerabilities[];
+          keys==["id"] and (.id|type)=="string" and (.id|length)>0)))
+  ' "$canonical" >/dev/null 2>&1 || return 1
+  jq -c --arg root "$root/" '
+    .results[] as $result
+    | $result.packages[]
+    | .package as $package
+    | .vulnerabilities[]
+    | .id as $advisory
+    | ($result.source.path|sub("^file://";"")) as $source_path
+    | {
+        schema:"firstmate/scanner-raw-finding/1",
+        scanner:"osv-scanner",
+        rule_id:$advisory,
+        severity:"error",
+        path:($source_path
+          | if startswith($root) then .[($root|length):] else . end),
+        line:null,
+        message:("Package '\''"+$package.name+"@"+$package.version+
+          "'\'' is vulnerable to '\''"+$advisory+"'\''."),
+        content:null,
+        subject:{
+          advisory_id:$advisory,
+          ecosystem:$package.ecosystem,
+          kind:"osv-package-advisory",
+          name:$package.name,
+          version:$package.version
+        }
+      }
+  ' "$canonical" > "$temporary" || return 1
   while IFS= read -r record; do
     [ -n "$record" ] || continue
     path=$(printf '%s\n' "$record" | jq -r '.path // ""')
-    package=$(printf '%s\n' "$record" | jq -r '
-      try (.message|capture("^Package '\''(?<spec>.+)'\'' is vulnerable").spec
-        | sub("@[^@]+$";"")) catch ""
-    ')
+    package=$(printf '%s\n' "$record" | jq -r '.subject.name')
     lockfile="$root/$path"
-    if [ -n "$package" ] &&
+    if [ "$(printf '%s\n' "$record" | jq -r '.subject.ecosystem')" = npm ] &&
       printf '%s\n' "$path" | grep -Eq '(^|/)package-lock\.json$' &&
       ! printf '%s\n' "$path" | grep -Eq '(^|/)\.\.(/|$)|^/' &&
       [ -f "$lockfile" ] &&
@@ -299,7 +374,7 @@ raw_from_osv_sarif() {
       printf '%s\n' "$record"
     fi
   done < "$temporary" >> "$destination"
-  rm -f "$temporary"
+  rm -f "$canonical" "$temporary"
 }
 
 raw_from_eslint() {
@@ -406,7 +481,13 @@ enrich_content() {
     if [ ! -s "$content_file" ]; then
       printf '%s\n' "$record" | jq -r '.message' > "$content_file"
     fi
-    printf '%s\n' "$record" | jq -c --rawfile content "$content_file" '.content=($content|sub("\n$";""))' \
+    printf '%s\n' "$record" | jq -c --rawfile content "$content_file" '
+      . + {subject:(if has("subject") then .subject else null end)}
+      | if .subject==null
+        then .content=($content|sub("\n$";""))
+        else .content=null
+        end
+    ' \
       >> "$destination"
   done < "$source"
   rm -f "$content_file"
@@ -429,6 +510,25 @@ run_sarif_scan() {
   fi
   if ! jq -e '(.runs|type)=="array"' "$output" >/dev/null 2>&1; then
     SCAN_ERROR="$scanner returned malformed SARIF"
+    return 1
+  fi
+  return 0
+}
+
+run_osv_scan() {
+  local root=$1 output=$2
+  shift 2
+  run_bounded "$(remaining_budget)" "$root" "$output" "$@"
+  if [ "$BOUNDED_TIMEOUT" = yes ]; then
+    SCAN_ERROR="osv-scanner exceeded its hard deadline (FC-006)"
+    return 1
+  fi
+  if [ "$RUN_RC" -gt 1 ]; then
+    SCAN_ERROR="osv-scanner crashed with exit $RUN_RC"
+    return 1
+  fi
+  if ! jq -e '(.results|type)=="array"' "$output" >/dev/null 2>&1; then
+    SCAN_ERROR="osv-scanner returned malformed JSON"
     return 1
   fi
   return 0
@@ -619,27 +719,27 @@ if changed_matches "$LOCK_RE"; then
       OSV_OK=false
     fi
     if [ "$OSV_OK" = true ] && [ "${#BASE_LOCKS[@]}" -gt 0 ]; then
-      OSV_ARGS=(--offline scan source --format sarif)
+      OSV_ARGS=(--offline scan source --format json)
       for file in "${BASE_LOCKS[@]}"; do OSV_ARGS+=(-L "$file"); done
-      if run_sarif_scan osv-scanner env "$BASE_DIR" "$TMP/osv-base.sarif" \
+      if run_osv_scan "$BASE_DIR" "$TMP/osv-base.json" env \
         OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY="$OSV_DB" "$OSV" "${OSV_ARGS[@]}" &&
-        raw_from_osv_sarif "$TMP/osv-base.sarif" "$BASE_DIR" "$RAW_BASE"; then :;
+        raw_from_osv_json "$TMP/osv-base.json" "$BASE_DIR" "$RAW_BASE"; then :;
       else OSV_OK=false; fi
     fi
     if [ "$OSV_OK" = true ] && [ "${#CANDIDATE_LOCKS[@]}" -gt 0 ]; then
-      OSV_ARGS=(--offline scan source --format sarif)
+      OSV_ARGS=(--offline scan source --format json)
       for file in "${CANDIDATE_LOCKS[@]}"; do OSV_ARGS+=(-L "$file"); done
-      if run_sarif_scan osv-scanner env "$CANDIDATE_DIR" "$TMP/osv-candidate.sarif" \
+      if run_osv_scan "$CANDIDATE_DIR" "$TMP/osv-candidate.json" env \
         OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY="$OSV_DB" "$OSV" "${OSV_ARGS[@]}" &&
-        raw_from_osv_sarif "$TMP/osv-candidate.sarif" "$CANDIDATE_DIR" "$RAW_CANDIDATE"; then :;
+        raw_from_osv_json "$TMP/osv-candidate.json" "$CANDIDATE_DIR" "$RAW_CANDIDATE"; then :;
       else OSV_OK=false; fi
     fi
     if [ "$OSV_OK" = true ] && [ "${#CANDIDATE_LOCKS[@]}" -gt 0 ]; then
-      OSV_ARGS=(--offline scan source --format sarif)
+      OSV_ARGS=(--offline scan source --format json)
       for file in "${CANDIDATE_LOCKS[@]}"; do OSV_ARGS+=(-L "$file"); done
-      if run_sarif_scan osv-scanner env "$CANDIDATE_DIR" "$TMP/osv-confirm.sarif" \
+      if run_osv_scan "$CANDIDATE_DIR" "$TMP/osv-confirm.json" env \
         OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY="$OSV_DB" "$OSV" "${OSV_ARGS[@]}" &&
-        raw_from_osv_sarif "$TMP/osv-confirm.sarif" "$CANDIDATE_DIR" "$RAW_CONFIRMATION"; then :;
+        raw_from_osv_json "$TMP/osv-confirm.json" "$CANDIDATE_DIR" "$RAW_CONFIRMATION"; then :;
       else OSV_OK=false; fi
     fi
     if [ "$OSV_OK" = true ]; then scanner_end osv-scanner ok

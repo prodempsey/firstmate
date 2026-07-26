@@ -17,7 +17,8 @@ OUT="$TMP/report.json"
 raw() {
   jq -nc --arg scanner "$1" --arg rule "$2" --arg path "$3" --arg content "$4" '
     {schema:"firstmate/scanner-raw-finding/1",scanner:$scanner,rule_id:$rule,
-     severity:"error",path:$path,line:1,message:("finding "+$rule),content:$content}'
+     severity:"error",path:$path,line:1,message:("finding "+$rule),
+     content:$content,subject:null}'
 }
 
 raw shellcheck SC1007 script.sh 'local a= b=' > "$BASE"
@@ -105,15 +106,16 @@ jq -e '
   fail "scanner golden set is not closed, unique, and complete"
 jq -c '.cases[]|{
   schema:"firstmate/scanner-raw-finding/1",
-  scanner,rule_id,severity,path,line,message:.id,content
+  scanner,rule_id,severity,path,line,message:.id,content,subject:(.subject // null)
 }' "$GOLDEN" > "$TMP/golden-candidate.jsonl"
 jq -c '.cases[]|select(.base_content!=null)|{
   schema:"firstmate/scanner-raw-finding/1",
-  scanner,rule_id,severity,path,line,message:.id,content:.base_content
+  scanner,rule_id,severity,path,line,message:.id,content:.base_content,
+  subject:(.subject // null)
 }' "$GOLDEN" > "$TMP/golden-base.jsonl"
 jq -c '.cases[]|select(.confirm)|{
   schema:"firstmate/scanner-raw-finding/1",
-  scanner,rule_id,severity,path,line,message:.id,content
+  scanner,rule_id,severity,path,line,message:.id,content,subject:(.subject // null)
 }' "$GOLDEN" > "$TMP/golden-confirmation.jsonl"
 "$ATTRIBUTOR" --base "$TMP/golden-base.jsonl" \
   --candidate "$TMP/golden-candidate.jsonl" \

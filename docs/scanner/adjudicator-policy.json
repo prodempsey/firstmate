@@ -60,7 +60,7 @@
     {
       "code": "dev-only-package",
       "corroborator": "candidate-package-lock-dev-scope",
-      "description": "The application independently re-read the candidate package-lock and proved that the exact affected package is marked dev-only."
+      "description": "The application bound OSV's validated structured package and advisory identity into the finding fingerprint, then independently re-read the candidate package-lock and proved that exact package is marked dev-only."
     }
   ]
 }

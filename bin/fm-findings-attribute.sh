@@ -4,7 +4,7 @@
 # This is the one generic baseline-attribution mechanism for Shakedown gates.
 # Producers write closed-schema raw findings for the base and candidate snapshots.
 # This helper fingerprints scanner identity + rule id + path + exact source-line
-# content + its ordered occurrence, then labels every candidate finding
+# content + closed structured subject + its ordered occurrence, then labels every candidate finding
 # candidate-new, inherited, or unattributed.
 #
 # FC-001 (closed-schema positive proof): A conclusion may be drawn only from ONE atomic pass that positively proves conformance to a single declared, closed schema; authority defaults to none and is NEVER inferred from the absence of a failing check.
@@ -15,7 +15,7 @@
 #     [--base <raw.jsonl>] [--policy <json>] --out <report.json>
 #
 # Raw finding schema firstmate/scanner-raw-finding/1 has exactly:
-#   schema, scanner, rule_id, severity, path, line, message, content
+#   schema, scanner, rule_id, severity, path, line, message, content, subject
 #
 # Report schema firstmate/scanner-attribution/1 has exactly:
 #   schema, baseline, findings
@@ -58,7 +58,7 @@ trap 'rm -rf "$TMP"' EXIT
 validate_raw() {
   jq -s -e '
     all(.[];
-      (keys == ["content","line","message","path","rule_id","scanner","schema","severity"])
+      (keys == ["content","line","message","path","rule_id","scanner","schema","severity","subject"])
       and .schema == "firstmate/scanner-raw-finding/1"
       and (.scanner|type) == "string" and (.scanner|length) > 0
       and (.rule_id|type) == "string" and (.rule_id|length) > 0
@@ -66,7 +66,16 @@ validate_raw() {
       and (.path == null or (.path|type) == "string")
       and (.line == null or ((.line|type) == "number" and .line >= 1 and .line == (.line|floor)))
       and (.message|type) == "string" and (.message|length) > 0
-      and (.content == null or (.content|type) == "string"))
+      and (.content == null or (.content|type) == "string")
+      and (.subject == null or (
+        (.subject|keys)==["advisory_id","ecosystem","kind","name","version"]
+        and .subject.kind=="osv-package-advisory"
+        and all(.subject.advisory_id,.subject.ecosystem,.subject.name,.subject.version;
+          (type=="string") and length>0)
+        and (.subject.advisory_id|length)<=256
+        and (.subject.ecosystem|length)<=64
+        and (.subject.name|length)<=512
+        and (.subject.version|length)<=256)))
   ' "$1" >/dev/null 2>&1
 }
 
@@ -95,9 +104,9 @@ jq -e '
 
 prepare_records() {
   jq -s -c '
-    sort_by(.scanner,.rule_id,.path // "",.content // "",.line // 0,.message)
-    | unique_by([.scanner,.rule_id,.path // "",.content // "",.line,.message,.severity])
-    | group_by([.scanner,.rule_id,.path // "",.content // ""])[]
+    sort_by(.scanner,.rule_id,.path // "",.content // "",(.subject|tojson),.line // 0,.message)
+    | unique_by([.scanner,.rule_id,.path // "",.content // "",.subject,.line,.message,.severity])
+    | group_by([.scanner,.rule_id,.path // "",.content // "",.subject])[]
     | sort_by(.line // 0)
     | to_entries[]
     | .key as $occurrence
@@ -112,7 +121,7 @@ fingerprint_records() {
     [ -n "$record" ] || continue
     fingerprint=$(
       printf '%s\n' "$record" |
-        jq -r '[.scanner,.rule_id,.path // "",.content // "",.occurrence]|@tsv' |
+        jq -r '[.scanner,.rule_id,.path // "",.content // "",(.subject|tojson),.occurrence]|@tsv' |
         sha256sum | awk '{print $1}'
     )
     printf '%s\n' "$record" |
@@ -237,7 +246,7 @@ jq -e '
   and (.baseline.available|type) == "boolean"
   and (.baseline.warning == null or (.baseline.warning|type) == "string")
   and all(.findings[];
-    (keys == ["attribution","blocking","fingerprint","line","message","occurrence","path","policy_decision","policy_reason","rule_id","scanner","schema","severity","stability"])
+    (keys == ["attribution","blocking","fingerprint","line","message","occurrence","path","policy_decision","policy_reason","rule_id","scanner","schema","severity","stability","subject"])
     and .schema == "firstmate/scanner-raw-finding/1"
     and (.attribution == "candidate-new" or .attribution == "inherited" or .attribution == "unattributed")
     and (.blocking|type) == "boolean"
@@ -245,6 +254,15 @@ jq -e '
     and (.policy_decision=="block" or .policy_decision=="report-only" or .policy_decision=="inherited")
     and (.policy_reason|type)=="string" and (.policy_reason|length)>0
     and (.stability=="confirmed" or .stability=="unconfirmed" or .stability=="not-required")
+    and (.subject == null or (
+      (.subject|keys)==["advisory_id","ecosystem","kind","name","version"]
+      and .subject.kind=="osv-package-advisory"
+      and all(.subject.advisory_id,.subject.ecosystem,.subject.name,.subject.version;
+        (type=="string") and length>0)
+      and (.subject.advisory_id|length)<=256
+      and (.subject.ecosystem|length)<=64
+      and (.subject.name|length)<=512
+      and (.subject.version|length)<=256))
     and (.fingerprint|test("^[0-9a-f]{64}$")))
 ' "$REPORT" >/dev/null || refuse "assembled report failed its closed-schema proof (FC-001)"
 
