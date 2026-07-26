@@ -18,10 +18,10 @@
 FM_CUE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The authority is bound UNCONDITIONALLY to THIS repo's validator, resolved by the library's own
 # directory (the real bin/) - no ambient environment variable can substitute a weaker, permissive,
-# or success-always authority for it, and no FM_ROOT_OVERRIDE can redirect it. The ONLY test
-# injection is the refusal-only, FIXTURE-GATED sandbox-marker seam inside the validator (a marker
-# file the fixture creates in the validated ledger's own directory), which can force a refusal but
-# never a false pass and cannot be engaged by any ambient variable. There is no override of this path.
+# or success-always authority for it, and no FM_ROOT_OVERRIDE can redirect it. There is NO test-
+# injection seam of any kind (no marker file, no environment variable): python3 and jsonschema are
+# genuine hard prerequisites whose real absence is the only thing that refuses. There is no override
+# of this path.
 _FM_CUE_VALIDATOR="$FM_CUE_LIB_DIR/fm-cue-validate.sh"
 
 fm_cue_ledger_prove() { # <ledger-path>

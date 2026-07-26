@@ -110,16 +110,19 @@ NOJS=$(fm_test_pythonpath_no_jsonschema "$TMP/nojs")
 PYTHONPATH="$NOJS" "$V" prove "$led" >/dev/null 2>"$TMP/e"
 if [ "$(sed -n 1p "$TMP/e")" = CUE_VALIDATOR_UNAVAILABLE ]; then pass "jsonschema genuinely unimportable -> CUE_VALIDATOR_UNAVAILABLE (fail closed)"; else fail "jsonschema absent must refuse"; fi
 
-# --- NO-SEAM regression (qa-scg1r7-q189 F1): the injection seam is DELETED, not merely guarded ----
-# The only correct guard is the absence of any seam. Assert the seam strings do not appear anywhere in
-# the cue authority's production code, so no ordinary shell (marker file, symlink, env var, or
-# otherwise) can engage a replacement of the prerequisite check.
+# --- NO-SEAM regression (qa-scg1r7-q189 F1, qa-scg1r8-q192 F1): the injection seam is DELETED, not
+# merely guarded, and no comment DESCRIBES one either. Assert none of the distinctive seam identifiers
+# (the env var, the marker filename, or the "sandbox-marker" description) appears anywhere - code OR
+# comments - in the cue authority's production scripts, so no ordinary shell can engage a replacement
+# of the prerequisite check and no stale doc claims a mechanism that no longer exists. (This bans only
+# the distinctive seam tokens, not the words "sandbox"/"seam" generally, which appear legitimately -
+# fm-verify's isolated test-checkout worktree, and the accurate "there is NO ... seam" negations.)
 for f in "$ROOT/bin/fm-cue-validate.sh" "$ROOT/bin/fm-cue-lib.sh" "$ROOT/bin/fm-failure-class.sh" "$ROOT/bin/fm-verify.sh"; do
-  if grep -qE 'FM_CUE_SIMULATE_MISSING|fm-cue-test-sandbox|SIMULATE_MISSING' "$f"; then
-    fail "a test-injection seam string is still present in production code: $f"
+  if grep -qE 'FM_CUE_SIMULATE_MISSING|SIMULATE_MISSING|fm-cue-test-sandbox|sandbox-marker' "$f"; then
+    fail "a test-injection seam string is still present in production code (or its docs): $f"
   fi
 done
-pass "no injection-seam string exists in the cue authority's production code (grep-based)"
+pass "no injection-seam string exists in the cue authority's production code or comments (grep-based)"
 
 # --- check-row: the raw single-row entrypoint (write path uses this pre-jq) --
 check_row() { printf '%s' "$1" > "$TMP/row.json"; "$V" check-row "$TMP/row.json" >/dev/null 2>&1; }
