@@ -9,6 +9,7 @@ INSTALLER="$ROOT/bin/fm-install-scanners.sh"
 DB_INSTALLER="$ROOT/bin/fm-install-osv-db.sh"
 RUNNER="$ROOT/bin/fm-scanner.sh"
 LOCK="$ROOT/docs/scanner/package-lock.json"
+POLICY="$ROOT/docs/scanner/blocking-policy.json"
 
 for version in 8.30.1 1.75.0 2.4.0 1.7.12 0.16.0 1.7.1; do
   assert_grep "$version" "$INSTALLER" "scanner installer is missing pin $version"
@@ -34,6 +35,18 @@ jq -e '
   and .packages[""].dependencies.ajv=="8.17.1"
 ' "$LOCK" >/dev/null || fail "Node scanner direct dependencies are not exactly pinned"
 pass "scanner installers pin binaries by checksum and Node tools by lockfile"
+
+jq -e '
+  .schema=="firstmate/scanner-blocking-policy/1"
+  and ([.scanners[].budget_s]|add)<30
+  and ([.scanners[].scanner]|length)==8
+  and any(.scanners[];
+    .scanner=="eslint"
+    and (.blocking_severities|index("error"))!=null
+    and (.report_only_rule_prefixes|index("security/"))!=null)
+' "$POLICY" >/dev/null ||
+  fail "committed scanner policy must reserve time and keep eslint-plugin-security report-only"
+pass "scanner policy closes blocking thresholds and fair per-scanner budgets"
 
 assert_no_grep 'trufflehog' "$RUNNER" "trufflehog must never enter the runtime battery"
 assert_no_grep 'trufflehog' "$INSTALLER" "trufflehog must never enter the pinned installer"

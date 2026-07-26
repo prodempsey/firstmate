@@ -1,0 +1,57 @@
+{
+  "schema": "firstmate/scanner-blocking-policy/1",
+  "default": {
+    "blocking_severities": ["error"],
+    "report_only_rule_prefixes": []
+  },
+  "scanners": [
+    {
+      "scanner": "actionlint",
+      "budget_s": 2,
+      "blocking_severities": ["error"],
+      "report_only_rule_prefixes": []
+    },
+    {
+      "scanner": "eslint",
+      "budget_s": 4,
+      "blocking_severities": ["error"],
+      "report_only_rule_prefixes": ["security/"]
+    },
+    {
+      "scanner": "gitleaks",
+      "budget_s": 5,
+      "blocking_severities": ["error"],
+      "report_only_rule_prefixes": []
+    },
+    {
+      "scanner": "jq",
+      "budget_s": 4,
+      "blocking_severities": ["error"],
+      "report_only_rule_prefixes": []
+    },
+    {
+      "scanner": "osv-scanner",
+      "budget_s": 4,
+      "blocking_severities": ["error"],
+      "report_only_rule_prefixes": []
+    },
+    {
+      "scanner": "oxlint",
+      "budget_s": 2,
+      "blocking_severities": ["error"],
+      "report_only_rule_prefixes": []
+    },
+    {
+      "scanner": "ruff",
+      "budget_s": 2,
+      "blocking_severities": ["error"],
+      "report_only_rule_prefixes": []
+    },
+    {
+      "scanner": "shellcheck",
+      "budget_s": 3,
+      "blocking_severities": ["error"],
+      "report_only_rule_prefixes": []
+    }
+  ]
+}

@@ -3,6 +3,7 @@
 `bin/fm-scanner.sh` owns scanner execution, normalization, timing, offline enforcement, and the `firstmate/scanner-report/1` contract.
 `bin/fm-findings-attribute.sh` is the reusable owner of inherited, candidate-new, and unattributed baseline semantics.
 `bin/fm-verify.sh` consumes that closed report as its `scanner` gate.
+`docs/scanner/blocking-policy.json` is the single committed authority for blocking severities, report-only rule prefixes, and per-scanner time slices.
 
 Install the pinned tools with `bin/fm-install-scanners.sh <scanner-directory>`.
 Refresh the OSV database explicitly with `bin/fm-install-osv-db.sh <scanner-directory>`.

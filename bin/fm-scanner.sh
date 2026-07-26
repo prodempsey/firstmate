@@ -12,7 +12,8 @@
 # and must find a pre-provisioned database under FM_SCANNER_OSV_DB.
 #
 # Usage:
-#   fm-scanner.sh --repo <git-repo> --candidate <sha> [--base <sha>] --out <json>
+#   fm-scanner.sh --repo <git-repo> --candidate <sha> [--base <sha>]
+#     [--scope diff|full] --out <json>
 #
 # Environment:
 #   FM_SCANNER_DIR              pinned tool installation (default: $FM_HOME/tools/scanners)
@@ -29,6 +30,7 @@ SCANNER_DIR="${FM_SCANNER_DIR:-$FM_HOME/tools/scanners}"
 OSV_DB="${FM_SCANNER_OSV_DB:-$SCANNER_DIR/osv-db}"
 CALL_TIMEOUT="${FM_VERIFY_SCANNER_TIMEOUT:-8}"
 TOTAL_BUDGET="${FM_VERIFY_SCANNER_BUDGET:-30}"
+POLICY="$(cd "$SCRIPT_DIR/.." && pwd)/docs/scanner/blocking-policy.json"
 
 usage() { sed -n '/^# Usage:/,/^set -u$/p' "$0" | sed 's/^# \{0,1\}//;$d'; }
 refuse() { printf 'fm-scanner: %s\n' "$1" >&2; exit 2; }
@@ -37,17 +39,20 @@ REPO=""
 CANDIDATE=""
 BASE=""
 OUT=""
+SCOPE="diff"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repo) REPO=${2:-}; shift ;;
     --candidate) CANDIDATE=${2:-}; shift ;;
     --base) BASE=${2:-}; shift ;;
+    --scope) SCOPE=${2:-}; shift ;;
     --out) OUT=${2:-}; shift ;;
     -h|--help) usage; exit 0 ;;
     *) refuse "unknown argument: $1" ;;
   esac
   shift
 done
+[ "$SCOPE" = diff ] || [ "$SCOPE" = full ] || refuse "--scope must be diff or full"
 
 for n in "$CALL_TIMEOUT" "$TOTAL_BUDGET"; do
   case "$n" in ''|*[!0-9]*) refuse "scanner deadlines must be positive integers" ;; esac
@@ -63,6 +68,13 @@ if [ -z "$CANDIDATE" ] || ! git -C "$REPO" cat-file -e "$CANDIDATE^{commit}" 2>/
   refuse "--candidate must resolve to a commit"
 fi
 [ -n "$OUT" ] || refuse "--out is required"
+[ -f "$POLICY" ] || refuse "committed scanner policy is missing: $POLICY"
+POLICY_TOTAL_BUDGET=$(jq -r '[.scanners[].budget_s]|add' "$POLICY" 2>/dev/null || true)
+case "$POLICY_TOTAL_BUDGET" in
+  ''|*[!0-9]*) refuse "committed scanner policy has invalid per-scanner budgets" ;;
+esac
+[ "$POLICY_TOTAL_BUDGET" -le "$TOTAL_BUDGET" ] ||
+  refuse "whole battery budget must reserve all committed per-scanner slices ($POLICY_TOTAL_BUDGET seconds)"
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/fm-scanner.XXXXXX") || refuse "cannot create scratch directory"
 BASE_DIR=""
@@ -89,14 +101,18 @@ fi
 
 RAW_BASE="$TMP/raw-base.jsonl"
 RAW_CANDIDATE="$TMP/raw-candidate.jsonl"
+RAW_CONFIRMATION="$TMP/raw-confirmation.jsonl"
 TIMINGS="$TMP/timings.jsonl"
 CHANGED="$TMP/changed.txt"
 : > "$RAW_BASE"
 : > "$RAW_CANDIDATE"
+: > "$RAW_CONFIRMATION"
 : > "$TIMINGS"
 : > "$CHANGED"
 
-if [ "$BASELINE_AVAILABLE" = true ]; then
+if [ "$SCOPE" = full ]; then
+  git -C "$CANDIDATE_DIR" ls-files > "$CHANGED"
+elif [ "$BASELINE_AVAILABLE" = true ]; then
   git -C "$REPO" diff --name-only --diff-filter=ACMR "$BASE...$CANDIDATE" > "$CHANGED" ||
     BASELINE_AVAILABLE=false
 fi
@@ -108,23 +124,22 @@ TIMEOUT_BIN=""
 for tb in timeout gtimeout; do
   if command -v "$tb" >/dev/null 2>&1; then TIMEOUT_BIN=$tb; break; fi
 done
-BATTERY_STARTED=$(date +%s)
 BOUNDED_TIMEOUT=no
 RUN_RC=0
 run_bounded() {
   local budget=$1 cwd=$2 outfile=$3
   shift 3
   BOUNDED_TIMEOUT=no
-  local elapsed global_remaining
-  elapsed=$(($(date +%s) - BATTERY_STARTED))
-  global_remaining=$((TOTAL_BUDGET - elapsed))
-  if [ "$global_remaining" -lt 1 ]; then
+  local elapsed scanner_remaining
+  elapsed=$(($(date +%s) - scanner_started))
+  scanner_remaining=$((scanner_budget - elapsed))
+  if [ "$scanner_remaining" -lt 1 ]; then
     : > "$outfile"
     BOUNDED_TIMEOUT=yes
     RUN_RC=124
     return
   fi
-  [ "$budget" -gt "$global_remaining" ] && budget=$global_remaining
+  [ "$budget" -gt "$scanner_remaining" ] && budget=$scanner_remaining
   if [ -n "$TIMEOUT_BIN" ] && [ "${FM_VERIFY_FORCE_PID_WATCHDOG:-}" != 1 ]; then
     (cd "$cwd" && exec "$TIMEOUT_BIN" -k 2 "$budget" "$@") > "$outfile" 2>&1
     RUN_RC=$?
@@ -147,25 +162,38 @@ run_bounded() {
 
 remaining_budget() {
   local elapsed remaining
-  elapsed=$(($(date +%s) - BATTERY_STARTED))
-  remaining=$((TOTAL_BUDGET - elapsed))
+  elapsed=$(($(date +%s) - scanner_started))
+  remaining=$((scanner_budget - elapsed))
   [ "$remaining" -gt "$CALL_TIMEOUT" ] && remaining=$CALL_TIMEOUT
   [ "$remaining" -lt 1 ] && remaining=1
   printf '%s\n' "$remaining"
 }
 
 scanner_started=0
-scanner_begin() { scanner_started=$(date +%s); }
+scanner_budget=0
+scanner_begin() {
+  local scanner=$1
+  scanner_started=$(date +%s)
+  scanner_budget=$(jq -r --arg scanner "$scanner" '
+    .scanners[]|select(.scanner==$scanner)|.budget_s
+  ' "$POLICY" 2>/dev/null | head -1)
+  case "$scanner_budget" in ''|*[!0-9]*) refuse "scanner policy has no valid budget for $scanner" ;; esac
+  [ "$scanner_budget" -gt 0 ] || refuse "scanner policy has no valid budget for $scanner"
+}
 scanner_end() {
   local scanner=$1 status=$2 duration
   duration=$((($(date +%s) - scanner_started) * 1000))
   jq -nc --arg scanner "$scanner" --arg status "$status" --arg duration "$duration" \
-    '{scanner:$scanner,status:$status,duration_ms:($duration|tonumber)}' >> "$TIMINGS"
+    --arg budget "$scanner_budget" \
+    '{scanner:$scanner,status:$status,duration_ms:($duration|tonumber),budget_s:($budget|tonumber)}' >> "$TIMINGS"
 }
 not_applicable() {
-  local scanner=$1 reason=$2
-  jq -nc --arg scanner "$scanner" --arg reason "$reason" \
-    '{scanner:$scanner,status:"not-applicable",duration_ms:0,reason:$reason}' >> "$TIMINGS"
+  local scanner=$1 reason=$2 budget
+  budget=$(jq -r --arg scanner "$scanner" '.scanners[]|select(.scanner==$scanner)|.budget_s' \
+    "$POLICY" 2>/dev/null | head -1)
+  jq -nc --arg scanner "$scanner" --arg reason "$reason" --arg budget "$budget" \
+    '{scanner:$scanner,status:"not-applicable",duration_ms:0,
+      budget_s:($budget|tonumber),reason:$reason}' >> "$TIMINGS"
 }
 
 emit_unavailable() {
@@ -228,7 +256,10 @@ raw_from_sarif() {
       schema:"firstmate/scanner-raw-finding/1",
       scanner:$scanner,
       rule_id:(.ruleId // "unknown-rule"),
-      severity:$severity,
+      severity:(if .level=="error" then "error"
+                elif .level=="warning" then "warning"
+                elif .level=="note" or .level=="none" then "note"
+                else $severity end),
       path:(if $uri == null then null
             else ($uri|sub("^file://";"")|if startswith($root) then .[($root|length):] else . end)
             end),
@@ -282,7 +313,9 @@ raw_from_shellcheck() {
       schema:"firstmate/scanner-raw-finding/1",
       scanner:"shellcheck",
       rule_id:("SC"+(.code|tostring)),
-      severity:(if .level == "error" then "error" else "warning" end),
+      severity:(if .level == "error" then "error"
+                elif .level == "warning" then "warning"
+                else "note" end),
       path:(.file|if startswith($root) then .[($root|length):] else . end),
       line:(.line // 1),
       message:(.message // "shellcheck finding"),
@@ -372,7 +405,7 @@ run_sarif_scan() {
 # Gitleaks runs raw against both snapshots.
 # The generic attributor is the only mechanism allowed to separate inherited
 # and candidate-new findings, so native baseline filtering is deliberately absent.
-scanner_begin
+scanner_begin gitleaks
 GITLEAKS=$(resolve_tool gitleaks)
 if tool_ready gitleaks "$GITLEAKS" 8.30.1; then
   GITLEAKS_OK=true
@@ -403,9 +436,21 @@ if tool_ready gitleaks "$GITLEAKS" 8.30.1; then
       --report-path "$TMP/gitleaks-candidate-dir.json" .
     if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -ne 0 ]; then GITLEAKS_OK=false; fi
   fi
+  if [ "$GITLEAKS_OK" = true ]; then
+    run_bounded "$(remaining_budget)" "$CANDIDATE_DIR" "$TMP/gitleaks-confirm-history.log" \
+      "$GITLEAKS" git --no-banner --redact --exit-code 0 --report-format json \
+      --report-path "$TMP/gitleaks-confirm-history.json" --log-opts="$log_opts"
+    if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -ne 0 ]; then GITLEAKS_OK=false; fi
+    run_bounded "$(remaining_budget)" "$CANDIDATE_DIR" "$TMP/gitleaks-confirm-dir.log" \
+      "$GITLEAKS" dir --no-banner --redact --exit-code 0 --report-format json \
+      --report-path "$TMP/gitleaks-confirm-dir.json" .
+    if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -ne 0 ]; then GITLEAKS_OK=false; fi
+  fi
   if [ "$GITLEAKS_OK" = true ] &&
     jq -s 'add' "$TMP/gitleaks-candidate-history.json" "$TMP/gitleaks-candidate-dir.json" > "$TMP/gitleaks-candidate.json" &&
-    raw_from_gitleaks "$TMP/gitleaks-candidate.json" "$CANDIDATE_DIR" "$RAW_CANDIDATE"; then
+    raw_from_gitleaks "$TMP/gitleaks-candidate.json" "$CANDIDATE_DIR" "$RAW_CANDIDATE" &&
+    jq -s 'add' "$TMP/gitleaks-confirm-history.json" "$TMP/gitleaks-confirm-dir.json" > "$TMP/gitleaks-confirm.json" &&
+    raw_from_gitleaks "$TMP/gitleaks-confirm.json" "$CANDIDATE_DIR" "$RAW_CONFIRMATION"; then
     scanner_end gitleaks ok
   else
     emit_unavailable gitleaks "scan timed out, crashed, or returned malformed JSON"
@@ -417,7 +462,7 @@ fi
 
 # oxlint: whole-repository JS scan at base and candidate.
 if git -C "$CANDIDATE_DIR" ls-files '*.js' '*.mjs' '*.cjs' | grep -q .; then
-  scanner_begin
+  scanner_begin oxlint
   OXLINT=$(resolve_tool oxlint)
   if tool_ready oxlint "$OXLINT" 1.75.0; then
     OXLINT_OK=true
@@ -433,6 +478,12 @@ if git -C "$CANDIDATE_DIR" ls-files '*.js' '*.mjs' '*.cjs' | grep -q .; then
         raw_from_sarif oxlint "$TMP/oxlint-candidate.sarif" "$CANDIDATE_DIR" "$RAW_CANDIDATE"; then :;
       else OXLINT_OK=false; fi
     fi
+    if [ "$OXLINT_OK" = true ]; then
+      if run_sarif_scan oxlint "$OXLINT" "$CANDIDATE_DIR" "$TMP/oxlint-confirm.sarif" \
+        -f sarif --deny-warnings --no-error-on-unmatched-pattern . &&
+        raw_from_sarif oxlint "$TMP/oxlint-confirm.sarif" "$CANDIDATE_DIR" "$RAW_CONFIRMATION"; then :;
+      else OXLINT_OK=false; fi
+    fi
     if [ "$OXLINT_OK" = true ]; then scanner_end oxlint ok
     else emit_unavailable oxlint "${SCAN_ERROR:-malformed output}"; scanner_end oxlint unavailable; fi
   else
@@ -444,7 +495,7 @@ fi
 
 # eslint 9 + sonarjs/n/security: candidate-diff JavaScript only.
 if changed_matches '\.(js|mjs|cjs)$'; then
-  scanner_begin
+  scanner_begin eslint
   ESLINT_EXECUTABLE=$(resolve_tool eslint-scanner)
   NODE=$(resolve_node_runtime)
   ESLINT_WRAPPER="$SCRIPT_DIR/fm-eslint-scanner.mjs"
@@ -488,6 +539,12 @@ if changed_matches '\.(js|mjs|cjs)$'; then
       if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -gt 1 ] ||
         ! raw_from_eslint eslint "$TMP/eslint-candidate.json" "$CANDIDATE_DIR" "$RAW_CANDIDATE"; then ESLINT_OK=false; fi
     fi
+    if [ "${#CANDIDATE_JS[@]}" -gt 0 ] && [ "$ESLINT_OK" = true ]; then
+      run_bounded "$(remaining_budget)" "$CANDIDATE_DIR" "$TMP/eslint-confirm.json" \
+        "${ESLINT_COMMAND[@]}" "${CANDIDATE_JS[@]}"
+      if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -gt 1 ] ||
+        ! raw_from_eslint eslint "$TMP/eslint-confirm.json" "$CANDIDATE_DIR" "$RAW_CONFIRMATION"; then ESLINT_OK=false; fi
+    fi
   fi
   if [ "$ESLINT_OK" = true ]; then scanner_end eslint ok
   else
@@ -503,7 +560,7 @@ fi
 # osv-scanner: lockfile-touching diffs only, with the fully-offline flag.
 LOCK_RE='(^|/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|go\.sum|poetry\.lock|Pipfile\.lock|composer\.lock|Gemfile\.lock)$'
 if changed_matches "$LOCK_RE"; then
-  scanner_begin
+  scanner_begin osv-scanner
   OSV=$(resolve_tool osv-scanner)
   if tool_ready osv-scanner "$OSV" 2.4.0; then
     OSV_OK=true
@@ -534,6 +591,14 @@ if changed_matches "$LOCK_RE"; then
         raw_from_sarif osv-scanner "$TMP/osv-candidate.sarif" "$CANDIDATE_DIR" "$RAW_CANDIDATE"; then :;
       else OSV_OK=false; fi
     fi
+    if [ "$OSV_OK" = true ] && [ "${#CANDIDATE_LOCKS[@]}" -gt 0 ]; then
+      OSV_ARGS=(--offline scan source --format sarif)
+      for file in "${CANDIDATE_LOCKS[@]}"; do OSV_ARGS+=(-L "$file"); done
+      if run_sarif_scan osv-scanner env "$CANDIDATE_DIR" "$TMP/osv-confirm.sarif" \
+        OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY="$OSV_DB" "$OSV" "${OSV_ARGS[@]}" &&
+        raw_from_sarif osv-scanner "$TMP/osv-confirm.sarif" "$CANDIDATE_DIR" "$RAW_CONFIRMATION"; then :;
+      else OSV_OK=false; fi
+    fi
     if [ "$OSV_OK" = true ]; then scanner_end osv-scanner ok
     else
       if ! grep -q '"scanner":"osv-scanner".*"rule_id":"scanner-unavailable"' "$RAW_CANDIDATE"; then
@@ -551,7 +616,7 @@ fi
 # actionlint: changed GitHub workflow files only.
 WORKFLOW_RE='^\.github/workflows/.*\.(yml|yaml)$'
 if changed_matches "$WORKFLOW_RE"; then
-  scanner_begin
+  scanner_begin actionlint
   ACTIONLINT=$(resolve_tool actionlint)
   if tool_ready actionlint "$ACTIONLINT" 1.7.12; then
     ACTIONLINT_OK=true
@@ -574,6 +639,12 @@ if changed_matches "$WORKFLOW_RE"; then
       if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -gt 1 ] ||
         ! raw_from_actionlint "$TMP/actionlint-candidate.json" "$CANDIDATE_DIR" "$RAW_CANDIDATE"; then ACTIONLINT_OK=false; fi
     fi
+    if [ "${#CANDIDATE_WORKFLOWS[@]}" -gt 0 ] && [ "$ACTIONLINT_OK" = true ]; then
+      run_bounded "$(remaining_budget)" "$CANDIDATE_DIR" "$TMP/actionlint-confirm.json" \
+        "$ACTIONLINT" -format '{{json .}}' -shellcheck= -pyflakes= "${CANDIDATE_WORKFLOWS[@]}"
+      if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -gt 1 ] ||
+        ! raw_from_actionlint "$TMP/actionlint-confirm.json" "$CANDIDATE_DIR" "$RAW_CONFIRMATION"; then ACTIONLINT_OK=false; fi
+    fi
     if [ "$ACTIONLINT_OK" = true ]; then scanner_end actionlint ok
     else emit_unavailable actionlint "scan timed out, crashed, or returned malformed JSON"; scanner_end actionlint unavailable; fi
   else
@@ -586,7 +657,7 @@ fi
 # jq: changed JSON and JSONL; optional local JSON Schema map is fail-closed.
 JSON_RE='\.(json|jsonl)$'
 if changed_matches "$JSON_RE"; then
-  scanner_begin
+  scanner_begin jq
   JQ=$(resolve_tool jq)
   if tool_ready jq "$JQ" jq-1.7.1; then
     JQ_OK=true
@@ -679,6 +750,56 @@ if changed_matches "$JSON_RE"; then
       done < <("$JQ" -r '.mappings[]|[.path,.schema_path]|@tsv' "$SCHEMA_MAP")
       [ "$JQ_OK" = true ] || break
     done
+    if [ "$JQ_OK" = true ]; then
+      for file in "${JSON_FILES[@]}"; do
+        [ -f "$CANDIDATE_DIR/$file" ] || continue
+        run_bounded "$(remaining_budget)" "$CANDIDATE_DIR" "$TMP/jq-confirm.out" "$JQ" empty "$file"
+        if [ "$BOUNDED_TIMEOUT" = yes ]; then JQ_OK=false; break; fi
+        if [ "$RUN_RC" -ne 0 ]; then
+          jq -nc --arg path "$file" --arg message "JSON/JSONL is not well formed" \
+            '{schema:"firstmate/scanner-raw-finding/1",scanner:"jq",rule_id:"well-formedness",
+              severity:"error",path:$path,line:1,message:$message,content:$message}' >> "$RAW_CONFIRMATION"
+        fi
+      done
+    fi
+    CONFIRM_SCHEMA_MAP="$CANDIDATE_DIR/.fm-scanner-schemas.json"
+    if [ "$JQ_OK" = true ] && [ -f "$CONFIRM_SCHEMA_MAP" ]; then
+      if ! "$JQ" -e '
+        keys == ["mappings","schema"]
+        and .schema == "firstmate/scanner-schema-map/1"
+        and (.mappings|type) == "array"
+        and all(.mappings[];
+          keys == ["path","schema_path"]
+          and (.path|type) == "string" and (.path|length)>0
+          and (.schema_path|type) == "string" and (.schema_path|length)>0)
+      ' "$CONFIRM_SCHEMA_MAP" >/dev/null 2>&1; then
+        jq -nc \
+          '{schema:"firstmate/scanner-raw-finding/1",scanner:"jq",rule_id:"schema-map",
+            severity:"error",path:".fm-scanner-schemas.json",line:1,
+            message:"schema declaration map is outside firstmate/scanner-schema-map/1",
+            content:"invalid scanner schema declaration map"}' >> "$RAW_CONFIRMATION"
+      else
+        while IFS=$'\t' read -r document schema_path; do
+          [ -n "$document" ] || continue
+          grep -Fqx "$document" "$CHANGED" || continue
+          [ -f "$CANDIDATE_DIR/$document" ] || continue
+          if [ ! -f "$CANDIDATE_DIR/$schema_path" ]; then
+            jq -nc --arg path "$document" --arg schema_path "$schema_path" \
+              '{schema:"firstmate/scanner-raw-finding/1",scanner:"jq",rule_id:"declared-schema-missing",
+                severity:"error",path:$path,line:1,
+                message:("declared schema is missing: "+$schema_path),content:$schema_path}' >> "$RAW_CONFIRMATION"
+            continue
+          fi
+          run_bounded "$(remaining_budget)" "$CANDIDATE_DIR" "$TMP/schema-confirm.json" \
+            "${SCHEMA_COMMAND[@]}" "$schema_path" "$document"
+          if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -gt 1 ] ||
+            ! raw_from_schema "$TMP/schema-confirm.json" "$CANDIDATE_DIR" "$RAW_CONFIRMATION"; then
+            JQ_OK=false
+            break
+          fi
+        done < <("$JQ" -r '.mappings[]|[.path,.schema_path]|@tsv' "$CONFIRM_SCHEMA_MAP")
+      fi
+    fi
     if [ "$JQ_OK" = true ]; then scanner_end jq ok
     else
       if ! grep -q '"scanner":"jq".*"rule_id":"scanner-unavailable"' "$RAW_CANDIDATE"; then
@@ -696,7 +817,7 @@ fi
 # ShellCheck scanner: all changed shell scripts, including scripts outside bin/.
 SHELL_RE='\.sh$'
 if changed_matches "$SHELL_RE"; then
-  scanner_begin
+  scanner_begin shellcheck
   SHELLCHECK=$(resolve_tool shellcheck)
   if tool_ready shellcheck "$SHELLCHECK" 0.11.0; then
     SHELLCHECK_OK=true
@@ -719,6 +840,12 @@ if changed_matches "$SHELL_RE"; then
       if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -gt 1 ] ||
         ! raw_from_shellcheck "$TMP/shellcheck-candidate.json" "$CANDIDATE_DIR" "$RAW_CANDIDATE"; then SHELLCHECK_OK=false; fi
     fi
+    if [ "${#CANDIDATE_SHELL[@]}" -gt 0 ] && [ "$SHELLCHECK_OK" = true ]; then
+      run_bounded "$(remaining_budget)" "$CANDIDATE_DIR" "$TMP/shellcheck-confirm.json" \
+        "$SHELLCHECK" --norc -f json "${CANDIDATE_SHELL[@]}"
+      if [ "$BOUNDED_TIMEOUT" = yes ] || [ "$RUN_RC" -gt 1 ] ||
+        ! raw_from_shellcheck "$TMP/shellcheck-confirm.json" "$CANDIDATE_DIR" "$RAW_CONFIRMATION"; then SHELLCHECK_OK=false; fi
+    fi
     if [ "$SHELLCHECK_OK" = true ]; then scanner_end shellcheck ok
     else emit_unavailable shellcheck "scan timed out, crashed, or returned malformed JSON"; scanner_end shellcheck unavailable; fi
   else
@@ -731,7 +858,7 @@ fi
 # ruff: changed Python only.
 PYTHON_RE='\.py$'
 if changed_matches "$PYTHON_RE"; then
-  scanner_begin
+  scanner_begin ruff
   RUFF=$(resolve_tool ruff)
   if tool_ready ruff "$RUFF" 0.16.0; then
     RUFF_OK=true
@@ -754,6 +881,12 @@ if changed_matches "$PYTHON_RE"; then
         raw_from_sarif ruff "$TMP/ruff-candidate.sarif" "$CANDIDATE_DIR" "$RAW_CANDIDATE"; then :;
       else RUFF_OK=false; fi
     fi
+    if [ "$RUFF_OK" = true ] && [ "${#CANDIDATE_PYTHON[@]}" -gt 0 ]; then
+      if run_sarif_scan ruff "$RUFF" "$CANDIDATE_DIR" "$TMP/ruff-confirm.sarif" \
+        check --no-cache --output-format sarif "${CANDIDATE_PYTHON[@]}" &&
+        raw_from_sarif ruff "$TMP/ruff-confirm.sarif" "$CANDIDATE_DIR" "$RAW_CONFIRMATION"; then :;
+      else RUFF_OK=false; fi
+    fi
     if [ "$RUFF_OK" = true ]; then scanner_end ruff ok
     else emit_unavailable ruff "${SCAN_ERROR:-malformed output}"; scanner_end ruff unavailable; fi
   else
@@ -767,15 +900,19 @@ fi
 # redacted matched line; this pass only fills null content from immutable files.
 enrich_content "$RAW_BASE" "${BASE_DIR:-$CANDIDATE_DIR}" "$TMP/raw-base-enriched.jsonl"
 enrich_content "$RAW_CANDIDATE" "$CANDIDATE_DIR" "$TMP/raw-candidate-enriched.jsonl"
+enrich_content "$RAW_CONFIRMATION" "$CANDIDATE_DIR" "$TMP/raw-confirmation-enriched.jsonl"
 mv "$TMP/raw-base-enriched.jsonl" "$RAW_BASE"
 mv "$TMP/raw-candidate-enriched.jsonl" "$RAW_CANDIDATE"
+mv "$TMP/raw-confirmation-enriched.jsonl" "$RAW_CONFIRMATION"
 
 ATTRIBUTION="$TMP/attribution.json"
 if [ "$BASELINE_AVAILABLE" = true ]; then
-  "$SCRIPT_DIR/fm-findings-attribute.sh" --base "$RAW_BASE" --candidate "$RAW_CANDIDATE" --out "$ATTRIBUTION" ||
+  "$SCRIPT_DIR/fm-findings-attribute.sh" --base "$RAW_BASE" --candidate "$RAW_CANDIDATE" \
+    --confirmation "$RAW_CONFIRMATION" --policy "$POLICY" --out "$ATTRIBUTION" ||
     refuse "baseline attributor failed"
 else
-  "$SCRIPT_DIR/fm-findings-attribute.sh" --candidate "$RAW_CANDIDATE" --out "$ATTRIBUTION" ||
+  "$SCRIPT_DIR/fm-findings-attribute.sh" --candidate "$RAW_CANDIDATE" \
+    --confirmation "$RAW_CONFIRMATION" --policy "$POLICY" --out "$ATTRIBUTION" ||
     refuse "baseline attributor failed"
 fi
 
@@ -805,10 +942,11 @@ jq -e '
   and (.duration_ms|type) == "number"
   and (.timings|type) == "array"
   and all(.timings[];
-    ((keys - ["reason"]) == ["duration_ms","scanner","status"])
+    ((keys - ["reason"]) == ["budget_s","duration_ms","scanner","status"])
     and (.scanner|type) == "string"
     and (.status == "ok" or .status == "unavailable" or .status == "not-applicable")
-    and (.duration_ms|type) == "number")
+    and (.duration_ms|type) == "number"
+    and (.budget_s|type) == "number" and .budget_s>=1)
   and (.findings|type) == "array"
 ' "$REPORT" >/dev/null || refuse "scanner report failed its closed-schema proof (FC-001)"
 

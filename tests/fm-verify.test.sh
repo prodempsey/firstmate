@@ -37,6 +37,13 @@ mkdir -p "$FM_SCANNER_DIR/bin"
 cat > "$FM_SCANNER_DIR/bin/gitleaks" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = "--version" ]; then printf 'gitleaks version 8.30.1\n'; exit 0; fi
+if [ -n "${FM_TEST_ADVANCE_BASE_REPO:-}" ] &&
+  [ -n "${FM_TEST_ADVANCE_BASE_SHA:-}" ] &&
+  [ -n "${FM_TEST_ADVANCE_BASE_MARKER:-}" ] &&
+  [ ! -e "$FM_TEST_ADVANCE_BASE_MARKER" ]; then
+  git -C "$FM_TEST_ADVANCE_BASE_REPO" update-ref refs/heads/main "$FM_TEST_ADVANCE_BASE_SHA"
+  : > "$FM_TEST_ADVANCE_BASE_MARKER"
+fi
 report=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -209,6 +216,30 @@ expect_code 1 "$rc" "scanner finding fails integrated verifier"
 [ "$(bget "$TMP/scanner-integration.json" '.findings[]|select(.gate=="scanner" and .code=="gitleaks/generic-api-key")|.code')" = gitleaks/generic-api-key ] ||
   fail "normalized scanner finding did not reach the top-level verifier findings"
 pass "scanner gate integration: a synthetic candidate diff blocks fm-verify"
+
+# --- baseline freshness: scanner stays pinned and final publication rechecks ---
+RBASE=$(build_repo base-advances-during-scan)
+echo feat >> "$RBASE/f.txt"; git -C "$RBASE" commit -qam feature
+BASE_CANDIDATE_SHA=$(git -C "$RBASE" rev-parse HEAD)
+ORIGINAL_BASE_SHA=$(git -C "$RBASE" rev-parse main)
+ORIGINAL_BASE_TREE=$(git -C "$RBASE" rev-parse 'main^{tree}')
+ADVANCED_BASE_SHA=$(printf 'advance base during scanner\n' |
+  git -C "$RBASE" commit-tree "$ORIGINAL_BASE_TREE" -p "$ORIGINAL_BASE_SHA")
+FM_TEST_ADVANCE_BASE_REPO="$RBASE"
+FM_TEST_ADVANCE_BASE_SHA="$ADVANCED_BASE_SHA"
+FM_TEST_ADVANCE_BASE_MARKER="$TMP/base-advanced"
+export FM_TEST_ADVANCE_BASE_REPO FM_TEST_ADVANCE_BASE_SHA FM_TEST_ADVANCE_BASE_MARKER
+rc=$(verify "$TMP/base-advances.json" --worktree "$RBASE" --base main \
+  --sha "$BASE_CANDIDATE_SHA" --branch fm/g1 --task g1)
+unset FM_TEST_ADVANCE_BASE_REPO FM_TEST_ADVANCE_BASE_SHA FM_TEST_ADVANCE_BASE_MARKER
+expect_code 1 "$rc" "a base advance during scanning invalidates the verifier pass"
+[ "$(bget "$TMP/base-advances.json" '.gates[]|select(.gate=="revalidation")|.status')" = fail ] ||
+  fail "final revalidation did not fail after the authoritative base advanced"
+[ "$(bget "$TMP/base-advances.json" '.gates[]|select(.gate=="scanner")|.details.baseline_matches_base_currency')" = true ] ||
+  fail "scanner baseline was not bound to the exact base_currency SHA"
+[ "$(bget "$TMP/base-advances.json" '.gates[]|select(.gate=="scanner")|.details.baseline_sha')" = "$ORIGINAL_BASE_SHA" ] ||
+  fail "scanner report did not retain the exact pre-advance base SHA"
+pass "baseline freshness: scanner/base_currency SHAs match and a later base advance blocks publication"
 
 # --- FC-005: a delayed BACKGROUND mutation cannot dirty the authoritative tree -
 # (the exact round-2 escape: the suite launches a child that writes AFTER return)

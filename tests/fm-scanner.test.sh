@@ -44,6 +44,13 @@ case "$name" in
       for file in inherited-secret.txt new-secret.txt; do
         [ -f "$file" ] || continue
         if grep -q 'GITLEAKS' "$file"; then
+          if [ -n "${FM_TEST_FLAKY_GITLEAKS_MARKER:-}" ] &&
+            [ "$file" = new-secret.txt ]; then
+            if [ -e "$FM_TEST_FLAKY_GITLEAKS_MARKER" ]; then
+              continue
+            fi
+            : > "$FM_TEST_FLAKY_GITLEAKS_MARKER"
+          fi
           printf '%s' "$comma"
           "$REAL_JQ" -nc --arg file "$file" --arg line "$(sed -n '1p' "$file")" \
             '{RuleID:"generic-api-key",File:$file,StartLine:1,Description:"potential secret",Line:$line}'
@@ -84,7 +91,10 @@ case "$name" in
       [ -f "$file" ] && grep -q ESLINT "$file" || continue
       printf '%s' "$comma"
       "$REAL_JQ" -nc --arg file "$PWD/$file" \
-        '{filePath:$file,messages:[{ruleId:"security/detect-eval-with-expression",severity:2,line:1,message:"eslint finding"}]}'
+        '{filePath:$file,messages:[
+          {ruleId:"security/detect-eval-with-expression",severity:2,line:1,message:"high-FP security heuristic"},
+          {ruleId:"sonarjs/no-identical-functions",severity:2,line:1,message:"deterministic eslint error"}
+        ]}'
       comma=","
     done
     printf ']\n'
@@ -145,7 +155,7 @@ case "$name" in
       [ -f "$file" ] && grep -q SHELLCHECK "$file" || continue
       printf '%s' "$comma"
       "$REAL_JQ" -nc --arg file "$file" \
-        '{file:$file,line:1,code:2086,level:"warning",message:"shellcheck finding"}'
+        '{file:$file,line:1,code:2086,level:"error",message:"shellcheck finding"}'
       comma=","
     done
     printf ']\n'
@@ -209,7 +219,7 @@ run_scanner() {
   local tool_dir=$1 out=$2
   shift 2
   FM_SCANNER_DIR="$tool_dir" FM_VERIFY_SCANNER_TIMEOUT="${FM_VERIFY_SCANNER_TIMEOUT:-2}" \
-    FM_VERIFY_SCANNER_BUDGET="${FM_VERIFY_SCANNER_BUDGET:-20}" \
+    FM_VERIFY_SCANNER_BUDGET="${FM_VERIFY_SCANNER_BUDGET:-30}" \
     "$SCANNER" --repo "$REPO" --base "$BASE" --candidate "$CANDIDATE" --out "$out" "$@" >/dev/null 2>&1
 }
 
@@ -217,6 +227,10 @@ OUT="$TMP/report.json"
 run_scanner "$TOOLS" "$OUT"
 expect_code 1 "$?" "synthetic diff with candidate-new findings fails"
 [ "$(jq '.timings|length' "$OUT")" -eq 8 ] || fail "scanner report did not time all eight battery members"
+[ "$(jq '[.timings[].budget_s]|add' "$OUT")" -lt 30 ] ||
+  fail "committed per-scanner budgets leave no reserve inside the 30s battery budget"
+[ "$(jq '[.timings[].budget_s]|unique|length' "$OUT")" -gt 1 ] ||
+  fail "scanner timings do not expose distinct per-scanner budgets"
 [ "$(jq '.duration_ms' "$OUT")" -lt 30000 ] || fail "scanner fixture exceeded the 30s gate budget"
 for scanner in gitleaks oxlint eslint osv-scanner actionlint jq shellcheck ruff; do
   [ "$(jq --arg scanner "$scanner" '[.findings[]|select(.scanner==$scanner and .attribution=="candidate-new" and .blocking)]|length' "$OUT")" -gt 0 ] ||
@@ -224,7 +238,43 @@ for scanner in gitleaks oxlint eslint osv-scanner actionlint jq shellcheck ruff;
   [ "$(jq --arg scanner "$scanner" '[.findings[]|select(.scanner==$scanner and .attribution=="inherited" and (.blocking|not))]|length' "$OUT")" -gt 0 ] ||
     fail "$scanner did not exclude its inherited fixture"
 done
+[ "$(jq '[.findings[]|select(
+    .scanner=="eslint"
+    and (.rule_id|startswith("security/"))
+    and .policy_decision=="report-only"
+    and (.blocking|not)
+  )]|length' "$OUT")" -gt 0 ] ||
+  fail "eslint-plugin-security findings did not remain visible and report-only"
+pass "severity policy: blocking errors gate while eslint-plugin-security remains report-only"
 pass "every Phase 1 scanner fires on a real fixture and excludes its inherited baseline finding"
+
+run_scanner "$TOOLS" "$TMP/full-report.json" --scope full
+expect_code 1 "$?" "full-scope scan with the same findings fails"
+jq -S '[.findings[]|{
+  scanner,rule_id,path,line,attribution,blocking,policy_decision,stability
+}]|sort_by(.scanner,.rule_id,.path,.line)' "$OUT" > "$TMP/diff-findings.json"
+jq -S '[.findings[]|{
+  scanner,rule_id,path,line,attribution,blocking,policy_decision,stability
+}]|sort_by(.scanner,.rule_id,.path,.line)' "$TMP/full-report.json" > "$TMP/full-findings.json"
+cmp -s "$TMP/diff-findings.json" "$TMP/full-findings.json" ||
+  fail "diff-scoped findings diverged from full-scope findings on touched surfaces"
+pass "incremental equivalence: diff and full scope produce the same touched-surface findings"
+
+FM_TEST_FLAKY_GITLEAKS_MARKER="$TMP/flaky-gitleaks-observed"
+export FM_TEST_FLAKY_GITLEAKS_MARKER
+rm -f "$FM_TEST_FLAKY_GITLEAKS_MARKER"
+run_scanner "$TOOLS" "$TMP/flaky-report.json"
+expect_code 1 "$?" "other stable blocking findings still fail the flaky fixture"
+[ "$(jq '[.findings[]|select(
+    .scanner=="gitleaks"
+    and .path=="new-secret.txt"
+    and .policy_decision=="report-only"
+    and .stability=="unconfirmed"
+    and (.policy_reason|contains("nondeterministic"))
+  )]|length' "$TMP/flaky-report.json")" -eq 1 ] ||
+  fail "a one-run-only blocking-tier finding was not downgraded with a nondeterminism note"
+unset FM_TEST_FLAKY_GITLEAKS_MARKER
+pass "nondeterminism: blocking-tier findings require a repeat-run confirmation"
 
 MAIN_REPO=$REPO
 MAIN_BASE=$BASE
@@ -321,13 +371,15 @@ for scanner in gitleaks oxlint eslint-scanner osv-scanner actionlint jq shellche
   } > "$wedged/bin/$target"
   chmod +x "$wedged/bin/$target"
   start=$SECONDS
-  FM_VERIFY_SCANNER_TIMEOUT=1 FM_VERIFY_SCANNER_BUDGET=20 run_scanner "$wedged" "$TMP/wedged-$scanner.json"
+  FM_VERIFY_SCANNER_TIMEOUT=1 FM_VERIFY_SCANNER_BUDGET=30 run_scanner "$wedged" "$TMP/wedged-$scanner.json"
   expect_code 1 "$?" "$report_name timeout fails closed"
   elapsed=$((SECONDS - start))
   [ "$elapsed" -lt 12 ] || fail "$report_name exceeded its portable deadline (${elapsed}s)"
   [ "$(jq --arg scanner "$report_name" '[.findings[]|select(.scanner==$scanner and .rule_id=="scanner-unavailable")]|length' "$TMP/wedged-$scanner.json")" -eq 1 ] ||
     fail "$report_name timeout did not yield exactly one scanner-unavailable finding"
+  [ "$(jq --arg scanner "$report_name" '[.timings[]|select(.scanner!=$scanner and .status=="unavailable")]|length' "$TMP/wedged-$scanner.json")" -eq 0 ] ||
+    fail "$report_name exhausted another scanner's reserved time slice"
 done
-pass "FC-006: every scanner is bounded and timeout produces one unavailable finding"
+pass "FC-006/G9: each scanner has a reserved budget and exhaustion stays local and loud"
 
 echo "# all fm-scanner tests passed"

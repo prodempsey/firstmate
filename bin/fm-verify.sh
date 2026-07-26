@@ -249,6 +249,10 @@ base_tip_now() {
   case "$BASE_SOURCE" in
     explicit) git -C "$WORKTREE" rev-parse --verify "$BASE_REF^{commit}" 2>/dev/null || true ;;
     local-default) git -C "$WORKTREE" rev-parse --verify "refs/heads/$BASE_LABEL^{commit}" 2>/dev/null || true ;;
+    trunk-check)
+      git -C "$WORKTREE" rev-parse --verify "$BASE_LABEL^{commit}" 2>/dev/null ||
+        printf '%s\n' "$BASE_SHA"
+      ;;
     *) printf '%s\n' "$BASE_SHA" ;;
   esac
 }
@@ -537,11 +541,6 @@ if [ -n "$drift" ]; then
   emit_finding revalidation identity-drift fail "the authority-bearing worktree changed during verification (FC-005):$drift"
   revalidation_status=fail
 fi
-emit_gate revalidation "$revalidation_status" "$(jq -nc \
-  --arg s0 "$SHA0" --arg s1 "$SHA1" --arg b0 "$BRANCH0" --arg b1 "$BRANCH1" \
-  --arg d0 "$DIRTY0" --arg d1 "$DIRTY1" --arg bs0 "$BASE0" --arg bs1 "$BASE1" \
-  '{before:{head_sha:$s0,branch:$b0,tree_dirty:($d0=="yes"),base_sha:(if $bs0=="" then null else $bs0 end)},
-    after:{head_sha:$s1,branch:$b1,tree_dirty:($d1=="yes"),base_sha:(if $bs1=="" then null else $bs1 end)}}')"
 
 ACTUAL_SHA=$SHA1
 ACTUAL_BRANCH=$BRANCH1
@@ -670,9 +669,12 @@ else
     emit_finding scanner scanner-unavailable fail \
       "SCANNER_UNAVAILABLE [battery]: exceeded the ${scanner_outer_budget}s outer hard deadline (FC-006/FC-004)"
     scanner_status=fail
-  elif [ ! -f "$SCANNER_REPORT" ] || ! jq -e '
+  elif [ ! -f "$SCANNER_REPORT" ] || ! jq -e \
+    --arg expected "$DIFF_BASE" --arg candidate "$ACTUAL_SHA" '
       .schema=="firstmate/scanner-report/1"
       and (keys == ["base_sha","baseline","budget_s","candidate_sha","duration_ms","findings","schema","timings"])
+      and .base_sha==(if $expected=="" then null else $expected end)
+      and .candidate_sha==$candidate
     ' "$SCANNER_REPORT" >/dev/null 2>&1; then
     emit_finding scanner scanner-unavailable fail \
       "SCANNER_UNAVAILABLE [battery]: scanner crashed or returned output outside firstmate/scanner-report/1 (rc=$scanner_rc; fail closed, FC-001/FC-004)"
@@ -693,8 +695,12 @@ else
     [ "$scanner_rc" -eq 0 ] || scanner_status=fail
   fi
   if [ -f "$SCANNER_REPORT" ] && jq -e '.schema=="firstmate/scanner-report/1"' "$SCANNER_REPORT" >/dev/null 2>&1; then
-    emit_gate scanner "$scanner_status" "$(jq -c --arg source "$SCANNER_ADOPTION_SOURCE" '{
+    emit_gate scanner "$scanner_status" "$(jq -c \
+      --arg source "$SCANNER_ADOPTION_SOURCE" --arg expected "$DIFF_BASE" '{
       adopted:true,adoption_source:$source,
+      base_currency_sha:(if $expected=="" then null else $expected end),
+      baseline_sha:.base_sha,
+      baseline_matches_base_currency:(.base_sha==(if $expected=="" then null else $expected end)),
       baseline:.baseline,budget_s:.budget_s,duration_ms:.duration_ms,
       timings:.timings,findings:.findings
     }' "$SCANNER_REPORT")"
@@ -702,6 +708,7 @@ else
     emit_gate scanner "$scanner_status" "$(jq -nc \
       --arg budget "$SCANNER_BUDGET" --arg source "$SCANNER_ADOPTION_SOURCE" \
       '{adopted:true,adoption_source:$source,
+        base_currency_sha:null,baseline_sha:null,baseline_matches_base_currency:false,
         baseline:{available:false,warning:"scanner report unavailable"},
         budget_s:($budget|tonumber),duration_ms:0,timings:[],findings:[]}')"
   fi
@@ -802,6 +809,26 @@ emit_gate brief_contract "$brief_status" "$(jq -nc \
 # ============================================================================
 # Assemble the bundle and verdict
 # ============================================================================
+SHA2=$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || true)
+BRANCH2=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+DIRTY2=no; [ -n "$(git -C "$WORKTREE" status --porcelain 2>/dev/null || true)" ] && DIRTY2=yes
+BASE2=$(base_tip_now)
+final_drift=""
+[ "$SHA1" = "$SHA2" ] || final_drift="$final_drift HEAD($SHA1->$SHA2)"
+[ "$BRANCH1" = "$BRANCH2" ] || final_drift="$final_drift branch($BRANCH1->$BRANCH2)"
+[ "$DIRTY1" = "$DIRTY2" ] || final_drift="$final_drift dirty($DIRTY1->$DIRTY2)"
+[ "$BASE_SHA" = "$BASE2" ] || final_drift="$final_drift base($BASE_SHA->$BASE2)"
+if [ -n "$final_drift" ]; then
+  emit_finding revalidation identity-drift fail \
+    "the authority-bearing candidate or base changed before bundle publication (FC-005):$final_drift"
+  revalidation_status=fail
+fi
+emit_gate revalidation "$revalidation_status" "$(jq -nc \
+  --arg s0 "$SHA0" --arg s2 "$SHA2" --arg b0 "$BRANCH0" --arg b2 "$BRANCH2" \
+  --arg d0 "$DIRTY0" --arg d2 "$DIRTY2" --arg bs0 "$BASE0" --arg bs2 "$BASE2" \
+  '{before:{head_sha:$s0,branch:$b0,tree_dirty:($d0=="yes"),base_sha:(if $bs0=="" then null else $bs0 end)},
+    after:{head_sha:$s2,branch:$b2,tree_dirty:($d2=="yes"),base_sha:(if $bs2=="" then null else $bs2 end)}}')"
+
 VERDICT=pass
 EXIT=0
 if grep -q '"status":"fail"' "$GATES" 2>/dev/null; then VERDICT=fail; fi
@@ -845,6 +872,15 @@ SUMMARY="$WORK/summary.md"
   if jq -e '.findings[]?|select(.attribution=="inherited")' "$SCANNER_REPORT" >/dev/null 2>&1; then
     jq -r '.findings[]|select(.attribution=="inherited")|
       "- ["+.scanner+"/"+.rule_id+"] "+.message+
+      (if .path then " ("+.path+(if .line then ":"+(.line|tostring) else "" end)+")" else "" end)' \
+      "$SCANNER_REPORT"
+  else
+    printf 'none\n'
+  fi
+  printf '\n## Scanner report-only findings\n'
+  if jq -e '.findings[]?|select(.policy_decision=="report-only")' "$SCANNER_REPORT" >/dev/null 2>&1; then
+    jq -r '.findings[]|select(.policy_decision=="report-only")|
+      "- ["+.scanner+"/"+.rule_id+"] "+.message+" - "+.policy_reason+
       (if .path then " ("+.path+(if .line then ":"+(.line|tostring) else "" end)+")" else "" end)' \
       "$SCANNER_REPORT"
   else
